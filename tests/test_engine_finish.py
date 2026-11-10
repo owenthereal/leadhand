@@ -2,6 +2,7 @@
 import re
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from fakeworld import FakeWorld, card
 from gitfixture import commit, run_git, write
@@ -453,6 +454,111 @@ class Crashes(unittest.TestCase):
         (acc,) = [e for e in w.events("accepted") if e["card"] == "final"]
         self.assertEqual(acc["sha"], intent["target"])
         self.assertEqual(run_git(w.repo, "reflog", "show", "--format=%H", f"refs/heads/{RUN}"), reflog)
+
+
+def base_wt(w):
+    return w.repo / ".worktrees" / f"{w.run_dir.name}--base"
+
+
+class FixRound2(unittest.TestCase):
+    def test_spent_final_fix_is_not_rechecked_after_a_card_accept_crash(self):
+        w = FakeWorld(self, [card(1), card(2)], gates=True)
+        w.start()
+        w.script(1, "implement", {"status": "QUESTION"})
+        w.parks[1] = "product decision"
+        w.script(None, "final_review", {"verdict": "defects"})
+        w.script(None, "final_fix", {"status": "QUESTION"})
+        fix = drive_to_run(w, lambda a: a["kind"] == "final_fix")
+        worker = w.launch(fix)
+        engine.unpark(w.run_dir, 1, "Use JSON.")
+        del w.parks[1]
+        engine.record(w.run_dir, "result", dispatch_id=fix["dispatch_id"], worker_id=worker,
+                      reply=w.perform(fix, worker))
+        for _ in range(60):
+            a = w.next()
+            w.act(a)
+            if a["action"] == "dispatch" and a["card"] == 1 and a["kind"] == "verify":
+                break
+        r = w.cli("next", w.run_dir, crash="after_fast_forward")
+        self.assertEqual(r.returncode, 97, r.stderr)
+        done = w.run()[-1]
+        self.assertEqual(done["outcome"], "complete", done["reasons"])
+        self.assertEqual(found_violations(w), [])
+        self.assertEqual(sorted(e["card"] for e in w.events("accepted")), [1, 2])
+        head = w.branch_tip(RUN)
+        for e in w.events("accepted"):
+            run_git(w.repo, "merge-base", "--is-ancestor", e["sha"], head)
+        (spent,) = [e for e in w.events("verdict_recorded") if e.get("dispatch_id") == fix["dispatch_id"]]
+        self.assertEqual(spent["verdict"], "spent")
+
+    def test_crash_between_base_violation_found_and_restored_recovers(self):
+        def move(world, ws, a):
+            commit(base_wt(world), {"src/moved.txt": "m\n"}, "moved base")
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        w.script(None, "evidence", {"tamper": move}, {})
+        real = engine.git
+
+        class Crash(Exception):
+            pass
+        armed = {"on": True}
+
+        def crashing(cwd, *args, **kw):
+            if armed["on"] and "update-ref" in args and any(str(x).endswith("-base") for x in args):
+                armed["on"] = False
+                raise Crash()
+            return real(cwd, *args, **kw)
+        with mock.patch.object(engine, "git", crashing):
+            with self.assertRaises(Crash):
+                w.run()
+        self.assertEqual([e["stage"] for e in found_violations(w)], ["found"])
+        done = w.run()[-1]
+        self.assertEqual(done["outcome"], "complete")
+        stages = [e["stage"] for e in w.events("violation")]
+        self.assertEqual(stages, ["found", "restored"])
+        self.assertEqual(run_git(base_wt(w), "rev-parse", "HEAD"), w.base)
+        kept = run_git(w.repo, "for-each-ref", "--format=%(refname)", "refs/leadhand/").splitlines()
+        self.assertTrue(any(k.endswith("-base") for k in kept), kept)
+
+    def test_evidence_rerun_after_a_worker_failure_gets_a_reset_base(self):
+        seen = {}
+
+        def leave(world, ws, a):
+            write(base_wt(world), {"tests/leftover_test.py": "x\n", "build/cache.o": "y\n"})
+
+        def look(world, ws, a):
+            seen["files"] = {p.name for p in base_wt(world).rglob("*") if p.is_file() and ".git" not in p.parts}
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        w.script(None, "evidence", {"tamper": leave, "status": "BLOCKED"}, {"tamper": look})
+        done = w.run()[-1]
+        self.assertEqual(done["outcome"], "complete")
+        self.assertEqual([i for i in w.run_dispatch_ids() if "evidence" in i], ["run-evidence-1", "run-evidence-2"])
+        self.assertNotIn("leftover_test.py", seen["files"])
+        self.assertNotIn("cache.o", seen["files"])
+
+    def test_voided_final_fix_reruns_from_the_run_head(self):
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        w.script(None, "final_review", {"verdict": "defects"})
+
+        def rewind(world, ws, a):
+            run_git(ws, "branch", "-f", RUN, world.base)
+        w.script(None, "final_fix", {"tamper": rewind}, {})
+        done = w.run()[-1]
+        self.assertEqual(done["outcome"], "complete")
+        (v,) = found_violations(w)
+        run_files = run_git(w.repo, "ls-tree", "-r", "--name-only", RUN).splitlines()
+        self.assertNotIn("src/final/run-w1-final_fix-1.txt", run_files)     # the voided worker's commit
+        self.assertIn("src/final/run-w1-final_fix-2.txt", run_files)
+        review = next(a for a in w.run_started if a["kind"] == "final_review" and a["wave"])
+        req = next(e for e in w.events("dispatch_requested") if e["dispatch_id"] == review["dispatch_id"])
+        base, tip = req["extra"]["diff_range"].split("..")
+        self.assertEqual(run_git(w.repo, "diff", "--name-only", base, tip).splitlines(),
+                         ["src/final/run-w1-final_fix-2.txt"])
+        keep = f"refs/leadhand/{w.meta()['run_id']}/violations/{v['n']}-final"
+        self.assertEqual(run_git(w.repo, "show", f"{keep}:src/final/run-w1-final_fix-1.txt"),
+                         "run-w1-final_fix-1")
 
 
 class NothingAccepted(unittest.TestCase):

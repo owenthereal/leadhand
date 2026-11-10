@@ -1255,7 +1255,9 @@ def _void(ctx: _Run, d: _Dispatch, events: list[dict]) -> bool:
             return False
         mine = [found]
     found = next(e for e in mine if e.get("stage") == "found")
-    if not any(e.get("stage") == "restored" for e in mine):
+    if not any(e.get("stage") == "restored" for e in mine) and "base_worktree" in found:
+        _restore_base(ctx, found)               # an evidence worker that changed the base worktree
+    elif not any(e.get("stage") == "restored" for e in mine):
         saved, siblings = _restore_violation(ctx, found)
         append_event(ctx.paths, "violation", stage="restored", by="check", dispatch_id=d.id,
                      card=d.req.get("card"), n=found["n"], ref=found["ref"], saved=saved, siblings=siblings,
@@ -1310,10 +1312,16 @@ def _find_violation(ctx: _Run, d: _Dispatch, events: list[dict]) -> dict | None:
     v = detect_violation(ctx.ws, req["expected_head"], req["expected_branch"]) if req.get("expected_head") else None
     before, now = req.get("refs") or {}, _ref_snapshot(ctx)
     latest, owned = _engine_writes(ctx, events, req["seq"])
+    # An acceptance whose fast-forward happened but whose `accepted` is not recorded yet (a
+    # crash in between) moved the run branch to its target: that is the engine's move too.
+    run_ref = f"refs/heads/{ctx.branch}"
+    targets = {e.get("target") for e in events if e["kind"] == "accept_started" and e["seq"] > req["seq"]}
     names = set(req["ref_scope"]) if req.get("ref_scope") else set(before) | set(now)
     moved = {}
     for name in sorted(names - owned):
         expected = latest[name] if name in latest else before.get(name)
+        if name == run_ref and now.get(name) in targets:
+            continue
         if now.get(name) != expected:
             moved[name] = {"old": expected, "new": now.get(name)}
     if v is None and not moved:
@@ -1618,7 +1626,7 @@ def _request_gate(ctx: _Run, events: list[dict], gate: str, head_sha: str, accep
     if gate in REVIEW_GATES:
         extra["diff_range"] = f"{ctx.meta['base_sha']}..{head_sha}"
     if gate == "evidence":
-        extra["base_worktree"] = str(_base_worktree(ctx))
+        extra["base_worktree"] = str(_base_worktree_path(ctx))      # reset in _request_run
     _request_run(ctx, events, kind=gate, gate=gate, attempt=1, role=res.role, route=res.route,
                  extra=extra, accepted=accepted)
 
@@ -1673,12 +1681,19 @@ def _base_violation(ctx: _Run, d: _Dispatch, events: list[dict]) -> bool:
                          head_moved=now != base, index_dirty=False, expected_head=d.req.get("expected_head"),
                          expected_branch=d.req.get("expected_branch"), refs={},
                          preserved={"base": keep} if now and now != base else {})
-    if now and now != base:
-        git(ctx.ws, "update-ref", "-m", "leadhand: keep a base worktree a verifier moved", keep, now)
-    _base_worktree(ctx)
-    append_event(ctx.paths, "violation", stage="restored", by="check", dispatch_id=d.id, card=None,
-                 n=n, ref=None, saved=now, siblings=[], preserved=found["preserved"])
+    _restore_base(ctx, found)
     return True
+
+
+def _restore_base(ctx: _Run, found: dict) -> None:
+    """Keep the moved base HEAD on its ref, reset the base worktree, record `restored`.
+    Repeat-safe: after a crash in between, `_void` calls it again."""
+    keep = (found.get("preserved") or {}).get("base")
+    if keep and found.get("base_head"):
+        git(ctx.ws, "update-ref", "-m", "leadhand: keep a base worktree a verifier moved", keep, found["base_head"])
+    _base_worktree(ctx)
+    append_event(ctx.paths, "violation", stage="restored", by="check", dispatch_id=found["dispatch_id"], card=None,
+                 n=found["n"], ref=None, saved=found.get("base_head"), siblings=[], preserved=found["preserved"])
 
 
 def _start_wave(ctx: _Run, events: list[dict], wave: int, failing: dict, head_sha: str,
@@ -1731,6 +1746,9 @@ def _request_run(ctx: _Run, events: list[dict], *, kind: str, attempt: int, role
         # Like an integrate worker: it commits on the final branch but must leave the run branch alone.
         run_ref = f"refs/heads/{ctx.branch}"
         guard = {"refs": {run_ref: head(ctx.ws, run_ref)}, "ref_scope": [run_ref]}
+    if kind == "evidence":
+        # Every evidence dispatch (first run, voided or failed re-run) starts from a clean base.
+        extra = {**extra, "base_worktree": str(_base_worktree(ctx))}
     full = {"base": ctx.meta["base_sha"], "branch": ctx.branch, "test_first": ctx.config.run.test_first,
             "cards": ",".join(str(c.number) for c in accepted), **extra}
     if gate is not None and not any(e["kind"] == "gate_started" and e.get("dispatch_id") == did for e in events):
@@ -1774,12 +1792,16 @@ def _after_run_result(ctx: _Run, d: _Dispatch, events: list[dict], index: dict[s
         return True, None
     wave = req.get("wave")
     if d.kind == "final_fix":
+        if any(e["kind"] == "verdict_recorded" and e.get("dispatch_id") == d.id for e in events):
+            return False, None                      # settled as spent: never checked again
         if "refs" in req and _run_check_voided(ctx, d, events, accepted):
             return True, None
         if r["status"] == "READY":
             base, tip = req["extra"]["base"], r.get("tip")
             if not tip or tip == base or base != _run_head(ctx):
-                return False, None                  # changed nothing, or the run head moved: spent
+                why = "changed nothing" if not tip or tip == base else "the run head moved"
+                _settle_spent(ctx, d, why)
+                return True, None
             res = _resolve_run(ctx, "final_reviewer", accepted)
             notes = ("## Fix wave\n\n"
                      f"This reviews fix wave {wave} for the failed \"{req['extra']['gate']}\" gate, whose "
@@ -1795,7 +1817,8 @@ def _after_run_result(ctx: _Run, d: _Dispatch, events: list[dict], index: dict[s
         if r["status"] == "BLOCKED":
             _run_worker_failed(ctx, d, events, index, accepted)
             return True, None
-        return False, None                          # QUESTION or SPENT: the wave is spent
+        _settle_spent(ctx, d, f"ended {r['status']}")
+        return True, None
     # The review of a fix wave.
     verdict = next((e for e in events if e["kind"] == "verdict_recorded" and e.get("dispatch_id") == d.id), None)
     if verdict is None:
@@ -1827,6 +1850,14 @@ def _after_run_result(ctx: _Run, d: _Dispatch, events: list[dict], index: dict[s
     return True, None
 
 
+def _settle_spent(ctx: _Run, d: _Dispatch, why: str) -> None:
+    """Record that a fix wave's implementer result spent the wave (its guard was checked
+    first), as `verdict_recorded{card: "final", verdict: "spent"}`, so the result is acted on
+    once: later steps never check its guard again, whatever moves afterwards."""
+    append_event(ctx.paths, "verdict_recorded", card=FINAL, wave=d.req.get("wave"), verdict="spent",
+                 reason=why, findings=_report_copy(d), dispatch_id=d.id)
+
+
 def _run_check_voided(ctx: _Run, d: _Dispatch, events: list[dict], accepted: list[Card]) -> bool:
     """A run-level check that changed what it guards: preserved, undone and run again with a
     fresh worker (R33). Past VIOLATION_CAP voided runs of the kind since the run was last
@@ -1844,11 +1875,35 @@ def _run_check_voided(ctx: _Run, d: _Dispatch, events: list[dict], accepted: lis
         what = (f"change tracked files: {', '.join(paths)}" if paths else f"move refs: {', '.join(refs)}")
         _end(ctx, events, blocked_reason="decision needed", why=(f"{d.kind} workers {what}",))
         return True
-    _rerun(ctx, d, events, accepted, notes=_voided_notes(d.req.get("notes") or ""))
+    if d.kind == "final_fix":
+        _recut_final(ctx, d, events)
+    _rerun(ctx, read_events(ctx.paths), accepted, notes=_voided_notes(d.req.get("notes") or ""), d=d)
     return True
 
 
-def _rerun(ctx: _Run, d: _Dispatch, events: list[dict], accepted: list[Card], *, notes: str) -> None:
+def _recut_final(ctx: _Run, d: _Dispatch, events: list[dict]) -> None:
+    """R36: the fresh re-run of a voided final fix starts from the run head. The final branch
+    is moved back there (compare-and-swap), and the voided worker's commits are kept only on
+    refs/leadhand/<run_id>/violations/<n>-final, so the fix review never covers them.
+    Recorded as `card_cut{card: "final", recut_after}`; repeat-safe."""
+    if any(e["kind"] == "card_cut" and e.get("recut_after") == d.id for e in events):
+        return
+    found = next(e for e in events if e["kind"] == "violation" and e.get("dispatch_id") == d.id
+                 and e.get("stage") == "found")
+    branch, head_sha = _final_branch(ctx), _run_head(ctx)
+    ref = f"refs/heads/{branch}"
+    old = _ref_value(ctx, ref)
+    if old != head_sha:
+        _check_out(ctx, events, None, ctx.branch)          # off the final branch before it moves
+        if old is not None:
+            git(ctx.ws, "update-ref", "-m", "leadhand: keep a voided final fix",
+                f"refs/leadhand/{ctx.meta['run_id']}/violations/{found['n']}-final", old)
+        git(ctx.ws, "update-ref", "-m", "leadhand: re-cut the final fix branch", ref, head_sha, old or "")
+    append_event(ctx.paths, "card_cut", card=FINAL, branch=branch, base=head_sha, wave=d.req.get("wave"),
+                 recut_after=d.id)
+
+
+def _rerun(ctx: _Run, events: list[dict], accepted: list[Card], *, notes: str, d: _Dispatch) -> None:
     """The same run-level dispatch again, on the same route with a fresh worker."""
     req = d.req
     _request_run(ctx, events, kind=d.kind, gate=req.get("gate"), wave=req.get("wave"), attempt=req["attempt"],
@@ -1874,7 +1929,7 @@ def _run_worker_failed(ctx: _Run, d: _Dispatch, events: list[dict], index: dict[
             _end_blocked(ctx, events, "environment",
                          why=(f"{d.kind} ended {r['status']} twice without a usable report",))
             return
-    _rerun(ctx, d, events, accepted, notes=req.get("notes") or "")
+    _rerun(ctx, events, accepted, notes=req.get("notes") or "", d=d)
 
 
 def _end(ctx: _Run, events: list[dict], *, blocked_reason: str | None = None, open_findings: bool = False,
