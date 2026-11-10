@@ -91,6 +91,10 @@ MENU_MAX_MOVES = 6
 DIALOG_REPEAT_LIMIT = 3
 # Publishing commands. Built from parts so the two-word command never appears as a literal.
 PUBLISH_RE = re.compile(r"\bgit\b[^\n;&|]*\b" + "pu" + r"sh\b|\bgh\s+pr\b|\bgh\s+repo\s+create\b")
+EXIT_REFUSED = 3                 # `leadhand run`: someone else owns the run
+REFUSED_RETRY_S = 20.0
+DONE_RE = re.compile(r'\\?"action\\?":\s*\\?"done\\?"')
+REQUIRED_GATES = ("final_review", "evidence", "verify")   # security too when the run requires it
 CARD_PINS = {1: ("claude", "sonnet", "low"), 2: ("codex", "gpt-6-luna", "medium")}
 
 
@@ -139,6 +143,30 @@ def short(v, n: int = 300) -> str:
     s = v if isinstance(v, str) else json.dumps(v, default=str)
     s = s.replace("\n", " | ")
     return s if len(s) <= n else s[: n - 3] + "..."
+
+
+def runner_processes(runner_json: Path) -> dict[str, dict]:
+    """runner.json's nested process records: {"runner": {pid, pgid, start}, "codex": {...}}."""
+    rj = read_json(runner_json)
+    return {role: rec for role in ("runner", "codex")
+            if isinstance(rec := rj.get(role), dict) and isinstance(rec.get("pid"), int)}
+
+
+def kill_runner_processes(runner_json: Path, sig: int, roles=("codex", "runner")) -> list[tuple[str, int]]:
+    """Signal the recorded processes whose pid and start time still match; returns what was signalled."""
+    done = []
+    recs = runner_processes(runner_json)
+    for role in roles:
+        rec = recs.get(role)
+        if not rec or not isinstance(rec.get("start"), str):
+            continue
+        if lh_procs.same_process(rec["pid"], rec["start"]):
+            try:
+                os.kill(rec["pid"], sig)
+                done.append((role, rec["pid"]))
+            except ProcessLookupError:
+                pass
+    return done
 
 
 # ---------------------------------------------------------------- transcripts
@@ -526,6 +554,14 @@ class Driver:
         self.facts["operator leadhand user config exists (not read)"] = user_cfg.exists()
         return not missing
 
+    def safe_setup(self) -> bool:
+        try:
+            return self.setup()
+        except Exception:
+            self.errors.append("setup: " + traceback.format_exc())
+            self.stop_reason = "setup failed"
+            return False
+
     def setup(self) -> bool:
         self.tmp = Path(tempfile.mkdtemp(prefix="lh e2e "))
         self.fx = make_fixture.make_fixture(self.tmp)
@@ -648,6 +684,16 @@ class Driver:
                 "last_line_to_exit_s": round(exit_t - s.stream_meta[-1]["t"], 1),
             })
 
+    def engine_said_done(self, session: Session) -> bool:
+        """Whether a `leadhand next` result in the session's stream or transcript was a `done` action."""
+        texts = []
+        stream = getattr(session, "dir", None)
+        if stream is not None and (stream / "stream.jsonl").exists():
+            texts.append((stream / "stream.jsonl").read_text(encoding="utf-8", errors="replace"))
+        for p in self.transcripts()[0]:
+            texts.append(p.read_text(encoding="utf-8", errors="replace"))
+        return any(DONE_RE.search(t) for t in texts)
+
     def drive(self) -> None:
         deadline = self.t0 + self.budget_s
         session = self.launch(self.launch_argv_first(), "first launch")
@@ -678,10 +724,27 @@ class Driver:
                 self.analyze_exit(session, events)
                 self.log(f"session {session.n} exited (code {session.exit_code}) without an outcome; "
                          f"open dispatches: {session.notes.get('dispatches_open_at_exit')}")
-                no_progress = 0 if session.notes.get("events_added") else no_progress + 1
                 if now >= deadline:
                     self.stop_reason = "budget ended"
                     break
+                if session.exit_code == EXIT_REFUSED:
+                    # The run lock is still held (an earlier supervisor lives): not a lack of progress.
+                    session.notes["refused"] = True
+                    self.facts.setdefault("refused launches (exit 3, lock held)", []).append(
+                        f"session {session.n} at {session.exited_utc}")
+                    time.sleep(REFUSED_RETRY_S)
+                    argv = self.relaunch_argv()
+                    if argv is None:
+                        self.stop_reason = "launch-line failed"
+                        break
+                    session = self.launch(argv, "relaunch after refusal (launch-line)")
+                    continue
+                if self.engine_said_done(session):
+                    session.notes["engine_done_without_outcome"] = True
+                    self.stop_reason = ("the engine returned a `done` action but no outcome event was "
+                                        "written; not relaunching")
+                    break
+                no_progress = 0 if session.notes.get("events_added") else no_progress + 1
                 if no_progress >= NO_PROGRESS_LIMIT:
                     self.stop_reason = f"{no_progress} sessions in a row added no event; stopped relaunching"
                     break
@@ -719,15 +782,8 @@ class Driver:
                 continue
             r = self.cmd([str(CLI), "stop-dispatch", str(self.run_dir), "--dispatch", d.name], timeout=120)
             stopped.append(f"{d.name}: exit {r.returncode}")
-            rj = read_json(d / "runner.json")
-            for pk, sk in (("runner_pid", "runner_start"), ("codex_pid", "codex_start"), ("pid", "start")):
-                pid, start = rj.get(pk), rj.get(sk)
-                if isinstance(pid, int) and isinstance(start, str) and lh_procs.same_process(pid, start):
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                        stopped.append(f"{d.name}: SIGKILL {pk} {pid}")
-                    except ProcessLookupError:
-                        pass
+            for role, pid in kill_runner_processes(d / "runner.json", signal.SIGKILL):
+                stopped.append(f"{d.name}: SIGKILL {role} {pid}")
         self.facts["runners stopped by the driver"] = stopped or "none"
 
     def finish_run(self) -> None:
@@ -853,8 +909,10 @@ class Driver:
         report = self.run_dir / "report.md"
         lines = report.read_text(encoding="utf-8").splitlines() if report.exists() else []
         line3 = lines[2] if len(lines) >= 3 else None
-        self.add("report.md line 3", "PASS" if line3 == "Outcome: complete" else "FAIL",
-                 {"line 3": line3 if line3 is not None else "missing", "report exists": report.exists()},
+        by_run = self.facts.get("report.md written by the run") is True
+        self.add("report.md line 3", "PASS" if line3 == "Outcome: complete" and by_run else "FAIL",
+                 {"line 3": line3 if line3 is not None else "missing", "report exists": report.exists(),
+                  "written by the run itself (not the driver's `leadhand report`)": by_run},
                  lines[:10])
 
     def c_gates(self, events, head, **_):
@@ -868,9 +926,17 @@ class Driver:
             facts[f"{g} last examined_sha == head"] = e.get("examined_sha") == head
             facts[f"{g} passed"] = e.get("passed")
         stale = [g for g, e in last.items() if e.get("examined_sha") != head]
+        required = list(REQUIRED_GATES)
+        if any(e.get("gate") == "security" for e in events if e.get("kind") in ("gate_started", "gate_result")):
+            required.append("security")
+        missing = [g for g in required if g not in last]
+        failed = [g for g in required if g in last and not last[g].get("passed")]
+        facts["required gates"] = required
+        facts["required gates missing"] = missing or "none"
+        facts["required gates not passed"] = failed or "none"
         facts["earlier results on another sha"] = [(e.get("gate"), (e.get("examined_sha") or "")[:12]) for e in res
                                                    if e.get("examined_sha") != head] or "none"
-        self.add("every gate examined the run head", "PASS" if last and head and not stale else "FAIL", facts)
+        self.add("every gate examined the run head", "PASS" if head and not stale and not missing and not failed else "FAIL", facts)
 
     def c_attempts(self, attempts, **_):
         brief = [(a.get("card"), a.get("role"), a.get("vendor"), a.get("model"), a.get("effort"), a.get("status"),
@@ -914,10 +980,13 @@ class Driver:
 
     def c_workspace(self, meta, sub_recs, **_):
         ws = real(meta.get("workspace") or "")
-        facts, ok = {"workspace": meta.get("workspace")}, True
+        # Evidence checks run in the base worktree `<repo>/.worktrees/<run dir name>--base`.
+        base_ws = real(Path(meta.get("repo") or "/nonexistent") / ".worktrees" / f"{self.run_dir.name}--base")
+        allowed = {ws, base_ws}
+        facts, ok = {"workspace": meta.get("workspace"), "base worktree (evidence)": base_ws}, True
         for path, recs in sub_recs.items():
             cwds = sorted({r.get("cwd") for r in recs if r.get("cwd")})
-            mine = all(real(c) == ws for c in cwds) and bool(cwds)
+            mine = all(real(c) in allowed for c in cwds) and bool(cwds)
             facts[f"claude {Path(path).name} cwd"] = cwds or "none"
             ok = ok and mine
         wdir = self.run_dir / "workers"
@@ -931,7 +1000,7 @@ class Driver:
                 rcwd = (first.get("payload") or {}).get("cwd")
             facts[f"codex {d.name} request cwd"] = req.get("cwd")
             facts[f"codex {d.name} rollout cwd"] = rcwd or "not found"
-            ok = ok and real(req.get("cwd") or "") == ws and (rcwd is None or real(rcwd) == ws)
+            ok = ok and real(req.get("cwd") or "") in allowed and (rcwd is None or real(rcwd) in allowed)
         if not sub_recs:
             ok = False
             facts["claude worker transcripts"] = "none found"
@@ -999,16 +1068,18 @@ class Driver:
 
     def c_sandbox(self, main_recs, sub_recs, **_):
         cli = str(CLI)
-        rows, heredoc, plain_violations = [], [], []
+        rows, heredoc, plain_violations, others = [], [], [], []
         for path, recs in list(main_recs.items()) + list(sub_recs.items()):
             results = tool_results(recs)
             for u in tool_uses(recs, path):
                 if u.name != "Bash":
                     continue
                 c = str(u.input.get("command") or "")
-                if cli not in c:
-                    continue
                 r = results.get(u.id)
+                if cli not in c:
+                    others.append({"command": short(c, 100), "sandboxed": r.sandboxed if r else "no result",
+                                   "disable_sandbox": bool(u.input.get("dangerouslyDisableSandbox"))})
+                    continue
                 row = {"file": Path(path).name, "command": short(c, 140),
                        "sandboxed": r.sandboxed if r else "no result",
                        "disable_sandbox": bool(u.input.get("dangerouslyDisableSandbox")),
@@ -1022,16 +1093,20 @@ class Driver:
         sandboxed = [r for r in rows if r["sandboxed"] is True]
         unknown = [r for r in rows if not isinstance(r["sandboxed"], bool)]
         flagged = [r for r in rows if isinstance(r["sandboxed"], bool)]
-        self.add("open check: CLI calls ran unsandboxed (exclusion matched)",
-                 "PASS" if flagged and not sandboxed else ("FAIL" if sandboxed else "OBSERVED"),
+        control = [o for o in others if o["sandboxed"] is True and not o["disable_sandbox"]]
+        verdict = ("FAIL" if sandboxed else "PASS" if flagged and control else "INCONCLUSIVE")
+        self.add("open check: CLI calls ran unsandboxed (exclusion matched)", verdict,
                  {"cli calls": len(rows), "with a sandboxed flag": len(flagged),
+                  "control: non-CLI Bash calls that ran sandboxed": [o["command"] for o in control[:5]] or "none",
+                  "non-CLI Bash calls (command, sandboxed)": [(o["command"], o["sandboxed"]) for o in others[:10]] or "none",
                   "sandboxed": [r["command"] for r in sandboxed] or "none",
                   "no sandboxed flag (e.g. background calls)": [r["command"] for r in unknown] or "none",
                   "dangerouslyDisableSandbox set": sum(r["disable_sandbox"] for r in rows),
                   "calls not starting with the CLI path": plain_violations or "none",
                   "first calls": [(r["command"], r["sandboxed"]) for r in rows[:8]]})
         self.add("open check: heredoc record command matched the exclusion",
-                 "PASS" if heredoc and all(r["sandboxed"] is False for r in heredoc) else ("FAIL" if heredoc else "OBSERVED"),
+                 ("FAIL" if any(r["sandboxed"] is True for r in heredoc) else
+                  "PASS" if heredoc and control and all(r["sandboxed"] is False for r in heredoc) else "INCONCLUSIVE"),
                  {"heredoc record calls": len(heredoc),
                   "sandboxed flags": [r["sandboxed"] for r in heredoc] or "none",
                   "examples": [r["command"] for r in heredoc[:3]] or "none"})
@@ -1120,7 +1195,7 @@ class Driver:
                     push_summary = ["FAIL     push probe crashed: " + traceback.format_exc().splitlines()[-1]]
             self.log("Step 2: end-to-end run")
             self.t0 = time.time()
-            if self.preflight() and self.setup():
+            if self.preflight() and self.safe_setup():
                 try:
                     self.drive()
                 except Exception:
@@ -1156,9 +1231,11 @@ CHECK_DOCS = [
     ("outcome complete", "the last `outcome` event in events.jsonl has outcome `complete`"),
     ("run branch holds both cards' commits", "each card's `accepted` sha is an ancestor of refs/heads/<run branch> "
      "(git merge-base --is-ancestor); also lists base..branch commits and runs the fixture tests in the workspace"),
-    ("report.md line 3", "line 3 of <run>/report.md is exactly `Outcome: complete`"),
-    ("every gate examined the run head", "for each gate, its last `gate_result` event's examined_sha equals "
-     "`git rev-parse refs/heads/<run branch>`; earlier results on other shas are listed"),
+    ("report.md line 3", "line 3 of <run>/report.md is exactly `Outcome: complete`, and the run wrote report.md "
+     "itself (FAIL when only the driver's fallback `leadhand report` produced it)"),
+    ("every gate examined the run head", "final_review, evidence and verify (and security when the run ran it) each "
+     "have a last `gate_result` that passed with examined_sha equal to `git rev-parse refs/heads/<run branch>`; "
+     "earlier results on other shas are listed"),
     ("claude implementer attempt on sonnet low", "attempts.jsonl has card 1, role implementer, vendor claude, "
      "model sonnet, effort low"),
     ("codex implementer attempt on gpt-6-luna medium", "attempts.jsonl has card 2, role implementer, vendor codex, "
@@ -1168,7 +1245,8 @@ CHECK_DOCS = [
     ("worker_started before result_recorded", "every dispatch with a `result_recorded` event has a "
      "`worker_started` event with a smaller seq"),
     ("workers ran in the workspace", "every Claude worker transcript record's cwd, every Codex request.json cwd and "
-     "rollout session_meta cwd resolve to run.json's workspace"),
+     "rollout session_meta cwd resolve to run.json's workspace (or the evidence base worktree "
+     "<repo>/.worktrees/<run dir name>--base)"),
     ("headline moved through implementing and reviewing", "status.json sampled every 5 s; some headline contains "
      "`Implementing` and some contains `Reviewing`"),
     ("no publishing command ran", "no Bash command in the supervisor or worker transcripts and no Codex "
@@ -1177,9 +1255,10 @@ CHECK_DOCS = [
     ("open check: print mode outlives long workers", "per session: exit time vs worker_started/result_recorded; "
      "dispatches open at exit; Codex results written after exit; quiet gaps after each stream `result`"),
     ("open check: CLI calls ran unsandboxed (exclusion matched)", "every Bash call containing the CLI path: its "
-     "tool_result record's `sandboxed` flag is false (supervisor and worker transcripts)"),
+     "tool_result record's `sandboxed` flag is false, AND at least one non-CLI Bash call (control, e.g. "
+     "`printenv LEADHAND_RUN_ID`) ran sandboxed; without that control the verdict is INCONCLUSIVE"),
     ("open check: heredoc record command matched the exclusion", "the `record ... --reply - <<'LEADHAND_REPLY'` "
-     "Bash calls: `sandboxed` is false"),
+     "Bash calls: `sandboxed` is false (same control as above)"),
     ("open check: Agent tool accepted the route model names", "every Agent call (subagent_type, model, effort) got "
      "a non-error result; the worker transcript's message.model is listed"),
     ("open check: leadhand:run loaded through the Skill tool", "a Skill tool call naming leadhand:run without "
