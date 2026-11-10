@@ -26,6 +26,7 @@ from LEADHAND_INSTALLED_VENDORS, and the engine's clock offset by `advance`.
 from __future__ import annotations
 
 import contextlib
+import io
 import itertools
 import json
 import os
@@ -112,13 +113,13 @@ class FakeWorld:
 
     # -- setup ----------------------------------------------------------------
 
-    def write_deck(self, cards, *, title="Demo deck"):
+    def write_deck(self, cards, *, title="Demo deck", branch="leadhand/demo"):
         text = (f"# Deck: {title}\nSource: docs/plan.md\nBase: main @ {self.base}\n"
-                "Branch: leadhand/demo\nBuild: true\nTest: true\n\n" + "\n".join(cards))
+                f"Branch: {branch}\nBuild: true\nTest: true\n\n" + "\n".join(cards))
         self.deck_path.write_text(text, encoding="utf-8")
 
     def start(self, **kw) -> Path:
-        with contextlib.redirect_stdout(open(os.devnull, "w")):
+        with contextlib.redirect_stdout(io.StringIO()):
             self.run_dir = engine.start(self.deck_path, repo=self.repo, **kw)
         return self.run_dir
 

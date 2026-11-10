@@ -17,6 +17,10 @@ class LadderExhausted(Exception):
     pass
 
 
+class PinnedVendorMissing(ConfigError):
+    """The card's Route pins a vendor that is not installed."""
+
+
 @dataclass(frozen=True)
 class Resolution:
     route: Route
@@ -92,7 +96,7 @@ def resolve(config: Config, *, role: str, card: Card | None = None, attempt: int
     # Pin: replaces role, vendor and effort steps for attempts 1 and 2.
     if is_impl and pin is not None and attempt <= 2:
         if pin.vendor not in installed:
-            raise ConfigError(f"card {card.number} is pinned to {pin.vendor}, which is not installed")
+            raise PinnedVendorMissing(f"card {card.number} is pinned to {pin.vendor}, which is not installed")
         steps = 0
         reasons.append(f"pinned: {_pin_text(pin)}")
         if attempt == 2:

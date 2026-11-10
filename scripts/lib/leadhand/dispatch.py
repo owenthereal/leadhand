@@ -66,7 +66,7 @@ from typing import Any, Iterable, Mapping
 from leadhand import procs
 from leadhand.briefs import parse_report_head, worker_prompt
 from leadhand.gitops import GitError, git_common_dir
-from leadhand.state import (_utc_now, append_attempt, crash_point, read_attempts, run_paths, state_lock,
+from leadhand.state import (utc_now, append_attempt, crash_point, read_attempts, run_paths, state_lock,
                             write_json_atomic)
 from leadhand.usage import CODEX_STREAM_SOURCE, UNKNOWN, Usage, charge, codex_usage_from_stream, estimate_cost
 
@@ -181,7 +181,7 @@ def _read_json(path: Path) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def _usage_dict(u: Usage) -> dict | None:
+def usage_dict(u: Usage) -> dict | None:
     return asdict(u) if u.known else None
 
 
@@ -199,7 +199,7 @@ def _result_from(d: Mapping[str, Any]) -> DispatchResult:
                           exit_reason=d["exit_reason"])
 
 
-def _load_result(wd: Path) -> DispatchResult | None:
+def load_result(wd: Path) -> DispatchResult | None:
     d = _read_json(wd / RESULT)
     return _result_from(d) if d else None
 
@@ -216,7 +216,7 @@ def _run_id(run_dir: Path) -> str:
     return str(meta.get("run_id") or Path(run_dir).name)
 
 
-def _minute_seconds() -> float:
+def minute_seconds() -> float:
     if os.environ.get("LEADHAND_TESTING") == "1" and os.environ.get("LEADHAND_MINUTE_SECONDS"):
         return float(os.environ["LEADHAND_MINUTE_SECONDS"])
     return 60.0
@@ -487,7 +487,7 @@ def _finalize_lock(wd: Path):
         os.close(fd)
 
 
-def _has_status_line(reply: str) -> bool:
+def has_status_line(reply: str) -> bool:
     if parse_report_head(reply) != ("Status", "BLOCKED", ""):
         return True
     first = next((ln for ln in reply.splitlines() if ln.strip()), "")
@@ -501,7 +501,7 @@ def _classify(stopped_for: str | None, codex_exit: int | None, reply: str,
         return "BLOCKED", "environment", "error", False    # the runner itself failed
     if stopped_for:
         return "SPENT", "", stopped_for, False
-    clean = codex_exit == 0 and bool(reply.strip()) and _has_status_line(reply)
+    clean = codex_exit == 0 and bool(reply.strip()) and has_status_line(reply)
     # A usage-limit message counts only when Codex did not finish cleanly with a status:
     # a READY reply after a clean exit stands, whatever warnings came before it.
     if not clean and (any(_USAGE_LIMIT.search(t) for t in errors) or _USAGE_LIMIT.search(stderr)):
@@ -509,7 +509,7 @@ def _classify(stopped_for: str | None, codex_exit: int | None, reply: str,
     if codex_exit is not None and codex_exit < 0 and not reply.strip():
         return "SPENT", "", "interrupted", False    # killed by a signal leadhand did not send
     if reply.strip():
-        if not _has_status_line(reply):
+        if not has_status_line(reply):
             return "BLOCKED", "", "completed", True
         key, value, blocked_by = parse_report_head(reply)
         # A reviewer's or verifier's reply leads with its Verdict/Result: the work finished.
@@ -544,7 +544,7 @@ def _charge_usage(req: DispatchRequest, wd: Path, *, thread: str | None, launche
 def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_exit: int | None,
               tracker: _Tracker, started_at: str | None) -> DispatchResult:
     with _finalize_lock(wd):
-        existing = _load_result(wd)
+        existing = load_result(wd)
         if existing is not None:
             return existing
         runner = _read_json(wd / RUNNER) or {}
@@ -574,7 +574,7 @@ def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_
                                                   generation=generation, stopped=stopped_for is not None,
                                                   stream=stream)
         crash_point("after_charge_before_attempt")
-        ended_at = _utc_now()
+        ended_at = utc_now()
         # Codex models are not priced: estimate_cost gives None for them, so an empty table suffices.
         cost = estimate_cost(usage, req.model, {}) if usage.known else None
         attempt = {
@@ -582,7 +582,7 @@ def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_
             "attempt": req.attempt, "role": req.role, "vendor": "codex", "model": req.model,
             "effort": req.effort, "worker_id": stream.thread_id, "started_at": started_at or ended_at,
             "ended_at": ended_at, "steps": stream.steps, "charge_ids": charge_ids,
-            "usage": _usage_dict(usage), "usage_known": usage.known, "usage_source": source,
+            "usage": usage_dict(usage), "usage_known": usage.known, "usage_source": source,
             "cost_estimate": cost, "exit_reason": exit_reason, "status": status, "blocked_by": blocked_by,
             "generation": generation,
         }
@@ -597,7 +597,7 @@ def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_
         result = {
             "dispatch_id": req.dispatch_id, "status": status, "blocked_by": blocked_by,
             "session_id": stream.thread_id, "reply": reply, "steps": stream.steps,
-            "usage": _usage_dict(usage), "usage_known": usage.known, "usage_source": source,
+            "usage": usage_dict(usage), "usage_known": usage.known, "usage_source": source,
             "exit_reason": exit_reason, "codex_exit": codex_exit, "charge_ids": charge_ids,
             "generation": generation, "stopped": stopped, "confirmed_at": time.time(),
             "cancel_token": ((_read_json(wd / CANCEL) or {}).get("token")
@@ -641,7 +641,7 @@ def _launch(wd: Path, record: dict, argv: list[str], env: Mapping[str, str], cwd
             cancelled) -> subprocess.Popen | None:
     """Two-phase launch: record the intent, re-check for a cancel, start Codex in a new
     process group, record it. None when a cancel arrived first (nothing started)."""
-    record["launching"] = {"at": _utc_now()}
+    record["launching"] = {"at": utc_now()}
     write_json_atomic(wd / RUNNER, record)
     crash_point("before_worker_launch")
     if cancelled():
@@ -678,11 +678,11 @@ def run_runner(worker_dir: Path) -> int:
         print(f"leadhand: another runner owns {wd}", file=sys.stderr)
         return 3
     _RUNNER_LOCK_FD = fd               # held until this process exits
-    if _load_result(wd) is not None:
+    if load_result(wd) is not None:
         return 0
     req = _load_request(wd)
     me = procs.process_info(os.getpid())
-    started_at = _utc_now()
+    started_at = utc_now()
     superseded = wd / SUPERSEDED
     generation = 1 + (sum(1 for _ in superseded.iterdir()) if superseded.is_dir() else 0)
     record = {"runner": me.record() if me else {"pid": os.getpid(), "pgid": os.getpgid(0), "start": None},
@@ -724,7 +724,7 @@ def run_runner(worker_dir: Path) -> int:
 
     stream = _Stream(wd / STREAM)
     t0 = time.monotonic()               # the time limit counts time awake
-    limit = req.minutes * _minute_seconds()
+    limit = req.minutes * minute_seconds()
     last_snap = t0
     last_beat = time.time()             # the heartbeat is wall-clock, like its mtime
     stopped_for: str | None = None
@@ -752,7 +752,7 @@ def run_runner(worker_dir: Path) -> int:
         raise_later = sys.exc_info()
     else:
         raise_later = None
-    write_json_atomic(wd / STOPPING, {"reason": stopped_for or "finished", "at": _utc_now()})
+    write_json_atomic(wd / STOPPING, {"reason": stopped_for or "finished", "at": utc_now()})
     tracker.stop(beat=wd / HEARTBEAT)      # also clears leftovers after a normal exit
     proc.wait()
     _finalize(wd, req, stopped_for=stopped_for, codex_exit=proc.returncode, tracker=tracker,
@@ -881,12 +881,12 @@ def _reap() -> None:
 def _cancel_locked(wd: Path, *, deadline: float, token: str | None) -> DispatchResult:
     """`cancel`'s body; the caller holds owner.lock. A None token keeps a cancel
     request that is already there."""
-    done = _load_result(wd)
+    done = load_result(wd)
     if done is not None:
         return done
     req = _load_request(wd)
     if token is not None or not (wd / CANCEL).exists():
-        write_json_atomic(wd / CANCEL, {"requested_at": _utc_now(), "by_pid": os.getpid(), "token": token})
+        write_json_atomic(wd / CANCEL, {"requested_at": utc_now(), "by_pid": os.getpid(), "token": token})
     target = _runner_target(wd)
     if target and _runner_alive(wd):
         with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -895,7 +895,7 @@ def _cancel_locked(wd: Path, *, deadline: float, token: str | None) -> DispatchR
     ack_by = time.monotonic() + CANCEL_ACK
     while True:
         _reap()
-        done = _load_result(wd)
+        done = load_result(wd)
         if done is not None:
             return done
         if not _runner_alive(wd):
@@ -925,7 +925,7 @@ def cancel(worker_dir: Path, *, timeout: float = 30.0) -> DispatchResult:
     Raises DispatchError after `timeout` naming what is still alive."""
     wd = Path(worker_dir)
     deadline = time.monotonic() + timeout
-    done = _load_result(wd)
+    done = load_result(wd)
     if done is not None:
         return done
     with _owner_lock(wd, deadline):
@@ -941,6 +941,16 @@ def _write_request(wd: Path, req: DispatchRequest) -> None:
         changed = sorted(k for k in set(existing) | set(data) if existing.get(k) != data.get(k))
         raise DispatchError(f"dispatch {req.dispatch_id} was requested with different "
                             f"{', '.join(changed)}; use a new dispatch id")
+
+
+def write_request(req: DispatchRequest) -> Path:
+    """Write the dispatch's request.json unless it is there (DispatchError if it differs).
+    A cancel can then finalize a dispatch whose runner was never started. Returns the worker folder."""
+    wd = Path(req.run_dir) / "workers" / req.dispatch_id
+    wd.mkdir(parents=True, exist_ok=True)
+    with _owner_lock(wd):
+        _write_request(wd, req)
+    return wd
 
 
 def dispatch(req: DispatchRequest, *, wait: float | None = None) -> DispatchResult:
@@ -960,11 +970,11 @@ def dispatch(req: DispatchRequest, *, wait: float | None = None) -> DispatchResu
     suspect: tuple[float, float] | None = None     # (heartbeat mtime, when first seen stale)
     while True:
         _reap()
-        done = _load_result(wd)
+        done = load_result(wd)
         if done is not None:
             return done
         with _owner_lock(wd):
-            done = _load_result(wd)
+            done = load_result(wd)
             if done is not None:
                 return done
             state = _owner_state(wd)
@@ -1012,7 +1022,7 @@ def dispatch(req: DispatchRequest, *, wait: float | None = None) -> DispatchResu
 # --------------------------------------------------------------------------
 # Commands
 
-def _limits_for(config, role: str):
+def limits_for(config, role: str):
     from leadhand.config import ConfigError
     key = LIMITS_ROLE.get(role, role)
     if key not in config.limits:
@@ -1020,23 +1030,32 @@ def _limits_for(config, role: str):
     return config.limits[key]
 
 
-def _request_from_args(args) -> DispatchRequest:
+def request_for(run_dir: Path, dispatch_id: str, *, card: int | None, attempt: int, role: str, model: str,
+                effort: str, brief: Path, report: Path, cwd: Path, resume: str | None = None) -> DispatchRequest:
+    """The DispatchRequest for a dispatch, with limits, network and writable folders from the
+    run repo's configuration. `leadhand dispatch` and the engine build requests only here, so
+    the request.json both write is the same."""
     from leadhand.config import load_config
-    run_dir = Path(args.run).absolute()
-    cwd = Path(args.cwd).absolute()
+    run_dir = Path(run_dir).absolute()
+    cwd = Path(cwd).absolute()
     meta = _read_json(run_paths(run_dir).run_json) or {}
     config = load_config(Path(meta.get("repo") or cwd))
-    limits = _limits_for(config, args.role)
+    limits = limits_for(config, role)
     writable = tuple(p if p.is_absolute() else cwd / p
                      for p in (Path(d).expanduser() for d in config.codex.writable_dirs))
-    return DispatchRequest(model=args.model, effort=args.effort, role=args.role,
-                           brief=Path(args.brief).absolute(), report=Path(args.report).absolute(), cwd=cwd,
-                           run_dir=run_dir, card=args.card, attempt=args.attempt, dispatch_id=args.dispatch_id,
-                           steps=limits.steps, minutes=limits.minutes, network=config.codex.network,
-                           writable_dirs=writable, resume=args.resume)
+    return DispatchRequest(model=model, effort=effort, role=role, brief=Path(brief).absolute(),
+                           report=Path(report).absolute(), cwd=cwd, run_dir=run_dir, card=card, attempt=attempt,
+                           dispatch_id=dispatch_id, steps=limits.steps, minutes=limits.minutes,
+                           network=config.codex.network, writable_dirs=writable, resume=resume)
 
 
-def _reply_lines(result: DispatchResult) -> list[str]:
+def _request_from_args(args) -> DispatchRequest:
+    return request_for(Path(args.run), args.dispatch_id, card=args.card, attempt=args.attempt, role=args.role,
+                       model=args.model, effort=args.effort, brief=Path(args.brief), report=Path(args.report),
+                       cwd=Path(args.cwd), resume=args.resume)
+
+
+def reply_lines(result: DispatchResult) -> list[str]:
     lines = [ln.rstrip() for ln in result.reply.strip().splitlines()]
     if not lines:
         lines = [f"Status: {result.status}"]
@@ -1047,7 +1066,7 @@ def _reply_lines(result: DispatchResult) -> list[str]:
 
 
 def _print_result(result: DispatchResult) -> None:
-    for line in _reply_lines(result):
+    for line in reply_lines(result):
         print(line)
     print(f"session: {result.session_id or 'none'}")
 

@@ -32,7 +32,6 @@ card's attempt.
 """
 from __future__ import annotations
 
-import argparse
 import hashlib
 import inspect
 import json
@@ -55,8 +54,8 @@ from leadhand.config import VENDORS, Config, ConfigError, Route, docs_dir_for, l
 from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, parse_deck
 from leadhand.gitops import (GitError, card_branch_name, changed_paths, cut_card_branch, default_base,
                              fast_forward, git, head, is_test_or_doc_path, prepare_workspace)
-from leadhand.route import LadderExhausted, Resolution, resolve
-from leadhand.state import (CardState, RunPaths, _utc_now, append_attempt, append_event, crash_point,
+from leadhand.route import LadderExhausted, PinnedVendorMissing, Resolution, resolve
+from leadhand.state import (CardState, RunPaths, utc_now, append_attempt, append_event, crash_point,
                             decide_outcome, fold_cards, new_run_dir, read_attempts, read_events, run_paths,
                             state_lock, write_json_atomic)
 
@@ -135,7 +134,7 @@ def _read_text(path: Path | str | None) -> str | None:
 
 
 def _has_status(text: str | None) -> bool:
-    return bool(text and text.strip()) and dsp._has_status_line(text)
+    return bool(text and text.strip()) and dsp.has_status_line(text)
 
 
 # --------------------------------------------------------------------------
@@ -266,21 +265,50 @@ def start(deck_path: Path, *, repo: Path, config: Config | None = None, new: boo
     return root
 
 
-def _find_unfinished(docs: Path, source: str, digest: str) -> Path | None:
+def _runs(docs: Path) -> list[tuple[Path, dict]]:
+    """Every run directory under docs_dir/runs with a readable run.json."""
     runs = docs / "runs"
-    if not runs.is_dir():
-        return None
+    out = []
+    if runs.is_dir():
+        for rj in runs.glob("*/run.json"):
+            try:
+                meta = json.loads(rj.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(meta, dict):
+                out.append((rj.parent, meta))
+    return out
+
+
+def _find_unfinished(docs: Path, source: str, digest: str) -> Path | None:
+    """The newest run of this deck that has no outcome, or whose latest outcome is blocked
+    (a blocked run continues, R25)."""
     found = []
-    for rj in runs.glob("*/run.json"):
-        try:
-            meta = json.loads(rj.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
+    for root, meta in _runs(docs):
         if meta.get("deck_source") != source or meta.get("deck_digest") != digest:
             continue
-        if _ended(read_events(run_paths(rj.parent))) is None:
-            found.append((str(meta.get("created_at", "")), str(rj.parent), rj.parent))
+        ended = _ended(read_events(run_paths(root)))
+        if ended is None or ended.get("outcome") == "blocked":
+            found.append((str(meta.get("created_at", "")), str(root), root))
     return max(found)[2] if found else None
+
+
+def _check_branch_free(docs: Path, repo: Path, branch: str) -> None:
+    """A new run never takes over another run's branch (R26): its card branches, worktree and
+    scratch files would be mistaken for the new run's."""
+    for root, meta in _runs(docs):
+        if meta.get("branch") == branch and meta.get("repo") == str(repo):
+            raise EngineError(f"run branch {branch} already belongs to the run in {root}; "
+                              "give the deck a different Branch: to start a new run")
+
+
+def _check_worktree_free(docs: Path, root: Path, ws: Path) -> None:
+    owner = next((r for r, meta in _runs(docs) if meta.get("workspace") == str(ws) and r != root), None)
+    if owner is not None or ws.exists():
+        root.rmdir()
+        raise EngineError(f"worktree {ws} already exists"
+                          + (f" and belongs to the run in {owner}" if owner else "")
+                          + "; remove it or start the run again")
 
 
 def _start(deck_path: Path, repo: Path, config: Config | None, new: bool) -> tuple[Path, bool]:
@@ -302,20 +330,24 @@ def _start(deck_path: Path, repo: Path, config: Config | None, new: bool) -> tup
         if existing is not None:
             return existing, True
 
+    _check_branch_free(docs, repo, deck.branch)
     slug = _slug(deck.title)
     root = new_run_dir(docs, slug, date.today())
+    # The worktree is named after the run directory, which is unique, so no two runs share it.
+    if config.run.worktree:
+        _check_worktree_free(docs, root, repo / ".worktrees" / root.name)
     paths = run_paths(root)
     _write_bytes_atomic(paths.deck, raw)
     if deck.base_sha:
         base_ref, base_sha = deck.base_ref, head(repo, deck.base_sha)
     else:
         base_ref, base_sha = default_base(repo)
-    ws = prepare_workspace(repo, run_branch=deck.branch, base_sha=base_sha, slug=slug,
+    ws = prepare_workspace(repo, run_branch=deck.branch, base_sha=base_sha, slug=root.name,
                            use_worktree=config.run.worktree)
     meta = {
         "run_id": secrets.token_hex(6), "repo": str(repo), "deck_source": str(deck_path),
         "deck_digest": deck.digest, "base_ref": base_ref, "base_sha": base_sha, "branch": deck.branch,
-        "workspace": str(Path(ws).absolute()), "slug": slug, "created_at": _utc_now(),
+        "workspace": str(Path(ws).absolute()), "slug": slug, "created_at": utc_now(),
         "supervisor_sessions": [],
     }
     write_json_atomic(paths.run_json, meta)
@@ -355,7 +387,7 @@ def _charge_supervisor(ctx: _Run) -> None:
         if path is None:
             return
         charges = usage.read_charges(ctx.paths)
-        _, reached = usage._new_claude(path, usage.charged_checkpoint(charges, "claude", sid))
+        _, reached = usage.new_claude_usage(path, usage.charged_checkpoint(charges, "claude", sid))
         if not reached["messages"]:
             return
         prefix = f"supervisor:{sid}:"
@@ -449,8 +481,10 @@ def _resolve_or_park(ctx: _Run, card: Card, *, role: str, attempt: int, last_ven
                        installed=installed_vendors(), profile=ctx.deck.profile)
     except LadderExhausted:
         reason = "ladder exhausted"
+    except PinnedVendorMissing:
+        reason = "pinned vendor not installed"
     except ConfigError as e:
-        reason = "pinned vendor not installed" if "is pinned to" in str(e) else str(e)
+        reason = str(e)
     append_event(ctx.paths, "parked", card=card.number, reason=reason)
     return None
 
@@ -468,6 +502,9 @@ def _request(ctx: _Run, c: CardState, events: list[dict], *, kind: str, attempt:
     if notes:
         with open(brief, "a", encoding="utf-8") as f:
             f.write("\n" + notes.rstrip("\n") + "\n")
+    # No worker can have written this dispatch's report yet: one already there is left over
+    # from an earlier run that used the same workspace.
+    Path(report).unlink(missing_ok=True)
     resume_worker = resume_session = None
     if resume is not None:
         if route.vendor == "claude":
@@ -475,7 +512,7 @@ def _request(ctx: _Run, c: CardState, events: list[dict], *, kind: str, attempt:
         else:
             resume_session = (resume.result or {}).get("session_id")
     try:
-        minutes = dsp._limits_for(ctx.config, role).minutes
+        minutes = dsp.limits_for(ctx.config, role).minutes
     except ConfigError as e:
         raise EngineError(str(e)) from None
     return append_event(ctx.paths, "dispatch_requested", dispatch_id=did, card=c.number, attempt=attempt,
@@ -487,7 +524,7 @@ def _request(ctx: _Run, c: CardState, events: list[dict], *, kind: str, attempt:
 
 def _budget_seconds(req: dict) -> float:
     minutes = req["minutes"] + (CODEX_GRACE_MINUTES if req["vendor"] == "codex" else 0)
-    return minutes * dsp._minute_seconds()
+    return minutes * dsp.minute_seconds()
 
 
 def _codex_command(ctx: _Run, req: dict) -> list[str]:
@@ -527,7 +564,9 @@ def _in_flight(ctx: _Run, d: _Dispatch) -> dict:
                 "reason": f"{d.kind} worker for card {d.req['card']} is running"}
     if d.req["vendor"] == "codex":
         result = _cancel_codex(ctx, d)
-        _record_result(ctx, d.id, worker, "\n".join(dsp._reply_lines(result)), stopped=True)
+        # A runner that finished before the cancel keeps its own status (the proxy only hung).
+        _record_result(ctx, d.id, worker, "\n".join(dsp.reply_lines(result)),
+                       stopped=result.exit_reason == "cancelled")
         return {"action": "stop_worker", "dispatch_id": d.id, "worker_id": worker, "vendor": "codex",
                 "record_result": False}
     return {"action": "stop_worker", "dispatch_id": d.id, "worker_id": worker, "vendor": "claude",
@@ -538,17 +577,12 @@ def _cancel_codex(ctx: _Run, d: _Dispatch) -> dsp.DispatchResult:
     """Stop the dispatch's runner (and Codex with its tool processes) and finalize result.json.
     When the proxy never ran the command, the request is written first, so a late run of the
     same command finds the cancelled result instead of starting Codex."""
-    wd = ctx.root / "workers" / d.id
-    wd.mkdir(parents=True, exist_ok=True)
+    req = d.req
     try:
-        if not (wd / dsp.REQUEST).exists():
-            req = d.req
-            args = argparse.Namespace(run=str(ctx.root), cwd=str(ctx.ws), role=req["role"], model=req["model"],
-                                      effort=req["effort"], brief=req["brief"], report=req["report"],
-                                      card=req["card"], attempt=req["attempt"], dispatch_id=d.id,
-                                      resume=req.get("resume_session"))
-            with dsp._owner_lock(wd):
-                dsp._write_request(wd, dsp._request_from_args(args))
+        wd = dsp.write_request(dsp.request_for(
+            ctx.root, d.id, card=req["card"], attempt=req["attempt"], role=req["role"], model=req["model"],
+            effort=req["effort"], brief=Path(req["brief"]), report=Path(req["report"]), cwd=ctx.ws,
+            resume=req.get("resume_session")))
         return dsp.cancel(wd, timeout=dsp.CANCEL_TIMEOUT)
     except (dsp.DispatchError, ConfigError, OSError) as e:
         raise EngineError(f"could not stop Codex dispatch {d.id}: {e}") from None
@@ -650,25 +684,32 @@ def _after_result(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
 
 def _worker_failed(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
                    index: dict[str, _Dispatch]) -> dict | None:
-    """BLOCKED from any worker, or a reviewer that ended without a verdict."""
+    """BLOCKED from any worker, or a reviewer that ended without a verdict.
+
+    A result that already ended the run (an `outcome` after it) is seen again only after the
+    run was resumed: the work is dispatched again as the same attempt, and the retry budget
+    counts only results since the latest `resumed`."""
     r = d.result
     status = r["status"]
-    if status == "BLOCKED" and r.get("blocked_by") == "usage limit":
-        _end_blocked(ctx, events, "provider capacity")
-        return None
-    same = [x for x in _card_dispatches(index, c.number, attempt=d.req["attempt"], kinds=(d.kind,))
-            if x.result is not None]
-    if status == "BLOCKED":
-        failures = [x for x in same if x.result["status"] == "BLOCKED" and x.result.get("blocked_by") != "usage limit"]
-        if len(failures) >= 2:
-            _end_blocked(ctx, events, "environment")
+    if not any(e["kind"] == "outcome" and e["seq"] > r["seq"] for e in events):
+        if status == "BLOCKED" and r.get("blocked_by") == "usage limit":
+            _end_blocked(ctx, events, "provider capacity")
             return None
-    else:
-        failures = [x for x in same if x.result["status"] != "BLOCKED" and x.result.get("verdict") is None]
-        if len(failures) >= 2:
-            append_event(ctx.paths, "parked", card=c.number,
-                         reason=f"{d.kind} ended {status} twice without a verdict")
-            return None
+        since = max((e["seq"] for e in events if e["kind"] == "resumed"), default=0)
+        same = [x for x in _card_dispatches(index, c.number, attempt=d.req["attempt"], kinds=(d.kind,))
+                if x.result is not None and x.result["seq"] > since]
+        if status == "BLOCKED":
+            failures = [x for x in same if x.result["status"] == "BLOCKED"
+                        and x.result.get("blocked_by") != "usage limit"]
+            if len(failures) >= 2:
+                _end_blocked(ctx, events, "environment")
+                return None
+        else:
+            failures = [x for x in same if x.result["status"] != "BLOCKED" and x.result.get("verdict") is None]
+            if len(failures) >= 2:
+                append_event(ctx.paths, "parked", card=c.number,
+                             reason=f"{d.kind} ended {status} twice without a verdict")
+                return None
     resume = index.get(d.req.get("resumes") or "")
     _request(ctx, c, events, kind=d.kind, attempt=d.req["attempt"], role=d.req["role"], route=d.route,
              extra=d.req.get("extra") or {}, resume=resume, notes=d.req.get("notes") or "")
@@ -820,7 +861,7 @@ def _copy_if_missing(src: Path | None, dest: Path, text: str | None = None) -> b
     return True
 
 
-def _head(report: str | None, reply: str, codex: dict | None, stopped: bool) -> dict:
+def _head(report: str | None, reply: str, codex: dsp.DispatchResult | None, stopped: bool) -> dict:
     """Status from the report's head line, else (stopped -> SPENT), the reply's head, the
     Codex runner's result, a Claude turn-limit note (SPENT), else BLOCKED with the raw reply kept."""
     def from_text(text: str, source: str) -> dict:
@@ -839,8 +880,8 @@ def _head(report: str | None, reply: str, codex: dict | None, stopped: bool) -> 
                 "source": "stopped", "raw_kept": False}
     if _has_status(reply):
         return from_text(reply, "reply")
-    if codex and codex.get("status"):
-        return {"status": codex["status"], "blocked_by": codex.get("blocked_by") or "", "head": "Status",
+    if codex is not None and codex.status:
+        return {"status": codex.status, "blocked_by": codex.blocked_by, "head": "Status",
                 "verdict": None, "result": None, "source": "runner", "raw_kept": True}
     if _TURN_LIMIT.search(reply or ""):
         return {"status": "SPENT", "blocked_by": "", "head": "Status", "verdict": None, "result": None,
@@ -871,7 +912,7 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str, stop
     files["reply"] = str(folder / "reply.md")
     codex = None
     if req["vendor"] == "codex":
-        codex = dsp._read_json(ctx.root / "workers" / dispatch_id / dsp.RESULT)
+        codex = dsp.load_result(ctx.root / "workers" / dispatch_id)
     head_info = _head(_read_text(folder / "report.md"), reply, codex, stopped)
     tip = None
     if d.kind in IMPLEMENTER_KINDS:
@@ -887,7 +928,7 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str, stop
                            possibly_incomplete=stopped)
     crash_point("after_charge_before_attempt")
 
-    ended_at = _utc_now()
+    ended_at = utc_now()
     model = req["model"] if req["vendor"] == "claude" else None
     cost = (usage.estimate_cost(charged.usage, model, ctx.config.prices)
             if model and charged.usage.known else None)
@@ -896,7 +937,7 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str, stop
         "role": role, "vendor": "claude", "model": model, "effort": req["effort"] if model else None,
         "agent": CODEX_AGENT if req["vendor"] == "codex" else agent_for(req["role"], "claude"),
         "worker_id": worker_id, "started_at": d.started["ts"], "ended_at": ended_at, "steps": None,
-        "charge_ids": [charge_id], "usage": dsp._usage_dict(charged.usage), "usage_known": charged.usage.known,
+        "charge_ids": [charge_id], "usage": dsp.usage_dict(charged.usage), "usage_known": charged.usage.known,
         "cost_estimate": cost, "exit_reason": "stopped" if stopped else "completed",
         "status": head_info["status"], "blocked_by": head_info["blocked_by"], "recorded_by": "engine",
     }
@@ -909,7 +950,7 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str, stop
             return again.result
         return append_event(ctx.paths, "result_recorded", dispatch_id=dispatch_id, card=n,
                             attempt=req["attempt"], dispatch_kind=d.kind, worker_id=worker_id, tip=tip,
-                            session_id=(codex or {}).get("session_id"), files=files, stopped=bool(stopped),
+                            session_id=codex.session_id if codex else None, files=files, stopped=bool(stopped),
                             charge_ids=[charge_id], **head_info)
 
 
@@ -931,6 +972,7 @@ def _record_ruling(ctx: _Run, card: Any, text: str) -> dict:
 
 def _record_park(ctx: _Run, card: Any, reason: str) -> dict:
     events = read_events(ctx.paths)
+    _not_ended(events)
     c = _card_state(ctx, events, card)
     if c.state in ("accepted", "parked"):
         raise EngineError(f"card {c.number} is already {c.state}")

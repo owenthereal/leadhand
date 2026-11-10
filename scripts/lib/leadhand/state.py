@@ -308,7 +308,7 @@ def append_jsonl(paths: RunPaths, file: Path, record: dict) -> None:
     _append(paths, file, lambda _last: record)
 
 
-def _utc_now() -> str:
+def utc_now() -> str:
     return (datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             .replace("+00:00", "Z"))
 
@@ -330,7 +330,7 @@ def append_event(paths: RunPaths, kind: str, /, **fields: Any) -> dict:
             if not isinstance(prev, int) or isinstance(prev, bool):
                 raise ValueError("last event in events.jsonl has no integer seq")
             seq = prev + 1
-        return {"seq": seq, "ts": _utc_now(), "kind": kind, **fields}
+        return {"seq": seq, "ts": utc_now(), "kind": kind, **fields}
 
     return _append(paths, paths.events, build)
 

@@ -59,7 +59,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .state import RunPaths, _read_jsonl, _utc_now, append_jsonl, state_lock
+from .state import RunPaths, _read_jsonl, utc_now, append_jsonl, state_lock
 
 # --------------------------------------------------------------------------
 # Provisional field paths (one constant each; see the module docstring)
@@ -465,7 +465,7 @@ def charge(paths: RunPaths, *, charge_id: str, source: str, key: str, dispatch_i
         prior = charged_checkpoint(earlier, source, key)
         mismatch = None
         if source == "claude":
-            used, checkpoint = _new_claude(
+            used, checkpoint = new_claude_usage(
                 None if path_or_thread is None else Path(path_or_thread), prior)
         else:
             used, checkpoint, mismatch = _new_codex(
@@ -474,13 +474,13 @@ def charge(paths: RunPaths, *, charge_id: str, source: str, key: str, dispatch_i
         if source == "codex" and not used.known and fallback is not None and fallback.known:
             used, stored_source = fallback, CODEX_STREAM_SOURCE
         record = Charge(charge_id=charge_id, source=stored_source, key=key, dispatch_id=dispatch_id,
-                        role=role, usage=used, checkpoint=checkpoint, ts=_utc_now(),
+                        role=role, usage=used, checkpoint=checkpoint, ts=utc_now(),
                         possibly_incomplete=possibly_incomplete, mismatch=mismatch)
         append_jsonl(paths, paths.charges, _charge_to_record(record))
         return record
 
 
-def _new_claude(path: Path | None, prior: dict) -> tuple[Usage, dict]:
+def new_claude_usage(path: Path | None, prior: dict) -> tuple[Usage, dict]:
     """New messages are charged in full; an already-charged message that has grown
     is charged only its extra output (its input side was charged with its first
     record). The checkpoint lists the new or grown IDs at their output so far."""
