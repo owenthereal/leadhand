@@ -84,9 +84,14 @@ class SupervisorFileTests(unittest.TestCase):
                 kind = args.split()[1]
                 self.assertIn(kind, engine.RECORD_KINDS, f"<cli> {name}{args}")
         # P5/R28: CLI calls are plain commands (the sandbox exclusion matches nothing else).
+        # The one exception is the quoted heredoc that records a worker's reply.
+        heredoc = " <run_dir> result --dispatch <dispatch_id> --worker <agent id> --reply - <<'LEADHAND_REPLY'"
+        self.assertEqual(sum(1 for c in calls if c == ("record", heredoc)), 1)
         for name, args in calls:
+            if (name, args) == ("record", heredoc):
+                continue
             plain = re.sub(r"<[a-z_ ]+>", "", args)     # drop placeholders such as <run_dir>
-            self.assertNotRegex(plain, r"[|;&>$]|\bcd\b", f"<cli> {name}{args}")
+            self.assertNotRegex(plain, r"[|;&<>$]|\bcd\b", f"<cli> {name}{args}")
 
     def test_run_skill_records_started_before_waiting(self):
         _, body = split(SKILL)

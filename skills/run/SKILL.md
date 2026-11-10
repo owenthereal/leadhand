@@ -31,13 +31,19 @@ How to call the CLI:
 - Every call is one plain command: `<cli>` and its arguments, written out
   literally. No pipes, redirects, `&&` or `;`, no `cd`, no variables or `$`.
   The CLI runs outside the sandbox only when the command is plain.
-- Put free text (a ruling, a note, a reason) in single quotes on one line, and
-  keep single quotes out of the text itself.
+- Free text for `--text`, `--reason` and `--note` goes in single quotes, and
+  the text itself must contain no single quote and no line break: write
+  do not, not don't, and rephrase any quote or line break from a copied
+  question. Example:
+  `<cli> record <run_dir> ruling --card 3 --text 'Keep the old flag, because the plan says do not break existing callers (plan: Task 3).'`
 - The CLI prints JSON. On failure it prints `error: ...` and exits 1. If the
   error shows your command was wrong (a flag, a number, an ID), correct it and
-  run it once more. Otherwise print the error and stop.
+  run it once more. Otherwise, TaskStop any worker you launched in this step,
+  print the error and stop.
 - Never run `sleep`; the Bash tool refuses it. Waiting means a background
   timer and ending your turn.
+- When a completion notice and a timer notice are both waiting, handle the
+  completion notice first.
 
 ### `dispatch` without `resume`
 
@@ -46,9 +52,10 @@ How to call the CLI:
    - `model`: `agent_model`, and `effort`: `agent_effort`, each only when it
      is not null (a Codex route has both null: leave both out);
    - `description`: `card <card> <kind> (attempt <attempt>)`;
-   - `prompt`: the action's `message`, verbatim;
-   - in the background (`run_in_background: true`). The tool returns the
-     worker's agent ID at once.
+   - `prompt`: the action's `message`, verbatim.
+
+   It runs in the background and returns the worker's agent ID at once.
+   Remember the `dispatch_id` you launched it for.
 2. Immediately record the start with that ID:
    `<cli> record <run_dir> started --dispatch <dispatch_id> --worker <agent id>`
 3. Start the timer with the Bash tool and `run_in_background: true`:
@@ -65,7 +72,8 @@ stop the worker you just launched with TaskStop and run `next`.
 ### `dispatch` with `resume`
 
 1. SendMessage to `resume.worker_id` with the action's `message`, verbatim.
-   This resumes that finished worker in its own transcript.
+   This resumes that finished worker in its own transcript. Remember the
+   `dispatch_id` you resumed it for.
 2. Record the start, where `<agent id>` is `resume.worker_id`:
    `<cli> record <run_dir> started --dispatch <dispatch_id> --worker <agent id>`
 3. Start the timer with the Bash tool and `run_in_background: true`:
@@ -75,9 +83,9 @@ stop the worker you just launched with TaskStop and run `next`.
 ### A worker's completion notice
 
 When a worker's completion notice arrives, record its reply: the notice's
-result text, verbatim, never a summary. Use the `dispatch_id` you started
-that worker for (if you are not sure which, run `next`: a `wait` names
-`dispatch_id` and `worker_id`).
+result text, verbatim, never a summary. Record it against the `dispatch_id`
+you remembered when you launched or resumed that worker. Only if you have
+lost it, run `next`: a `wait` names `dispatch_id` and `worker_id`.
 
 ```
 <cli> record <run_dir> result --dispatch <dispatch_id> --worker <agent id> --reply - <<'LEADHAND_REPLY'
@@ -105,7 +113,8 @@ turn. If no timer of yours is running for `dispatch_id`, start one first:
 
 ### `stop_worker`
 
-1. TaskStop the worker, with `worker_id` as the task ID.
+1. TaskStop the worker, with `worker_id` as the task ID. If TaskStop says the
+   task is unknown or already finished, carry on with step 2.
 2. If `record_result` is true (a Claude worker), record it as stopped:
    `<cli> record <run_dir> result --dispatch <dispatch_id> --worker <worker_id> --stopped --reply 'Status: SPENT (time limit)'`
    If `record_result` is false (a Codex route), the engine has already
@@ -161,6 +170,11 @@ that file does not exist, print the action's `outcome`, `qualifier` and
 
 ## Steering
 
-When the operator tells you to skip a card, record it parked and carry on:
-`<cli> record <run_dir> park --card <card> --reason 'operator: skip'`
-Then run `next`.
+When the operator tells you to skip a card:
+
+1. Run `next`. If it returns a `wait` for that card, stop its worker first:
+   TaskStop `worker_id`, then
+   `<cli> record <run_dir> result --dispatch <dispatch_id> --worker <worker_id> --stopped --reply 'Status: SPENT (time limit)'`
+2. Record the card parked:
+   `<cli> record <run_dir> park --card <card> --reason 'operator: skip'`
+3. Run `next` and carry on.
