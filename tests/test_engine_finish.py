@@ -4,9 +4,9 @@ import unittest
 from pathlib import Path
 
 from fakeworld import FakeWorld, card
-from gitfixture import run_git
+from gitfixture import commit, run_git, write
 from leadhand import engine
-from leadhand.state import append_event
+from leadhand.state import append_event, read_events
 
 RUN = "leadhand/demo"
 FINAL = "leadhand/demo--card-final"
@@ -212,6 +212,7 @@ class Evidence(unittest.TestCase):
         later = [e["gate"] for e in w.events("gate_result")[before:]]
         self.assertEqual(later, ["evidence", "verify"])          # final_review stayed current
         self.assertEqual(done["outcome"], "complete")
+        self.assertFalse(w.paths.handoff.exists())          # the blocked run's handoff is gone
         self.assertEqual(len(runs_lines(w)), 1)
         self.assertIn("| complete |", runs_lines(w)[0])
 
@@ -287,11 +288,171 @@ class Unpark(unittest.TestCase):
                       reply=w.perform(gate, worker))
         del w.parks[1]
         done = w.run()[-1]
-        self.assertEqual(done["outcome"], "complete")
+        self.assertEqual(done["outcome"], "complete", (done["reasons"], w.events("accepted")))
         head = w.branch_tip(RUN)
         self.assertEqual([e["card"] for e in w.events("accepted")], [2, 1])
         self.assertEqual(gates(w)[-3:], [("final_review", head, True), ("evidence", head, True),
                                          ("verify", head, True)])
+
+
+def drive_to_run(w, pred):
+    """Act on every action until a run-level dispatch matching `pred`; return it unacted."""
+    for _ in range(80):
+        a = w.next()
+        if a["action"] == "dispatch" and a["card"] is None and pred(a):
+            return a
+        w.act(a)
+    raise AssertionError("no matching run-level dispatch")
+
+
+def finish_worker(w, a):
+    worker = w.launch(a)
+    engine.record(w.run_dir, "result", dispatch_id=a["dispatch_id"], worker_id=worker, reply=w.perform(a, worker))
+
+
+def found_violations(w):
+    return [e for e in w.events("violation") if e.get("stage") == "found" and (e.get("by") or "check") != "implementer"]
+
+
+class Guards(unittest.TestCase):
+    def test_final_fix_moving_the_run_branch_is_voided_and_restored(self):
+        w = FakeWorld(self, [card(1), card(2)], gates=True)
+        w.start()
+        w.script(None, "final_review", {"verdict": "defects"})
+
+        def rewind(world, ws, a):
+            run_git(ws, "branch", "-f", RUN, world.base)
+        w.script(None, "final_fix", {"tamper": rewind}, {})
+        done = w.run()[-1]
+        self.assertEqual(done["outcome"], "complete")
+        (v,) = found_violations(w)
+        self.assertEqual((v["dispatch_id"], v["dispatch_kind"]), ("run-w1-final_fix-1", "final_fix"))
+        self.assertIn("run-w1-final_fix-2", w.run_dispatch_ids())
+        head = w.branch_tip(RUN)
+        for e in w.events("accepted"):
+            run_git(w.repo, "merge-base", "--is-ancestor", e["sha"], head)
+        self.assertEqual(sorted(e["card"] for e in w.events("accepted") if e["card"] != "final"), [1, 2])
+
+    def test_accepted_work_missing_from_the_run_branch_fails_the_run(self):
+        w = FakeWorld(self, [card(1)])                       # card loop only: no outcome yet
+        w.start()
+        w.run()
+        run_git(w.repo, "update-ref", f"refs/heads/{RUN}", w.base)
+        ctx = engine._load(w.run_dir, check_digest=False)
+        out = engine._end(ctx, read_events(w.paths), gates_current=True)
+        self.assertEqual(out["outcome"], "failed")
+        self.assertTrue(any("accepted work missing from the run branch" in r for r in out["reasons"]), out["reasons"])
+
+    def test_evidence_base_worktree_is_reset_and_guarded(self):
+        def tamper(world, ws, a):
+            bw = world.repo / ".worktrees" / f"{world.run_dir.name}--base"
+            write(bw, {"tests/leftover.txt": "x\n"})
+            commit(bw, {"src/moved.txt": "moved\n"}, "verifier moved the base")
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        w.script(None, "evidence", {"tamper": tamper}, {})
+        done = w.run()[-1]
+        self.assertEqual(done["outcome"], "complete")
+        (v,) = found_violations(w)
+        self.assertEqual((v["dispatch_id"], v["dispatch_kind"]), ("run-evidence-1", "evidence"))
+        rerun = next(a for a in w.run_started if a["dispatch_id"] == "run-evidence-2")
+        self.assertIsNone(rerun["resume"])
+        bw = w.repo / ".worktrees" / f"{w.run_dir.name}--base"
+        self.assertEqual(run_git(bw, "rev-parse", "HEAD"), w.base)
+        self.assertEqual(run_git(bw, "status", "--porcelain", "--ignored"), "")
+        self.assertEqual([e["dispatch_id"] for e in w.events("gate_result") if e["gate"] == "evidence"],
+                         ["run-evidence-2"])
+
+    def test_gate_violation_reruns_with_a_fresh_worker(self):
+        def tamper(world, ws, a):
+            write(ws, {"README.md": "changed by the final reviewer\n"})
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        w.script(None, "final_review", {"tamper": tamper}, {})
+        done = w.run()[-1]
+        self.assertEqual(done["outcome"], "complete")
+        (v,) = found_violations(w)
+        self.assertEqual((v["dispatch_id"], v["card"]), ("run-final_review-1", None))
+        self.assertEqual(w.run_dispatch_ids()[:2], ["run-final_review-1", "run-final_review-2"])
+        self.assertIsNone(w.run_started[1]["resume"])
+        self.assertEqual([e["dispatch_id"] for e in w.events("gate_result") if e["gate"] == "final_review"],
+                         ["run-final_review-2"])
+
+    def test_gate_violation_cap_ends_blocked(self):
+        def tamper(world, ws, a):
+            write(ws, {"README.md": "changed by the verifier\n"})
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        t = {"tamper": tamper}
+        w.script(None, "verify", t, t, t, t)
+        done = w.run()[-1]
+        self.assertEqual((done["outcome"], done["qualifier"]), ("blocked", "decision needed"))
+        self.assertEqual(len(found_violations(w)), engine.VIOLATION_CAP + 1)
+        self.assertTrue(any("verify workers change tracked files: README.md" in r for r in done["reasons"]))
+        self.assertTrue(w.paths.handoff.is_file())
+
+
+class RunWorkerFailures(unittest.TestCase):
+    def test_gate_without_a_result_twice_ends_blocked_environment(self):
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        w.script(None, "verify", {"status": "READY"}, {"status": "READY"})
+        done = w.run()[-1]
+        self.assertEqual((done["outcome"], done["qualifier"]), ("blocked", "environment"))
+        self.assertEqual([i for i in w.run_dispatch_ids() if "verify" in i], ["run-verify-1", "run-verify-2"])
+
+    def test_gate_usage_limit_ends_blocked_provider_capacity(self):
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        w.script(None, "evidence", {"status": "BLOCKED", "blocked_by": "usage limit"})
+        done = w.run()[-1]
+        self.assertEqual((done["outcome"], done["qualifier"]), ("blocked", "provider capacity"))
+        append_event(w.paths, "resumed", note="capacity is back")
+        self.assertEqual(w.run()[-1]["outcome"], "complete")
+        self.assertEqual([i for i in w.run_dispatch_ids() if "evidence" in i], ["run-evidence-1", "run-evidence-2"])
+
+
+class Crashes(unittest.TestCase):
+    def test_crash_before_gate_record_records_once(self):
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        finish_worker(w, drive_to_run(w, lambda a: a["gate"] == "final_review"))
+        r = w.cli("next", w.run_dir, crash="before_gate_record")
+        self.assertEqual(r.returncode, 97, r.stderr)
+        self.assertEqual(w.events("gate_result"), [])
+        self.assertEqual(w.run()[-1]["outcome"], "complete")
+        self.assertEqual([e["dispatch_id"] for e in w.events("gate_result")],
+                         ["run-final_review-1", "run-evidence-1", "run-verify-1"])
+
+    def crash_final_accept(self, point):
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        w.script(None, "final_review", {"verdict": "defects"})
+        finish_worker(w, drive_to_run(w, lambda a: a["kind"] == "final_review" and a["wave"]))
+        before = w.branch_tip(RUN)
+        r = w.cli("next", w.run_dir, crash=point)
+        self.assertEqual(r.returncode, 97, r.stderr)
+        (intent,) = [e for e in w.events("accept_started") if e["card"] == "final"]
+        self.assertEqual([e for e in w.events("accepted") if e["card"] == "final"], [])
+        return w, before, intent
+
+    def test_crash_before_final_fast_forward_reconciles(self):
+        w, before, intent = self.crash_final_accept("before_fast_forward")
+        self.assertEqual(w.branch_tip(RUN), before)
+        self.assertEqual(w.run()[-1]["outcome"], "complete")
+        (acc,) = [e for e in w.events("accepted") if e["card"] == "final"]
+        self.assertEqual(acc["sha"], intent["target"])
+        self.assertEqual(len([e for e in w.events("accept_started") if e["card"] == "final"]), 1)
+        self.assertEqual(w.branch_tip(RUN), intent["target"])
+
+    def test_crash_after_final_fast_forward_reconciles(self):
+        w, before, intent = self.crash_final_accept("after_fast_forward")
+        self.assertEqual(w.branch_tip(RUN), intent["target"])
+        reflog = run_git(w.repo, "reflog", "show", "--format=%H", f"refs/heads/{RUN}")
+        self.assertEqual(w.run()[-1]["outcome"], "complete")
+        (acc,) = [e for e in w.events("accepted") if e["card"] == "final"]
+        self.assertEqual(acc["sha"], intent["target"])
+        self.assertEqual(run_git(w.repo, "reflog", "show", "--format=%H", f"refs/heads/{RUN}"), reflog)
 
 
 class NothingAccepted(unittest.TestCase):

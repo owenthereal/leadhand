@@ -472,10 +472,16 @@ def _step(ctx: _Run, events: list[dict]) -> dict | None:
         return None
     cards = fold_cards(events, ctx.numbers)
     index = _dispatches(events)
-    open_run = [d for d in _run_dispatches(index) if d.result is None]
-    if open_run:
+    runs = _run_dispatches(index)
+    if runs and runs[-1].result is None:
         # A gate or fix wave worker is using the workspace (a card unparked meanwhile waits).
-        return _in_flight(ctx, open_run[-1])
+        return _in_flight(ctx, runs[-1])
+    if runs:
+        # Its result is acted on before any card moves the workspace or the run branch, so its
+        # guard is checked against what the worker saw.
+        acted, action = _after_run_result(ctx, runs[-1], events, index, _accepted_cards(ctx, cards))
+        if acted:
+            return action
     n = _pick(ctx, cards, events)
     if n is None:
         return _end_of_run(ctx, cards, events)
@@ -1521,9 +1527,10 @@ def _risk_card(accepted: list[Card]) -> Card:
 
 
 def _required_gates(ctx: _Run, accepted: list[Card], head_sha: str) -> list[str]:
-    """Every gate, with security only when the highest accepted risk is medium or high or a
-    path changed since the base is sensitive."""
-    risky = any(c.risk in ("medium", "high") for c in accepted)
+    """Every gate, with security only when the highest accepted risk is medium or high (an
+    unknown risk counts as medium, as in `_risk_card`) or a path changed since the base is
+    sensitive."""
+    risky = any(c.risk != "low" for c in accepted)
     security = risky or any(is_sensitive_path(p) for p in changed_paths(ctx.ws, ctx.meta["base_sha"], head_sha))
     return [g for g in GATES if g != "security" or security]
 
@@ -1599,7 +1606,7 @@ def _end_of_run(ctx: _Run, cards: dict[int, CardState], events: list[dict]) -> d
             return None
     holds = ((f"evidence gaps on {head_sha[:12]}: {settled['evidence'].get('findings') or ''}",)
              if "evidence" in settled else ())
-    _end(ctx, events, gates_current=True, open_findings=any(g in settled for g in REVIEW_GATES),
+    _end(ctx, events, gates_current=not settled, open_findings=any(g in settled for g in REVIEW_GATES),
          holds=holds, verification_failed="verify" in settled)
     return None
 
@@ -1616,22 +1623,62 @@ def _request_gate(ctx: _Run, events: list[dict], gate: str, head_sha: str, accep
                  extra=extra, accepted=accepted)
 
 
+def _base_worktree_path(ctx: _Run) -> Path:
+    return Path(ctx.meta["repo"]) / ".worktrees" / f"{ctx.root.name}--base"
+
+
 def _base_worktree(ctx: _Run) -> Path:
     """`<repo>/.worktrees/<run dir name>--base`, detached at the run's base commit, for the
-    evidence gate. Idempotent: an existing registered worktree is reused. It is kept after the
-    run (beside the run's own worktree) so the evidence can be re-checked; `git worktree
-    remove` deletes it."""
+    evidence gate. Before every evidence request it is put back exactly: stale worktree
+    records pruned, created when missing, then detached at the base, hard-reset and cleaned
+    of every untracked and ignored file. Idempotent. It is kept after the run (beside the
+    run's own worktree) so the evidence can be re-checked; `git worktree remove` deletes it."""
     repo = Path(ctx.meta["repo"])
-    path = repo / ".worktrees" / f"{ctx.root.name}--base"
+    path = _base_worktree_path(ctx)
+    base = ctx.meta["base_sha"]
+    git(repo, "worktree", "prune")
     listed = git(repo, "worktree", "list", "--porcelain").splitlines()
     registered = {Path(ln[len("worktree "):]).resolve() for ln in listed if ln.startswith("worktree ")}
-    if path.exists():
-        if path.resolve() in registered:
-            return path
+    if path.exists() and path.resolve() not in registered:
         raise EngineError(f"{path} exists but is not a worktree of {repo}; move it aside")
-    ensure_excluded(repo, ".worktrees/")
-    git(repo, "worktree", "add", "--quiet", "--detach", str(path), ctx.meta["base_sha"])
+    if not path.exists():
+        ensure_excluded(repo, ".worktrees/")
+        git(repo, "worktree", "add", "--quiet", "--detach", str(path), base)
+    git(path, "checkout", "--quiet", "--force", "--detach", base, "--")
+    git(path, "reset", "--quiet", "--hard", base)
+    git(path, "clean", "-q", "-f", "-d", "-x")
     return path
+
+
+def _base_violation(ctx: _Run, d: _Dispatch, events: list[dict]) -> bool:
+    """After an evidence result: the base worktree must still be at the base commit with no
+    tracked change. Otherwise record a check violation (found, then restored: a moved HEAD is
+    kept on refs/leadhand/<run_id>/violations/<n>-base and the worktree is reset), so the
+    result is void like any other check violation."""
+    path = Path((d.req.get("extra") or {}).get("base_worktree") or _base_worktree_path(ctx))
+    base = ctx.meta["base_sha"]
+    try:
+        now = git(path, "rev-parse", "--verify", "HEAD")
+        dirty = git(path, "status", "--porcelain", "--untracked-files=no")
+    except (GitError, OSError):
+        now, dirty = None, ""
+    if now == base and not dirty:
+        return False
+    n = 1 + sum(1 for e in events if e["kind"] == "violation" and _by(e) != "implementer"
+                and e.get("stage") == "found")
+    keep = f"refs/leadhand/{ctx.meta['run_id']}/violations/{n}-base"
+    found = append_event(ctx.paths, "violation", stage="found", by="check", dispatch_id=d.id, card=None,
+                         dispatch_kind=d.kind, n=n, ref=None, base_worktree=str(path), base_head=now,
+                         paths=sorted({ln[3:] for ln in dirty.splitlines() if len(ln) > 3}),
+                         head_moved=now != base, index_dirty=False, expected_head=d.req.get("expected_head"),
+                         expected_branch=d.req.get("expected_branch"), refs={},
+                         preserved={"base": keep} if now and now != base else {})
+    if now and now != base:
+        git(ctx.ws, "update-ref", "-m", "leadhand: keep a base worktree a verifier moved", keep, now)
+    _base_worktree(ctx)
+    append_event(ctx.paths, "violation", stage="restored", by="check", dispatch_id=d.id, card=None,
+                 n=n, ref=None, saved=now, siblings=[], preserved=found["preserved"])
+    return True
 
 
 def _start_wave(ctx: _Run, events: list[dict], wave: int, failing: dict, head_sha: str,
@@ -1680,6 +1727,10 @@ def _request_run(ctx: _Run, events: list[dict], *, kind: str, attempt: int, role
         _ensure_clean(ctx, events, branch=branch, why=f"before {kind} {did}")
         guard = {"expected_branch": branch, "expected_head": head(ctx.ws, f"refs/heads/{branch}"),
                  "refs": _ref_snapshot(ctx)}
+    elif kind == "final_fix":
+        # Like an integrate worker: it commits on the final branch but must leave the run branch alone.
+        run_ref = f"refs/heads/{ctx.branch}"
+        guard = {"refs": {run_ref: head(ctx.ws, run_ref)}, "ref_scope": [run_ref]}
     full = {"base": ctx.meta["base_sha"], "branch": ctx.branch, "test_first": ctx.config.run.test_first,
             "cards": ",".join(str(c.number) for c in accepted), **extra}
     if gate is not None and not any(e["kind"] == "gate_started" and e.get("dispatch_id") == did for e in events):
@@ -1723,6 +1774,8 @@ def _after_run_result(ctx: _Run, d: _Dispatch, events: list[dict], index: dict[s
         return True, None
     wave = req.get("wave")
     if d.kind == "final_fix":
+        if "refs" in req and _run_check_voided(ctx, d, events, accepted):
+            return True, None
         if r["status"] == "READY":
             base, tip = req["extra"]["base"], r.get("tip")
             if not tip or tip == base or base != _run_head(ctx):
@@ -1759,6 +1812,9 @@ def _after_run_result(ctx: _Run, d: _Dispatch, events: list[dict], index: dict[s
     if any(e["kind"] == "accepted" and e.get("card") == FINAL and e.get("dispatch_id") == d.id for e in events):
         return False, None
     target = req["expected_head"]
+    reviewed = (req.get("extra") or {}).get("diff_range", "").partition("..")[2]
+    if target != reviewed:
+        raise EngineError(f"fix review {d.id} examined {target}, not the fix tip {reviewed}")
     started = any(e["kind"] == "accept_started" and e.get("dispatch_id") == d.id for e in events)
     if not started and not is_ancestor(ctx.ws, f"refs/heads/{ctx.branch}", target):
         return False, None                          # a card was accepted meanwhile: the wave is stale
@@ -1775,7 +1831,7 @@ def _run_check_voided(ctx: _Run, d: _Dispatch, events: list[dict], accepted: lis
     """A run-level check that changed what it guards: preserved, undone and run again with a
     fresh worker (R33). Past VIOLATION_CAP voided runs of the kind since the run was last
     resumed, the run ends blocked for a decision instead (there is no card to park)."""
-    if not _void(ctx, d, events):
+    if not _void(ctx, d, events) and not (d.kind == "evidence" and _base_violation(ctx, d, events)):
         return False
     events = read_events(ctx.paths)
     since = _reopened_since(events)
@@ -1827,13 +1883,18 @@ def _end(ctx: _Run, events: list[dict], *, blocked_reason: str | None = None, op
     """Decide the outcome and append it, with the allowed next step and the run head. The
     wrap-up (handoff, report, runs.md) follows in `_wrap_up`.
 
-    `gates_current` means every required gate has a result on the run head; a gate that
-    failed there for good is reported through `open_findings`, `holds` or
-    `verification_failed` instead."""
+    `gates_current` means every required gate passed on the run head; a gate that failed
+    there for good is also reported through `open_findings`, `holds` or
+    `verification_failed`. Every accepted card and fix must still be on the run branch;
+    otherwise the state cannot be reconciled and the run fails."""
     cards = fold_cards(events, ctx.numbers)
+    run_ref = f"refs/heads/{ctx.branch}"
+    missing = [f"card {e.get('card')} at {str(e.get('sha'))[:12]}" for e in events
+               if e["kind"] == "accepted" and e.get("sha") and not is_ancestor(ctx.ws, e["sha"], run_ref)]
+    unreconciled = f"accepted work missing from the run branch: {', '.join(missing)}" if missing else None
     decision = decide_outcome(cards, removed=frozenset(), open_findings=open_findings, holds=holds,
                               gates_current=gates_current, verification_failed=verification_failed,
-                              cancelled=False, blocked_reason=blocked_reason, unreconciled=None)
+                              cancelled=False, blocked_reason=blocked_reason, unreconciled=unreconciled)
     return append_event(ctx.paths, "outcome", outcome=decision.outcome.value, qualifier=decision.qualifier,
                         reasons=[*decision.reasons, *why],
                         next_step=allowed_next_step(decision, ctx.config.after_run), head=_run_head(ctx))
@@ -1846,6 +1907,8 @@ def _wrap_up(ctx: _Run, ended: dict, events: list[dict]) -> None:
         return
     if ended.get("outcome") == "blocked":
         _write_handoff(ctx, ended, events)
+    else:
+        ctx.paths.handoff.unlink(missing_ok=True)      # a resumed blocked run's handoff no longer applies
     from leadhand import report as report_mod
     path = report_mod.write_report(ctx.root)
     _record_run_line(ctx, ended, events)
