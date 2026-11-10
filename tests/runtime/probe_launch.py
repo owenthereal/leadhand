@@ -85,41 +85,46 @@ class Ctx:
         self.dry = dry
         self.tag = f"{os.getpid()}"
         self.tmp: Path | None = None
-        self.fixture: Path | None = None
+        self.fixtures: dict[str, Path] = {}
         self.pgids: list[int] = []
         self.tmux_sockets: list[str] = []
         self.markers: list[Path] = []
         self.cache: dict = {}
 
-    def fixture_path(self) -> str:
+    def fixture_path(self, name: str = "fixture repo") -> str:
+        """A temp Git repo per name (steps 3 and 6 get their own), all under one temp dir."""
         if self.dry:
-            return "<tmp>/lhprobe XXXX/fixture repo"
-        if self.fixture is None:
-            self.fixture = make_fixture(self)
-        return str(self.fixture)
+            return f"<tmp>/lhprobe XXXX/{name}"
+        if name not in self.fixtures:
+            if self.tmp is None:
+                self.tmp = Path(tempfile.mkdtemp(prefix="lhprobe ")).resolve()
+            self.fixtures[name] = make_fixture(self.tmp / name)
+        return str(self.fixtures[name])
 
 
-def make_fixture(ctx: Ctx) -> Path:
-    ctx.tmp = Path(tempfile.mkdtemp(prefix="lhprobe "))
-    repo = (ctx.tmp / "fixture repo").resolve()
+GIT_TIMEOUT = 60
+
+
+def make_fixture(repo: Path) -> Path:
     repo.mkdir()
     (repo / "README.md").write_text("probe fixture\n")
-    git = ["git", "-C", str(repo)]
-    subprocess.run(git + ["init", "-q", "-b", "main"], check=True)
-    subprocess.run(git + ["add", "README.md"], check=True)
-    subprocess.run(
-        git + ["-c", "user.name=probe", "-c", "user.email=probe@example.invalid",
-               "commit", "-q", "-m", "init"],
-        check=True,
-    )
+    # Isolate from the operator's git config: no signing (pinentry), no hooks.
+    git = ["git", "-C", str(repo), "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+           "-c", "user.name=probe", "-c", "user.email=probe@example.invalid"]
+    for args in (["init", "-q", "-b", "main"], ["add", "README.md"],
+                 ["commit", "-q", "--no-gpg-sign", "-m", "init"]):
+        subprocess.run(git + args, check=True, timeout=GIT_TIMEOUT,
+                       stdin=subprocess.DEVNULL, capture_output=True)
     return repo
 
 
-def child_env(hook_log: Path | str) -> dict:
+def child_env(hook_log: Path | str, extra: dict | None = None) -> dict:
     env = dict(os.environ)
     env.pop("CLAUDECODE", None)
+    env.pop("PROBE_DENY_UNSANDBOXED", None)
     env["LEADHAND_RUN_ID"] = RUN_ID
     env["PROBE_LOG"] = str(hook_log)
+    env.update(extra or {})
     return env
 
 
@@ -138,14 +143,22 @@ def headless_argv(ctx: Ctx, prompt: str, agent: str | None = "lhprobe:super",
 
 
 def tmux_argv(sock: str, name: str, cwd: str, hook_log: str) -> list[str]:
+    # remain-on-exit keeps the pane (and its last screen) if claude exits early.
     return [
-        "tmux", "-L", sock, "new-session", "-d", "-s", name, "-c", cwd,
+        "tmux", "-L", sock, "start-server", ";",
+        "set-option", "-g", "remain-on-exit", "on", ";",
+        "new-session", "-d", "-s", name, "-c", cwd,
         "-x", "200", "-y", "50",
         "-e", f"LEADHAND_RUN_ID={RUN_ID}", "-e", f"PROBE_LOG={hook_log}",
         "env", "-u", "CLAUDECODE",
         "claude", "--plugin-dir", str(PLUGIN_DIR), "--agent", "lhprobe:super",
         "--permission-mode", "auto",
     ]
+
+
+# Step 6 only: log-input.sh denies any Bash call that sets dangerouslyDisableSandbox,
+# so a model retry can't make a marker appear for the wrong reason.
+STEP6_ENV = {"PROBE_DENY_UNSANDBOXED": "1"}
 
 
 def overlay_json() -> str:
@@ -229,7 +242,8 @@ def copy_transcripts(session_id: str | None, dest: Path) -> list[str]:
     return found
 
 
-def run_headless(ctx: Ctx, label: str, argv: list[str], grace: int = 0) -> dict:
+def run_headless(ctx: Ctx, label: str, argv: list[str], grace: int = 0,
+                 fixture: str = "fixture repo", env_extra: dict | None = None) -> dict:
     """Run one `claude -p` session, timestamping each stream-json line."""
     hook_log = ctx.art / f"{label}-hooks.jsonl"
     stream_path = ctx.art / f"{label}-stream.jsonl"
@@ -238,7 +252,7 @@ def run_headless(ctx: Ctx, label: str, argv: list[str], grace: int = 0) -> dict:
     start = time.monotonic()
     with open(stream_path, "w") as stream_f, open(stderr_path, "w") as err_f:
         proc = subprocess.Popen(
-            argv, cwd=ctx.fixture_path(), env=child_env(hook_log),
+            argv, cwd=ctx.fixture_path(fixture), env=child_env(hook_log, env_extra),
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err_f,
             text=True, start_new_session=True,
         )
@@ -277,6 +291,7 @@ def run_headless(ctx: Ctx, label: str, argv: list[str], grace: int = 0) -> dict:
     return {
         "label": label,
         "argv": argv,
+        "env_extra": env_extra or {},
         "exit_code": "timeout" if timed_out else proc.returncode,
         "exit_s": exit_s,
         "records": records,
@@ -344,12 +359,13 @@ def tool_results(records) -> dict:
 
 
 def assistant_models(records) -> dict:
-    models = {"main": set(), "subagent": set()}
+    """message.model values grouped by the record's parent_tool_use_id (as recorded)."""
+    models: dict[str, set] = {}
     for _, r in records:
         if r.get("type") == "assistant" and isinstance(r.get("message"), dict):
-            side = "subagent" if r.get("parent_tool_use_id") else "main"
+            key = f"parent={r.get('parent_tool_use_id')}"
             if r["message"].get("model"):
-                models[side].add(r["message"]["model"])
+                models.setdefault(key, set()).add(r["message"]["model"])
     return {k: sorted(v) for k, v in models.items()}
 
 
@@ -378,14 +394,46 @@ def effort_fields(result: dict) -> list[str]:
     return sorted(seen)[:20]
 
 
-def split_hooks(hooks: list[dict]) -> tuple[list[dict], list[dict]]:
-    main = [h for h in hooks if not (h.get("hook_input") or {}).get("agent_id")]
-    sub = [h for h in hooks if (h.get("hook_input") or {}).get("agent_id")]
-    return main, sub
+def command_role(cmd: str | None) -> str | None:
+    """Who ran a Bash command, from the commands the probe agents are told to run.
+
+    Classifying by command, not by agent_id, keeps Step 4's subject (agent_id)
+    out of the classification it is compared against.
+    """
+    cmd = (cmd or "").strip()
+    if cmd.startswith("echo probe"):
+        return "main"
+    if cmd == "pwd" or cmd.startswith("pwd ") or cmd.startswith("pwd;"):
+        return "worker"
+    return None
 
 
 def hook_command(h: dict) -> str:
     return str(((h.get("hook_input") or {}).get("tool_input") or {}).get("command", ""))
+
+
+def split_hooks(hooks: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(main, worker) hook lines, classified by command."""
+    main = [h for h in hooks if command_role(hook_command(h)) == "main"]
+    sub = [h for h in hooks if command_role(hook_command(h)) == "worker"]
+    return main, sub
+
+
+def classification_mismatches(hooks: list[dict]) -> list[str]:
+    """Lines where command-based role disagrees with agent_id presence."""
+    out = []
+    for h in hooks:
+        role = command_role(hook_command(h))
+        has_id = bool((h.get("hook_input") or {}).get("agent_id"))
+        if role and (role == "worker") != has_id:
+            out.append(f"{role} command {hook_command(h)!r} has agent_id={has_id}")
+    return out
+
+
+def bash_by_role(records, role: str) -> list[dict]:
+    """Bash tool_use blocks from the stream whose command matches `role`."""
+    return [u for u in tool_uses(records)
+            if u["name"] == "Bash" and command_role(u["input"].get("command")) == role]
 
 
 def result_excerpt(result: dict) -> list[str]:
@@ -413,48 +461,95 @@ def common_observed(result: dict) -> dict:
 # Each step returns (status, commands[(argv, exit)], excerpt lines, observed dict, summary).
 
 
-def step1(ctx: Ctx):
-    r = cached_headless(ctx, "lhprobe:super", "go")
+FALLBACK_AGENT = "leadhand-supervisor"
+
+
+def fallback_agents_json() -> str:
+    """The brief's fallback: super's definition passed inline with --agents."""
+    text = (PLUGIN_DIR / "agents" / "super.md").read_text()
+    body = text.split("\n---\n", 1)[1].strip() if text.startswith("---\n") else text
+    return json.dumps({FALLBACK_AGENT: {
+        "description": "Probe supervisor (inline --agents fallback for leadhand runtime checks).",
+        "prompt": body,
+        "model": "haiku",
+    }})
+
+
+def fallback_argv(ctx: Ctx) -> list[str]:
+    return headless_argv(ctx, "go", agent=FALLBACK_AGENT,
+                         extra=["--agents", fallback_agents_json()])
+
+
+def launch_facts(ctx: Ctx, r: dict) -> dict:
+    """Step 1's observations for one headless foreground session."""
     uses = tool_uses(r["records"])
     results = tool_results(r["records"])
-    main_bash = [u["input"].get("command") for u in uses if u["name"] == "Bash" and not u["parent"]]
-    sub_bash = [u for u in uses if u["name"] == "Bash" and u["parent"]]
-    dispatch = [u["input"] for u in uses if u["name"] in AGENT_TOOLS and not u["parent"]]
-    _, sub_hooks = split_hooks(r["hooks"])
+    main_bash = bash_by_role(r["records"], "main")
+    worker_bash = bash_by_role(r["records"], "worker")
+    dispatch = [u for u in uses if u["name"] in AGENT_TOOLS]
+    main_hooks, worker_hooks = split_hooks(r["hooks"])
     launch_cwd = os.path.realpath(ctx.fixture_path())
-    worker_hook_cwd = (sub_hooks[0]["hook_input"].get("cwd") if sub_hooks else None)
-    worker_pwd_out = [results.get(u["id"], (None, None))[1] for u in sub_bash]
+    worker_hook_cwd = worker_hooks[0]["hook_input"].get("cwd") if worker_hooks else None
+    worker_pwd_out = [results.get(u["id"], (None, None))[1] for u in worker_bash]
     cwd_candidates = [c for c in [worker_hook_cwd] + [(o or "").strip() for o in worker_pwd_out] if c]
     init = r["init"]
     obs = common_observed(r)
     obs.update({
+        "init_keys": sorted(init.keys()),
         "init_agent": init.get("agent", "absent"),
         "init_model": init.get("model"),
         "init_permissionMode": init.get("permissionMode"),
-        "init_agents_lhprobe": [a for a in init.get("agents", []) if "lhprobe" in str(a)],
-        "main_bash_commands": main_bash,
-        "main_ran_probe_echo": any("echo probe" in (c or "") for c in main_bash),
-        "agent_dispatch_inputs": dispatch,
-        "assistant_models": assistant_models(r["records"]),
+        "init_agents_lhprobe": [a for a in init.get("agents", []) or []
+                                if "lhprobe" in str(a) or FALLBACK_AGENT in str(a)],
+        "all_bash_commands": [u["input"].get("command") for u in uses if u["name"] == "Bash"],
+        "main_ran_probe_echo": bool(main_bash) or bool(main_hooks),
+        "main_bash_parent_ids": [u["parent"] for u in main_bash],
+        "agent_dispatch": [{"id": u["id"], "parent": u["parent"], "input": u["input"]}
+                           for u in dispatch],
+        "assistant_models_by_parent": assistant_models(r["records"]),
         "effort_fields": effort_fields(r) or "none found",
-        "worker_bash_commands": [u["input"].get("command") for u in sub_bash],
+        "worker_bash_parent_ids": [u["parent"] for u in worker_bash],
+        "worker_bash_parent_is_dispatch": bool(worker_bash) and all(
+            u["parent"] in {d["id"] for d in dispatch} for u in worker_bash),
         "worker_pwd_output": worker_pwd_out,
         "worker_hook_cwd": worker_hook_cwd,
-        "worker_hook_pwd": sub_hooks[0].get("pwd") if sub_hooks else None,
+        "worker_hook_pwd": worker_hooks[0].get("pwd") if worker_hooks else None,
         "launch_cwd": launch_cwd,
         "worker_cwd_matches_launch": bool(cwd_candidates) and all(
             os.path.realpath(c) == launch_cwd for c in cwd_candidates),
+        "hook_classification_mismatches": classification_mismatches(r["hooks"]) or "none",
         "permission_route": shlex.join(ctx.perm),
     })
+    return obs
+
+
+def step1(ctx: Ctx):
+    r = cached_headless(ctx, "lhprobe:super", "go")
+    obs = launch_facts(ctx, r)
+    commands = [(r["argv"], r["exit_code"])]
+    excerpt = result_excerpt(r)
+    summary = (f"exit={r['exit_code']} probe_echo={obs['main_ran_probe_echo']} "
+               f"models={obs['assistant_models_by_parent']} "
+               f"worker_cwd_ok={obs['worker_cwd_matches_launch']}")
+    obs["fallback_run"] = "no (plugin-scoped --agent ran the probe echo)"
+    if not obs["main_ran_probe_echo"]:
+        fb = run_headless(ctx, "headless-fallback-agents", fallback_argv(ctx))
+        commands.append((fb["argv"], fb["exit_code"]))
+        excerpt = (["[plugin-scoped] " + l for l in excerpt[:5]]
+                   + ["[--agents fallback] " + l for l in result_excerpt(fb)[:5]])
+        obs["fallback_run"] = f"yes: --agents JSON defining {FALLBACK_AGENT}"
+        for k, v in launch_facts(ctx, fb).items():
+            obs[f"fallback {k}"] = v
+        summary += (f"; fallback {FALLBACK_AGENT}: exit={fb['exit_code']} "
+                    f"probe_echo={obs['fallback main_ran_probe_echo']}")
     ok = r["exit_code"] == 0 and obs["main_ran_probe_echo"] and obs["worker_cwd_matches_launch"]
-    summary = f"exit={r['exit_code']} models={obs['assistant_models']} worker_cwd_ok={obs['worker_cwd_matches_launch']}"
-    return ("PASS" if ok else "OBSERVED", [(r["argv"], r["exit_code"])],
-            result_excerpt(r), obs, summary)
+    return ("PASS" if ok else "OBSERVED", commands, excerpt, obs, summary)
 
 
 def skill_facts(r: dict) -> dict:
     uses = tool_uses(r["records"])
-    main_bash = [u["input"].get("command") or "" for u in uses if u["name"] == "Bash" and not u["parent"]]
+    main_bash = [u["input"].get("command") or "" for u in bash_by_role(r["records"], "main")]
+    main_bash += [hook_command(h) for h in split_hooks(r["hooks"])[0] if not main_bash]
     non_assistant = [json.dumps(x) for _, x in r["records"] if x.get("type") != "assistant"]
     non_assistant += [json.dumps(x) for x in r["transcript_records"] if x.get("type") != "assistant"]
     init_skills = r["init"].get("skills", "absent")
@@ -493,23 +588,37 @@ def tmux(sock: str, *args: str, check: bool = False) -> subprocess.CompletedProc
                           timeout=30, check=check)
 
 
+DIALOG_REPEAT_LIMIT = 3  # the same dialog text this many times = stale, stop answering it
+
+
 def step3(ctx: Ctx):
     sock = name = f"lhprobe-{ctx.tag}"
     hook_log = ctx.art / "interactive-hooks.jsonl"
-    argv = tmux_argv(sock, name, ctx.fixture_path(), str(hook_log))
+    argv = tmux_argv(sock, name, ctx.fixture_path("interactive repo"), str(hook_log))
     ctx.tmux_sockets.append(sock)
     commands = [(argv, None)]
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
     commands[0] = (argv, proc.returncode)
     if proc.returncode != 0:
         return ("FAIL", commands, proc.stderr.splitlines()[:10], {"tmux_stderr": proc.stderr}, "tmux failed")
+    capture_errors: list[str] = []
 
     def capture() -> str:
-        return tmux(sock, "capture-pane", "-p", "-t", name).stdout
+        p = tmux(sock, "capture-pane", "-p", "-t", name)
+        if p.returncode != 0:
+            capture_errors.append(f"rc={p.returncode} {p.stderr.strip()}")
+        return p.stdout
+
+    def pane_state() -> str:
+        p = tmux(sock, "display-message", "-p", "-t", name, "dead=#{pane_dead} status=#{pane_dead_status}")
+        return p.stdout.strip() if p.returncode == 0 else f"rc={p.returncode} {p.stderr.strip()}"
 
     def answer_dialog(pane: str, answered: list) -> bool:
+        """Press Enter on a known dialog; False once the same dialog has gone stale."""
         for pat in DIALOG_PATTERNS:
             if re.search(pat, pane):
+                if answered.count(pat) >= DIALOG_REPEAT_LIMIT:
+                    return False
                 answered.append(pat)
                 tmux(sock, "send-keys", "-t", name, "Enter")
                 time.sleep(2)
@@ -522,32 +631,37 @@ def step3(ctx: Ctx):
     ready_s = None
     while time.monotonic() - start < DIALOG_TIMEOUT + 30:
         pane = capture()
-        if answer_dialog(pane, answered):
-            if answered.count(answered[-1]) > 3:
-                break
-            continue
         if READY_PATTERN.search(pane):
             ready_s = round(time.monotonic() - start, 1)
             break
-        time.sleep(2)
+        if "dead=1" in pane_state():
+            break
+        if not answer_dialog(pane, answered):
+            if any(answered.count(p) >= DIALOG_REPEAT_LIMIT for p in DIALOG_PATTERNS
+                   if re.search(p, pane)):
+                break  # stale dialog: answering it again won't help
+            time.sleep(2)
     (ctx.art / "interactive-pane-startup.txt").write_text(pane)
-    obs = {"dialogs_answered": answered or "none"}
+    obs = {"dialogs_answered": answered or "none", "pane_state": pane_state(),
+           "capture_errors": capture_errors or "none"}
     if ready_s is None:
         obs["pane_last_lines"] = pane.rstrip().splitlines()[-10:]
         return ("FAIL", commands, pane.rstrip().splitlines()[-10:], obs,
-                "never reached the prompt (see interactive-pane-startup.txt)")
+                f"never reached the prompt ({obs['pane_state']}; see interactive-pane-startup.txt)")
     obs["ready_after_s"] = ready_s
     send = [["tmux", "-L", sock, "send-keys", "-t", name, "-l", "go"],
             ["tmux", "-L", sock, "send-keys", "-t", name, "Enter"]]
     for a in send:
-        subprocess.run(a, capture_output=True, timeout=30)
-        commands.append((a, 0))
+        p = subprocess.run(a, capture_output=True, timeout=30)
+        commands.append((a, p.returncode))
         time.sleep(0.5)
     sent = time.monotonic()
     last_pane, stable_since, worker_seen_s = "", time.monotonic(), None
     while time.monotonic() - sent < INTERACTIVE_TIMEOUT:
         time.sleep(2)
         pane = capture()
+        if "dead=1" in pane_state():
+            break
         if answer_dialog(pane, answered):
             continue
         if pane != last_pane:
@@ -564,7 +678,10 @@ def step3(ctx: Ctx):
     ctx.cache["interactive"] = {"hooks": hooks}
     obs.update({
         "dialogs_answered": answered or "none",
+        "pane_state": pane_state(),
+        "capture_errors": capture_errors or "none",
         "probe_log_lines": len(hooks),
+        "hook_classification_mismatches": classification_mismatches(hooks) or "none",
         "main_bash_lines": [hook_command(h) for h in main],
         "worker_bash_lines": [hook_command(h) for h in sub],
         "worker_line_after_s": worker_seen_s,
@@ -605,13 +722,15 @@ def step4(ctx: Ctx):
         for who, h in (("main", main[0] if main else None), ("worker", sub[0] if sub else None)):
             for k, v in identity(h).items():
                 obs[f"{src} {who} {k}"] = v
-        obs[f"{src} line_count"] = f"main={len(main)} worker={len(sub)}"
+        obs[f"{src} line_count"] = f"main={len(main)} worker={len(sub)} total={len(hooks)}"
+        obs[f"{src} classification"] = "by command (main=`echo probe…`, worker=`pwd`)"
+        obs[f"{src} agent_id_vs_command_mismatches"] = classification_mismatches(hooks) or "none"
     excerpt = [json.dumps(h)[:300] for h in r["hooks"][:10]]
     m, s = split_hooks(r["hooks"])
     mi = identity(m[0] if m else None)
     si = identity(s[0] if s else None)
     summary = (f"main agent_id={mi.get('agent_id')} agent_type={mi.get('agent_type')}; "
-               f"worker agent_id={'set' if s else 'n/a'} agent_type={si.get('agent_type')}; "
+               f"worker agent_id={si.get('agent_id', 'n/a')} agent_type={si.get('agent_type')}; "
                f"run_id={mi.get('LEADHAND_RUN_ID')}")
     return ("OBSERVED", [(r["argv"], r["exit_code"])], excerpt, obs, summary)
 
@@ -620,7 +739,7 @@ def step5(ctx: Ctx):
     r = cached_headless(ctx, "lhprobe:super", "go-bg", grace=BACKGROUND_GRACE)
     uses = tool_uses(r["records"])
     results = tool_results(r["records"])
-    dispatch = [u for u in uses if u["name"] in AGENT_TOOLS and not u["parent"]]
+    dispatch = [u for u in uses if u["name"] in AGENT_TOOLS]
     d = dispatch[0] if dispatch else None
     ret = results.get(d["id"]) if d else None
     result_recs = [(t, x) for t, x in r["records"] if x.get("type") == "result"]
@@ -640,6 +759,8 @@ def step5(ctx: Ctx):
         "worker_hook_lines_after_grace": len(sub),
         "grace_s": BACKGROUND_GRACE,
         "subagent_records_in_stream": sum(1 for _, x in r["records"] if x.get("parent_tool_use_id")),
+        "worker_bash_in_stream": len(bash_by_role(r["records"], "worker")),
+        "hook_classification_mismatches": classification_mismatches(r["hooks"]) or "none",
     })
     waited = obs["worker_hook_lines_before_exit"] > 0 and bool(notif)
     summary = (f"exit_after={r['exit_s']}s worker_before_exit={obs['worker_hook_lines_before_exit']} "
@@ -665,35 +786,56 @@ def step6(ctx: Ctx):
             "user_exclusion_gh": PROBE_HOME / f"gh-{variant}-{ctx.tag}.txt",
         }
         ctx.markers += markers.values()
-        r = run_headless(ctx, f"settings-{variant}", step6_argv(ctx, variant))
+        # Each command's marker filename is unique, so retries or edited commands still match.
+        needles = {k: m.name if k != "net_probe" else NET_PROBE.name for k, m in markers.items()}
+        r = run_headless(ctx, f"settings-{variant}", step6_argv(ctx, variant),
+                         fixture="settings repo", env_extra=STEP6_ENV)
         commands.append((r["argv"], r["exit_code"]))
         uses = [u for u in tool_uses(r["records"]) if u["name"] == "Bash"]
         results = tool_results(r["records"])
         obs[f"{variant} exit_code"] = r["exit_code"]
+        obs[f"{variant} deny_unsandboxed_hook"] = "on (PROBE_DENY_UNSANDBOXED=1)"
+        tainted = []
         for key, cmd in cmds.items():
-            use = next((u for u in uses if (u["input"].get("command") or "").strip() == cmd), None)
-            out = results.get(use["id"], (None, ""))[1] if use else None
+            mine = [u for u in uses if needles[key] in (u["input"].get("command") or "")]
+            hook_mine = [h for h in r["hooks"] if needles[key] in hook_command(h)]
+            unsandboxed = [u for u in mine if u["input"].get("dangerouslyDisableSandbox")]
+            unsandboxed_hooks = [h for h in hook_mine if ((h.get("hook_input") or {})
+                                 .get("tool_input") or {}).get("dangerouslyDisableSandbox")]
+            exact = [u for u in mine if (u["input"].get("command") or "").strip() == cmd]
+            first = exact[0] if exact else (mine[0] if mine else None)
+            out = results.get(first["id"], (None, ""))[1] if first else None
             m = markers[key]
             obs[f"{variant} {key} command"] = cmd
-            obs[f"{variant} {key} run_exactly"] = bool(use)
-            obs[f"{variant} {key} disable_sandbox_flag"] = (
-                use["input"].get("dangerouslyDisableSandbox", "absent") if use else None)
-            obs[f"{variant} {key} output"] = (out or "")[:200].replace("\n", " | ") if use else None
+            obs[f"{variant} {key} use_count"] = len(mine)
+            obs[f"{variant} {key} hook_line_count"] = len(hook_mine)
+            obs[f"{variant} {key} run_exactly"] = bool(exact)
+            obs[f"{variant} {key} variants_run"] = sorted({u["input"].get("command") for u in mine
+                                                          if u not in exact}) or "none"
+            obs[f"{variant} {key} any_disable_sandbox"] = bool(unsandboxed or unsandboxed_hooks)
+            obs[f"{variant} {key} denied_by_hook"] = sum(1 for h in hook_mine if h.get("denied"))
+            obs[f"{variant} {key} first_output"] = (out or "")[:200].replace("\n", " | ") if first else None
             obs[f"{variant} {key} marker_exists"] = m.exists()
             obs[f"{variant} {key} marker_content"] = m.read_text().strip()[:80] if m.exists() else None
-            if use:
+            if len(mine) > 1 or unsandboxed or unsandboxed_hooks or (mine and not exact):
+                tainted.append(key)
+            if first:
                 excerpt.append(f"[{variant}] {key}: {(out or '').strip()[:150]}")
         if "user_exclusion_gh" not in cmds:
             obs[f"{variant} user_exclusion_gh"] = "skipped: no `gh *` entry in user excludedCommands"
         obs[f"{variant} other_bash_commands"] = [
             u["input"].get("command") for u in uses
-            if (u["input"].get("command") or "").strip() not in cmds.values()] or "none"
-    c_net = obs.get("control net_probe marker_exists")
-    o_net = obs.get("overlay net_probe marker_exists")
-    o_gh = obs.get("overlay user_exclusion_gh marker_exists", "n/a")
-    c_gh = obs.get("control user_exclusion_gh marker_exists", "n/a")
-    summary = (f"net-probe marker control={c_net} overlay={o_net}; "
-               f"user gh exclusion control={c_gh} overlay={o_gh}")
+            if not any(n in (u["input"].get("command") or "") for n in needles.values())] or "none"
+        obs[f"{variant} TAINTED"] = (f"yes: {tainted} (retried, edited, or sandbox-disable attempted)"
+                                     if tainted else "no")
+
+    def mark(variant: str, key: str) -> str:
+        v = obs.get(f"{variant} {key} marker_exists", "n/a")
+        return f"{v}{'(TAINTED)' if key in obs.get(f'{variant} TAINTED', '') else ''}"
+    summary = (f"net-probe marker control={mark('control', 'net_probe')} "
+               f"overlay={mark('overlay', 'net_probe')}; user gh exclusion "
+               f"control={mark('control', 'user_exclusion_gh')} "
+               f"overlay={mark('overlay', 'user_exclusion_gh')}")
     return ("OBSERVED", commands, excerpt[:10], obs, summary)
 
 
@@ -701,23 +843,31 @@ STEP_FUNCS = {1: step1, 2: step2, 3: step3, 4: step4, 5: step5, 6: step6}
 
 
 def dry_commands(ctx: Ctx, n: int) -> list[str]:
-    fx = ctx.fixture_path()
-    note = f"  (cwd={fx!r}; env LEADHAND_RUN_ID={RUN_ID}, PROBE_LOG=<out>/task2-artifacts/<label>-hooks.jsonl)"
+    def note(fixture: str = "fixture repo", extra: str = "") -> str:
+        return (f"  (cwd={ctx.fixture_path(fixture)!r}; env LEADHAND_RUN_ID={RUN_ID}, "
+                f"PROBE_LOG=<out>/task2-artifacts/<label>-hooks.jsonl{extra})")
     if n in (1, 4):
-        return [shlex.join(headless_argv(ctx, "go")) + note]
+        cmds = [shlex.join(headless_argv(ctx, "go")) + note()]
+        if n == 1:
+            cmds.append("(only if the probe echo did not run) "
+                        + shlex.join(fallback_argv(ctx)) + note())
+        return cmds
     if n == 2:
-        return [shlex.join(headless_argv(ctx, "go")) + note,
-                shlex.join(headless_argv(ctx, "go", "lhprobe:super-ns")) + note]
+        return [shlex.join(headless_argv(ctx, "go")) + note(),
+                shlex.join(headless_argv(ctx, "go", "lhprobe:super-ns")) + note()]
     if n == 3:
         sock = f"lhprobe-{ctx.tag}"
+        fx = ctx.fixture_path("interactive repo")
         return [shlex.join(tmux_argv(sock, sock, fx, "<out>/task2-artifacts/interactive-hooks.jsonl")),
                 f"tmux -L {sock} send-keys -t {sock} -l go ; tmux -L {sock} send-keys -t {sock} Enter",
                 f"(poll: tmux -L {sock} capture-pane -p -t {sock}; answer first-run dialogs with Enter)"]
     if n == 5:
-        return [shlex.join(headless_argv(ctx, "go-bg")) + note
+        return [shlex.join(headless_argv(ctx, "go-bg")) + note()
                 + f"  (then wait {BACKGROUND_GRACE}s and re-read PROBE_LOG)"]
     if n == 6:
-        return [shlex.join(step6_argv(ctx, v)) + note for v in ("control", "overlay")]
+        extra = ", " + ", ".join(f"{k}={v}" for k, v in STEP6_ENV.items())
+        return [shlex.join(step6_argv(ctx, v)) + note("settings repo", extra)
+                for v in ("control", "overlay")]
     return []
 
 
@@ -731,7 +881,8 @@ def fmt(v) -> str:
 def write_section(ctx: Ctx, n: int, status: str, commands, excerpt, obs, error=None) -> None:
     parts = [f"\n## Step {n}: {STEPS[n]}\n", f"status: {status}\n", "\n### Commands\n"]
     for argv, code in commands:
-        parts.append(f"\n```\n{shlex.join(argv)}\n```\nexit_code: {code}\n")
+        text = argv if isinstance(argv, str) else shlex.join(argv)
+        parts.append(f"\n```\n{text}\n```\nexit_code: {code}\n")
     parts.append("\n### Excerpt\n\n```\n" + "\n".join(str(l) for l in excerpt[:10]) + "\n```\n")
     parts.append("\n### Observed\n\n")
     parts += [f"- {k}: {fmt(v)}\n" for k, v in obs.items()]
@@ -830,7 +981,12 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:  # noqa: BLE001 - a failing step is a finding
                 tb = traceback.format_exc()
                 status, line = "FAIL", tb.strip().splitlines()[-1]
-                write_section(ctx, n, status, [], tb.strip().splitlines()[-10:], {}, error=tb[-3000:])
+                try:  # the planned commands, with placeholder fixture paths
+                    planned = [(c, "not recorded: step raised")
+                               for c in dry_commands(Ctx(ctx.out, ctx.route, True), n)]
+                except Exception:  # noqa: BLE001
+                    planned = []
+                write_section(ctx, n, status, planned, tb.strip().splitlines()[-10:], {}, error=tb[-3000:])
             summary.append(f"Step {n} {STEPS[n]}: {status} {line}")
     finally:
         cleanup(ctx)
