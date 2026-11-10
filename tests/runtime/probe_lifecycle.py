@@ -41,6 +41,7 @@ PLUGIN_DIR = HERE / "probe-plugin"
 FAKE_RUNNER = HERE / "fake-runner.sh"
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
+CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
 
 SUPER_AGENT = "lhprobe:super-lifecycle"
 WORKER_AGENT = "lhprobe:cmd-worker"
@@ -114,7 +115,12 @@ class Ctx:
         self.tmp: Path | None = None
         self.fixtures: dict[str, Path] = {}
         self.cmds: list[tuple[list[str], object]] = []
-        self.pgids: list[int] = []
+        # Process groups to kill at cleanup, each with how to tell it is still ours:
+        # {"pgid", "needle"}: some member's command holds needle;
+        # {"pgid", "parent", "parent_needle"}: the leader's parent is `parent` and that
+        # parent's command holds parent_needle (Codex's argv holds no probe path).
+        self.groups: list[dict] = []
+        self.sessions: list = []          # interactive sessions of the current step
         self.needles: list[str] = []      # any process whose command holds one is ours
         self.codex_sandbox: list[str] = []
         self.tmux_started = False
@@ -260,6 +266,16 @@ def kill_group(pgid: int) -> None:
         time.sleep(1)
 
 
+def group_owned(g: dict, rows: list[dict]) -> bool:
+    """True only while the recorded group still provably belongs to this probe."""
+    members = [r for r in rows if r["pgid"] == g["pgid"]]
+    if "needle" in g:
+        return any(g["needle"] in r["command"] for r in members)
+    parent = row_of(g["parent"], rows)
+    return (parent is not None and g["parent_needle"] in parent["command"]
+            and any(r["ppid"] == g["parent"] for r in members))
+
+
 def kill_pid(pid: int, sig=signal.SIGKILL) -> None:
     try:
         os.kill(pid, sig)
@@ -301,6 +317,7 @@ class Session:
         self.started = 0.0
         self.sid: str | None = None
         self.sid_source = "not found"
+        ctx.sessions.append(self)
 
     def start(self) -> None:
         argv = tmux_new_argv(self.ctx, self.name, str(self.cwd), str(self.hook_log))
@@ -402,6 +419,19 @@ class Session:
     def sub_paths(self) -> list[Path]:
         sid = self.session_id()
         return sorted(CLAUDE_PROJECTS.glob(f"*/{sid}/subagents/*.jsonl")) if sid else []
+
+    def facts(self) -> dict:
+        """Recorded for every session, also when its step fails."""
+        out = {}
+        for key, fn in (("session_id", self.session_id),
+                        ("session_id_source", lambda: self.sid_source),
+                        ("transcripts_found", lambda: self.copy_transcripts() or "none"),
+                        ("dialogs_answered", lambda: self.answered or "none")):
+            try:
+                out[key] = fn()
+            except Exception as e:  # noqa: BLE001 - recorded, not fatal
+                out[key] = f"error: {type(e).__name__}: {e}"
+        return out
 
     def copy_transcripts(self) -> list[str]:
         dest = self.ctx.art / f"{self.label}-transcripts"
@@ -575,9 +605,6 @@ def step1(ctx: Ctx):
         "token_processes_at_end": brief(rows_with(token, snap)) or "none",
         "claude_alive_at_end": bool(row_of(cpid, snap)),
         "pane_dead": sess.dead(),
-        "session_id": sess.session_id(),
-        "session_id_source": sess.sid_source,
-        "transcripts_found": sess.copy_transcripts() or "none",
     })
     subs = sess.sub_paths()
     if subs:
@@ -599,6 +626,7 @@ def step2(ctx: Ctx):
     sess.start()
     sess.send(dispatch_bg_msg(cmd, "stop worker"))
     rows = wait_until(lambda: sleep_rows(token), DISPATCH_TIMEOUT, sess)
+    seen_at = time.monotonic()
     if not rows:
         sess.save("no-sleep")
         raise StepFail(f"worker's `{cmd}` never started", sess.pane.splitlines()[-10:])
@@ -607,12 +635,19 @@ def step2(ctx: Ctx):
     recs = sess.main_records()
     disp = [u for u in tool_uses(recs) if u["name"] in ("Agent", "Task")]
     res = tool_results(recs)
-    obs["dispatch_input"] = disp[0]["input"] if disp else "no Agent call in transcript yet"
-    obs["dispatch_result"] = res.get(disp[0]["id"], "")[:400] if disp else None
+    obs["dispatch_input_before_stop"] = disp[0]["input"] if disp else "no Agent call in transcript yet"
+    sleep_pid = rows[0]["pid"]
     stop_msg = ("Now call the TaskStop tool on the background agent you dispatched, using the "
                 "task or agent ID its launch returned. Then reply with one line: stopped: <the "
                 "TaskStop result>")
     progress("  step2: worker sleeping; asking the supervisor to call TaskStop")
+    obs["sleep_seen_by_probe_for_s_at_stop_msg"] = round(time.monotonic() - seen_at, 1)
+    try:
+        obs["sleep_ps_etime_at_stop_msg"] = subprocess.run(
+            ["ps", "-o", "etime=", "-p", str(sleep_pid)], capture_output=True, text=True,
+            timeout=CMD_TIMEOUT).stdout.strip() or "gone"
+    except Exception as e:  # noqa: BLE001
+        obs["sleep_ps_etime_at_stop_msg"] = f"error: {e}"
     sess.send(stop_msg)
     sent = time.monotonic()
     gone_at = None
@@ -632,9 +667,12 @@ def step2(ctx: Ctx):
     i = user_index(recs, "TaskStop tool on the background agent") or 0
     res = tool_results(recs)
     stops = [u for u in tool_uses(recs, i) if u["name"] == "TaskStop"]
+    disp = [u for u in tool_uses(recs) if u["name"] in ("Agent", "Task")]
     sess.save("after")
     subs = sess.sub_paths()
     obs.update({
+        "dispatch_input": disp[0]["input"] if disp else "no Agent call in transcript",
+        "dispatch_result": res.get(disp[0]["id"], "<no result>")[:400] if disp else None,
         "taskstop_calls": [{"input": u["input"], "result": res.get(u["id"], "<no result>")[:400]}
                            for u in stops] or "none",
         "other_tools_after_stop_msg": [u["name"] for u in tool_uses(recs, i)
@@ -648,9 +686,6 @@ def step2(ctx: Ctx):
         "subagent_transcripts": {p.name: len(read_jsonl(p)) for p in subs} or "none",
         "subagent_transcript_tail": ([summarize(r) for r in read_jsonl(subs[-1])[-3:]]
                                      if subs else "none"),
-        "session_id": sess.session_id(),
-        "session_id_source": sess.sid_source,
-        "transcripts_found": sess.copy_transcripts() or "none",
     })
     sess.kill()
     summary = (f"taskstop_called={bool(stops)} sleep_gone_after={gone_at}s "
@@ -678,10 +713,14 @@ def step3(ctx: Ctx):
         i = user_index(r, needle)
         return i is not None and any(reply in t for t in assistant_texts(r, i + 1))
 
-    if not wait_until(lambda: replied("resume worker", "finished"), TURN_TIMEOUT, sess):
+    finished = wait_until(lambda: replied("resume worker", "finished"), TURN_TIMEOUT, sess)
+    obs["finished_reply_detected"] = bool(finished)
+    if not finished:
         sess.save("no-finish")
-        raise StepFail("supervisor never replied `finished` (or no transcript found)",
-                       sess.pane.splitlines()[-10:])
+        if not any(token in c for c in hook_commands(sess)):
+            raise StepFail("supervisor never replied `finished` and the worker's echo never ran",
+                           sess.pane.splitlines()[-10:])
+        progress("  step3: no `finished` reply seen, but the worker's echo ran; continuing")
     recs = sess.main_records()
     disp = [u for u in tool_uses(recs) if u["name"] in ("Agent", "Task")]
     res = tool_results(recs)
@@ -731,9 +770,6 @@ def step3(ctx: Ctx):
         "followup_in_subagent_transcript": any(
             user_index(read_jsonl(p), "what did you run before") is not None
             for p in sess.sub_paths()),
-        "session_id": sess.session_id(),
-        "session_id_source": sess.sid_source,
-        "transcripts_found": sess.copy_transcripts() or "none",
     })
     sess.kill()
     summary = (f"sendmessage_called={bool(sends)} answered_from_history={obs['token_in_answer']} "
@@ -810,8 +846,6 @@ def step4_variant(ctx: Ctx, detach: bool) -> tuple[dict, str]:
         "signals_caught": ((rdir / "signals").read_text().strip()
                            if (rdir / "signals").exists() else "none"),
         "claude_alive_at_end": alive(cpid),
-        "session_id": sess.session_id(),
-        "transcripts_found": sess.copy_transcripts() or "none",
     })
     if rdir.exists():
         shutil.copytree(rdir, ctx.art / f"step4-{variant}-runner", dirs_exist_ok=True)
@@ -968,7 +1002,9 @@ def start_codex_runner(ctx: Ctx, label: str, prompt: str) -> dict:
         raise StepFail(f"{label}: runner wrote no runner.json",
                        (rdir / "runner.log").read_text(errors="replace").splitlines()[-10:]
                        if (rdir / "runner.log").exists() else [])
-    ctx.pgids += [runner["runner_pid"], runner["codex_pid"]]
+    ctx.groups += [{"pgid": runner["runner_pid"], "needle": str(rdir)},
+                   {"pgid": runner["codex_pgid"] or runner["codex_pid"],
+                    "parent": runner["runner_pid"], "parent_needle": str(rdir)}]
     rrow = row_of(runner["runner_pid"])
     info.update({"runner": runner,
                  "runner_alive_after_launcher_exit": rrow is not None,
@@ -1078,9 +1114,10 @@ def step5(ctx: Ctx):
     o, ex = step5_run(ctx, "step5-run1", ctx.token("30.5"), ladder=False)
     obs.update({f"run1 {k}": v for k, v in o.items()})
     excerpt += ex[-4:]
-    ok_cmd = any(ctx.token("30.5") in str(c.get("command")) and c.get("exit_code") == 0
-                 for c in o.get("command_executions", []))
-    if not ok_cmd:
+    # Retry only on what the probe saw itself: the sleep in ps and codex's exit code.
+    ok_run = bool(o.get("sleep_seen")) and o.get("codex_exit") == 0
+    obs["run1 retry_gate"] = f"sleep_seen={o.get('sleep_seen')} codex_exit={o.get('codex_exit')}"
+    if not ok_run:
         progress("  step5: sleep did not succeed under the default sandbox; retrying with "
                  "-s workspace-write")
         ctx.codex_sandbox = ["-s", "workspace-write"]
@@ -1122,6 +1159,32 @@ def resume_variants(tid: str) -> list[tuple[str, list[str], bool]]:
     ]
 
 
+EFFORT_KEY = re.compile(r"^(model|effort|reasoning_effort|model_reasoning_effort)$")
+
+
+def rollout_facts(ctx: Ctx, tid: str) -> dict:
+    """Copy Codex's rollout files for the thread and list each turn's model and effort."""
+    files = sorted(CODEX_SESSIONS.rglob(f"*{tid}*.jsonl")) if CODEX_SESSIONS.exists() else []
+    dest = ctx.art / "step6-rollout"
+    turns, types, keys = [], {}, {}
+    for f in files:
+        dest.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, dest / f.name)
+        for i, r in enumerate(read_jsonl(f)):
+            rtype = str(r.get("type"))
+            types[rtype] = types.get(rtype, 0) + 1
+            payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+            keys.setdefault(rtype, sorted(set(r) | {f"payload.{k}" for k in payload}))
+            hits = find_keys(r, EFFORT_KEY)
+            if rtype == "turn_context" or hits:
+                turns.append({"file": f.name, "line": i, "type": rtype,
+                              "timestamp": r.get("timestamp"),
+                              **{path: v for path, v in hits}})
+    return {"rollout_files": [str(f) for f in files] or "none found under ~/.codex/sessions",
+            "rollout_record_types": types, "rollout_record_keys": keys,
+            "rollout_model_effort_records": turns}
+
+
 def run_codex(ctx: Ctx, label: str, argv: list[str], prompt: str) -> dict:
     cwd = ctx.fixture("codex")
     try:
@@ -1151,13 +1214,19 @@ def step6(ctx: Ctx):
                        (r["stderr"] or r["stdout"]).splitlines()[:10])
     tid = str(a["thread"]["value"])
     ask = "What word did I ask you to remember? Reply with only that word."
-    excerpt, works = [], []
+    excerpt, works, order = [], [], ["first exec"]
     for name, argv, pinned in resume_variants(tid):
-        if not pinned and obs["codex_config_model"] != CODEX_MODEL:
-            obs[f"{name}"] = (f"skipped: no -m/-c would use the configured model "
-                              f"{obs['codex_config_model']!r}, not {CODEX_MODEL}")
-            excerpt.append(f"{name}: skipped (unpinned)")
-            continue
+        if not pinned:
+            if works or name != "bare-no-mc":
+                why = (f"pinned variant(s) {works} worked, so no turn on the default model was "
+                       f"needed" if works else "only bare-no-mc runs as the unpinned exception")
+                obs[name] = (f"not run: {why} (codex_config_model="
+                             f"{obs['codex_config_model']!r}; cheapest route is {CODEX_MODEL})")
+                excerpt.append(f"{name}: not run (unpinned)")
+                continue
+            obs[f"{name} exception"] = (
+                "no pinned variant worked, so this one tiny turn runs on Codex's configured "
+                f"default model {obs['codex_config_model']!r} to find any working order")
         progress(f"  step6: {name}")
         rr = run_codex(ctx, f"step6-{name}", argv, ask)
         ra = analyze_codex(parse_lines(rr["stdout"]))
@@ -1173,9 +1242,17 @@ def step6(ctx: Ctx):
         }
         if rr["exit"] == 0 and recalled:
             works.append(name)
+        if rr["exit"] == 0:
+            order.append(name)
         excerpt.append(f"{name}: exit={rr['exit']} recalled={recalled} "
                        f"{(rr['stderr'].strip().splitlines() or [''])[0][:100]}")
     obs["variants_that_worked"] = works or "none"
+    # Which model and effort each turn really ran with, from Codex's own rollout.
+    obs["turns_in_order (first exec, then each resume that exited 0)"] = order
+    try:
+        obs.update(rollout_facts(ctx, tid))
+    except Exception as e:  # noqa: BLE001 - recorded, not fatal
+        obs["rollout_error"] = f"{type(e).__name__}: {e}"
     where = f"{a['thread']['event']}.{a['thread']['field']}"
     return "OBSERVED", excerpt[:10], obs, f"thread_id_in={where} worked={works or 'none'}"
 
@@ -1223,9 +1300,12 @@ def dry_commands(ctx: Ctx, n: int) -> list[str]:
                 "kill -INT/-TERM/-KILL -<codex pgid>, 3 s apart"]
     if n == 6:
         return ([shlex.join(["codex", "exec", *CODEX_PIN, *CODEX_JSON, "-"]) + "  < remember-word prompt"]
-                + [shlex.join(a) + ("" if pinned else "  (only if ~/.codex/config.toml model is "
-                                    f"{CODEX_MODEL})")
-                   for _, a, pinned in resume_variants("<thread_id>")])
+                + [shlex.join(a) + ("" if pinned else
+                                    "  (bare-no-mc only, and only if no pinned order worked; "
+                                    "json-before-no-mc never runs)")
+                   for _, a, pinned in resume_variants("<thread_id>")]
+                + ["then copy ~/.codex/sessions/**/*<thread_id>*.jsonl and record each turn's "
+                   "model and effort"])
     return []
 
 
@@ -1264,8 +1344,15 @@ def cleanup(ctx: Ctx) -> None:
             tmux(ctx, "kill-server")
         except Exception:  # noqa: BLE001
             pass
-    for pgid in ctx.pgids:
-        kill_group(pgid)
+    for g in ctx.groups:  # re-checked before each signal, so a recycled pgid is never hit
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                if not group_owned(g, ps_rows()):
+                    break
+                os.killpg(g["pgid"], sig)
+            except Exception:  # noqa: BLE001 - gone, not ours, or ps failed
+                break
+            time.sleep(1)
     try:
         leftovers = [r for r in ps_rows() if any(n in r["command"] for n in ctx.needles)]
     except Exception:  # noqa: BLE001
@@ -1345,17 +1432,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         for n in steps:
             progress(f"Step {n}: {STEPS[n]} ...")
-            ctx.cmds = []
+            ctx.cmds, ctx.sessions = [], []
+            error = None
             try:
                 status, excerpt, obs, line = STEP_FUNCS[n](ctx)
-                write_section(ctx, n, status, excerpt, obs)
             except StepFail as e:
-                status, line = "FAIL", e.reason
-                write_section(ctx, n, status, e.lines, {"failure": e.reason})
+                status, line, excerpt, obs = "FAIL", e.reason, e.lines, {"failure": e.reason}
             except Exception:  # noqa: BLE001 - a failing step is a finding
-                tb = traceback.format_exc()
-                status, line = "FAIL", tb.strip().splitlines()[-1]
-                write_section(ctx, n, status, tb.strip().splitlines()[-10:], {}, error=tb[-3000:])
+                error = traceback.format_exc()
+                status, line = "FAIL", error.strip().splitlines()[-1]
+                excerpt, obs, error = error.strip().splitlines()[-10:], {}, error[-3000:]
+            # Session ID, transcripts and dialogs for every session, whatever the outcome.
+            for sess in ctx.sessions:
+                for k, v in sess.facts().items():
+                    obs[f"{sess.label} {k}"] = v
+            write_section(ctx, n, status, excerpt, obs, error=error)
             summary.append(f"Step {n} {STEPS[n]}: {status} {line}")
             progress(summary[-1])
     finally:
