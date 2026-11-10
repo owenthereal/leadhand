@@ -1,0 +1,323 @@
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+
+from gitfixture import (
+    commit, current_branch, hermetic, make_origin, make_repo, run_git, update_origin, write,
+)
+from leadhand.gitops import (
+    GitError, Violation, card_branch_name, changed_paths, cut_card_branch, default_base,
+    detect_violation, fast_forward, git, git_common_dir, head, is_test_or_doc_path,
+    needs_integration, preserve_and_restore, prepare_workspace, rebase_onto,
+)
+
+RUN = "leadhand/run-1"
+
+
+class GitopsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="leadhand gitops "))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        hermetic(self)
+
+    # -- helpers ---------------------------------------------------------
+
+    def workspace(self, *, use_worktree=True, default_branch="main"):
+        repo = make_repo(self.tmp, default_branch=default_branch)
+        base = run_git(repo, "rev-parse", "HEAD")
+        ws = prepare_workspace(repo, run_branch=RUN, base_sha=base, slug="run-1", use_worktree=use_worktree)
+        return repo, ws, base
+
+    def card(self, ws, n, files):
+        branch, base = cut_card_branch(ws, RUN, n)
+        tip = commit(ws, files, f"card {n}")
+        return branch, base, tip
+
+    def exclude_lines(self, repo):
+        return (git_common_dir(repo) / "info" / "exclude").read_text().splitlines()
+
+    # -- default base ----------------------------------------------------
+
+    def test_default_base_uses_origin_default_branch(self):
+        repo = make_repo(self.tmp, default_branch="develop")
+        origin = make_origin(repo)
+        stale = run_git(repo, "rev-parse", "refs/remotes/origin/develop")
+        upstream = commit(repo, {"up.txt": "1\n"}, "upstream work")
+        self.assertEqual(update_origin(origin, repo, "develop"), upstream)
+        commit(repo, {"local.txt": "1\n"}, "local only")  # local develop is ahead of origin
+
+        self.assertNotEqual(stale, upstream)
+        self.assertEqual(default_base(repo), ("origin/develop", upstream))  # fetched
+        self.assertEqual(run_git(repo, "rev-parse", "refs/remotes/origin/develop"), upstream)
+
+        # Without refs/remotes/origin/HEAD it asks the remote.
+        run_git(repo, "remote", "set-head", "origin", "--delete")
+        self.assertEqual(default_base(repo), ("origin/develop", upstream))
+
+    def test_default_base_without_origin_uses_local_default(self):
+        repo = make_repo(self.tmp, default_branch="trunk")
+        trunk = run_git(repo, "rev-parse", "HEAD")
+        run_git(repo, "branch", "feature")
+        self.assertEqual(default_base(repo), ("trunk", trunk))
+
+        # From a linked worktree on another branch, the main repo's branch still wins.
+        other = self.tmp / "feature tree"
+        run_git(repo, "worktree", "add", "--quiet", str(other), "feature")
+        commit(other, {"f.txt": "f\n"}, "feature work")
+        self.assertEqual(default_base(other), ("trunk", trunk))
+
+    # -- workspace -------------------------------------------------------
+
+    def test_prepare_workspace_is_idempotent_and_excludes_paths(self):
+        repo, ws, base = self.workspace()
+        self.assertEqual(ws, repo / ".worktrees" / "run-1")
+        self.assertTrue(ws.is_dir())
+        self.assertEqual(current_branch(ws), RUN)
+        self.assertEqual(head(ws), base)
+
+        advanced = commit(ws, {"run.txt": "1\n"}, "run work")
+        again = prepare_workspace(repo, run_branch=RUN, base_sha=base, slug="run-1", use_worktree=True)
+        self.assertEqual(again, ws)
+        self.assertEqual(head(repo, RUN), advanced)  # an existing run branch is not reset
+
+        lines = self.exclude_lines(repo)
+        self.assertEqual(lines.count(".worktrees/"), 1)
+        self.assertEqual(lines.count(".leadhand/"), 1)
+        write(repo, {".leadhand/state.json": "{}\n"})
+        self.assertEqual(run_git(repo, "status", "--porcelain"), "")
+
+    def test_prepare_workspace_without_worktree_uses_checkout(self):
+        repo, ws, base = self.workspace(use_worktree=False)
+        self.assertEqual(ws, repo)
+        self.assertEqual(current_branch(repo), RUN)
+        self.assertEqual(head(repo), base)
+        self.assertFalse((repo / ".worktrees").exists())
+        self.assertEqual(prepare_workspace(repo, run_branch=RUN, base_sha=base, slug="run-1", use_worktree=False), repo)
+        self.assertEqual(current_branch(repo), RUN)
+        self.assertIn(".leadhand/", self.exclude_lines(repo))
+
+    # -- cards -----------------------------------------------------------
+
+    def test_cut_card_branch_from_run_tip_and_reuse(self):
+        repo, ws, base = self.workspace()
+        tip = commit(ws, {"run.txt": "1\n"}, "run work")
+        self.assertEqual(card_branch_name(RUN, 3), "leadhand/run-1--card-3")
+
+        branch, cut_from = cut_card_branch(ws, RUN, 3)
+        self.assertEqual((branch, cut_from), ("leadhand/run-1--card-3", tip))
+        self.assertEqual(current_branch(ws), branch)
+        work = commit(ws, {"card.txt": "3\n"}, "card work")
+
+        run_git(ws, "checkout", "--quiet", RUN)
+        commit(ws, {"run.txt": "2\n"}, "more run work")
+        self.assertEqual(cut_card_branch(ws, RUN, "3"), (branch, tip))
+        self.assertEqual(current_branch(ws), branch)
+        self.assertEqual(head(ws, branch), work)  # reused, not reset
+
+    def test_fast_forward_is_idempotent(self):
+        repo, ws, base = self.workspace()
+        branch, _, tip = self.card(ws, 1, {"a.txt": "a\n"})
+        self.assertEqual(fast_forward(ws, RUN, tip), tip)
+        self.assertEqual(head(ws, RUN), tip)
+        self.assertEqual(fast_forward(ws, RUN, tip), tip)
+        self.assertEqual(fast_forward(ws, RUN, branch), tip)
+        self.assertEqual(head(ws, RUN), tip)
+
+    def test_fast_forward_refuses_divergence(self):
+        repo, ws, base = self.workspace()
+        _, _, tip_a = self.card(ws, 1, {"a.txt": "a\n"})
+        run_git(ws, "checkout", "--quiet", RUN)
+        _, _, tip_b = self.card(ws, 2, {"b.txt": "b\n"})
+        fast_forward(ws, RUN, tip_b)
+        with self.assertRaises(GitError):
+            fast_forward(ws, RUN, tip_a)
+        self.assertEqual(head(ws, RUN), tip_b)
+
+    def test_fast_forward_moves_a_run_branch_checked_out_in_the_workspace(self):
+        repo, ws, base = self.workspace(use_worktree=False)
+        run_git(ws, "checkout", "--quiet", "-b", "side")
+        tip = commit(ws, {"s.txt": "s\n"}, "side")
+        run_git(ws, "checkout", "--quiet", RUN)
+        self.assertEqual(fast_forward(ws, RUN, tip), tip)
+        self.assertEqual(head(ws), tip)
+        self.assertEqual(run_git(ws, "status", "--porcelain"), "")
+        self.assertTrue((ws / "s.txt").exists())
+
+    def test_needs_integration_after_independent_accept(self):
+        repo, ws, x = self.workspace()
+        a, base_a, _ = self.card(ws, 1, {"a.txt": "a\n"})
+        b, base_b, tip_b = self.card(ws, 2, {"b.txt": "b\n"})
+        self.assertEqual((base_a, base_b), (x, x))
+        self.assertFalse(needs_integration(ws, RUN, a))
+        fast_forward(ws, RUN, tip_b)
+        self.assertTrue(needs_integration(ws, RUN, a))
+        self.assertFalse(needs_integration(ws, RUN, b))
+
+    def test_rebase_onto_success(self):
+        repo, ws, x = self.workspace()
+        a, _, _ = self.card(ws, 1, {"a.txt": "a\n"})
+        _, _, tip_b = self.card(ws, 2, {"b.txt": "b\n"})
+        fast_forward(ws, RUN, tip_b)
+        self.assertEqual(rebase_onto(ws, a, RUN), [])
+        self.assertFalse(needs_integration(ws, RUN, a))
+        self.assertEqual(changed_paths(ws, RUN, a), ["a.txt"])
+        self.assertEqual(fast_forward(ws, RUN, a), head(ws, a))
+
+    def test_rebase_onto_conflict_returns_paths_and_leaves_branch_unchanged(self):
+        repo, ws, x = self.workspace()
+        a, _, tip_a = self.card(ws, 1, {"shared file.txt": "from a\n", "only a.txt": "a\n"})
+        _, _, tip_b = self.card(ws, 2, {"shared file.txt": "from b\n"})
+        fast_forward(ws, RUN, tip_b)
+        self.assertEqual(rebase_onto(ws, a, RUN), ["shared file.txt"])
+        self.assertEqual(head(ws, a), tip_a)
+        self.assertEqual(current_branch(ws), a)
+        self.assertEqual(run_git(ws, "status", "--porcelain"), "")
+        for state in ("rebase-merge", "rebase-apply"):
+            p = Path(run_git(ws, "rev-parse", "--path-format=absolute", "--git-path", state))
+            self.assertFalse(p.exists(), state)
+
+    # -- violations ------------------------------------------------------
+
+    def test_detect_violation_head_moved(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h = self.card(ws, 1, {"a.txt": "a\n"})
+        self.assertIsNone(detect_violation(ws, h, branch))
+        commit(ws, {"r.txt": "reviewer\n"}, "reviewer commit")
+        self.assertEqual(detect_violation(ws, h, branch), Violation(True, False, ()))
+        run_git(ws, "reset", "--quiet", "--hard", h)
+        run_git(ws, "checkout", "--quiet", "--detach", h)
+        self.assertEqual(detect_violation(ws, h, branch), Violation(True, False, ()))
+
+    def test_detect_violation_index_dirty(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h = self.card(ws, 1, {"a.txt": "a\n"})
+        write(ws, {"a.txt": "staged\n"})
+        run_git(ws, "add", "a.txt")
+        self.assertEqual(detect_violation(ws, h, branch), Violation(False, True, ()))
+
+    def test_detect_violation_tracked_change(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h = self.card(ws, 1, {"a.txt": "a\n"})
+        write(ws, {"a.txt": "edited\n"})
+        (ws / "README.md").unlink()
+        self.assertEqual(detect_violation(ws, h, branch), Violation(False, False, ("README.md", "a.txt")))
+
+    def test_untracked_build_output_is_not_a_violation(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h = self.card(ws, 1, {"a.txt": "a\n"})
+        write(ws, {"build/out.o": "bin\n", "new file.txt": "x\n"})
+        (ws / "a.txt").touch()  # stat-only change
+        self.assertIsNone(detect_violation(ws, h, branch))
+
+    # -- preserve and restore -------------------------------------------
+
+    def test_preserve_keeps_staged_and_unstaged_versions_separately(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h = self.card(ws, 1, {"f.txt": "orig\n"})
+        write(ws, {"f.txt": "A\n"})
+        run_git(ws, "add", "f.txt")
+        write(ws, {"f.txt": "B\n"})
+        saved = preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=branch)
+        self.assertEqual(run_git(ws, "rev-parse", "refs/leadhand/saved/1"), saved)
+        self.assertEqual(run_git(ws, "show", f"{saved}:f.txt"), "B")
+        self.assertEqual(run_git(ws, "show", f"{saved}^2:f.txt"), "A")
+        self.assertEqual(run_git(ws, "rev-parse", f"{saved}^1"), h)
+        self.assertEqual((ws / "f.txt").read_text(), "orig\n")
+        self.assertEqual(run_git(ws, "stash", "list"), "")  # refs/stash untouched
+
+    def test_preserve_keeps_staged_change_whose_working_copy_was_restored(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h = self.card(ws, 1, {"f.txt": "orig\n"})
+        write(ws, {"f.txt": "A\n"})
+        run_git(ws, "add", "f.txt")
+        write(ws, {"f.txt": "orig\n"})
+        saved = preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=branch)
+        self.assertEqual(run_git(ws, "show", f"{saved}^2:f.txt"), "A")
+        self.assertEqual(run_git(ws, "show", f"{saved}:f.txt"), "orig")
+        self.assertIsNone(detect_violation(ws, h, branch))
+
+    def test_restore_leaves_expected_head_and_clean_index(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h = self.card(ws, 1, {"f.txt": "orig\n"})
+
+        # HEAD moved by a commit and nothing else: the saved commit is the moved HEAD.
+        moved = commit(ws, {"f.txt": "committed\n"}, "reviewer commit")
+        saved = preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=branch)
+        self.assertEqual(saved, moved)
+        self.assertEqual(head(ws), h)
+        self.assertIsNone(detect_violation(ws, h, branch))
+
+        # Moved to another branch with a commit, a staged change and an untracked file.
+        run_git(ws, "checkout", "--quiet", "-b", "elsewhere")
+        moved = commit(ws, {"g.txt": "g\n"}, "elsewhere")
+        write(ws, {"f.txt": "staged\n", "scratch.log": "keep me\n"})
+        run_git(ws, "add", "f.txt")
+        saved = preserve_and_restore(ws, ref="refs/leadhand/saved/2", expected_head=h, expected_branch=branch)
+        self.assertEqual(run_git(ws, "rev-parse", f"{saved}^1"), moved)
+        self.assertEqual(current_branch(ws), branch)
+        self.assertEqual(head(ws), h)
+        self.assertEqual(head(ws, branch), h)
+        self.assertIsNone(detect_violation(ws, h, branch))
+        self.assertEqual(run_git(ws, "diff", "--cached", "--name-only"), "")
+        self.assertEqual((ws / "scratch.log").read_text(), "keep me\n")
+        self.assertFalse((ws / "g.txt").exists())
+
+    def test_preserve_refuses_a_ref_outside_refs(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h = self.card(ws, 1, {"f.txt": "orig\n"})
+        write(ws, {"f.txt": "edited\n"})
+        with self.assertRaises(GitError):
+            preserve_and_restore(ws, ref="SAVED", expected_head=h, expected_branch=branch)
+        self.assertEqual((ws / "f.txt").read_text(), "edited\n")
+
+    def test_commits_created_by_library_are_never_signed(self):
+        repo, ws, _ = self.workspace()
+        # Fixture commits pass -c commit.gpgsign=false; the library must do the same.
+        run_git(repo, "config", "commit.gpgsign", "true")
+        run_git(repo, "config", "gpg.program", "false")  # any signing attempt fails
+        a, _, _ = self.card(ws, 1, {"a.txt": "a\n"})
+        _, _, tip_b = self.card(ws, 2, {"b.txt": "b\n"})
+        fast_forward(ws, RUN, tip_b)
+        self.assertEqual(rebase_onto(ws, a, RUN), [])
+        h = head(ws)
+        write(ws, {"a.txt": "edited\n"})
+        run_git(ws, "add", "a.txt")
+        preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=a)
+
+    # -- misc ------------------------------------------------------------
+
+    def test_paths_with_spaces(self):
+        repo, ws, base = self.workspace()
+        self.assertIn(" ", str(ws))
+        branch, _, tip = self.card(ws, 1, {"my dir/a file.txt": "a\n", "café notes.md": "n\n"})
+        self.assertEqual(changed_paths(ws, base, tip), ["café notes.md", "my dir/a file.txt"])
+        write(ws, {"my dir/a file.txt": "edited\n"})
+        self.assertEqual(detect_violation(ws, tip, branch), Violation(False, False, ("my dir/a file.txt",)))
+        saved = preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=tip, expected_branch=branch)
+        self.assertEqual(run_git(ws, "show", f"{saved}:my dir/a file.txt"), "edited")
+        self.assertIsNone(detect_violation(ws, tip, branch))
+
+    def test_git_error_includes_stderr(self):
+        repo = make_repo(self.tmp)
+        with self.assertRaises(GitError) as cm:
+            git(repo, "rev-parse", "--verify", "no-such-ref")
+        self.assertIn("no-such-ref", str(cm.exception))
+        self.assertEqual(git(repo, "rev-parse", "--abbrev-ref", "HEAD"), "main")
+        self.assertEqual(git_common_dir(repo), (repo / ".git").resolve())
+
+    def test_is_test_or_doc_path(self):
+        yes = [
+            "tests/test_x.py", "test/a.c", "spec/a_spec.rb", "docs/guide.html", "pkg/tests/helper.py",
+            "test_foo.py", "src/foo_test.go", "src/foo.test.ts", "src/foo.spec.js",
+            "README.md", "notes/usage.rst", "requirements.txt",
+        ]
+        no = ["src/main.py", "scripts/build.sh", "src/contest.py", "src/latest.py", "docs", "tests", "src/tester.py"]
+        for p in yes:
+            self.assertTrue(is_test_or_doc_path(p), p)
+        for p in no:
+            self.assertFalse(is_test_or_doc_path(p), p)
+
+
+if __name__ == "__main__":
+    unittest.main()
