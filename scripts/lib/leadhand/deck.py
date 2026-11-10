@@ -4,11 +4,11 @@ from __future__ import annotations
 import hashlib
 import heapq
 import re
-import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from leadhand.config import Config, ConfigError, Route, load_config, parse_route, unsupported_settings
+from leadhand.gitops import GitError, git
 
 HEADER_KEYS = ("Source", "Base", "Branch", "Build", "Test", "Profile", "Finish")
 CARD_KEYS = ("Covers", "Role", "Hard", "Risk", "Depends on", "Source", "Allowed paths",
@@ -291,12 +291,9 @@ def check_deck(deck: Deck, repo: Path, config: Config) -> list[Problem]:
         err(f"base commit {deck.base_sha!r} is not a commit hash")
     else:
         try:
-            r = subprocess.run(["git", "cat-file", "-e", f"{deck.base_sha}^{{commit}}"],
-                               cwd=repo, capture_output=True, timeout=GIT_TIMEOUT)
-            if r.returncode != 0:
-                err(f"base commit {deck.base_sha} not found in {repo}")
-        except (OSError, subprocess.TimeoutExpired) as e:
-            err(f"base commit {deck.base_sha} could not be checked: {e}")
+            git(repo, "cat-file", "-e", f"{deck.base_sha}^{{commit}}", timeout=GIT_TIMEOUT)
+        except GitError:
+            err(f"base commit {deck.base_sha} not found in {repo}")
 
     seen: set[int] = set()
     for c in deck.cards:
@@ -337,7 +334,7 @@ def check_deck(deck: Deck, repo: Path, config: Config) -> list[Problem]:
 
 
 def _cmd_check(args) -> int:
-    repo = Path(args.repo)
+    repo = Path(args.repo).resolve()  # git calls need an absolute workspace
     try:
         deck = parse_deck(Path(args.deck))
         config = load_config(repo)

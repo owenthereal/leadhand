@@ -484,6 +484,10 @@ class GitopsTests(unittest.TestCase):
 
     def test_git_helpers_refuse_paths_outside_the_fixture(self):
         here = Path(__file__).resolve().parent  # inside the project's own checkout
+        # Should the guard regress, leave nothing behind in tests/ or the temp dir.
+        self.addCleanup(lambda: (here / "escaped-fixture-file.txt").unlink(missing_ok=True))
+        self.addCleanup(shutil.rmtree, here / "escaped repo", ignore_errors=True)
+        self.addCleanup(lambda: (self.tmp.parent / "escaped.txt").unlink(missing_ok=True))
         for cwd in (None, here, self.tmp.parent, Path("/")):
             with self.subTest(cwd=cwd), self.assertRaises(AssertionError):
                 run_git(cwd, "status")
@@ -502,7 +506,8 @@ class GitopsTests(unittest.TestCase):
         # Read-only commands only: before the fix, None ran them in the process cwd.
         repo = make_repo(self.tmp)
         not_a_dir = repo / "README.md"
-        for cwd in (None, self.tmp / "missing", not_a_dir):
+        # "", "." and relative paths would resolve against the process cwd.
+        for cwd in (None, self.tmp / "missing", not_a_dir, "", Path(""), Path("."), ".", Path("tests"), "my repo"):
             with self.subTest(cwd=cwd):
                 with self.assertRaises(GitError):
                     git(cwd, "rev-parse", "HEAD")

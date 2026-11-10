@@ -32,11 +32,12 @@ class GitError(RuntimeError):
 
 def _run(cwd: Path, args: tuple[str, ...] | list[str], env: Mapping[str, str] | None = None,
          timeout: float = GIT_TIMEOUT) -> subprocess.CompletedProcess[str]:
-    # Every git call in this module goes through here. A None cwd would make git run
-    # in the process cwd (the operator's repo), so refuse it before running anything.
-    if cwd is None or not Path(cwd).is_dir():
-        raise GitError(f"git {' '.join(args)}: workspace directory {cwd!r} does not exist")
-    full_env ={k: v for k, v in os.environ.items() if k not in _REPO_VARS}
+    # Every git call in this module goes through here. None, "", "." or any relative
+    # path would make git run against the process cwd (the operator's repo), so only
+    # an existing absolute directory is accepted, before anything runs.
+    if cwd is None or not Path(cwd).is_absolute() or not Path(cwd).is_dir():
+        raise GitError(f"git {' '.join(args)}: workspace {cwd!r} is not an existing absolute directory")
+    full_env = {k: v for k, v in os.environ.items() if k not in _REPO_VARS}
     full_env["GIT_TERMINAL_PROMPT"] = "0"
     if env:
         full_env.update(env)
