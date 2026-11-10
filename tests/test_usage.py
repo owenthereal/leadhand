@@ -261,7 +261,7 @@ class ChargeClaudeTests(UsageCase):
         # codex: missing session file
         u = self.codex_charge(3, "ghost")
         self.assertFalse(u.usage.known)
-        self.assertEqual(usage.charged_checkpoint([u], "codex", "ghost"), {"cumulative": {}})
+        self.assertEqual(usage.charged_checkpoint([u], "codex", "ghost"), {"responses": [], "cumulative": {}})
         # totals say the run has an unknown charge
         all_charges = usage.read_charges(self.paths)
         self.assertEqual(usage.unknown_count(all_charges), 2)
@@ -319,31 +319,6 @@ class CodexTests(UsageCase):
         total = usage.totals(usage.read_charges(self.paths))["implementer"]
         self.assertEqual(total.input, 250)
 
-    def test_charge_codex_counter_reset_charges_new_epoch_in_full(self):
-        f = rollout_path(self.sessions, "thr1")
-        append_lines(f, codex_line(100, 0, 40))
-        c1 = self.codex_charge(1)
-        append_lines(f, codex_line(250, 0, 90))
-        c2 = self.codex_charge(2)
-        self.assertEqual((c2.usage.input, c2.usage.output, c2.epoch_reset), (150, 50, False))
-        # the thread was resumed and its counter restarted below the checkpoint
-        append_lines(f, codex_line(30, 0, 5))
-        c3 = self.codex_charge(3)
-        self.assertEqual((c3.usage.input, c3.usage.output, c3.epoch_reset), (30, 5, True))
-        raw = [json.loads(line) for line in self.paths.charges.read_text().splitlines()]
-        self.assertTrue(raw[2]["epoch_reset"])
-        self.assertNotIn("epoch_reset", raw[0])
-        self.assertEqual(usage.read_charges(self.paths)[2], c3)
-        # the checkpoint is the cumulative reached (not a max): growth continues from it
-        self.assertEqual(usage.charged_checkpoint([c1, c2, c3], "codex", "thr1")["cumulative"]["input"], 30)
-        append_lines(f, codex_line(80, 0, 12))
-        c4 = self.codex_charge(4)
-        self.assertEqual((c4.usage.input, c4.usage.output, c4.epoch_reset), (50, 7, False))
-        # a single lower field is enough to count as a reset
-        append_lines(f, codex_line(500, 0, 3))
-        c5 = self.codex_charge(5)
-        self.assertEqual((c5.usage.input, c5.usage.output, c5.epoch_reset), (500, 3, True))
-
     def test_codex_stream_usage_sums_turn_completed(self):
         events = [
             {"type": "thread.started", "thread_id": "thr1"},
@@ -357,6 +332,158 @@ class CodexTests(UsageCase):
         self.assertEqual((u.input, u.cached, u.output, u.reasoning), (110, 40, 15, 5))
         self.assertTrue(u.known)
         self.assertFalse(usage.codex_usage_from_stream([{"type": "thread.started"}]).known)
+
+
+FIXTURES = ROOT / "tests" / "fixtures"
+
+
+def fixture_lines(name, count=None):
+    lines = (FIXTURES / name).read_text(encoding="utf-8").splitlines()
+    return lines if count is None else lines[:count]
+
+
+class CodexRolloutFixtureTests(UsageCase):
+    """The real (sanitized) post-resume rollout: a killed turn (response 1, 19120
+    tokens) then a resumed turn (response 2, 20818). Its token_count total is
+    20818 and omits the killed turn; the token_usage_records sum to 39938."""
+
+    ROLLOUT = "codex-rollout-interrupted.jsonl"
+
+    def place(self, count=None, thread="thr1"):
+        f = rollout_path(self.sessions, thread)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("\n".join(fixture_lines(self.ROLLOUT, count)) + "\n", encoding="utf-8")
+        return f
+
+    def test_rollout_charges_every_response_not_the_token_count_total(self):
+        self.place()
+        c = self.codex_charge(1)
+        self.assertTrue(c.usage.known)
+        # 39874 input of which 26112 cached; 64 output: 39938 tokens, not 20818
+        self.assertEqual((c.usage.input, c.usage.cached, c.usage.output, c.usage.reasoning),
+                         (39874 - 26112, 26112, 64, 0))
+        self.assertEqual(c.usage.input + c.usage.cached + c.usage.output, 39938)
+        self.assertEqual(c.checkpoint["responses"], ["resp_fixture_1", "resp_fixture_2"])
+        self.assertIsNone(c.mismatch)
+        self.assertFalse(c.possibly_incomplete)
+        self.assertEqual(usage.codex_cumulative("thr1", self.sessions).input, 39874 - 26112)
+
+    def test_rollout_charged_twice_charges_nothing_new(self):
+        self.place()
+        first = self.codex_charge(1)
+        second = self.codex_charge(2)
+        self.assertTrue(second.usage.known)
+        self.assertEqual((second.usage.input, second.usage.cached, second.usage.output), (0, 0, 0))
+        total = usage.totals(usage.read_charges(self.paths))["implementer"]
+        self.assertEqual(total, first.usage)
+
+    def test_rollout_truncated_before_resume_charges_only_the_killed_turn(self):
+        self.place(count=18)  # the killed turn: no token_count was ever written
+        killed = self.codex_charge(1)
+        self.assertTrue(killed.usage.known)
+        self.assertEqual((killed.usage.input, killed.usage.cached, killed.usage.output),
+                         (19062 - 7168, 7168, 58))
+        self.assertEqual(killed.checkpoint["responses"], ["resp_fixture_1"])
+        # the resume appends to the same file: only the resumed turn is new
+        self.place()
+        resumed = self.codex_charge(2)
+        self.assertEqual((resumed.usage.input, resumed.usage.cached, resumed.usage.output),
+                         (20812 - 18944, 18944, 6))
+        total = usage.totals(usage.read_charges(self.paths))["implementer"]
+        self.assertEqual((total.input, total.cached, total.output), (39874 - 26112, 26112, 64))
+
+    def test_rollout_repeated_response_id_counts_once(self):
+        f = self.place()
+        record = fixture_lines(self.ROLLOUT)[16]  # the first token_usage_record, repeated
+        append_lines(f, record)
+        c = self.codex_charge(1)
+        self.assertEqual((c.usage.cached, c.usage.output), (26112, 64))
+
+    def test_rollout_thread_total_mismatch_is_recorded_not_fatal(self):
+        f = self.place()
+        lines = fixture_lines(self.ROLLOUT)
+        rec = json.loads(lines[27])
+        rec["payload"]["thread_token_usage"]["output_tokens"] = 1000
+        lines[27] = json.dumps(rec)
+        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        c = self.codex_charge(1)
+        self.assertEqual(c.usage.output, 64)  # still charged from the records
+        self.assertEqual(c.mismatch["thread_token_usage"]["output"], 1000)
+        self.assertEqual(c.mismatch["records"]["output"], 64)
+        self.assertEqual(usage.read_charges(self.paths)[0], c)
+
+    def test_possibly_incomplete_flag_is_recorded_on_the_charge(self):
+        self.place(count=18)
+        c = usage.charge(self.paths, charge_id="d1:codex:thr1", source="codex", key="thr1",
+                         dispatch_id="d1", role="implementer", path_or_thread="thr1",
+                         sessions_dir=self.sessions, possibly_incomplete=True)
+        self.assertTrue(c.possibly_incomplete)
+        raw = json.loads(self.paths.charges.read_text().splitlines()[0])
+        self.assertTrue(raw["possibly_incomplete"])
+        self.assertEqual(usage.read_charges(self.paths)[0], c)
+
+    def test_rollout_without_any_usable_record_is_unknown(self):
+        self.place(count=3)
+        self.assertFalse(self.codex_charge(1).usage.known)
+
+    def test_token_count_is_only_a_fallback_for_a_rollout_without_records(self):
+        f = self.place()
+        lines = [line for line in fixture_lines(self.ROLLOUT)
+                 if '"token_usage_record"' not in line]
+        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        c = self.codex_charge(1)
+        self.assertEqual((c.usage.input, c.usage.cached, c.usage.output), (20812 - 18944, 18944, 6))
+
+
+class CodexStreamFixtureTests(unittest.TestCase):
+    def test_stream_usage_sums_turn_completed(self):
+        events = [json.loads(line) for line in fixture_lines("codex-exec-stream.jsonl")]
+        u = usage.codex_usage_from_stream(events)
+        self.assertTrue(u.known)
+        self.assertEqual((u.input, u.cached, u.output, u.reasoning, u.cache_write_5m),
+                         (137911 - 128640, 128640, 368, 0, 0))
+
+    def test_stream_cache_write_tokens_are_kept_as_five_minute_writes(self):
+        u = usage.codex_usage_from_stream([{"type": "turn.completed", "usage": {
+            "input_tokens": 100, "cached_input_tokens": 10, "cache_write_input_tokens": 5,
+            "output_tokens": 3, "reasoning_output_tokens": 1}}])
+        self.assertEqual((u.input, u.cached, u.cache_write_5m, u.cache_write_1h, u.output),
+                         (90, 10, 5, 0, 3))
+
+
+class ClaudeFixtureTests(UsageCase):
+    def place(self, name, count=None):
+        f = self.projects / "p" / "s" / "subagents" / "agent-agent1.jsonl"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("\n".join(fixture_lines(name, count)) + "\n", encoding="utf-8")
+        return f
+
+    def test_stopped_transcript_charges_its_one_message_once(self):
+        f = self.place("claude-subagent-stopped.jsonl")
+        c = self.claude_charge(1, f)
+        self.assertEqual((c.usage.input, c.usage.cached, c.usage.cache_write_5m,
+                          c.usage.cache_write_1h, c.usage.output), (2, 2077, 5811, 0, 117))
+        self.assertEqual(c.checkpoint, {"messages": {"msg_fixture_1": 117}})
+        again = self.claude_charge(2, f)
+        self.assertEqual((again.usage.input, again.usage.output), (0, 0))
+
+    def test_resumed_transcript_charges_each_message_once(self):
+        f = self.place("claude-subagent-resumed.jsonl")
+        c = self.claude_charge(1, f)
+        self.assertEqual((c.usage.input, c.usage.cached, c.usage.cache_write_5m, c.usage.output),
+                         (12, 27653, 6384, 734))  # 734 per message ID, not 1468
+
+    def test_resumed_file_growth_is_charged_once(self):
+        f = self.place("claude-subagent-resumed.jsonl", count=30)  # before the resume
+        c1 = self.claude_charge(1, f)
+        self.assertEqual((c1.usage.input, c1.usage.output), (4, 99 + 411))
+        self.place("claude-subagent-resumed.jsonl")  # the resume appended to the same file
+        c2 = self.claude_charge(2, f)
+        self.assertEqual((c2.usage.input, c2.usage.output), (8, 111 + 113))
+        c3 = self.claude_charge(3, f)
+        self.assertEqual((c3.usage.input, c3.usage.output), (0, 0))
+        total, _ = usage.claude_usage(f, exclude_ids=frozenset())
+        self.assertEqual(usage.totals(usage.read_charges(self.paths))["implementer"], total)
 
 
 CRASH_SCRIPT = """
