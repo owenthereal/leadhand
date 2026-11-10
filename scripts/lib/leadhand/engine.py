@@ -29,6 +29,19 @@ Actions (`next_action`):
 
 Dispatch IDs are `c<card>-a<attempt>-<kind>-<n>`, `n` counting that kind within the
 card's attempt.
+
+Integration before acceptance: a card is accepted only by fast-forwarding the run branch
+to a tip that contains the run tip. When the card branch does not, the engine rebases it
+(`integration_started` -> `rebased` | `conflict`), a conflict goes to an `integrate`
+attempt, and the integrated card is re-reviewed (`rereview`) and its deck checks run
+(`verify`) before the fast-forward. Once a card has been integrated, every tip it is
+accepted at needs a passing verify of that exact tip.
+
+Reviewers and verifiers may build but never change the workspace or move refs. Each of
+their dispatches records the card tip and branch it must leave in place and a snapshot of
+the run's refs; after the result, any change is a `violation`: preserved under
+`refs/leadhand/<run_id>/violations/`, restored, the result voided and the same kind
+dispatched again on the same route.
 """
 from __future__ import annotations
 
@@ -53,7 +66,8 @@ from leadhand.briefs import CODEX_AGENT, agent_for, dispatch_message, parse_repo
 from leadhand.config import VENDORS, Config, ConfigError, Route, docs_dir_for, load_config
 from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, parse_deck
 from leadhand.gitops import (GitError, card_branch_name, changed_paths, cut_card_branch, default_base,
-                             fast_forward, git, head, is_test_or_doc_path, prepare_workspace)
+                             detect_violation, fast_forward, git, head, is_test_or_doc_path,
+                             needs_integration, prepare_workspace, preserve_and_restore, rebase_onto)
 from leadhand.route import LadderExhausted, PinnedVendorMissing, Resolution, resolve
 from leadhand.state import (CardState, RunPaths, utc_now, append_attempt, append_event, crash_point,
                             decide_outcome, fold_cards, new_run_dir, read_attempts, read_events, run_paths,
@@ -61,8 +75,11 @@ from leadhand.state import (CardState, RunPaths, utc_now, append_attempt, append
 
 ACTIONS = ("dispatch", "wait", "check_diff", "answer", "stop_worker", "done")
 RECORD_KINDS = ("started", "result", "ruling", "park", "diff-check")
-IMPLEMENTER_KINDS = ("implement", "fix", "answer", "continue")
+IMPLEMENTER_KINDS = ("implement", "fix", "answer", "continue", "integrate")
 REVIEW_KINDS = ("review", "rereview")
+# Reviewers and verifiers: they may build, but must leave the workspace and the run's refs as they were.
+CHECK_KINDS = (*REVIEW_KINDS, "verify")
+VOIDED_NOTE = "## An earlier run of this check was voided"
 CODEX_GRACE_MINUTES = 5       # the Codex runner enforces its own limit; the proxy gets this much more
 TIMER_INTERVAL = 10.0
 MAX_STEPS = 200               # mechanical steps in one next_action call
@@ -421,13 +438,18 @@ def _step(ctx: _Run, events: list[dict]) -> dict | None:
         append_event(ctx.paths, "card_cut", card=n, branch=branch, base=base)
         return None
     if c.state == "cut":
-        _start_attempt(ctx, c, events, attempt=max(1, c.attempt), last_vendor=None, notes="")
+        unpark = _pending_unpark(events, n)
+        if unpark is not None:
+            _resume_unparked(ctx, c, events, index, unpark["note"])
+        else:
+            _start_attempt(ctx, c, events, attempt=max(1, c.attempt), last_vendor=None, notes="")
         return None
     if c.state == "accepting":
         _finish_accept(ctx, n, c.accept_target)
         return None
     if c.state == "integrating":
-        raise EngineError(f"card {n}: integration steps are not supported in this version")
+        _integration_step(ctx, c, events, index)
+        return None
     if c.state == "reviewed":
         return _after_verdict(ctx, c, events, index)
     if c.state == "fixing" and c.dispatch_kind != "fix":
@@ -495,7 +517,16 @@ def _request(ctx: _Run, c: CardState, events: list[dict], *, kind: str, attempt:
     n = 1 + sum(1 for e in events if e["kind"] == "dispatch_requested" and e.get("card") == c.number
                 and e.get("attempt") == attempt and e.get("dispatch_kind") == kind)
     did = f"c{c.number}-a{attempt}-{kind}-{n}"
-    full = {"base": c.base or "", "branch": c.branch or "", "test_first": ctx.config.run.test_first, **extra}
+    full = {"base": _card_base(ctx, c, events), "branch": c.branch or "", "test_first": ctx.config.run.test_first,
+            **extra}
+    guard: dict[str, Any] = {}
+    if c.branch:
+        _check_out(ctx, c.branch)
+        if kind in CHECK_KINDS:
+            # What the worker must leave as it found it (R14): the card tip on the card branch,
+            # and every ref of the run.
+            guard = {"expected_branch": c.branch, "expected_head": head(ctx.ws, f"refs/heads/{c.branch}"),
+                     "refs": _ref_snapshot(ctx)}
     brief, report = write_brief(kind, ws=ctx.ws, deck=ctx.deck, card=ctx.card(c.number), attempt=attempt,
                                 dispatch_id=did, extra=full)
     if notes:
@@ -518,7 +549,26 @@ def _request(ctx: _Run, c: CardState, events: list[dict], *, kind: str, attempt:
                         dispatch_kind=kind, role=role, vendor=route.vendor, model=route.model,
                         effort=route.effort, brief=str(brief), report=str(report), extra=extra, notes=notes,
                         resumes=resume.id if resume is not None else None, resume_worker=resume_worker,
-                        resume_session=resume_session, minutes=minutes)
+                        resume_session=resume_session, minutes=minutes, **guard)
+
+
+def _check_out(ctx: _Run, branch: str) -> None:
+    """Put the workspace on the card branch (it is elsewhere after another card ran, e.g. when a
+    parked card resumes). Never creates the branch."""
+    try:
+        current = git(ctx.ws, "symbolic-ref", "--quiet", "--short", "HEAD")
+    except GitError:
+        current = None                      # detached
+    if current != branch:
+        git(ctx.ws, "checkout", "--quiet", branch, "--")
+
+
+def _card_base(ctx: _Run, c: CardState, events: list[dict]) -> str:
+    """The commit the card's work starts from: its cut base, or, once it has been integrated,
+    where its branch meets the run branch (the run tip it was rebased onto)."""
+    if c.branch and any(e["kind"] == "integration_started" and e.get("card") == c.number for e in events):
+        return git(ctx.ws, "merge-base", f"refs/heads/{ctx.branch}", f"refs/heads/{c.branch}")
+    return c.base or ""
 
 
 def _budget_seconds(req: dict) -> float:
@@ -597,7 +647,7 @@ def _start_attempt(ctx: _Run, c: CardState, events: list[dict], *, attempt: int,
 
 
 def _escalate(ctx: _Run, c: CardState, events: list[dict], index: dict[str, _Dispatch], why: str,
-              review: _Dispatch | None = None) -> None:
+              review: _Dispatch | None = None, label: str = "The review findings") -> None:
     """A fresh worker on the next rung of the ladder, with the previous report in its brief."""
     impl = _card_dispatches(index, c.number, kinds=IMPLEMENTER_KINDS)
     last = max(impl, key=lambda d: d.req["seq"])
@@ -605,7 +655,7 @@ def _escalate(ctx: _Run, c: CardState, events: list[dict], index: dict[str, _Dis
     lines = ["## Previous attempt", "",
              f"Attempt {attempt} on this card {why}. Read what it reported before you start; the card "
              "branch holds its commits. Keep what is sound and fix or replace the rest.", ""]
-    for name, d in (("Its report", last), ("The review findings", review)):
+    for name, d in (("Its report", last), (label, review)):
         if d is not None and d.result is not None:
             lines.append(f"- {name}: {_report_copy(d)}")
     _start_attempt(ctx, c, events, attempt=attempt + 1, last_vendor=last.req["vendor"], notes="\n".join(lines))
@@ -631,7 +681,7 @@ def _request_review(ctx: _Run, c: CardState, events: list[dict], impl: _Dispatch
         return
     tip = impl.result.get("tip") or c.tip
     _request(ctx, c, events, kind="review", attempt=impl.req["attempt"], role=res.role, route=res.route,
-             extra={"diff_range": f"{c.base}..{tip}", "implementer_report": _report_copy(impl)})
+             extra={"diff_range": f"{_card_base(ctx, c, events)}..{tip}", "implementer_report": _report_copy(impl)})
 
 
 def _request_fix(ctx: _Run, c: CardState, events: list[dict], index: dict[str, _Dispatch]) -> None:
@@ -647,6 +697,17 @@ def _request_fix(ctx: _Run, c: CardState, events: list[dict], index: dict[str, _
 def _after_result(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
                   index: dict[str, _Dispatch]) -> dict | None:
     r = d.result
+    if d.kind in CHECK_KINDS and not _workspace_kept(ctx, c, d, events):
+        return None                         # the result is void; the same check was requested again
+    if d.kind == "verify":
+        if r.get("result") == "pass":
+            _accept(ctx, c.number, d.req["extra"]["tip"])
+        elif r.get("result") == "fail":
+            _escalate(ctx, c, events, index, "failed the deck's checks after integration", review=d,
+                      label="The verifier's report")
+        else:
+            return _worker_failed(ctx, c, d, events, index)
+        return None
     if d.kind in REVIEW_KINDS:
         if r.get("verdict") in ("clean", "defects"):
             append_event(ctx.paths, "verdict_recorded", card=c.number, verdict=r["verdict"],
@@ -654,6 +715,9 @@ def _after_result(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
             return None
         return _worker_failed(ctx, c, d, events, index)
     status = r["status"]
+    if status == "READY" and d.kind == "integrate":
+        _after_integrate(ctx, c, d, events, index)
+        return None
     if status == "READY":
         fix = _fix_round(events, c.number, d.req["attempt"], before_seq=d.req["seq"])
         if fix is not None:
@@ -702,8 +766,9 @@ def _worker_failed(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
                 ending = e["seq"]
             elif e["kind"] == "resumed" and ending is not None:
                 since = ending
+        voided = {e.get("dispatch_id") for e in events if e["kind"] == "violation"}
         same = [x for x in _card_dispatches(index, c.number, attempt=d.req["attempt"], kinds=(d.kind,))
-                if x.result is not None and x.result["seq"] > since]
+                if x.result is not None and x.result["seq"] > since and x.id not in voided]
         if status == "BLOCKED":
             failures = [x for x in same if x.result["status"] == "BLOCKED"
                         and x.result.get("blocked_by") != "usage limit"]
@@ -711,10 +776,12 @@ def _worker_failed(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
                 _end_blocked(ctx, events, "environment")
                 return None
         else:
-            failures = [x for x in same if x.result["status"] != "BLOCKED" and x.result.get("verdict") is None]
+            failures = [x for x in same if x.result["status"] != "BLOCKED" and x.result.get("verdict") is None
+                        and x.result.get("result") is None]
             if len(failures) >= 2:
+                what = "a result" if d.kind == "verify" else "a verdict"
                 append_event(ctx.paths, "parked", card=c.number,
-                             reason=f"{d.kind} ended {status} twice without a verdict")
+                             reason=f"{d.kind} ended {status} twice without {what}")
                 return None
     resume = index.get(d.req.get("resumes") or "")
     _request(ctx, c, events, kind=d.kind, attempt=d.req["attempt"], role=d.req["role"], route=d.route,
@@ -747,7 +814,7 @@ def _after_fix(ctx: _Run, c: CardState, d: _Dispatch, fix: dict, events: list[di
         review = index[fix["review"]]
         _request(ctx, c, events, kind="rereview", attempt=d.req["attempt"], role=review.req["role"],
                  route=review.route, resume=review,
-                 extra={"diff_range": f"{c.base}..{tip}", "findings": fix["findings"],
+                 extra={"diff_range": f"{_card_base(ctx, c, events)}..{tip}", "findings": fix["findings"],
                         "implementer_report": _report_copy(d)})
         return None
     check = next((e for e in events if e["kind"] == "diff_checked" and e.get("dispatch_id") == d.id), None)
@@ -770,9 +837,24 @@ def _fix_diff_path(ctx: _Run, d: _Dispatch) -> Path:
 
 
 def _accept(ctx: _Run, card: int, target: str | None) -> None:
-    """Accept a card: fast-forward the run branch to its reviewed tip (intent, move, completion)."""
+    """Accept a card: fast-forward the run branch to its reviewed tip (intent, move, completion).
+
+    A card branch that does not contain the run tip is integrated first; a card that was
+    integrated is accepted only at a tip a verify passed on."""
     if not target:
         raise EngineError(f"card {card}: no tip to accept")
+    events = read_events(ctx.paths)
+    c = fold_cards(events, ctx.numbers)[card]
+    branch = c.branch or card_branch_name(ctx.branch, card)
+    if needs_integration(ctx.ws, ctx.branch, branch):
+        integ = append_event(ctx.paths, "integration_started", card=card,
+                             onto=head(ctx.ws, f"refs/heads/{ctx.branch}"), tip=head(ctx.ws, f"refs/heads/{branch}"))
+        _rebase(ctx, card, branch, integ)
+        return
+    integrated = any(e["kind"] == "integration_started" and e.get("card") == card for e in events)
+    if integrated and not _verified(events, card, target):
+        _request_verify(ctx, c, events, target)
+        return
     append_event(ctx.paths, "accept_started", card=card, target=target)
     crash_point("before_fast_forward")
     _finish_accept(ctx, card, target)
@@ -783,6 +865,259 @@ def _finish_accept(ctx: _Run, card: int, target: str) -> None:
     fast_forward(ctx.ws, ctx.branch, target)
     crash_point("after_fast_forward")
     append_event(ctx.paths, "accepted", card=card, sha=target)
+
+
+# -- integration ------------------------------------------------------------
+
+def _contains(ctx: _Run, branch: str, sha: str) -> bool:
+    """Whether the branch's tip has `sha` in its history."""
+    return git(ctx.ws, "merge-base", sha, f"refs/heads/{branch}") == head(ctx.ws, sha)
+
+
+def _verified(events: list[dict], card: int, target: str) -> bool:
+    """A verify of exactly `target` passed (and was not voided)."""
+    voided = {e.get("dispatch_id") for e in events if e["kind"] == "violation"}
+    return any(d.kind == "verify" and d.req.get("card") == card and (d.req.get("extra") or {}).get("tip") == target
+               and d.result is not None and d.result.get("result") == "pass" and d.id not in voided
+               for d in _dispatches(events).values())
+
+
+def _request_verify(ctx: _Run, c: CardState, events: list[dict], target: str) -> None:
+    res = _resolve_or_park(ctx, ctx.card(c.number), role="verifier", attempt=1, last_vendor=None)
+    if res is not None:
+        _request(ctx, c, events, kind="verify", attempt=max(1, c.attempt), role=res.role, route=res.route,
+                 extra={"tip": target})
+
+
+def _abort_stale_rebase(ctx: _Run) -> None:
+    """A rebase left in progress by a process that died mid-way: abort it, which puts the
+    card branch back where it was (the rebase never completed, so nothing is lost)."""
+    for name in ("rebase-merge", "rebase-apply"):
+        if Path(git(ctx.ws, "rev-parse", "--path-format=absolute", "--git-path", name)).exists():
+            git(ctx.ws, "rebase", "--abort")
+            return
+
+
+def _rebase(ctx: _Run, card: int, branch: str, integ: dict) -> None:
+    """Rebase the card branch onto the run tip recorded by `integration_started`, then record
+    `rebased` or `conflict`. Repeat-safe: a card branch that already contains the run tip
+    counts as rebased; on conflict rebase_onto has aborted the rebase."""
+    crash_point("before_rebase")
+    _abort_stale_rebase(ctx)
+    onto = integ["onto"]
+    conflicts = [] if _contains(ctx, branch, onto) else rebase_onto(ctx.ws, branch, onto)
+    crash_point("after_rebase")
+    if conflicts:
+        append_event(ctx.paths, "conflict", card=card, onto=onto, paths=conflicts)
+    else:
+        append_event(ctx.paths, "rebased", card=card, onto=onto, tip=head(ctx.ws, f"refs/heads/{branch}"))
+
+
+def _integration_step(ctx: _Run, c: CardState, events: list[dict], index: dict[str, _Dispatch]) -> None:
+    """The card is integrating and nothing is dispatched for the step: rebase (again, after a
+    crash), dispatch an integrate attempt for a conflict, or re-review a rebased card."""
+    steps = [e for e in events if e.get("card") == c.number
+             and e["kind"] in ("integration_started", "rebased", "conflict")]
+    integ = [e for e in steps if e["kind"] == "integration_started"][-1]
+    last = steps[-1]
+    branch = c.branch or card_branch_name(ctx.branch, c.number)
+    if last["kind"] == "integration_started":
+        _rebase(ctx, c.number, branch, integ)
+    elif last["kind"] == "conflict":
+        _request_integrate(ctx, c, events, index, last)
+    else:
+        _request_integration_review(ctx, c, events, index, last)
+
+
+def _request_integrate(ctx: _Run, c: CardState, events: list[dict], index: dict[str, _Dispatch],
+                       conflict: dict) -> None:
+    """A new attempt on the route of the card's last implementer attempt (not escalated) that
+    may rebase the card branch, and only it, onto the run tip."""
+    card = ctx.card(c.number)
+    last = max(_card_dispatches(index, c.number, kinds=IMPLEMENTER_KINDS), key=lambda d: d.req["seq"])
+    attempt = max(d.req["attempt"] for d in _card_dispatches(index, c.number)) + 1
+    cut = max(e["seq"] for e in events if e["kind"] == "card_cut" and e.get("card") == c.number)
+    landed = [ctx.card(e["card"]) for e in events if e["kind"] == "accepted" and e["seq"] > cut
+              and e.get("card") != c.number and e.get("card") in ctx.numbers]
+    run_intent = "; ".join(f"card {x.number} ({x.title}): {x.done_when}" for x in landed)
+    _request(ctx, c, events, kind="integrate", attempt=attempt, role=last.req["role"], route=last.route,
+             extra={"run_tip": conflict["onto"], "conflicts": ", ".join(conflict["paths"]),
+                    "card_intent": f"card {card.number} ({card.title}): {card.done_when}",
+                    "run_intent": run_intent or "(no card was accepted since this card was cut)"})
+
+
+def _after_integrate(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
+                     index: dict[str, _Dispatch]) -> None:
+    """An integrate attempt reported READY: its branch must now contain the run tip."""
+    integ = [e for e in events if e["kind"] == "integration_started" and e.get("card") == c.number][-1]
+    branch = c.branch or card_branch_name(ctx.branch, c.number)
+    if _contains(ctx, branch, integ["onto"]):
+        append_event(ctx.paths, "rebased", card=c.number, onto=integ["onto"],
+                     tip=d.result.get("tip") or head(ctx.ws, f"refs/heads/{branch}"), dispatch_id=d.id)
+    else:
+        _escalate(ctx, c, events, index, "reported READY without rebasing the card branch onto the run tip")
+
+
+def _request_integration_review(ctx: _Run, c: CardState, events: list[dict], index: dict[str, _Dispatch],
+                                rebased: dict) -> None:
+    """Re-review the integrated diff with a fresh reviewer."""
+    impl = [d for d in _card_dispatches(index, c.number, kinds=IMPLEMENTER_KINDS) if d.result is not None]
+    last = max(impl, key=lambda d: d.req["seq"]) if impl else None
+    res = _resolve_or_park(ctx, ctx.card(c.number), role="reviewer", attempt=1,
+                           last_vendor=last.req["vendor"] if last else None)
+    if res is None:
+        return
+    verdicts = [e for e in events if e["kind"] == "verdict_recorded" and e.get("card") == c.number]
+    findings = (verdicts[-1].get("findings") if verdicts else "") or "(none: no review findings before integration)"
+    onto, tip = rebased["onto"], rebased["tip"]
+    notes = ("## Integration\n\n"
+             f"Other cards were accepted while this card waited, so its branch was rebased onto the run "
+             f"tip {onto}. Review the integrated diff {onto}..{tip} as a whole. The findings above are "
+             "from the card's review before integration, if any; check that the card still does what it "
+             "should on top of the run tip.")
+    _request(ctx, c, events, kind="rereview", attempt=max(1, c.attempt), role=res.role, route=res.route,
+             extra={"diff_range": f"{onto}..{tip}", "findings": findings,
+                    "implementer_report": (_report_copy(last) if last else "") or "(none recorded)"},
+             notes=notes)
+
+
+# -- unparking ----------------------------------------------------------------
+
+def _pending_unpark(events: list[dict], card: int) -> dict | None:
+    """The `unparked` event the card has not acted on yet (a card parked before it was cut
+    keeps its note through the cut)."""
+    last = None
+    for e in events:
+        if e.get("card") != card:
+            continue
+        if e["kind"] == "unparked":
+            last = e
+        elif e["kind"] in ("dispatch_requested", "parked"):
+            last = None
+    return last
+
+
+def _resume_unparked(ctx: _Run, c: CardState, events: list[dict], index: dict[str, _Dispatch], note: str) -> None:
+    """Resume the card's last implementer worker with the operator's note as the answer when
+    that worker is known; otherwise start a fresh worker on the card's attempt with the note."""
+    started = [d for d in _card_dispatches(index, c.number, kinds=IMPLEMENTER_KINDS) if d.started is not None]
+    last = max(started, key=lambda d: d.req["seq"]) if started else None
+    if last is not None and (last.req["vendor"] == "claude" or (last.result or {}).get("session_id")):
+        _request(ctx, c, events, kind="answer", attempt=last.req["attempt"], role=last.req["role"],
+                 route=last.route, extra={"ruling": note}, resume=last)
+        return
+    _start_attempt(ctx, c, events, attempt=max(1, c.attempt), last_vendor=None,
+                   notes=f"## The operator's note\n\nThis card was parked; the operator resumed it with:\n\n{note}")
+
+
+# -- reviewer and verifier violations ----------------------------------------
+
+def _ref_snapshot(ctx: _Run) -> dict[str, str]:
+    """ref -> object for the run branch, its card branches and everything under refs/leadhand/."""
+    out = git(ctx.ws, "for-each-ref", "--format=%(objectname) %(refname)", f"refs/heads/{ctx.branch}",
+              f"refs/heads/{ctx.branch}--card-*", "refs/leadhand/")
+    snap = {}
+    for line in out.splitlines():
+        sha, _, name = line.partition(" ")
+        if name:
+            snap[name] = sha
+    return snap
+
+
+def _workspace_kept(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict]) -> bool:
+    """True when the reviewer or verifier left the workspace and the run's refs as it found
+    them. Otherwise (now or recorded earlier) the change is preserved and undone, the result
+    is void, the same kind is requested again on the same route, and False is returned.
+
+    Two phases: `violation{stage: found}` is written before anything is moved, so a crash
+    mid-way still voids the result; `violation{stage: restored}` follows the restore."""
+    if not d.req.get("expected_head"):
+        return True
+    mine = [e for e in events if e["kind"] == "violation" and e.get("dispatch_id") == d.id]
+    if not mine:
+        found = _find_violation(ctx, d, events)
+        if found is None:
+            return True
+        mine = [found]
+    found = next(e for e in mine if e.get("stage") == "found")
+    if not any(e.get("stage") == "restored" for e in mine):
+        saved, siblings = _restore_violation(ctx, found)
+        append_event(ctx.paths, "violation", stage="restored", dispatch_id=d.id, card=c.number, n=found["n"],
+                     ref=found["ref"], saved=saved, siblings=siblings, preserved=found["preserved"])
+    notes = d.req.get("notes") or ""
+    if VOIDED_NOTE not in notes:
+        notes = (notes.rstrip("\n") + "\n\n" if notes else "") + VOIDED_NOTE + (
+            "\n\nAn earlier worker on this check changed the workspace or moved a branch, so its result "
+            "was voided. Build and run tests as you need, but never edit or stage tracked files, commit, "
+            "check out another branch, or create, move or delete any ref.")
+    _request(ctx, c, events, kind=d.kind, attempt=d.req["attempt"], role=d.req["role"], route=d.route,
+             extra=d.req.get("extra") or {}, notes=notes)
+    return False
+
+
+def _find_violation(ctx: _Run, d: _Dispatch, events: list[dict]) -> dict | None:
+    """Compare the workspace and refs with what the dispatch recorded; record `found` if they differ."""
+    req = d.req
+    v = detect_violation(ctx.ws, req["expected_head"], req["expected_branch"])
+    before, now = req.get("refs") or {}, _ref_snapshot(ctx)
+    moved = {name: {"old": before.get(name), "new": now.get(name)}
+             for name in sorted(set(before) | set(now)) if before.get(name) != now.get(name)}
+    if v is None and not moved:
+        return None
+    n = 1 + sum(1 for e in events if e["kind"] == "violation" and e.get("stage") == "found")
+    ref = f"refs/leadhand/{ctx.meta['run_id']}/violations/{n}"
+    preserved: dict[str, str] = {}
+    for name, m in moved.items():
+        if m["new"] is None:
+            continue                        # deleted: restoring it brings it back
+        slug = re.sub(r"[^A-Za-z0-9_]+", "-", name.removeprefix("refs/")).strip("-") or "ref"
+        keep, k = f"{ref}-{slug}", 1
+        while keep in preserved.values():
+            k += 1
+            keep = f"{ref}-{slug}-{k}"
+        preserved[name] = keep
+    paths: set[str] = set()
+    if v is not None:
+        paths.update(v.tracked_changes)
+        if v.index_dirty:
+            staged = git(ctx.ws, "diff", "--cached", "--name-only", "-z", "--no-renames", "--no-ext-diff", "HEAD", "--")
+            paths.update(p for p in staged.split("\0") if p)
+    return append_event(ctx.paths, "violation", stage="found", dispatch_id=d.id, card=req["card"],
+                        dispatch_kind=d.kind, n=n, ref=ref if v is not None else None, paths=sorted(paths),
+                        head_moved=bool(v and v.head_moved), index_dirty=bool(v and v.index_dirty),
+                        expected_head=req["expected_head"], expected_branch=req["expected_branch"],
+                        refs=moved, preserved=preserved)
+
+
+def _restore_violation(ctx: _Run, found: dict) -> tuple[str | None, list[str]]:
+    """Keep every moved ref's new tip and the workspace on side refs, then put the workspace
+    and the refs back. Repeat-safe after a crash at any point. Returns (saved commit, siblings)."""
+    ws = ctx.ws
+    for name, keep in found["preserved"].items():
+        git(ws, "update-ref", "-m", "leadhand: preserve a ref a reviewer moved", keep, found["refs"][name]["new"])
+    saved, siblings = None, []
+    ref = found["ref"]
+    if ref:
+        if detect_violation(ws, found["expected_head"], found["expected_branch"]) is not None:
+            saved = preserve_and_restore(ws, ref=ref, expected_head=found["expected_head"],
+                                         expected_branch=found["expected_branch"])
+        now = _ref_snapshot(ctx)
+        saved = saved or now.get(ref)
+        siblings = [s for s in (f"{ref}-branch", f"{ref}-autostash") if s in now]
+    now = _ref_snapshot(ctx)
+    for name, m in found["refs"].items():
+        cur = now.get(name)
+        if cur == m["old"]:
+            continue
+        if cur != m["new"]:
+            raise EngineError(f"{name} changed again after the violation by {found['dispatch_id']} "
+                              f"(recorded {m['new']}, now {cur}); restore it by hand")
+        if m["old"] is None:
+            git(ws, "update-ref", "-m", "leadhand: remove a ref a reviewer created", "-d", name, cur)
+        else:
+            # The moved value is the expected current value: a ref changed meanwhile is not overwritten.
+            git(ws, "update-ref", "-m", "leadhand: restore a ref a reviewer moved", name, m["old"], cur or "")
+    return saved, siblings
 
 
 def _end_blocked(ctx: _Run, events: list[dict], reason: str) -> None:
@@ -1006,6 +1341,19 @@ def _record_diff_check(ctx: _Run, card: Any, ok: Any, note: str = "") -> dict:
         ok = ok.lower() in ("yes", "true")
     return append_event(ctx.paths, "diff_checked", card=c.number, dispatch_id=d.id, ok=bool(ok),
                         note=(note or "").strip())
+
+
+def unpark(run_dir: Path, card: Any, note: str) -> dict:
+    """The operator's `leadhand unpark`: a parked card continues, its last worker resumed with
+    the note as the answer (or a fresh worker given the note). Returns the `unparked` event."""
+    ctx = _load(run_dir, check_digest=False)
+    if not note or not note.strip():
+        raise EngineError("unparking a card needs a note")
+    with state_lock(ctx.paths):
+        c = _card_state(ctx, read_events(ctx.paths), card)
+        if c.state != "parked":
+            raise EngineError(f"card {c.number} is not parked (it is {c.state})")
+        return append_event(ctx.paths, "unparked", card=c.number, note=note.strip())
 
 
 # --------------------------------------------------------------------------

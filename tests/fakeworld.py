@@ -7,7 +7,12 @@ does, with fake workers instead of real ones:
   workspace, commit them on the checked-out card branch and write a report whose
   first line is the scripted `Status:`;
 - review kinds (review, rereview) write `Verdict: ...` with findings;
-- verify kinds write `Result: ...`.
+- verify kinds write `Result: ...`;
+- integrate rebases the card branch onto the run tip, resolving conflicts in
+  the card's favour, and reports like an implementer.
+
+A step's `tamper(world, ws, action)` runs inside the worker before its report is
+written: a reviewer or verifier that changes the workspace or moves refs.
 
 Claude routes run in-process: the world records `started` with a fake agent ID,
 does the work, appends a usage record to that agent's fake transcript and
@@ -225,7 +230,7 @@ class FakeWorld:
 
     def report_text(self, a: dict, step: dict) -> str:
         kind = a["kind"]
-        if "status" in step or kind in IMPLEMENTER_KINDS:
+        if "status" in step or kind in IMPLEMENTER_KINDS or kind == "integrate":
             status = step.get("status", "READY")
             text = f"Status: {status}\n"
             if step.get("blocked_by"):
@@ -247,7 +252,10 @@ class FakeWorld:
     def claude_worker(self, a: dict, worker: str) -> str | None:
         step = self._take(a)
         ws = self.workspace()
-        if a["kind"] in IMPLEMENTER_KINDS:
+        if a["kind"] == "integrate":
+            run_tip = run_git(ws, "rev-parse", f"refs/heads/{self.meta()['branch']}")
+            run_git(ws, "-c", "core.editor=true", "rebase", "--quiet", "-X", "theirs", run_tip)
+        elif a["kind"] in IMPLEMENTER_KINDS:
             files = step.get("files") or {f"src/card{a['card']}/{a['dispatch_id']}.txt": f"{a['dispatch_id']}\n"}
             write(ws, files)
             if step.get("crash") == "before_commit":
@@ -256,6 +264,8 @@ class FakeWorld:
             run_git(ws, "commit", "--quiet", "-m", f"work for {a['dispatch_id']}")
             if step.get("crash") == "after_commit":
                 return None
+        if step.get("tamper"):
+            step["tamper"](self, ws, a)
         report = Path(a["report"])
         text = self.report_text(a, step)
         if step.get("report", True):
