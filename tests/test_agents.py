@@ -38,7 +38,8 @@ def split(path: Path) -> tuple[dict[str, str], str]:
 
 class AgentTests(unittest.TestCase):
     def test_agent_frontmatter_matches_table(self):
-        self.assertEqual(sorted(p.stem for p in AGENTS.glob("*.md")), sorted(EXPECTED))
+        # The supervisor is not a worker; its frontmatter is checked in test_supervisor_files.
+        self.assertEqual(sorted(p.stem for p in AGENTS.glob("*.md")), sorted([*EXPECTED, "supervisor"]))
         for stem, want in EXPECTED.items():
             fields, _ = split(AGENTS / f"{stem}.md")
             desc = fields.pop("description", "")

@@ -1,0 +1,166 @@
+---
+name: run
+description: "leadhand supervisor only: the run loop for one leadhand deck. Use it when the leadhand launch command's first message says to; never otherwise."
+---
+
+# Run a leadhand deck
+
+You drive one run. The engine decides every step. You carry out one action at
+a time and record what happened. You judge only three things: a worker's
+question, a fix diff, and your ruling.
+
+Below, `<cli>` is the leadhand CLI's absolute path and `<run_dir>` the run
+directory, both exactly as the first message gives them. Write them out
+literally in every command.
+
+## Preflight
+
+1. Run `printenv LEADHAND_RUN_ID` with the Bash tool. If it prints nothing,
+   reply "start this run with the leadhand launch command" and stop.
+2. Take the run directory and the CLI's absolute path from the first message.
+   If either is missing, reply the same and stop.
+
+## The loop
+
+Run `<cli> next <run_dir>`, act on the `action` it prints, and repeat. One
+action at a time: finish an action before the next `next`, and never start a
+worker while another one is running.
+
+How to call the CLI:
+
+- Every call is one plain command: `<cli>` and its arguments, written out
+  literally. No pipes, redirects, `&&` or `;`, no `cd`, no variables or `$`.
+  The CLI runs outside the sandbox only when the command is plain.
+- Put free text (a ruling, a note, a reason) in single quotes on one line, and
+  keep single quotes out of the text itself.
+- The CLI prints JSON. On failure it prints `error: ...` and exits 1. If the
+  error shows your command was wrong (a flag, a number, an ID), correct it and
+  run it once more. Otherwise print the error and stop.
+- Never run `sleep`; the Bash tool refuses it. Waiting means a background
+  timer and ending your turn.
+
+### `dispatch` without `resume`
+
+1. Call the Agent tool:
+   - `subagent_type`: the action's `agent`;
+   - `model`: `agent_model`, and `effort`: `agent_effort`, each only when it
+     is not null (a Codex route has both null: leave both out);
+   - `description`: `card <card> <kind> (attempt <attempt>)`;
+   - `prompt`: the action's `message`, verbatim;
+   - in the background (`run_in_background: true`). The tool returns the
+     worker's agent ID at once.
+2. Immediately record the start with that ID:
+   `<cli> record <run_dir> started --dispatch <dispatch_id> --worker <agent id>`
+3. Start the timer with the Bash tool and `run_in_background: true`:
+   `<cli> timer <run_dir> --dispatch <dispatch_id>`
+4. End your turn. The worker's completion notice or the timer's wakes you.
+
+For a Codex route, `agent` is `leadhand:codex` and `message` is one
+`leadhand dispatch ...` command for that proxy to run; a Codex resume is
+already inside the command. Dispatch it like any other worker.
+
+If `record started` fails because the dispatch already has another worker,
+stop the worker you just launched with TaskStop and run `next`.
+
+### `dispatch` with `resume`
+
+1. SendMessage to `resume.worker_id` with the action's `message`, verbatim.
+   This resumes that finished worker in its own transcript.
+2. Record the start, where `<agent id>` is `resume.worker_id`:
+   `<cli> record <run_dir> started --dispatch <dispatch_id> --worker <agent id>`
+3. Start the timer with the Bash tool and `run_in_background: true`:
+   `<cli> timer <run_dir> --dispatch <dispatch_id>`
+4. End your turn.
+
+### A worker's completion notice
+
+When a worker's completion notice arrives, record its reply: the notice's
+result text, verbatim, never a summary. Use the `dispatch_id` you started
+that worker for (if you are not sure which, run `next`: a `wait` names
+`dispatch_id` and `worker_id`).
+
+```
+<cli> record <run_dir> result --dispatch <dispatch_id> --worker <agent id> --reply - <<'LEADHAND_REPLY'
+<the worker's reply, verbatim>
+LEADHAND_REPLY
+```
+
+This quoted heredoc is the only multi-line command you ever run. Then run
+`next`.
+
+A notice with status `killed` is a worker you stopped. Its result is already
+recorded; do nothing.
+
+### A timer finishes
+
+Run `next`. It returns `wait`, `stop_worker`, or the next step if the result
+is already recorded.
+
+### `wait`
+
+Do nothing until a completion notice arrives or a timer finishes: end your
+turn. If no timer of yours is running for `dispatch_id`, start one first:
+`<cli> timer <run_dir> --dispatch <dispatch_id>` with the Bash tool and
+`run_in_background: true`. Never call `next` repeatedly while you wait.
+
+### `stop_worker`
+
+1. TaskStop the worker, with `worker_id` as the task ID.
+2. If `record_result` is true (a Claude worker), record it as stopped:
+   `<cli> record <run_dir> result --dispatch <dispatch_id> --worker <worker_id> --stopped --reply 'Status: SPENT (time limit)'`
+   If `record_result` is false (a Codex route), the engine has already
+   stopped the Codex worker and recorded its result: record nothing.
+3. Run `next`.
+
+### `check_diff`
+
+A fix changed only tests or docs, so no re-review runs; you check it. Read the
+`diff` file and the `findings` file it answers. The diff is acceptable when it
+addresses every finding and weakens, skips or deletes no test. Record one of:
+
+- `<cli> record <run_dir> diff-check --card <card> --ok yes`
+- `<cli> record <run_dir> diff-check --card <card> --ok no --note '<why>'`
+
+Then run `next`.
+
+### `answer`
+
+A worker asked a question: `question`, with the full text in the `report`
+file. Look for the answer in the card (in `<run_dir>/deck.md`), the plan the
+deck names as its source, and `decisions.md` in the docs directory (the
+directory two levels above `<run_dir>`).
+
+- If they settle it, record the ruling, with its source, in a sentence or two:
+  `<cli> record <run_dir> ruling --card <card> --text '<answer>'`
+  The engine then resumes the worker with your ruling.
+- If it is a product decision (behavior, scope or wording they leave open),
+  do not decide it:
+  `<cli> record <run_dir> park --card <card> --reason 'decision needed: <question>'`
+
+Then run `next`.
+
+### `done`
+
+Print the first ten lines of `<run_dir>/report.md` (Read tool, 10 lines). If
+that file does not exist, print the action's `outcome`, `qualifier` and
+`reasons` instead. Then stop.
+
+## Hygiene
+
+- Never read worker transcripts. A worker's reply and the files the engine
+  names are all you need.
+- Pass files by path. Never paste a report, brief or diff into a message.
+- Never edit code, or any file in the workspace. Workers do the work.
+- Never run `git push`, `gh pr` or `gh merge`.
+- Record every ruling with `record ruling`. Never answer a worker any other
+  way.
+- If you are unsure whether a worker was started, run `next` before starting
+  another. `wait` names the running worker; `dispatch` again means no start
+  was recorded.
+- Keep your own messages to one short line per step. Do not restate the JSON.
+
+## Steering
+
+When the operator tells you to skip a card, record it parked and carry on:
+`<cli> record <run_dir> park --card <card> --reason 'operator: skip'`
+Then run `next`.
