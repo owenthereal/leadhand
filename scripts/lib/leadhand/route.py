@@ -91,12 +91,14 @@ def resolve(config: Config, *, role: str, card: Card | None = None, attempt: int
 
     # Pin: replaces role, vendor and effort steps for attempts 1 and 2.
     if is_impl and pin is not None and attempt <= 2:
+        if pin.vendor not in installed:
+            raise ConfigError(f"card {card.number} is pinned to {pin.vendor}, which is not installed")
         steps = 0
         reasons.append(f"pinned: {_pin_text(pin)}")
         if attempt == 2:
             steps = 1
             reasons.append("attempt 2: +1")
-        effort = shift_effort(pin.effort, steps, allow_max=True)
+        effort = shift_effort(pin.effort, steps, allow_max=pin.effort == "max")
         if EFFORTS.index(pin.effort) + steps != EFFORTS.index(effort):
             reasons.append(f"clamped to {effort}")
         return Resolution(Route(pin.vendor, pin.model, effort), role, tuple(reasons))
@@ -132,6 +134,8 @@ def resolve(config: Config, *, role: str, card: Card | None = None, attempt: int
 
     # Step 3: effort steps.
     steps = 0
+    if (profile or config.profile) not in PROFILE_SHIFT:
+        raise ConfigError(f"profile: {(profile or config.profile)!r} is not one of lean, standard, thorough")
     shift = PROFILE_SHIFT[profile or config.profile]
     if shift:
         steps += shift

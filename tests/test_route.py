@@ -89,7 +89,10 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(self.key(res), ("claude", "opus", "xhigh"))
         self.assertIn("pinned: claude opus xhigh", res.reasons)
         res = self.r(card=card, attempt=2)
-        self.assertEqual(self.key(res), ("claude", "opus", "max"))
+        self.assertEqual(self.key(res), ("claude", "opus", "xhigh"))
+        self.assertIn("clamped to xhigh", res.reasons)
+        maxed = replace(self.card, route_pin=Route("claude", "opus", "max"))
+        self.assertEqual(self.r(card=maxed, attempt=2).route.effort, "max")
         res = self.r(card=card, attempt=3)
         self.assertEqual(self.key(res), ("codex", "gpt-6.1-sol", "xhigh"))  # high +1 (pinned)
 
@@ -133,6 +136,21 @@ class RouteTests(unittest.TestCase):
         res = resolve(thorough, role="implementer", card=pinned)
         self.assertEqual(res.route.effort, "max")
         self.assertNotIn("clamped to xhigh", res.reasons)
+
+    def test_pin_requires_installed_vendor(self):
+        card = replace(self.card, route_pin=Route("codex", "gpt-6.1-sol", "high"))
+        with self.assertRaisesRegex(ConfigError, "pinned to codex, which is not installed"):
+            self.r(card=card, installed=frozenset({"claude"}))
+
+    def test_invalid_profile_is_config_error(self):
+        with self.assertRaisesRegex(ConfigError, "Thorough"):
+            self.r(profile="Thorough")
+
+    def test_low_pin_not_shifted_by_profile_or_risk(self):
+        thorough = self.cfg('profile = "thorough"\n')
+        card = replace(self.card, risk="high", route_pin=Route("claude", "sonnet", "low"))
+        res = resolve(thorough, role="implementer", card=card)
+        self.assertEqual(self.key(res), ("claude", "sonnet", "low"))
 
     def test_cli_route_prints_route_and_reasons(self):
         env = dict(os.environ, LEADHAND_CONFIG=str(self.cfgfile))
