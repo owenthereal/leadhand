@@ -183,6 +183,26 @@ class ArgvTests(LaunchTestCase):
             "--agent", "leadhand:supervisor", "--model", "sonnet", "--effort", "low",
             "--permission-mode", "auto", argv[-1]])
 
+    def test_print_mode_adds_headless_stream_flags_before_the_prompt(self):
+        argv = launch.launch_argv(claude_bin="claude", agent="leadhand:supervisor",
+                                  first_message="go", plugin_dir=None, settings=None, print_mode=True)
+        self.assertEqual(argv, ["claude", "--agent", "leadhand:supervisor", "--permission-mode", "auto",
+                                "-p", "--output-format", "stream-json", "--verbose", "go"])
+        code, _, _ = self.run_inprocess(print_mode=True)
+        self.assertEqual(code, 0)
+        argv = self.starts()[0]["argv"]
+        self.assertEqual(argv[-6:-1], ["auto", "-p", "--output-format", "stream-json", "--verbose"])
+
+    def test_cli_print_option_is_hidden_and_off_by_default(self):
+        from leadhand import cli
+        parser = cli.build_parser()
+        self.assertFalse(parser.parse_args(["run", "deck.md"]).print_mode)
+        self.assertTrue(parser.parse_args(["run", "deck.md", "--print"]).print_mode)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            parser.parse_args(["run", "--help"])
+        self.assertNotIn("--print", out.getvalue())
+
     def test_first_message_names_skill_invocation(self):
         code, _, _ = self.run_inprocess()
         self.assertEqual(code, 0)

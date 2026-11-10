@@ -26,6 +26,7 @@ is not established, so the overlay holds nothing else.
 """
 from __future__ import annotations
 
+import argparse
 import errno
 import fcntl
 import json
@@ -48,6 +49,9 @@ EXIT_REFUSED = 3
 PLATFORM = sys.platform        # read at launch time; tests inject another platform
 KEEP_AWAKE_TIMEOUT = 10.0
 FORWARDED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+# `run --print` (hidden; end-to-end drivers only): a headless session whose stream goes
+# to the launcher's stdout. The prompt stays the last argument.
+PRINT_ARGS = ("-p", "--output-format", "stream-json", "--verbose")
 
 ATTENDED_WARNING = (
     "leadhand: attended use only. Until the Claude-side run guard lands, keep this session "
@@ -184,7 +188,8 @@ class RunLock:
 
 
 def launch_argv(*, claude_bin: str, agent: str, first_message: str, plugin_dir: Path | None,
-                settings: str | None, model: str | None = None, effort: str | None = None) -> list[str]:
+                settings: str | None, model: str | None = None, effort: str | None = None,
+                print_mode: bool = False) -> list[str]:
     argv = [claude_bin]
     if plugin_dir is not None:
         argv += ["--plugin-dir", str(plugin_dir)]
@@ -195,7 +200,10 @@ def launch_argv(*, claude_bin: str, agent: str, first_message: str, plugin_dir: 
         argv += ["--model", model]
     if effort:
         argv += ["--effort", effort]
-    return argv + ["--permission-mode", "auto", first_message]
+    argv += ["--permission-mode", "auto"]
+    if print_mode:
+        argv += PRINT_ARGS
+    return argv + [first_message]
 
 
 def keep_awake_prefix(platform: str) -> list[str]:
@@ -289,7 +297,8 @@ def _stop_keep_awake(proc: subprocess.Popen | None) -> None:
         proc.wait(timeout=KEEP_AWAKE_TIMEOUT)
 
 
-def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "claude") -> int:
+def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "claude",
+        print_mode: bool = False) -> int:
     """Own the run and start its supervisor; return the supervisor's exit code.
 
     1 when the run cannot be launched, 3 when someone else owns it. A child
@@ -327,7 +336,8 @@ def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "cla
         plugin = Path(os.path.abspath(plugin_dir)) if plugin_dir is not None else None
         argv = launch_argv(
             claude_bin=claude_bin, agent=SUPERVISOR_AGENT, first_message=first_message(root),
-            plugin_dir=plugin, settings=cli_settings(), model=model, effort=effort)
+            plugin_dir=plugin, settings=cli_settings(), model=model, effort=effort,
+            print_mode=print_mode)
         env = {**os.environ, "LEADHAND_RUN_ID": run_id, "LEADHAND_RUN_DIR": str(root),
                "LEADHAND_CLI": str(CLI_PATH)}
         print(ATTENDED_WARNING.format(cli=CLI_PATH), file=sys.stderr, flush=True)
@@ -409,7 +419,8 @@ def launch_line(run_dir: Path, *, plugin_dir: Path | None = None) -> str:
 
 def _cmd_run(args) -> int:
     try:
-        return run(Path(args.run_dir), plugin_dir=Path(args.plugin_dir) if args.plugin_dir else None)
+        return run(Path(args.run_dir), plugin_dir=Path(args.plugin_dir) if args.plugin_dir else None,
+                   print_mode=args.print_mode)
     except (OSError, ValueError) as e:      # e.g. an unreadable events.jsonl; the lock is released
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -429,6 +440,7 @@ def add_commands(sub) -> None:
     p = sub.add_parser("run", help="own a run and start its supervisor session (attended use only)")
     p.add_argument("run_dir", help="the run directory or its deck.md")
     p.add_argument("--plugin-dir", help="load the leadhand plugin from this directory")
+    p.add_argument("--print", dest="print_mode", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(func=_cmd_run)
 
     p = sub.add_parser("launch-line", help="print the exact command that launches or resumes a run")
