@@ -11,7 +11,7 @@ Standard library only. Every step runs independently; failures are recorded,
 not raised. Steps 1-4 drive an interactive `claude --agent
 lhprobe:super-lifecycle` in tmux, each with its own fixture repo; steps 5-6 run
 `codex exec`. Processes are matched by unique sleep durations (for example
-`sleep 120.1<nnnn>`), never by agent_id or parent fields, which are recorded as
+`time.sleep(120.1<nnnn>)` in a python3 worker command), never by agent_id or parent fields, which are recorded as
 observations only. Expect about 15 minutes of wall time.
 
 Internal modes, used by step 5 only (not for direct use):
@@ -270,6 +270,19 @@ def sleep_rows(token: str, rows: list[dict] | None = None) -> list[dict]:
     """Processes whose program is `sleep` and whose arguments hold the token."""
     return [r for r in rows_with(token, rows)
             if os.path.basename(r["command"].split()[0]) == "sleep"]
+
+
+def py_sleep_cmd(token: str) -> str:
+    """Long worker command that Claude Code's Bash tool does not block; token stays in argv."""
+    return f"python3 -c 'import time; time.sleep({token})'"
+
+
+def py_sleep_rows(token: str, rows: list[dict] | None = None) -> list[dict]:
+    """Processes whose program is python and whose arguments hold the token (not the shell
+    wrapper, whose program is a shell)."""
+    return [r for r in (ps_rows() if rows is None else rows)
+            if token in r["command"].split("time.sleep(")[-1]
+            and os.path.basename(r["command"].split()[0]).lower().startswith("python")]
 
 
 def row_of(pid: int, rows: list[dict] | None = None) -> dict | None:
@@ -653,17 +666,17 @@ def step1(ctx: Ctx):
     token = ctx.token("120.1")
     ctx.needles.append(token)
     marker = sess.cwd / "late-marker.txt"
-    cmd = f"sleep {token}; echo late >> {shlex.quote(str(marker))}"
-    obs = {"worker_command": cmd,
+    cmd = f"{py_sleep_cmd(token)}; echo late >> {shlex.quote(str(marker))}"
+    obs = {"worker_command": cmd, "note": "Claude Code's Bash tool blocks foreground `sleep N`; the probe uses python3 time.sleep instead.",
            "deviation": "late marker is a file in the fixture repo, not $PROBE_LOG: the hook "
                         "log holds JSON lines, and the fixture is writable under Claude's sandbox"}
     sess.start()
     sess.send(dispatch_bg_msg(cmd, "lifecycle worker"))
     sent = time.monotonic()
-    rows = wait_until(lambda: sleep_rows(token), DISPATCH_TIMEOUT, sess)
+    rows = wait_until(lambda: py_sleep_rows(token), DISPATCH_TIMEOUT, sess)
     if not rows:
         sess.save("no-sleep")
-        raise StepFail(f"worker's `sleep {token}` never started", sess.pane.splitlines()[-10:])
+        raise StepFail(f"worker's `{cmd}` never started", sess.pane.splitlines()[-10:])
     obs["sleep_started_after_s"] = round(time.monotonic() - sent, 1)
     cpid = sess.pane_pid()
     snap = ps_rows()
@@ -671,9 +684,9 @@ def step1(ctx: Ctx):
     obs["claude_process"] = brief([crow]) if crow else f"pid {cpid} not in ps"
     obs["token_processes_before_kill"] = brief(rows_with(token, snap))
     obs["sleep_pgid_equals_claude_pgid"] = bool(crow) and all(
-        r["pgid"] == crow["pgid"] for r in sleep_rows(token, snap))
+        r["pgid"] == crow["pgid"] for r in py_sleep_rows(token, snap))
     obs["sleep_is_claude_descendant"] = [r["pid"] in {d["pid"] for d in descendants(cpid, snap)}
-                                         for r in sleep_rows(token, snap)]
+                                         for r in py_sleep_rows(token, snap)]
     obs["hook_fields_for_sleep_command (observation)"] = hook_fields(sess, token)
     progress(f"  step1: sleep running; SIGTERM claude pid {cpid} in {STEP1_KILL_AFTER}s")
     idle(STEP1_KILL_AFTER, sess)
@@ -691,7 +704,7 @@ def step1(ctx: Ctx):
         snap = ps_rows()
         if seen["claude_gone_after_s"] is None and not row_of(cpid, snap):
             seen["claude_gone_after_s"] = t
-        if seen["sleep_gone_after_s"] is None and not sleep_rows(token, snap):
+        if seen["sleep_gone_after_s"] is None and not py_sleep_rows(token, snap):
             seen["sleep_gone_after_s"] = t
         if seen["marker_after_s"] is None and marker.exists():
             seen["marker_after_s"] = t
@@ -705,7 +718,7 @@ def step1(ctx: Ctx):
         "watch": end_reason,
         "late_written": marker.exists(),
         "late_marker_content": marker.read_text().strip() if marker.exists() else None,
-        "sleep_survives_at_end": brief(sleep_rows(token, snap)) or False,
+        "sleep_survives_at_end": brief(py_sleep_rows(token, snap)) or False,
         "token_processes_at_end": brief(rows_with(token, snap)) or "none",
         "claude_alive_at_end": bool(row_of(cpid, snap)),
         "pane_dead": sess.dead(),
@@ -725,11 +738,11 @@ def step2(ctx: Ctx):
     sess = Session(ctx, "step2")
     token = ctx.token("60.2")
     ctx.needles.append(token)
-    cmd = f"sleep {token}"
-    obs = {"worker_command": cmd}
+    cmd = py_sleep_cmd(token)
+    obs = {"worker_command": cmd, "note": "Claude Code's Bash tool blocks foreground `sleep N`; the probe uses python3 time.sleep instead."}
     sess.start()
     sess.send(dispatch_bg_msg(cmd, "stop worker"))
-    rows = wait_until(lambda: sleep_rows(token), DISPATCH_TIMEOUT, sess)
+    rows = wait_until(lambda: py_sleep_rows(token), DISPATCH_TIMEOUT, sess)
     seen_at = time.monotonic()
     if not rows:
         sess.save("no-sleep")
@@ -758,7 +771,7 @@ def step2(ctx: Ctx):
 
     def stopped():
         nonlocal gone_at
-        if gone_at is None and not sleep_rows(token):
+        if gone_at is None and not py_sleep_rows(token):
             gone_at = round(time.monotonic() - sent, 1)
         r = sess.main_records()
         i = user_index(r, "TaskStop tool on the background agent")
@@ -783,7 +796,7 @@ def step2(ctx: Ctx):
                                        if u["name"] != "TaskStop"] or "none",
         "supervisor_reply": assistant_texts(recs, i)[-3:],
         "sleep_gone_after_s": gone_at,
-        "sleep_alive_at_end": brief(sleep_rows(token)) or False,
+        "sleep_alive_at_end": brief(py_sleep_rows(token)) or False,
         "task_notification_after_stop": [summarize(r)[:300] for r in recs[i:]
                                          if "task-notification" in json.dumps(r)][:3] or "none",
         "main_transcript_tail": [summarize(r) for r in recs[-3:]],
@@ -1377,13 +1390,13 @@ def dry_commands(ctx: Ctx, n: int) -> list[str]:
                                                 f"<out>/task3-artifacts/{label}-hooks.jsonl"))
     send = f"tmux -L {ctx.sock} send-keys -t lh3-<label> -l <message> ; ... Enter"
     if n == 1:
-        cmd = f"sleep {ctx.token('120.1')}; echo late >> '<fixture>/late-marker.txt'"
+        cmd = f"{py_sleep_cmd(ctx.token('120.1'))}; echo late >> '<fixture>/late-marker.txt'"
         return [tm("step1"), send, f"  message: {dispatch_bg_msg(cmd, 'lifecycle worker')}",
-                f"wait for `sleep {ctx.token('120.1')}` in ps; {STEP1_KILL_AFTER}s later "
+                f"wait for `{py_sleep_cmd(ctx.token('120.1'))}` in ps; {STEP1_KILL_AFTER}s later "
                 f"kill -TERM <pane_pid>; watch {STEP1_WATCH}s"]
     if n == 2:
         return [tm("step2"), send,
-                "  message 1: " + dispatch_bg_msg(f"sleep {ctx.token('60.2')}", "stop worker"),
+                "  message 1: " + dispatch_bg_msg(py_sleep_cmd(ctx.token('60.2')), "stop worker"),
                 "  message 2 (once the sleep is in ps): call TaskStop on that agent",
                 "read the main and subagent transcripts under ~/.claude/projects/*/<session_id>*"]
     if n == 3:

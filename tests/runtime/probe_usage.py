@@ -340,10 +340,17 @@ def ps_rows() -> list[dict]:
     return [r for r in rows if r["pid"] != os.getpid() and "Z" not in r["stat"]]
 
 
-def sleep_rows(token: str, rows: list[dict] | None = None) -> list[dict]:
-    """Processes whose program is `sleep` and whose arguments hold the token."""
+def py_sleep_cmd(token: str) -> str:
+    """Long worker command that Claude Code's Bash tool does not block; token stays in argv."""
+    return f"python3 -c 'import time; time.sleep({token})'"
+
+
+def py_sleep_rows(token: str, rows: list[dict] | None = None) -> list[dict]:
+    """Processes whose program is python and whose arguments hold the token (not the shell
+    wrapper, whose program is a shell)."""
     return [r for r in (ps_rows() if rows is None else rows)
-            if token in r["command"] and os.path.basename(r["command"].split()[0]) == "sleep"]
+            if token in r["command"].split("time.sleep(")[-1]
+            and os.path.basename(r["command"].split()[0]).lower().startswith("python")]
 
 
 def brief(rows: list[dict]) -> list[str]:
@@ -1165,12 +1172,12 @@ def send_msg(aid: str | None) -> str:
 def step2_stop(ctx: Ctx, sess: Session) -> tuple[dict, str]:
     token = ctx.token("300.2")
     ctx.needles.append(token)
-    cmd = f"sleep {token}"
-    obs: dict = {"worker_command": cmd}
+    cmd = py_sleep_cmd(token)
+    obs: dict = {"worker_command": cmd, "note": "Claude Code's Bash tool blocks foreground `sleep N`; the probe uses python3 time.sleep instead."}
     info: dict = {}
     try:
         sess.send(dispatch_msg(cmd, "usage stop worker", background=True))
-        rows = wait_until(lambda: sleep_rows(token), DISPATCH_TIMEOUT, sess)
+        rows = wait_until(lambda: py_sleep_rows(token), DISPATCH_TIMEOUT, sess)
         if not rows:
             sess.save("no-sleep")
             raise StepFail(f"worker's `{cmd}` never started", sess.pane.splitlines()[-10:])
@@ -1186,7 +1193,7 @@ def step2_stop(ctx: Ctx, sess: Session) -> tuple[dict, str]:
 
         def stopped():
             nonlocal gone_at
-            if gone_at is None and not sleep_rows(token):
+            if gone_at is None and not py_sleep_rows(token):
                 gone_at = round(time.monotonic() - sent, 1)
             return replied(sess, STOP_NEEDLE, "stopped")
 
@@ -1205,7 +1212,7 @@ def step2_stop(ctx: Ctx, sess: Session) -> tuple[dict, str]:
                                 "result": (res.get(u["id"]) or {}).get("text", "<no result>")[:400]}
                                for u in stops] or "none",
             "sleep_gone_after_stop_s": gone_at,
-            "sleep_alive_at_end": brief(sleep_rows(token)) or False,
+            "sleep_alive_at_end": brief(py_sleep_rows(token)) or False,
             "transcript_records_after_stop": after,
             "usage": usage_analysis(read_jsonl(path)) if path else "no transcript",
             "transcript_tail": [summarize(r) for r in read_jsonl(path)[-3:]] if path else "none",
@@ -1448,7 +1455,7 @@ def dry_commands(ctx: Ctx, n: int) -> list[str]:
                 + ["read the same rollout file again; compare record counts and cumulative totals"])
     if n == 2:
         return [tm("step2"), send,
-                "  message 1: " + dispatch_msg(f"sleep {ctx.token('300.2')}", "usage stop worker", True),
+                "  message 1: " + dispatch_msg(py_sleep_cmd(ctx.token('300.2')), "usage stop worker", True),
                 f"  message 2 (once the sleep is in ps): {STOP_MSG}",
                 "  message 3: " + dispatch_msg(f"echo lhprobe-resume-{ctx.uniq}", "usage resume worker", False),
                 f"  message 4: {send_msg('<agent id>')}",
