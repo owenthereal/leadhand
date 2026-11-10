@@ -4,7 +4,7 @@ import sys
 
 from leadhand import __version__
 
-COMMAND_MODULES: list[str] = ["leadhand.deck"]
+COMMAND_MODULES: list[str] = ["leadhand.deck", "leadhand.route"]
 
 
 def add_commands(sub) -> None:
