@@ -1,3 +1,4 @@
+import os
 import shutil
 import tempfile
 import unittest
@@ -19,7 +20,7 @@ class GitopsTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="leadhand gitops "))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        hermetic(self)
+        hermetic(self, self.tmp)
 
     # -- helpers ---------------------------------------------------------
 
@@ -480,6 +481,22 @@ class GitopsTests(unittest.TestCase):
         saved = preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=tip, expected_branch=branch)
         self.assertEqual(run_git(ws, "show", f"{saved}:my dir/a file.txt"), "edited")
         self.assertIsNone(detect_violation(ws, tip, branch))
+
+    def test_git_helpers_refuse_paths_outside_the_fixture(self):
+        here = Path(__file__).resolve().parent  # inside the project's own checkout
+        for cwd in (None, here, self.tmp.parent, Path("/")):
+            with self.subTest(cwd=cwd), self.assertRaises(AssertionError):
+                run_git(cwd, "status")
+        with self.assertRaises(AssertionError):
+            write(here, {"escaped-fixture-file.txt": "x\n"})
+        self.assertFalse((here / "escaped-fixture-file.txt").exists())
+        with self.assertRaises(AssertionError):
+            write(self.tmp, {"../escaped.txt": "x\n"})
+        self.assertFalse((self.tmp.parent / "escaped.txt").exists())
+        with self.assertRaises(AssertionError):
+            make_repo(here, name="escaped repo")
+        self.assertFalse((here / "escaped repo").exists())
+        self.assertEqual(os.environ["GIT_CEILING_DIRECTORIES"], str(self.tmp.resolve().parent))
 
     def test_git_error_includes_stderr(self):
         repo = make_repo(self.tmp)
