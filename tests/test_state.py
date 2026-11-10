@@ -159,6 +159,43 @@ class AppendTests(RunDirCase):
         with self.assertRaises(ValueError):
             state.read_events(self.paths)
 
+    def test_read_holds_state_lock_so_tail_repair_cannot_tear_it(self):
+        # Simulate: reader gets the first chunk (A + crash remnant), a writer then
+        # repairs the tail and appends B, reader gets the rest. Without the lock
+        # the splice is `A\nPAR` + `...B` -> a complete unparseable line.
+        state.append_attempt(self.paths, {"a": 1})
+        first_len = self.paths.attempts.stat().st_size
+        with open(self.paths.attempts, "ab") as f:
+            f.write(b'{"par')
+        cut = first_len + 5
+        writer_done = threading.Event()
+
+        def writer():
+            state.append_attempt(self.paths, {"b": 2})
+            writer_done.set()
+
+        real = state._read_bytes
+        threads = []
+
+        def torn_read(file):
+            head = real(file)[:cut]
+            t = threading.Thread(target=writer)
+            threads.append(t)
+            t.start()
+            writer_done.wait(0.5)  # a locked reader keeps the writer waiting
+            return head + real(file)[cut:]
+
+        with mock.patch.object(state, "_read_bytes", torn_read):
+            result = state.read_attempts(self.paths)
+        self.assertEqual(result, [{"a": 1}])
+        threads[0].join(timeout=30)
+        self.assertTrue(writer_done.is_set())
+        self.assertEqual(state.read_attempts(self.paths), [{"a": 1}, {"b": 2}])
+
+    def test_read_of_missing_run_dir_is_empty(self):
+        gone = state.run_paths(self.root / "nope")
+        self.assertEqual(state.read_events(gone), [])
+
     def test_append_after_truncated_final_record_stays_valid(self):
         state.append_event(self.paths, "run_started")
         state.append_event(self.paths, "paused")
@@ -446,6 +483,50 @@ class FoldCardsTests(unittest.TestCase):
         c = state.fold_cards(events, [1])[1]
         self.assertEqual((c.state, c.worker_id, c.dispatch_id), ("requested", None, "d2"))
 
+    def test_fold_cards_parked_stays_parked_on_late_events(self):
+        events = [
+            ev(1, "card_cut", card=1, branch="b", base="a"),
+            ev(2, "dispatch_requested", dispatch_id="d1", card=1, attempt=1,
+               dispatch_kind="implement", vendor="codex"),
+            ev(3, "parked", card=1, reason="operator"),
+            ev(4, "worker_started", dispatch_id="d1", worker_id="w1"),
+            ev(5, "result_recorded", dispatch_id="d1", status="READY", tip="t"),
+            ev(6, "verdict_recorded", card=1, verdict="approve", findings=None),
+            ev(7, "fix_round", card=1, n=1),
+            ev(8, "accept_started", card=1, target="t"),
+        ]
+        c = state.fold_cards(events, [1])[1]
+        self.assertEqual(c.state, "parked")
+        self.assertEqual((c.status, c.tip, c.verdict, c.worker_id), ("READY", "t", "approve", "w1"))
+        self.assertEqual(c.park_reason, "operator")
+        events.append(ev(9, "unparked", card=1, note="go"))
+        self.assertEqual(state.fold_cards(events, [1])[1].state, "cut")
+
+    def test_fold_cards_exposes_dispatch_kind_for_phase_disambiguation(self):
+        events = [
+            ev(1, "card_cut", card=1, branch="b", base="a"),
+            ev(2, "dispatch_requested", dispatch_id="d1", card=1, attempt=1,
+               dispatch_kind="implement", vendor="codex"),
+        ]
+        c = state.fold_cards(events, [1])[1]
+        self.assertEqual((c.state, c.dispatch_kind), ("requested", "implement"))
+        events.append(ev(3, "dispatch_requested", dispatch_id="d2", card=1, attempt=1,
+                         dispatch_kind="review", vendor="claude"))
+        c = state.fold_cards(events, [1])[1]
+        self.assertEqual((c.state, c.dispatch_kind), ("reviewing", "review"))
+        # fix round recorded, no fix dispatch yet: fixing, but dispatch_kind is not "fix"
+        events.append(ev(4, "verdict_recorded", card=1, verdict="changes", findings="f"))
+        events.append(ev(5, "fix_round", card=1, n=1))
+        c = state.fold_cards(events, [1])[1]
+        self.assertEqual((c.state, c.dispatch_kind), ("fixing", "review"))
+        events.append(ev(6, "dispatch_requested", dispatch_id="d3", card=1, attempt=2,
+                         dispatch_kind="fix", vendor="codex"))
+        c = state.fold_cards(events, [1])[1]
+        self.assertEqual((c.state, c.dispatch_kind), ("fixing", "fix"))
+        events.append(ev(7, "card_cut", card=1, branch="b2", base="a"))
+        self.assertIsNone(state.fold_cards(events, [1])[1].dispatch_kind)
+        self.assertIsNone(state.fold_cards([], [1])[1].dispatch_kind)
+
     def test_card_states_constant(self):
         self.assertEqual(state.CARD_STATES, (
             "pending", "cut", "requested", "started", "reported", "reviewing", "reviewed",
@@ -454,7 +535,8 @@ class FoldCardsTests(unittest.TestCase):
 
 def card(number, st="accepted", **kw):
     base = dict(number=number, state=st, attempt=1, branch=None, base=None, tip=None,
-                dispatch_id=None, worker_id=None, vendor=None, status=None, verdict=None,
+                dispatch_id=None, dispatch_kind=None, worker_id=None, vendor=None,
+                status=None, verdict=None,
                 findings=None, fix_rounds=0, kind_counts={}, accept_target=None,
                 accepted_sha=None, park_reason=None)
     base.update(kw)

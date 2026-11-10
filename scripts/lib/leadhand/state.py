@@ -276,16 +276,31 @@ def _parse_line(raw: bytes, file: Path) -> dict:
     return value
 
 
-def _read_jsonl(file: Path) -> list[dict]:
+def _read_bytes(file: Path) -> bytes:
+    """Whole-file read (a seam for tests; may take several read() calls)."""
+    with open(file, "rb") as f:
+        return f.read()
+
+
+def _read_jsonl(paths: RunPaths, file: Path) -> list[dict]:
     """Every complete line, parsed. A final line with no newline is a write in
     progress or a crash remnant and is ignored; a complete line that does not
-    parse is real corruption and raises ValueError."""
-    try:
-        raw = Path(file).read_bytes()
-    except FileNotFoundError:
+    parse is real corruption and raises ValueError.
+
+    The read holds the (short-held) state lock: a writer's tail repair
+    (truncate a remnant, then append) between two read() calls would otherwise
+    splice the remnant onto the new record and look like corruption.
+    """
+    file = Path(file)
+    if not paths.root.is_dir():
         return []
+    with state_lock(paths):
+        try:
+            raw = _read_bytes(file)
+        except FileNotFoundError:
+            return []
     lines = raw.split(b"\n")[:-1]
-    return [_parse_line(line, Path(file)) for line in lines if line.strip()]
+    return [_parse_line(line, file) for line in lines if line.strip()]
 
 
 def append_jsonl(paths: RunPaths, file: Path, record: dict) -> None:
@@ -321,7 +336,7 @@ def append_event(paths: RunPaths, kind: str, /, **fields: Any) -> dict:
 
 
 def read_events(paths: RunPaths) -> list[dict]:
-    return _read_jsonl(paths.events)
+    return _read_jsonl(paths, paths.events)
 
 
 def append_attempt(paths: RunPaths, record: dict) -> None:
@@ -329,7 +344,7 @@ def append_attempt(paths: RunPaths, record: dict) -> None:
 
 
 def read_attempts(paths: RunPaths) -> list[dict]:
-    return _read_jsonl(paths.attempts)
+    return _read_jsonl(paths, paths.attempts)
 
 
 def write_json_atomic(path: Path, data: dict) -> None:
@@ -374,6 +389,7 @@ class CardState:
     base: str | None
     tip: str | None
     dispatch_id: str | None
+    dispatch_kind: str | None
     worker_id: str | None
     vendor: str | None
     status: str | None
@@ -388,7 +404,7 @@ class CardState:
 
 def _blank_card(number: int) -> CardState:
     return CardState(number=number, state="pending", attempt=0, branch=None, base=None,
-                     tip=None, dispatch_id=None, worker_id=None, vendor=None, status=None,
+                     tip=None, dispatch_id=None, dispatch_kind=None, worker_id=None, vendor=None, status=None,
                      verdict=None, findings=None, fix_rounds=0, kind_counts={},
                      accept_target=None, accepted_sha=None, park_reason=None)
 
@@ -437,6 +453,25 @@ def fold_cards(events: list[dict], card_numbers: list[int]) -> dict[int, CardSta
         unparked{card, note}                    -> cut if the card has a branch, else pending.
                                                    park_reason cleared.
 
+    A parked card records the fields of later events (a late result_recorded or
+    verdict_recorded for its in-flight dispatch still sets status, tip, verdict, ...) but its
+    state stays `parked`; only `unparked` leaves it.
+
+    Phases that share a state are told apart by `dispatch_kind` (the kind of the card's
+    current dispatch, set by dispatch_requested, cleared by card_cut):
+        reviewing + dispatch_kind "review"  -> a review dispatch is in flight or finished,
+                                               verdict not yet recorded
+        reviewing + anything else           -> not reachable by folding
+        fixing    + dispatch_kind "fix"     -> a fix dispatch is requested/started
+        fixing    + dispatch_kind != "fix"  -> fix round recorded, nothing dispatched yet
+                                               (dispatch_kind is the previous dispatch's)
+        requested / started                 -> dispatch_kind says implement, conflict, ...
+        reported                            -> dispatch_kind says which dispatch reported
+        integrating                         -> integration_started / rebased / conflict recorded;
+                                               dispatch_kind is the previous dispatch's, so it
+                                               says nothing about the integration step (a
+                                               conflict dispatch moves the card to requested)
+
     The dispatch's own kind is `dispatch_kind` (implement, fix, review, conflict, ...)
     because `kind` is the event kind in every record. worker_started and result_recorded
     name only a dispatch_id; they apply to the card that dispatch belongs to, and only while
@@ -465,17 +500,20 @@ def fold_cards(events: list[dict], card_numbers: list[int]) -> dict[int, CardSta
             continue
         if kind in ("worker_started", "result_recorded") and card.dispatch_id != e.get("dispatch_id"):
             continue
+        held = card.state == "parked" and kind != "unparked"
+        before = card.state
 
         if kind == "card_cut":
             card.state = "cut"
             card.branch = e.get("branch")
             card.base = e.get("base")
             card.tip = card.verdict = card.findings = card.status = None
-            card.dispatch_id = card.worker_id = card.accept_target = None
+            card.dispatch_id = card.dispatch_kind = card.worker_id = card.accept_target = None
             card.fix_rounds = 0
         elif kind == "dispatch_requested":
             card.state = {"review": "reviewing", "fix": "fixing"}.get(dispatch_kind, "requested")
             card.dispatch_id = e.get("dispatch_id")
+            card.dispatch_kind = dispatch_kind
             card.attempt = e.get("attempt", card.attempt)
             card.vendor = e.get("vendor")
             card.worker_id = card.status = None
@@ -516,6 +554,8 @@ def fold_cards(events: list[dict], card_numbers: list[int]) -> dict[int, CardSta
         elif kind == "unparked":
             card.state = "cut" if card.branch is not None else "pending"
             card.park_reason = None
+        if held:
+            card.state = before  # only `unparked` leaves parked
     return cards
 
 
