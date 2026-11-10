@@ -295,9 +295,12 @@ def _find_unfinished(docs: Path, source: str, digest: str) -> Path | None:
 
 def _free_branch(docs: Path, repo: Path, requested: str) -> str:
     """The deck's branch, or its first free numeric suffix (`-2`, `-3`, ...) when another run
-    of this repo owns it: a new run never reuses another run's branch, card branches or
-    worktree (R26')."""
+    of this repo owns it or the branch already exists (left by a start that crashed before
+    run.json, or made by someone else): a new run never reuses another run's branch, card
+    branches or worktree (R26')."""
     taken = {meta.get("branch") for _, meta in _runs(docs) if meta.get("repo") == str(repo)}
+    taken |= {ref.removeprefix("refs/heads/")
+              for ref in git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/").splitlines()}
     branch, n = requested, 1
     while branch in taken:
         n += 1
@@ -684,14 +687,21 @@ def _worker_failed(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
 
     A result that already ended the run (an `outcome` after it) is seen again only after the
     run was resumed: the work is dispatched again as the same attempt, and the retry budget
-    counts only results since the latest `resumed`."""
+    counts only results after the latest ending a `resumed` followed (a relaunch without an
+    ending keeps the budget)."""
     r = d.result
     status = r["status"]
     if not any(e["kind"] == "outcome" and e["seq"] > r["seq"] for e in events):
         if status == "BLOCKED" and r.get("blocked_by") == "usage limit":
             _end_blocked(ctx, events, "provider capacity")
             return None
-        since = max((e["seq"] for e in events if e["kind"] == "resumed"), default=0)
+        # The budget restarts only after an ending the run was resumed from, not on every relaunch.
+        since, ending = 0, None
+        for e in events:
+            if e["kind"] == "outcome":
+                ending = e["seq"]
+            elif e["kind"] == "resumed" and ending is not None:
+                since = ending
         same = [x for x in _card_dispatches(index, c.number, attempt=d.req["attempt"], kinds=(d.kind,))
                 if x.result is not None and x.result["seq"] > since]
         if status == "BLOCKED":

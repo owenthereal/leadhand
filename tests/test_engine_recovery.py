@@ -4,8 +4,10 @@ import io
 import json
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from fakeworld import FakeWorld, card
+from gitfixture import commit, run_git
 from leadhand import engine
 from leadhand.engine import EngineError
 from leadhand.state import append_event
@@ -46,6 +48,19 @@ class ResumeAfterBlocked(unittest.TestCase):
                                                 "c1-a1-implement-3", "c1-a1-implement-4"])
         self.assertEqual(len(w.events("outcome")), 1)
         self.assertEqual([e["card"] for e in w.events("accepted")], [1])
+
+    def test_relaunch_without_an_outcome_keeps_the_retry_budget(self):
+        w = FakeWorld(self, card_list())
+        w.start()
+        blocked = {"status": "BLOCKED", "blocked_by": "environment"}
+        w.script(1, "implement", blocked, blocked)
+        w.act(w.next())
+        retry = w.next()
+        self.assertEqual(retry["dispatch_id"], "c1-a1-implement-2")
+        append_event(w.paths, "resumed", note="the launcher relaunched the supervisor")
+        w.act(retry)
+        done = w.next()
+        self.assertEqual((done["action"], done["outcome"], done["qualifier"]), ("done", "blocked", "environment"))
 
     def test_park_after_the_run_ended_raises(self):
         w = FakeWorld(self, card_list())
@@ -108,6 +123,39 @@ class RunCollisions(unittest.TestCase):
         self.assertIn(f"run: {first}-2\n", r.stdout)
         self.assertEqual(w.branch_tip("leadhand/demo"), finished_tip)
         self.assertEqual(w.branch_tip("leadhand/demo-2"), w.base)
+
+    def test_interrupted_start_retry_uses_a_free_branch(self):
+        w = FakeWorld(self, card_list())
+        real = engine.write_json_atomic
+        calls = []
+
+        def fail_once(path, data):
+            if Path(path).name == "run.json" and not calls:
+                calls.append(path)
+                raise OSError("simulated crash before run.json")
+            return real(path, data)
+
+        with mock.patch.object(engine, "write_json_atomic", side_effect=fail_once):
+            with self.assertRaises(OSError):
+                w.start()
+        self.assertEqual(run_git(w.repo, "rev-parse", "refs/heads/leadhand/demo"), w.base)
+        run_dir = w.start()
+        meta = json.loads((run_dir / "run.json").read_text())
+        self.assertEqual((meta["branch"], meta["branch_requested"]), ("leadhand/demo-2", "leadhand/demo"))
+        self.assertTrue(Path(meta["workspace"]).is_dir())
+        w.run()
+        self.assertEqual([e["card"] for e in w.events("accepted")], [1])
+
+    def test_unrecorded_existing_branch_is_not_reused(self):
+        w = FakeWorld(self, card_list())
+        run_git(w.repo, "checkout", "--quiet", "-b", "leadhand/demo")
+        theirs = commit(w.repo, {"theirs.txt": "not a run\n"}, "someone else's work")
+        run_git(w.repo, "checkout", "--quiet", "main")
+        w.start()
+        self.assertEqual(w.meta()["branch"], "leadhand/demo-2")
+        self.assertEqual(w.branch_tip("leadhand/demo-2"), w.base)
+        w.run()
+        self.assertEqual(w.branch_tip("leadhand/demo"), theirs)
 
     def test_new_run_without_worktree_ignores_a_stale_scratch_report(self):
         w = FakeWorld(self, card_list(), config="[run]\nworktree = false\n")
