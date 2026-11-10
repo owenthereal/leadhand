@@ -1107,7 +1107,7 @@ def _resume_unparked(ctx: _Run, c: CardState, events: list[dict], index: dict[st
         notes = (notes + "\n\n" if notes else "") + (
             f"## The operator's note\n\nThis card was parked because {parks[-1]['reason']}. "
             f"The operator resumed it with:\n\n{note}")
-        resume = None if capped.kind in CHECK_KINDS else index.get(capped.req.get("resumes") or "")
+        resume = None if capped.kind not in IMPLEMENTER_KINDS else index.get(capped.req.get("resumes") or "")
         _request(ctx, c, events, kind=capped.kind, attempt=capped.req["attempt"], role=capped.req["role"],
                  route=capped.route, extra=capped.req.get("extra") or {}, notes=notes, resume=resume)
         return
@@ -1198,10 +1198,13 @@ def _workspace_kept(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict]) -
             "\n\nAn earlier worker on this step changed the workspace or moved a branch it must "
             "leave alone, so its result was voided. Never stage or commit what this brief does not "
             "ask for, check out another branch, or create, move or delete any other ref.")
-    # The same resume chain as the voided dispatch, so its guard and routing carry over (an
-    # answer to an integrate worker stays one).
+    # R33: a check (review, rereview, verify, and any later check kind) runs again with a fresh
+    # worker, never the one whose result was voided. An implementer-side step keeps the voided
+    # dispatch's resume chain, so its guard and routing carry over (an answer to an integrate
+    # worker stays one).
+    resume = None if d.kind not in IMPLEMENTER_KINDS else _dispatches(events).get(d.req.get("resumes") or "")
     _request(ctx, c, events, kind=d.kind, attempt=d.req["attempt"], role=d.req["role"], route=d.route,
-             extra=d.req.get("extra") or {}, notes=notes, resume=_dispatches(events).get(d.req.get("resumes") or ""))
+             extra=d.req.get("extra") or {}, notes=notes, resume=resume)
     return False
 
 

@@ -646,6 +646,34 @@ class FixRound2(unittest.TestCase):
         self.assertEqual([e["dispatch_id"] for e in w.events("verdict_recorded")], ["c1-a1-review-4"])
         self.assertEqual([e["card"] for e in w.events("accepted")], [1])
 
+    def test_voided_rereview_is_rerun_by_a_fresh_worker(self):
+        # R33: a voided check never resumes the reviewer whose result was voided.
+        def tamper(world, ws, a):
+            write(ws, {"README.md": "changed by the reviewer\n"})
+
+        w = FakeWorld(self, [card(1)])
+        w.start()
+        w.script(1, "review", {"verdict": "defects"})
+        w.script(1, "fix", {"files": {"src/widget.py": "fixed = True\n"}})     # production: a rereview
+        w.script(1, "rereview", {"tamper": tamper}, {})
+        w.run()
+        first = requested(w, "c1-a1-rereview-1")
+        self.assertEqual(first["resumes"], "c1-a1-review-1")
+        self.assertEqual(first["resume_worker"], worker_of(w, "c1-a1-review-1"))
+        (v,) = found(w)
+        self.assertEqual(v["dispatch_id"], "c1-a1-rereview-1")
+        rerun = requested(w, "c1-a1-rereview-2")
+        self.assertIsNone(rerun["resumes"])
+        self.assertIsNone(rerun["resume_worker"])
+        started = w.started[w.dispatch_ids().index("c1-a1-rereview-2")]
+        self.assertIsNone(started["resume"])
+        self.assertEqual((rerun["vendor"], rerun["model"], rerun["effort"], rerun["role"]),
+                         (first["vendor"], first["model"], first["effort"], first["role"]))
+        self.assertEqual(rerun["extra"], first["extra"])
+        self.assertEqual([e["dispatch_id"] for e in w.events("verdict_recorded")],
+                         ["c1-a1-review-1", "c1-a1-rereview-2"])
+        self.assertEqual([e["card"] for e in w.events("accepted")], [1])
+
 
 if __name__ == "__main__":
     unittest.main()
