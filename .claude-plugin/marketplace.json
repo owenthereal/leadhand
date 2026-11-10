@@ -1,0 +1,7 @@
+{
+  "name": "leadhand",
+  "owner": {"name": "leadhand"},
+  "plugins": [
+    {"name": "leadhand", "source": "./", "version": "0.1.0", "description": "Give leadhand an approved plan. It carries the work through implementation and review with fresh, bounded workers, and returns a checked branch with clear evidence."}
+  ]
+}
