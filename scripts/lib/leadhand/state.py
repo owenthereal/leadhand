@@ -455,7 +455,8 @@ def fold_cards(events: list[dict], card_numbers: list[int]) -> dict[int, CardSta
 
     A parked card records the fields of later events (a late result_recorded or
     verdict_recorded for its in-flight dispatch still sets status, tip, verdict, ...) but its
-    state stays `parked`; only `unparked` leaves it.
+    state stays `parked`; only `unparked` leaves it, and `accepted`, which overrides `parked`
+    (the run branch is the truth: once the fast-forward is recorded, the card is in).
 
     Phases that share a state are told apart by `dispatch_kind` (the kind of the card's
     current dispatch, set by dispatch_requested, cleared by card_cut):
@@ -500,7 +501,8 @@ def fold_cards(events: list[dict], card_numbers: list[int]) -> dict[int, CardSta
             continue
         if kind in ("worker_started", "result_recorded") and card.dispatch_id != e.get("dispatch_id"):
             continue
-        held = card.state == "parked" and kind != "unparked"
+        # Only `unparked` leaves parked, except `accepted`: the run branch is the truth (R12).
+        held = card.state == "parked" and kind not in ("unparked", "accepted")
         before = card.state
 
         if kind == "card_cut":
@@ -555,7 +557,7 @@ def fold_cards(events: list[dict], card_numbers: list[int]) -> dict[int, CardSta
             card.state = "cut" if card.branch is not None else "pending"
             card.park_reason = None
         if held:
-            card.state = before  # only `unparked` leaves parked
+            card.state = before
     return cards
 
 

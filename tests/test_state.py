@@ -502,6 +502,18 @@ class FoldCardsTests(unittest.TestCase):
         events.append(ev(9, "unparked", card=1, note="go"))
         self.assertEqual(state.fold_cards(events, [1])[1].state, "cut")
 
+    def test_fold_cards_accepted_overrides_parked(self):
+        # R12: the run branch is the truth; once the fast-forward is recorded the card is in.
+        events = [
+            ev(1, "card_cut", card=1, branch="b", base="a"),
+            ev(2, "accept_started", card=1, target="t"),
+            ev(3, "parked", card=1, reason="operator"),
+            ev(4, "accepted", card=1, sha="t"),
+            ev(5, "unparked", card=1, note="late"),
+        ]
+        c = state.fold_cards(events, [1])[1]
+        self.assertEqual((c.state, c.accepted_sha), ("accepted", "t"))
+
     def test_fold_cards_exposes_dispatch_kind_for_phase_disambiguation(self):
         events = [
             ev(1, "card_cut", card=1, branch="b", base="a"),
