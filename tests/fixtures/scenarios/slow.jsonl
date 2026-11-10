@@ -1,0 +1,7 @@
+{"type": "thread.started", "thread_id": "{thread}"}
+{"type": "turn.started"}
+{"action": "append_loop", "path": "progress.log", "interval": 0.2}
+{"type": "item.started", "item": {"id": "item_1", "type": "command_execution", "command": "sleep 60", "aggregated_output": "", "exit_code": null, "status": "in_progress"}}
+{"action": "tool_child", "seconds": 60}
+{"action": "sleep", "seconds": 60}
+{"action": "last_message", "text": "Status: READY\n"}

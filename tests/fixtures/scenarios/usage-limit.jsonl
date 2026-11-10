@@ -1,0 +1,6 @@
+{"type": "thread.started", "thread_id": "{thread}"}
+{"type": "turn.started"}
+{"type": "error", "message": "You've hit your usage limit. Try again later."}
+{"type": "turn.failed", "error": {"message": "You've hit your usage limit. Try again later."}}
+{"action": "stderr", "text": "ERROR: You've hit your usage limit."}
+{"action": "exit", "code": 1}

@@ -1,0 +1,6 @@
+{"type": "thread.started", "thread_id": "{thread}"}
+{"type": "turn.started"}
+{"action": "rollout", "fixture": "codex-rollout-interrupted.jsonl"}
+{"type": "item.completed", "item": {"id": "item_1", "type": "command_execution", "command": "echo hi", "aggregated_output": "hi", "exit_code": 0, "status": "completed"}}
+{"action": "sleep", "seconds": 60}
+{"action": "last_message", "text": "Status: READY\n"}

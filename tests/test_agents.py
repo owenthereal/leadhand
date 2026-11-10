@@ -16,7 +16,7 @@ EXPECTED = {
                  "omitClaudeMd": "true", "tools": TOOLS_READ_BASH},
     "scout": {"name": "scout", "model": "haiku", "effort": "low", "maxTurns": "30",
               "omitClaudeMd": "true", "tools": TOOLS_READ_BASH},
-    "codex": {"name": "codex", "model": "haiku", "effort": "low", "maxTurns": "4", "tools": "Bash"},
+    "codex": {"name": "codex", "model": "haiku", "effort": "low", "maxTurns": "12", "tools": "Bash"},
 }
 CARRY_CONTRACT = ("implementer", "verifier", "scout")
 
@@ -64,7 +64,8 @@ class AgentTests(unittest.TestCase):
 
     def test_codex_proxy_runs_one_command(self):
         _, body = split(AGENTS / "codex.md")
-        for phrase in ("exactly the one command", "verbatim", "Never run another command"):
+        for phrase in ("exactly the one command", "verbatim", "Never run another command",
+                       "If the command prints `still running`, run the exact\nsame command again."):
             self.assertIn(phrase, body)
 
 
