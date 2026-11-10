@@ -383,6 +383,57 @@ class GitopsTests(unittest.TestCase):
         self.assertFalse(self.git_path_exists(ws, "CHERRY_PICK_HEAD"))
         self.assertIsNone(detect_violation(ws, h, branch))
 
+    def autostash_fixture(self):
+        repo, ws, _ = self.workspace()
+        branch, _, _ = self.card(ws, 1, {"f.txt": "orig\n", "g.txt": "g\n"})
+        run_git(ws, "checkout", "--quiet", "-b", "side")
+        commit(ws, {"f.txt": "side\n"}, "side")
+        run_git(ws, "checkout", "--quiet", branch)
+        h = commit(ws, {"f.txt": "card\n"}, "card")
+        write(ws, {"g.txt": "dirty\n"})  # the reviewer's uncommitted change, autostashed
+        return ws, branch, h
+
+    def assert_autostash_kept(self, ws, branch, h):
+        saved = preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=branch)
+        self.assertIn("<<<<<<<", run_git(ws, "show", f"{saved}:f.txt"))
+        self.assertEqual(run_git(ws, "stash", "list"), "")
+        self.assertEqual(run_git(ws, "show", "refs/leadhand/saved/1-autostash:g.txt"), "dirty")
+        self.assertEqual(current_branch(ws), branch)
+        self.assertIsNone(detect_violation(ws, h, branch))
+        self.assertEqual((ws / "g.txt").read_text(), "g\n")
+
+        # A later violation under the same ref drops the stale sibling.
+        write(ws, {"g.txt": "again\n"})
+        preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=branch)
+        self.assertFalse(self.ref_exists(ws, "refs/leadhand/saved/1-autostash"))
+        self.assertEqual(run_git(ws, "stash", "list"), "")
+
+    def test_preserve_keeps_a_conflicted_merge_autostash(self):
+        ws, branch, h = self.autostash_fixture()
+        run_git(ws, "merge", "--autostash", "--no-edit", "side", check=False)
+        self.assertTrue(self.ref_exists(ws, "MERGE_AUTOSTASH"))
+        self.assert_autostash_kept(ws, branch, h)
+        self.assertFalse(self.ref_exists(ws, "MERGE_AUTOSTASH"))
+
+    def test_preserve_keeps_a_conflicted_rebase_autostash(self):
+        ws, branch, h = self.autostash_fixture()
+        run_git(ws, "rebase", "--autostash", "side", check=False)
+        self.assertTrue((self.git_path_exists(ws, "rebase-merge/autostash")
+                         or self.git_path_exists(ws, "rebase-apply/autostash")))
+        self.assert_autostash_kept(ws, branch, h)
+        self.assertFalse(self.git_path_exists(ws, "rebase-merge"))
+
+    def test_preserve_drops_a_stale_branch_sibling(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h = self.card(ws, 1, {"f.txt": "orig\n"})
+        commit(ws, {"f.txt": "stray\n"}, "reviewer commit on the card branch")
+        run_git(ws, "checkout", "--quiet", "--detach", h)
+        preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=branch)
+        self.assertTrue(self.ref_exists(ws, "refs/leadhand/saved/1-branch"))
+        write(ws, {"f.txt": "edited\n"})
+        preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=branch)
+        self.assertFalse(self.ref_exists(ws, "refs/leadhand/saved/1-branch"))
+
     def test_prepare_workspace_without_worktree_refuses_uncommitted_changes(self):
         repo = make_repo(self.tmp)
         base = run_git(repo, "rev-parse", "HEAD")

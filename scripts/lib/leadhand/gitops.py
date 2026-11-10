@@ -352,8 +352,12 @@ def preserve_and_restore(ws: Path, *, ref: str, expected_head: str, expected_bra
 
     When `expected_branch` itself moved to a commit the saved commit does not contain
     (HEAD was elsewhere), that tip is kept on the sibling ref `<ref>-branch`. A deleted
-    `expected_branch` is recreated. In-progress rebase, am, cherry-pick and merge states
-    are cleared. `refs/stash` is never touched. Untracked files are left alone."""
+    `expected_branch` is recreated. The autostash of a conflicted merge or rebase
+    (`--autostash` or the autoStash settings) is kept on `<ref>-autostash` instead of
+    landing on the shared stash. A sibling ref this call does not need is deleted, so
+    `ref` and its siblings always describe one violation. In-progress rebase, am,
+    cherry-pick and merge states are cleared. `refs/stash` is never touched. Untracked
+    files are left alone."""
     if not ref.startswith("refs/") or _run(ws, ("check-ref-format", ref)).returncode != 0:
         raise GitError(f"not a valid ref to preserve under: {ref!r}")
     _check_branch_name(ws, expected_branch)
@@ -366,15 +370,45 @@ def preserve_and_restore(ws: Path, *, ref: str, expected_head: str, expected_bra
         raise _fail(r, ws)
     git(ws, "update-ref", "-m", "leadhand: preserve workspace", ref, saved)
     branch_ref = f"refs/heads/{expected_branch}"
+    moved_tip = None
     if _ref_exists(ws, branch_ref):
         tip = head(ws, branch_ref)
         if not (_test(ws, "merge-base", "--is-ancestor", tip, saved)
                 or _test(ws, "merge-base", "--is-ancestor", tip, expected_head)):
-            git(ws, "update-ref", "-m", "leadhand: preserve moved branch", f"{ref}-branch", tip)
+            moved_tip = tip
+    _set_sibling(ws, f"{ref}-branch", moved_tip, "leadhand: preserve moved branch")
+    # Take any autostash out of the operation first: quitting it or resetting would
+    # push it onto the shared refs/stash.
+    _set_sibling(ws, f"{ref}-autostash", _take_autostash(ws), "leadhand: preserve autostash")
     _clear_operations(ws)
     git(ws, "checkout", "--quiet", "--force", "-B", expected_branch, expected_head, "--")
     git(ws, "reset", "--quiet", "--hard", expected_head)
     return saved
+
+
+def _set_sibling(ws: Path, name: str, sha: str | None, message: str) -> None:
+    """Point `name` at `sha`, or delete it when None, so a ref set from an earlier
+    call never lingers beside a later violation."""
+    if sha is not None:
+        git(ws, "update-ref", "-m", message, name, sha)
+    elif _ref_exists(ws, name):
+        git(ws, "update-ref", "-d", name)
+
+
+def _take_autostash(ws: Path) -> str | None:
+    """Detach the autostash of a conflicted merge or rebase and return its commit.
+    Only one is expected; any further one is left for git to stash."""
+    r = _run(ws, ("rev-parse", "--verify", "--quiet", "MERGE_AUTOSTASH"))
+    if r.returncode == 0 and r.stdout.strip():
+        git(ws, "update-ref", "-d", "MERGE_AUTOSTASH")
+        return r.stdout.strip()
+    for state in ("rebase-merge", "rebase-apply"):
+        marker = _git_path(ws, state) / "autostash"
+        if marker.exists():
+            sha = head(ws, marker.read_text(encoding="utf-8").strip())
+            marker.unlink()
+            return sha
+    return None
 
 
 def _snapshot_conflicted(ws: Path) -> str:
