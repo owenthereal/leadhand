@@ -380,6 +380,24 @@ def _start(deck_path: Path, repo: Path, config: Config | None, new: bool) -> tup
 # next_action
 
 def next_action(run_dir: Path) -> dict:
+    try:
+        return _next_action(run_dir)
+    finally:
+        _write_status(run_dir)
+
+
+def _write_status(run_dir: Path) -> None:
+    """Rewrite status.json at a checkpoint; a rendering error must never break the engine."""
+    try:
+        if not run_paths(Path(run_dir)).run_json.is_file():
+            return
+        from leadhand import status
+        status.write_status(Path(run_dir))
+    except Exception as e:
+        print(f"leadhand: could not write status.json: {e}", file=sys.stderr)
+
+
+def _next_action(run_dir: Path) -> dict:
     """Perform every mechanical step that is due, then return the supervisor's next action."""
     ctx = _load(run_dir, check_digest=True)
     _charge_supervisor(ctx)
@@ -1391,6 +1409,13 @@ def _end_blocked(ctx: _Run, events: list[dict], reason: str) -> None:
 # record
 
 def record(run_dir: Path, kind: str, **fields: Any) -> dict:
+    try:
+        return _record(run_dir, kind, **fields)
+    finally:
+        _write_status(run_dir)
+
+
+def _record(run_dir: Path, kind: str, **fields: Any) -> dict:
     """Record what the supervisor saw or decided. Returns the event written (or the one
     already there, for a repeated `started` or `result`)."""
     handlers = {"started": _record_started, "result": _record_result, "ruling": _record_ruling,

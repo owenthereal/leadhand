@@ -5,7 +5,8 @@ from pathlib import Path
 
 from leadhand import __version__
 
-COMMAND_MODULES: list[str] = ["leadhand.deck", "leadhand.route", "leadhand.dispatch", "leadhand.engine", "leadhand.launch"]
+COMMAND_MODULES: list[str] = ["leadhand.deck", "leadhand.route", "leadhand.dispatch", "leadhand.engine", "leadhand.launch",
+                                "leadhand.status", "leadhand.report"]
 
 
 def add_commands(sub) -> None:
