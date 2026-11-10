@@ -83,7 +83,7 @@ _HEADER_KV = re.compile(r"^(%s):\s*(.*)$" % "|".join(HEADER_KEYS))
 _FIELD = re.compile(r"^- ([A-Z][A-Za-z ]*?):\s*(.*)$")
 _CARD = re.compile(r"^## Card (\d+):\s*(.*?)\s*$")
 _REQ = re.compile(r"^- (R\d+)\s+(.*)(?:→|->)\s*cards?\s+(.+?)\s*$")
-_HARD = re.compile(r"^yes(?:\s*(?:—|-|:)\s*(.*))?$")
+_HARD = re.compile(r"^yes(?:\s*(?:—|–|-|:)\s*(.*))?$")
 
 
 def _csv(text: str) -> tuple[str, ...]:
@@ -212,16 +212,13 @@ def parse_deck(path: Path) -> Deck:
             in_ctx = False
             while i < n and not lines[i].startswith("## "):
                 text = lines[i]
-                if not in_ctx:
-                    fm = _FIELD.match(text)
-                    if fm:
-                        if fm.group(1) not in CARD_KEYS:
-                            raise DeckError(f"unknown card field {fm.group(1)!r}", i + 1)
-                        fields.append((fm.group(1), fm.group(2).strip(), i + 1))
-                        i += 1
-                        continue
-                    if text.strip():
-                        in_ctx = True
+                fm = _FIELD.match(text)
+                if fm and fm.group(1) in CARD_KEYS:
+                    fields.append((fm.group(1), fm.group(2).strip(), i + 1))
+                    i += 1
+                    continue
+                if text.strip():
+                    in_ctx = True
                 if in_ctx:
                     ctx.append(text)
                 i += 1

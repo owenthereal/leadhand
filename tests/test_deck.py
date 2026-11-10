@@ -119,10 +119,26 @@ class DeckTests(unittest.TestCase):
         self.assertIn(("error", "card 3: Hard: yes needs a reason"), self.messages(d))
 
     def test_hard_yes_with_reason_forms(self):
-        for sep in ("—", "-", ":"):
+        for sep in ("—", "–", "-", ":"):
             d = parse_deck(self.write(deck_text([(1, "implementer", f"yes {sep} no test can check it", "none")])))
             self.assertTrue(d.cards[0].hard)
             self.assertEqual(d.cards[0].hard_reason, "no test can check it")
+
+    def test_fields_after_context_are_parsed(self):
+        text = (deck_text([(1, "implementer", "no", "none"), (2, "implementer", "no", "none")])
+                .replace("- Depends on: none\n- Source: plan\n- Allowed paths: src/\n- Out of scope: nothing\n- Done when: tests pass\n- Stop if: stuck\n", "- Source: plan\n- Allowed paths: src/\n- Out of scope: nothing\n- Done when: tests pass\n- Stop if: stuck\n")
+                + "\nContext: see plan.\n- Depends on: 1\n- Route: codex gpt-6.1-sol xhigh\n"
+                "- Inferred: one\n- Inferred: two\n")
+        c = parse_deck(self.write(text)).cards[1]
+        self.assertEqual(c.depends_on, (1,))
+        self.assertEqual(c.route_pin.model, "gpt-6.1-sol")
+        self.assertEqual(c.inferred, ("one", "two"))
+        self.assertEqual(c.context, "see plan.")
+
+    def test_unknown_key_bullet_is_context(self):
+        text = deck_text([(1, "implementer", "no", "none")]) + "\n- Files: src/a.py\n"
+        c = parse_deck(self.write(text)).cards[0]
+        self.assertEqual(c.context, "- Files: src/a.py")
 
     def test_scout_card_rejected_in_this_version(self):
         d = parse_deck(self.write(deck_text([(1, "scout", "no", "none")])))
