@@ -593,5 +593,59 @@ class FixRound1(unittest.TestCase):
         self.assertEqual([e["card"] for e in w.events("accepted")], [2, 1])
 
 
+class FixRound2(unittest.TestCase):
+    def test_voided_answer_to_integrate_keeps_its_resume_chain(self):
+        # Review scratch test: an answer resuming an integrate worker moves the run branch.
+        def push_run(world, ws, a):
+            run_git(ws, "update-ref", f"refs/heads/{RUN}", "HEAD")
+
+        w = parked_world(self, card1_files={"src/shared.txt": "card one\n"},
+                         card2_files={"src/shared.txt": "card two\n"})
+        engine.unpark(w.run_dir, card=1, note=NOTE)
+        onto = w.branch_tip(RUN)
+        w.script(1, "integrate", {"rebase": False, "status": "QUESTION"})
+        w.script(1, "answer", {}, {"rebase": True, "tamper": push_run}, {"rebase": True})
+        w.rulings[1] = ["Keep card one's version."]
+        w.run()
+        (v,) = found(w)
+        self.assertEqual(v["dispatch_id"], "c1-a2-answer-1")
+        self.assertEqual(v["refs"][f"refs/heads/{RUN}"]["old"], onto)
+        rerun = requested(w, "c1-a2-answer-2")
+        self.assertEqual(rerun["resumes"], "c1-a2-integrate-1")
+        self.assertEqual(rerun["resume_worker"], worker_of(w, "c1-a2-integrate-1"))
+        self.assertEqual(rerun["refs"], {f"refs/heads/{RUN}": onto})
+        (rebased,) = w.events("rebased")
+        self.assertEqual(rebased["dispatch_id"], "c1-a2-answer-2")
+        ids = w.dispatch_ids()
+        self.assertEqual(ids[ids.index("c1-a2-answer-2") + 1], "c1-a2-rereview-1")
+        self.assertEqual([e["card"] for e in w.events("accepted")], [2, 1])
+        self.assertEqual(run_git(w.repo, "show", f"{RUN}:src/shared.txt"), "card one")
+
+    def test_unpark_after_violation_cap_reruns_the_check(self):
+        def tamper(world, ws, a):
+            write(ws, {"README.md": f"rewritten by {a['dispatch_id']}\n"})
+
+        w = FakeWorld(self, [card(1)])
+        w.session("supervisor-1")
+        w.start()
+        w.script(1, "review", *({"tamper": tamper} for _ in range(3)), {})
+        w.run()
+        (parked,) = w.events("parked")
+        self.assertTrue(parked["reason"].startswith("checks change tracked files"))
+        engine.unpark(w.run_dir, card=1, note="The test command no longer rewrites README.md.")
+        a = w.next()
+        self.assertEqual((a["action"], a["kind"], a["dispatch_id"], a["resume"]),
+                         ("dispatch", "review", "c1-a1-review-4", None))
+        old = requested(w, "c1-a1-review-3")
+        self.assertEqual(a["route"], {"vendor": old["vendor"], "model": old["model"], "effort": old["effort"]})
+        self.assertEqual(a["role"], old["role"])
+        self.assertIn("no longer rewrites README.md", Path(a["brief"]).read_text())
+        w.act(a)
+        w.run()
+        self.assertEqual([i for i in w.dispatch_ids() if "implement" in i or "answer" in i], ["c1-a1-implement-1"])
+        self.assertEqual([e["dispatch_id"] for e in w.events("verdict_recorded")], ["c1-a1-review-4"])
+        self.assertEqual([e["card"] for e in w.events("accepted")], [1])
+
+
 if __name__ == "__main__":
     unittest.main()

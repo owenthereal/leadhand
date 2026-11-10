@@ -1096,7 +1096,21 @@ def _resume_unparked(ctx: _Run, c: CardState, events: list[dict], index: dict[st
     """Resume the card's last implementer worker with the operator's note as the answer when
     that worker can still be reached: a Claude worker started in the current supervisor
     session (Claude workers die with their session), or a Codex dispatch with a recorded
-    thread. Otherwise start a fresh worker on the card's attempt with the note."""
+    thread. Otherwise start a fresh worker on the card's attempt with the note.
+
+    R32: a card the violation cap parked re-runs the kind it was parked on instead, on the
+    same route: a fresh reviewer or verifier; an integrate step keeps its resume chain."""
+    parks = [e for e in events if e["kind"] == "parked" and e.get("card") == c.number]
+    capped = index.get(parks[-1].get("cap_dispatch") or "") if parks else None
+    if capped is not None:
+        notes = (capped.req.get("notes") or "").rstrip("\n")
+        notes = (notes + "\n\n" if notes else "") + (
+            f"## The operator's note\n\nThis card was parked because {parks[-1]['reason']}. "
+            f"The operator resumed it with:\n\n{note}")
+        resume = None if capped.kind in CHECK_KINDS else index.get(capped.req.get("resumes") or "")
+        _request(ctx, c, events, kind=capped.kind, attempt=capped.req["attempt"], role=capped.req["role"],
+                 route=capped.route, extra=capped.req.get("extra") or {}, notes=notes, resume=resume)
+        return
     started = [d for d in _card_dispatches(index, c.number, kinds=IMPLEMENTER_KINDS) if d.started is not None]
     last = max(started, key=lambda d: d.req["seq"]) if started else None
     if last is not None:
@@ -1175,7 +1189,8 @@ def _workspace_kept(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict]) -
         refs = sorted({r for e in count for r in e.get("refs") or {}})
         reason = (f"checks change tracked files: {', '.join(paths)}" if paths
                   else f"{d.kind} workers move refs: {', '.join(refs)}")
-        append_event(ctx.paths, "parked", card=c.number, reason=reason)
+        # R32: unparking re-runs this kind (the card's work was not the problem).
+        append_event(ctx.paths, "parked", card=c.number, reason=reason, cap_dispatch=d.id, cap_kind=d.kind)
         return False
     notes = d.req.get("notes") or ""
     if VOIDED_NOTE not in notes:
@@ -1183,8 +1198,10 @@ def _workspace_kept(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict]) -
             "\n\nAn earlier worker on this step changed the workspace or moved a branch it must "
             "leave alone, so its result was voided. Never stage or commit what this brief does not "
             "ask for, check out another branch, or create, move or delete any other ref.")
+    # The same resume chain as the voided dispatch, so its guard and routing carry over (an
+    # answer to an integrate worker stays one).
     _request(ctx, c, events, kind=d.kind, attempt=d.req["attempt"], role=d.req["role"], route=d.route,
-             extra=d.req.get("extra") or {}, notes=notes)
+             extra=d.req.get("extra") or {}, notes=notes, resume=_dispatches(events).get(d.req.get("resumes") or ""))
     return False
 
 
