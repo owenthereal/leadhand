@@ -10,7 +10,7 @@ from gitfixture import (
 from leadhand.gitops import (
     GitError, Violation, card_branch_name, changed_paths, cut_card_branch, default_base,
     detect_violation, fast_forward, git, git_common_dir, head, is_test_or_doc_path,
-    needs_integration, preserve_and_restore, prepare_workspace, rebase_onto,
+    is_ancestor, needs_integration, preserve_and_restore, prepare_workspace, rebase_onto,
 )
 
 RUN = "leadhand/run-1"
@@ -154,6 +154,13 @@ class GitopsTests(unittest.TestCase):
         fast_forward(ws, RUN, tip_b)
         self.assertTrue(needs_integration(ws, RUN, a))
         self.assertFalse(needs_integration(ws, RUN, b))
+
+    def test_is_ancestor(self):
+        repo, ws, x = self.workspace()
+        a, _, tip_a = self.card(ws, 1, {"a.txt": "a\n"})
+        self.assertTrue(is_ancestor(ws, x, tip_a))
+        self.assertTrue(is_ancestor(ws, tip_a, tip_a))
+        self.assertFalse(is_ancestor(ws, tip_a, x))
 
     def test_rebase_onto_success(self):
         repo, ws, x = self.workspace()

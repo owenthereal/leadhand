@@ -66,7 +66,7 @@ from leadhand.briefs import CODEX_AGENT, agent_for, dispatch_message, parse_repo
 from leadhand.config import VENDORS, Config, ConfigError, Route, docs_dir_for, load_config
 from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, parse_deck
 from leadhand.gitops import (GitError, card_branch_name, changed_paths, cut_card_branch, default_base,
-                             detect_violation, fast_forward, git, head, is_test_or_doc_path,
+                             detect_violation, fast_forward, git, head, is_ancestor, is_test_or_doc_path,
                              needs_integration, prepare_workspace, preserve_and_restore, rebase_onto)
 from leadhand.route import LadderExhausted, PinnedVendorMissing, Resolution, resolve
 from leadhand.state import (CardState, RunPaths, utc_now, append_attempt, append_event, crash_point,
@@ -80,6 +80,11 @@ REVIEW_KINDS = ("review", "rereview")
 # Reviewers and verifiers: they may build, but must leave the workspace and the run's refs as they were.
 CHECK_KINDS = (*REVIEW_KINDS, "verify")
 VOIDED_NOTE = "## An earlier run of this check was voided"
+VIOLATION_CAP = 2             # voided re-runs per card and kind; one more violation parks the card
+# Card states whose card has work open (a dispatch, a review, a fix, an integration or an acceptance).
+ACTIVE_STATES = ("requested", "started", "reported", "reviewing", "reviewed", "fixing", "integrating", "accepting")
+OPERATIONS = (("rebase-merge", "rebase"), ("rebase-apply", "rebase"), ("MERGE_HEAD", "merge"),
+              ("CHERRY_PICK_HEAD", "cherry-pick"), ("REVERT_HEAD", "revert"), ("sequencer", "sequencer"))
 CODEX_GRACE_MINUTES = 5       # the Codex runner enforces its own limit; the proxy gets this much more
 TIMER_INTERVAL = 10.0
 MAX_STEPS = 200               # mechanical steps in one next_action call
@@ -412,12 +417,20 @@ def _charge_supervisor(ctx: _Run) -> None:
                      dispatch_id="supervisor", role="supervisor", path_or_thread=path)
 
 
-def _pick(ctx: _Run, cards: dict[int, CardState]) -> int | None:
-    """A card already in flight, else the first pending card whose dependencies are all accepted."""
+def _pick(ctx: _Run, cards: dict[int, CardState], events: list[dict]) -> int | None:
+    """One card in flight at a time: a card with open work always comes first; then a card
+    that was cut but not dispatched yet; then an unparked card (it waits until nothing else
+    is in flight); else the first pending card whose dependencies are all accepted."""
     order = dependency_order(ctx.deck)
     for n in order:
-        if cards[n].state not in ("pending", "accepted", "parked"):
+        if cards[n].state in ACTIVE_STATES:
             return n
+    cut = [n for n in order if cards[n].state == "cut"]
+    for n in cut:
+        if _pending_unpark(events, n) is None:
+            return n
+    if cut:
+        return cut[0]
     for n in order:
         if cards[n].state == "pending" and all(cards[d].state == "accepted"
                                                for d in ctx.card(n).depends_on if d in cards):
@@ -427,13 +440,19 @@ def _pick(ctx: _Run, cards: dict[int, CardState]) -> int | None:
 
 def _step(ctx: _Run, events: list[dict]) -> dict | None:
     """One mechanical step (returns None after appending an event) or an action."""
+    if _finish_leftovers(ctx, events):
+        return None
     cards = fold_cards(events, ctx.numbers)
-    n = _pick(ctx, cards)
+    n = _pick(ctx, cards, events)
     if n is None:
         return _end_of_run(ctx, cards)
     c = cards[n]
     index = _dispatches(events)
     if c.state == "pending":
+        _no_open_dispatch(ctx, events, n)
+        current = _current_branch(ctx)
+        if _ensure_clean(ctx, events, branch=current or ctx.branch, why=f"before cutting card {n}"):
+            return None
         branch, base = cut_card_branch(ctx.ws, ctx.branch, n)
         append_event(ctx.paths, "card_cut", card=n, branch=branch, base=base)
         return None
@@ -521,12 +540,22 @@ def _request(ctx: _Run, c: CardState, events: list[dict], *, kind: str, attempt:
             **extra}
     guard: dict[str, Any] = {}
     if c.branch:
-        _check_out(ctx, c.branch)
+        _check_out(ctx, events, c.number, c.branch)
         if kind in CHECK_KINDS:
-            # What the worker must leave as it found it (R14): the card tip on the card branch,
+            # Implementer leftovers are preserved and cleared first (R30), so they are not
+            # blamed on the check.
+            _ensure_clean(ctx, events, branch=c.branch, why=f"before {kind} {did}")
+            # What the worker must leave as it found it (R14'): the card tip on the card branch,
             # and every ref of the run.
             guard = {"expected_branch": c.branch, "expected_head": head(ctx.ws, f"refs/heads/{c.branch}"),
                      "refs": _ref_snapshot(ctx)}
+            if kind == "verify" and extra.get("tip") != guard["expected_head"]:
+                raise EngineError(f"card {c.number}: verify of {extra.get('tip')} requested, but the card "
+                                  f"branch is at {guard['expected_head']}")
+        elif kind == "integrate" or (kind == "answer" and _integrate_origin(_dispatches(events), resume)):
+            # An integrate worker rewrites the card branch, but must leave the run branch alone.
+            run_ref = f"refs/heads/{ctx.branch}"
+            guard = {"refs": {run_ref: head(ctx.ws, run_ref)}, "ref_scope": [run_ref]}
     brief, report = write_brief(kind, ws=ctx.ws, deck=ctx.deck, card=ctx.card(c.number), attempt=attempt,
                                 dispatch_id=did, extra=full)
     if notes:
@@ -552,15 +581,34 @@ def _request(ctx: _Run, c: CardState, events: list[dict], *, kind: str, attempt:
                         resume_session=resume_session, minutes=minutes, **guard)
 
 
-def _check_out(ctx: _Run, branch: str) -> None:
-    """Put the workspace on the card branch (it is elsewhere after another card ran, e.g. when a
-    parked card resumes). Never creates the branch."""
+def _current_branch(ctx: _Run) -> str | None:
     try:
-        current = git(ctx.ws, "symbolic-ref", "--quiet", "--short", "HEAD")
+        return git(ctx.ws, "symbolic-ref", "--quiet", "--short", "HEAD")
     except GitError:
-        current = None                      # detached
-    if current != branch:
+        return None                         # detached
+
+
+def _check_out(ctx: _Run, events: list[dict], card: int, branch: str) -> None:
+    """Put the workspace on the card branch when HEAD is on another one (after another card
+    ran, e.g. when a parked card resumes). Never while another card has a dispatch open;
+    leftovers in the way are preserved and cleared first (R30). Never creates the branch."""
+    current = _current_branch(ctx)
+    if current == branch:
+        return
+    _no_open_dispatch(ctx, events, card)
+    _ensure_clean(ctx, events, branch=current or branch, why=f"before switching to {branch}")
+    if _current_branch(ctx) != branch:
         git(ctx.ws, "checkout", "--quiet", branch, "--")
+
+
+def _no_open_dispatch(ctx: _Run, events: list[dict], card: int) -> None:
+    """Refuse to touch the workspace for `card` while another card's worker may be using it."""
+    cards = fold_cards(events, ctx.numbers)
+    for d in _dispatches(events).values():
+        other = d.req.get("card")
+        if (d.result is None and other != card and other in cards
+                and cards[other].state not in ("parked", "accepted") and cards[other].dispatch_id == d.id):
+            raise EngineError(f"card {other} has dispatch {d.id} open; card {card} must wait for it")
 
 
 def _card_base(ctx: _Run, c: CardState, events: list[dict]) -> str:
@@ -697,8 +745,13 @@ def _request_fix(ctx: _Run, c: CardState, events: list[dict], index: dict[str, _
 def _after_result(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
                   index: dict[str, _Dispatch]) -> dict | None:
     r = d.result
-    if d.kind in CHECK_KINDS and not _workspace_kept(ctx, c, d, events):
-        return None                         # the result is void; the same check was requested again
+    if "refs" in d.req and not _workspace_kept(ctx, c, d, events):
+        return None                         # the result is void; the same kind was requested again (or parked)
+    if d.kind in IMPLEMENTER_KINDS and _left_operation(ctx, c, d, events):
+        # A rebase, merge or cherry-pick left in progress is the worker's failure: its state
+        # is preserved and cleared, and the dispatch counts as BLOCKED (environment).
+        events = read_events(ctx.paths)
+        return _worker_failed(ctx, c, d, events, _dispatches(events))
     if d.kind == "verify":
         if r.get("result") == "pass":
             _accept(ctx, c.number, d.req["extra"]["tip"])
@@ -715,7 +768,7 @@ def _after_result(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
             return None
         return _worker_failed(ctx, c, d, events, index)
     status = r["status"]
-    if status == "READY" and d.kind == "integrate":
+    if status == "READY" and _integrate_origin(index, d) is not None:
         _after_integrate(ctx, c, d, events, index)
         return None
     if status == "READY":
@@ -754,9 +807,16 @@ def _worker_failed(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
     counts only results after the latest ending a `resumed` followed (a relaunch without an
     ending keeps the budget)."""
     r = d.result
-    status = r["status"]
+    broken = _broken_dispatches(events)
+
+    def head_of(x: _Dispatch) -> tuple[str, str]:
+        if x.id in broken:
+            return "BLOCKED", "environment"
+        return x.result["status"], x.result.get("blocked_by") or ""
+
+    status, blocked_by = head_of(d)
     if not any(e["kind"] == "outcome" and e["seq"] > r["seq"] for e in events):
-        if status == "BLOCKED" and r.get("blocked_by") == "usage limit":
+        if status == "BLOCKED" and blocked_by == "usage limit":
             _end_blocked(ctx, events, "provider capacity")
             return None
         # The budget restarts only after an ending the run was resumed from, not on every relaunch.
@@ -766,17 +826,17 @@ def _worker_failed(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
                 ending = e["seq"]
             elif e["kind"] == "resumed" and ending is not None:
                 since = ending
-        voided = {e.get("dispatch_id") for e in events if e["kind"] == "violation"}
+        voided = _voided(events)
         same = [x for x in _card_dispatches(index, c.number, attempt=d.req["attempt"], kinds=(d.kind,))
                 if x.result is not None and x.result["seq"] > since and x.id not in voided]
         if status == "BLOCKED":
-            failures = [x for x in same if x.result["status"] == "BLOCKED"
-                        and x.result.get("blocked_by") != "usage limit"]
+            failures = [x for x in same if head_of(x) != ("BLOCKED", "usage limit")
+                        and head_of(x)[0] == "BLOCKED"]
             if len(failures) >= 2:
                 _end_blocked(ctx, events, "environment")
                 return None
         else:
-            failures = [x for x in same if x.result["status"] != "BLOCKED" and x.result.get("verdict") is None
+            failures = [x for x in same if head_of(x)[0] != "BLOCKED" and x.result.get("verdict") is None
                         and x.result.get("result") is None]
             if len(failures) >= 2:
                 what = "a result" if d.kind == "verify" else "a verdict"
@@ -847,8 +907,10 @@ def _accept(ctx: _Run, card: int, target: str | None) -> None:
     c = fold_cards(events, ctx.numbers)[card]
     branch = c.branch or card_branch_name(ctx.branch, card)
     if needs_integration(ctx.ws, ctx.branch, branch):
+        k = 1 + sum(1 for e in events if e["kind"] == "integration_started" and e.get("card") == card)
         integ = append_event(ctx.paths, "integration_started", card=card,
-                             onto=head(ctx.ws, f"refs/heads/{ctx.branch}"), tip=head(ctx.ws, f"refs/heads/{branch}"))
+                             onto=head(ctx.ws, f"refs/heads/{ctx.branch}"), tip=head(ctx.ws, f"refs/heads/{branch}"),
+                             keep=f"refs/leadhand/{ctx.meta['run_id']}/integration/{card}-{k}")
         _rebase(ctx, card, branch, integ)
         return
     integrated = any(e["kind"] == "integration_started" and e.get("card") == card for e in events)
@@ -871,12 +933,12 @@ def _finish_accept(ctx: _Run, card: int, target: str) -> None:
 
 def _contains(ctx: _Run, branch: str, sha: str) -> bool:
     """Whether the branch's tip has `sha` in its history."""
-    return git(ctx.ws, "merge-base", sha, f"refs/heads/{branch}") == head(ctx.ws, sha)
+    return is_ancestor(ctx.ws, sha, f"refs/heads/{branch}")
 
 
 def _verified(events: list[dict], card: int, target: str) -> bool:
     """A verify of exactly `target` passed (and was not voided)."""
-    voided = {e.get("dispatch_id") for e in events if e["kind"] == "violation"}
+    voided = _voided(events)
     return any(d.kind == "verify" and d.req.get("card") == card and (d.req.get("extra") or {}).get("tip") == target
                and d.result is not None and d.result.get("result") == "pass" and d.id not in voided
                for d in _dispatches(events).values())
@@ -889,21 +951,17 @@ def _request_verify(ctx: _Run, c: CardState, events: list[dict], target: str) ->
                  extra={"tip": target})
 
 
-def _abort_stale_rebase(ctx: _Run) -> None:
-    """A rebase left in progress by a process that died mid-way: abort it, which puts the
-    card branch back where it was (the rebase never completed, so nothing is lost)."""
-    for name in ("rebase-merge", "rebase-apply"):
-        if Path(git(ctx.ws, "rev-parse", "--path-format=absolute", "--git-path", name)).exists():
-            git(ctx.ws, "rebase", "--abort")
-            return
-
-
 def _rebase(ctx: _Run, card: int, branch: str, integ: dict) -> None:
     """Rebase the card branch onto the run tip recorded by `integration_started`, then record
     `rebased` or `conflict`. Repeat-safe: a card branch that already contains the run tip
-    counts as rebased; on conflict rebase_onto has aborted the rebase."""
+    counts as rebased; on conflict rebase_onto has aborted the rebase. The pre-integration
+    tip is kept on the integration's `keep` ref first; anything left in the workspace (an
+    implementer's leftovers, or a rebase a dead process left in progress) is preserved and
+    cleared, which puts the card branch back where it was."""
+    if integ.get("keep"):
+        git(ctx.ws, "update-ref", "-m", "leadhand: card tip before integration", integ["keep"], integ["tip"])
     crash_point("before_rebase")
-    _abort_stale_rebase(ctx)
+    _ensure_clean(ctx, read_events(ctx.paths), branch=branch, why=f"before rebasing card {card}")
     onto = integ["onto"]
     conflicts = [] if _contains(ctx, branch, onto) else rebase_onto(ctx.ws, branch, onto)
     crash_point("after_rebase")
@@ -951,16 +1009,40 @@ def _after_integrate(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
     """An integrate attempt reported READY: its branch must now contain the run tip."""
     integ = [e for e in events if e["kind"] == "integration_started" and e.get("card") == c.number][-1]
     branch = c.branch or card_branch_name(ctx.branch, c.number)
-    if _contains(ctx, branch, integ["onto"]):
-        append_event(ctx.paths, "rebased", card=c.number, onto=integ["onto"],
-                     tip=d.result.get("tip") or head(ctx.ws, f"refs/heads/{branch}"), dispatch_id=d.id)
-    else:
-        _escalate(ctx, c, events, index, "reported READY without rebasing the card branch onto the run tip")
+    onto = integ["onto"]
+    kept = (f" The card's commits before integration are kept on {integ['keep']}."
+            if integ.get("keep") else "")
+    if not _contains(ctx, branch, onto):
+        _escalate(ctx, c, events, index,
+                  "reported READY without rebasing the card branch onto the run tip." + kept)
+        return
+    tip = d.result.get("tip") or head(ctx.ws, f"refs/heads/{branch}")
+    old_base = git(ctx.ws, "merge-base", onto, integ["tip"])
+    if changed_paths(ctx.ws, old_base, integ["tip"]) and not changed_paths(ctx.ws, onto, tip):
+        # The card's work vanished (`rebase --skip`, a reset to the run tip): SPENT, not integrated.
+        _escalate(ctx, c, events, index,
+                  "ended SPENT: its integration left none of the card's changes on top of the run tip." + kept)
+        return
+    append_event(ctx.paths, "rebased", card=c.number, onto=onto, tip=tip, dispatch_id=d.id)
+
+
+def _integrate_origin(index: dict[str, _Dispatch], d: _Dispatch | None) -> _Dispatch | None:
+    """The integrate dispatch `d` is, or that `d` answers (through any chain of answers)."""
+    seen = set()
+    while d is not None and d.id not in seen:
+        if d.kind == "integrate":
+            return d
+        if d.kind != "answer":
+            return None
+        seen.add(d.id)
+        d = index.get(d.req.get("resumes") or "")
+    return None
 
 
 def _request_integration_review(ctx: _Run, c: CardState, events: list[dict], index: dict[str, _Dispatch],
                                 rebased: dict) -> None:
-    """Re-review the integrated diff with a fresh reviewer."""
+    """Re-review the integrated diff with a fresh reviewer. Every integrated card gets it,
+    including a low-risk card that `card_review = "by-risk"` let through without a review."""
     impl = [d for d in _card_dispatches(index, c.number, kinds=IMPLEMENTER_KINDS) if d.result is not None]
     last = max(impl, key=lambda d: d.req["seq"]) if impl else None
     res = _resolve_or_park(ctx, ctx.card(c.number), role="reviewer", attempt=1,
@@ -997,25 +1079,46 @@ def _pending_unpark(events: list[dict], card: int) -> dict | None:
     return last
 
 
+def _current_session(ctx: _Run) -> str | None:
+    """The supervisor session making this call: CLAUDE_CODE_SESSION_ID, else the last one run.json
+    recorded."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    if sid:
+        return sid
+    try:
+        sessions = json.loads(ctx.paths.run_json.read_text(encoding="utf-8")).get("supervisor_sessions") or []
+    except (OSError, ValueError):
+        sessions = []
+    return sessions[-1] if sessions else None
+
+
 def _resume_unparked(ctx: _Run, c: CardState, events: list[dict], index: dict[str, _Dispatch], note: str) -> None:
     """Resume the card's last implementer worker with the operator's note as the answer when
-    that worker is known; otherwise start a fresh worker on the card's attempt with the note."""
+    that worker can still be reached: a Claude worker started in the current supervisor
+    session (Claude workers die with their session), or a Codex dispatch with a recorded
+    thread. Otherwise start a fresh worker on the card's attempt with the note."""
     started = [d for d in _card_dispatches(index, c.number, kinds=IMPLEMENTER_KINDS) if d.started is not None]
     last = max(started, key=lambda d: d.req["seq"]) if started else None
-    if last is not None and (last.req["vendor"] == "claude" or (last.result or {}).get("session_id")):
-        _request(ctx, c, events, kind="answer", attempt=last.req["attempt"], role=last.req["role"],
-                 route=last.route, extra={"ruling": note}, resume=last)
-        return
+    if last is not None:
+        if last.req["vendor"] == "claude":
+            session = last.started.get("session")
+            reachable = bool(session) and session == _current_session(ctx)
+        else:
+            reachable = bool((last.result or {}).get("session_id"))
+        if reachable:
+            _request(ctx, c, events, kind="answer", attempt=last.req["attempt"], role=last.req["role"],
+                     route=last.route, extra={"ruling": note}, resume=last)
+            return
     _start_attempt(ctx, c, events, attempt=max(1, c.attempt), last_vendor=None,
                    notes=f"## The operator's note\n\nThis card was parked; the operator resumed it with:\n\n{note}")
 
 
-# -- reviewer and verifier violations ----------------------------------------
+# -- violations: checks that change things, and implementer leftovers ----------
 
 def _ref_snapshot(ctx: _Run) -> dict[str, str]:
-    """ref -> object for the run branch, its card branches and everything under refs/leadhand/."""
+    """ref -> object for the run branch, its card branches and this run's refs/leadhand/<run_id>/ (R14')."""
     out = git(ctx.ws, "for-each-ref", "--format=%(objectname) %(refname)", f"refs/heads/{ctx.branch}",
-              f"refs/heads/{ctx.branch}--card-*", "refs/leadhand/")
+              f"refs/heads/{ctx.branch}--card-*", f"refs/leadhand/{ctx.meta['run_id']}/")
     snap = {}
     for line in out.splitlines():
         sha, _, name = line.partition(" ")
@@ -1024,16 +1127,34 @@ def _ref_snapshot(ctx: _Run) -> dict[str, str]:
     return snap
 
 
+def _by(e: dict) -> str:
+    return e.get("by") or "check"
+
+
+def _voided(events: list[dict]) -> set[str]:
+    """Dispatches whose result a check violation voided."""
+    return {e["dispatch_id"] for e in events
+            if e["kind"] == "violation" and _by(e) != "implementer" and e.get("dispatch_id")}
+
+
+def _broken_dispatches(events: list[dict]) -> set[str]:
+    """Implementer dispatches that left a Git operation in progress: they count as BLOCKED (environment)."""
+    return {e["after_dispatch"] for e in events
+            if e["kind"] == "violation" and _by(e) == "implementer" and e.get("stage") == "found"
+            and e.get("operation") and e.get("after_dispatch")}
+
+
 def _workspace_kept(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict]) -> bool:
-    """True when the reviewer or verifier left the workspace and the run's refs as it found
-    them. Otherwise (now or recorded earlier) the change is preserved and undone, the result
-    is void, the same kind is requested again on the same route, and False is returned.
+    """True when the worker left what its dispatch guards as it found it: for a reviewer or
+    verifier the card tip, a clean workspace and the run's refs; for an integrate worker the
+    run branch. Otherwise (now or recorded earlier) the change is preserved and undone, the
+    result is void, and the same kind is requested again on the same route; after
+    VIOLATION_CAP voided runs of a kind the card is parked instead. Returns False then.
 
     Two phases: `violation{stage: found}` is written before anything is moved, so a crash
     mid-way still voids the result; `violation{stage: restored}` follows the restore."""
-    if not d.req.get("expected_head"):
-        return True
-    mine = [e for e in events if e["kind"] == "violation" and e.get("dispatch_id") == d.id]
+    mine = [e for e in events if e["kind"] == "violation" and _by(e) != "implementer"
+            and e.get("dispatch_id") == d.id]
     if not mine:
         found = _find_violation(ctx, d, events)
         if found is None:
@@ -1042,29 +1163,78 @@ def _workspace_kept(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict]) -
     found = next(e for e in mine if e.get("stage") == "found")
     if not any(e.get("stage") == "restored" for e in mine):
         saved, siblings = _restore_violation(ctx, found)
-        append_event(ctx.paths, "violation", stage="restored", dispatch_id=d.id, card=c.number, n=found["n"],
-                     ref=found["ref"], saved=saved, siblings=siblings, preserved=found["preserved"])
+        append_event(ctx.paths, "violation", stage="restored", by="check", dispatch_id=d.id, card=c.number,
+                     n=found["n"], ref=found["ref"], saved=saved, siblings=siblings, preserved=found["preserved"])
+    events = read_events(ctx.paths)
+    since = max((e["seq"] for e in events if e["kind"] == "unparked" and e.get("card") == c.number), default=0)
+    count = [e for e in events if e["kind"] == "violation" and _by(e) != "implementer"
+             and e.get("stage") == "found" and e.get("card") == c.number
+             and e.get("dispatch_kind") == d.kind and e["seq"] > since]
+    if len(count) > VIOLATION_CAP:
+        paths = sorted({p for e in count for p in e.get("paths") or []})
+        refs = sorted({r for e in count for r in e.get("refs") or {}})
+        reason = (f"checks change tracked files: {', '.join(paths)}" if paths
+                  else f"{d.kind} workers move refs: {', '.join(refs)}")
+        append_event(ctx.paths, "parked", card=c.number, reason=reason)
+        return False
     notes = d.req.get("notes") or ""
     if VOIDED_NOTE not in notes:
         notes = (notes.rstrip("\n") + "\n\n" if notes else "") + VOIDED_NOTE + (
-            "\n\nAn earlier worker on this check changed the workspace or moved a branch, so its result "
-            "was voided. Build and run tests as you need, but never edit or stage tracked files, commit, "
-            "check out another branch, or create, move or delete any ref.")
+            "\n\nAn earlier worker on this step changed the workspace or moved a branch it must "
+            "leave alone, so its result was voided. Never stage or commit what this brief does not "
+            "ask for, check out another branch, or create, move or delete any other ref.")
     _request(ctx, c, events, kind=d.kind, attempt=d.req["attempt"], role=d.req["role"], route=d.route,
              extra=d.req.get("extra") or {}, notes=notes)
     return False
 
 
+def _engine_writes(ctx: _Run, events: list[dict], after: int) -> tuple[dict[str, str | None], set[str]]:
+    """What the engine itself recorded moving after event `after`: branch -> the value it last
+    set, and the leadhand refs it wrote (owned outright)."""
+    latest: dict[str, str | None] = {}
+    owned: set[str] = set()
+    run_ref = f"refs/heads/{ctx.branch}"
+    for e in events:
+        if e["seq"] <= after:
+            continue
+        kind = e["kind"]
+        if kind == "accepted":
+            latest[run_ref] = e.get("sha")
+        elif kind == "card_cut" and e.get("branch"):
+            latest[f"refs/heads/{e['branch']}"] = e.get("base")
+        elif kind == "rebased" and e.get("card") is not None:
+            latest[f"refs/heads/{card_branch_name(ctx.branch, e['card'])}"] = e.get("tip")
+        elif kind == "integration_started" and e.get("keep"):
+            owned.add(e["keep"])
+        elif kind == "violation":
+            if e.get("ref"):
+                owned.update({e["ref"], f"{e['ref']}-branch", f"{e['ref']}-autostash"})
+            owned.update((e.get("preserved") or {}).values())
+            if e.get("stage") == "found" and _by(e) == "implementer":
+                latest[f"refs/heads/{e['expected_branch']}"] = e.get("expected_head")
+            elif e.get("stage") == "found":
+                for name, m in (e.get("refs") or {}).items():
+                    latest[name] = m.get("old")
+    return latest, owned
+
+
 def _find_violation(ctx: _Run, d: _Dispatch, events: list[dict]) -> dict | None:
-    """Compare the workspace and refs with what the dispatch recorded; record `found` if they differ."""
+    """Compare the workspace and refs with what the dispatch recorded; record `found` if they
+    differ. Moves the engine recorded after the dispatch are its own, not the worker's."""
     req = d.req
-    v = detect_violation(ctx.ws, req["expected_head"], req["expected_branch"])
+    v = detect_violation(ctx.ws, req["expected_head"], req["expected_branch"]) if req.get("expected_head") else None
     before, now = req.get("refs") or {}, _ref_snapshot(ctx)
-    moved = {name: {"old": before.get(name), "new": now.get(name)}
-             for name in sorted(set(before) | set(now)) if before.get(name) != now.get(name)}
+    latest, owned = _engine_writes(ctx, events, req["seq"])
+    names = set(req["ref_scope"]) if req.get("ref_scope") else set(before) | set(now)
+    moved = {}
+    for name in sorted(names - owned):
+        expected = latest[name] if name in latest else before.get(name)
+        if now.get(name) != expected:
+            moved[name] = {"old": expected, "new": now.get(name)}
     if v is None and not moved:
         return None
-    n = 1 + sum(1 for e in events if e["kind"] == "violation" and e.get("stage") == "found")
+    n = 1 + sum(1 for e in events if e["kind"] == "violation" and _by(e) != "implementer"
+                and e.get("stage") == "found")
     ref = f"refs/leadhand/{ctx.meta['run_id']}/violations/{n}"
     preserved: dict[str, str] = {}
     for name, m in moved.items():
@@ -1076,17 +1246,21 @@ def _find_violation(ctx: _Run, d: _Dispatch, events: list[dict]) -> dict | None:
             k += 1
             keep = f"{ref}-{slug}-{k}"
         preserved[name] = keep
-    paths: set[str] = set()
-    if v is not None:
-        paths.update(v.tracked_changes)
-        if v.index_dirty:
-            staged = git(ctx.ws, "diff", "--cached", "--name-only", "-z", "--no-renames", "--no-ext-diff", "HEAD", "--")
-            paths.update(p for p in staged.split("\0") if p)
-    return append_event(ctx.paths, "violation", stage="found", dispatch_id=d.id, card=req["card"],
-                        dispatch_kind=d.kind, n=n, ref=ref if v is not None else None, paths=sorted(paths),
+    return append_event(ctx.paths, "violation", stage="found", by="check", dispatch_id=d.id, card=req["card"],
+                        dispatch_kind=d.kind, n=n, ref=ref if v is not None else None, paths=_violation_paths(ctx, v),
                         head_moved=bool(v and v.head_moved), index_dirty=bool(v and v.index_dirty),
-                        expected_head=req["expected_head"], expected_branch=req["expected_branch"],
+                        expected_head=req.get("expected_head"), expected_branch=req.get("expected_branch"),
                         refs=moved, preserved=preserved)
+
+
+def _violation_paths(ctx: _Run, v) -> list[str]:
+    if v is None:
+        return []
+    paths = set(v.tracked_changes)
+    if v.index_dirty:
+        staged = git(ctx.ws, "diff", "--cached", "--name-only", "-z", "--no-renames", "--no-ext-diff", "HEAD", "--")
+        paths.update(p for p in staged.split("\0") if p)
+    return sorted(paths)
 
 
 def _restore_violation(ctx: _Run, found: dict) -> tuple[str | None, list[str]]:
@@ -1094,7 +1268,7 @@ def _restore_violation(ctx: _Run, found: dict) -> tuple[str | None, list[str]]:
     and the refs back. Repeat-safe after a crash at any point. Returns (saved commit, siblings)."""
     ws = ctx.ws
     for name, keep in found["preserved"].items():
-        git(ws, "update-ref", "-m", "leadhand: preserve a ref a reviewer moved", keep, found["refs"][name]["new"])
+        git(ws, "update-ref", "-m", "leadhand: preserve a ref a worker moved", keep, found["refs"][name]["new"])
     saved, siblings = None, []
     ref = found["ref"]
     if ref:
@@ -1113,11 +1287,75 @@ def _restore_violation(ctx: _Run, found: dict) -> tuple[str | None, list[str]]:
             raise EngineError(f"{name} changed again after the violation by {found['dispatch_id']} "
                               f"(recorded {m['new']}, now {cur}); restore it by hand")
         if m["old"] is None:
-            git(ws, "update-ref", "-m", "leadhand: remove a ref a reviewer created", "-d", name, cur)
+            git(ws, "update-ref", "-m", "leadhand: remove a ref a worker created", "-d", name, cur)
         else:
             # The moved value is the expected current value: a ref changed meanwhile is not overwritten.
-            git(ws, "update-ref", "-m", "leadhand: restore a ref a reviewer moved", name, m["old"], cur or "")
+            git(ws, "update-ref", "-m", "leadhand: restore a ref a worker moved", name, m["old"], cur or "")
     return saved, siblings
+
+
+def _operation(ctx: _Run) -> str | None:
+    """The Git operation left in progress in the workspace (rebase, merge, ...), if any."""
+    args = [a for name, _ in OPERATIONS for a in ("--git-path", name)]
+    found = git(ctx.ws, "rev-parse", "--path-format=absolute", *args).splitlines()
+    for (_, op), path in zip(OPERATIONS, found):
+        if Path(path).exists():
+            return op
+    return None
+
+
+def _ensure_clean(ctx: _Run, events: list[dict], *, branch: str, why: str, after_dispatch: str | None = None,
+                  operations_only: bool = False) -> dict | None:
+    """R30: before a check is dispatched and before the engine rebases or switches branches,
+    anything an implementer left in the workspace (a dirty tree or index, HEAD off `branch`'s
+    tip, an operation in progress) is preserved under refs/leadhand/<run_id>/leftovers/<n>
+    (with preserve_and_restore's siblings) and cleared, putting the workspace on `branch` at
+    its tip. Recorded as `violation{by: implementer}`; it voids nothing. With
+    `operations_only`, only an operation in progress counts. Returns the `found` event."""
+    op = _operation(ctx)
+    if operations_only and op is None:
+        return None
+    tip = head(ctx.ws, f"refs/heads/{branch}")
+    v = detect_violation(ctx.ws, tip, branch)
+    if op is None and v is None:
+        return None
+    n = 1 + sum(1 for e in read_events(ctx.paths) if e["kind"] == "violation" and _by(e) == "implementer"
+                and e.get("stage") == "found")
+    found = append_event(ctx.paths, "violation", stage="found", by="implementer", n=n,
+                         ref=f"refs/leadhand/{ctx.meta['run_id']}/leftovers/{n}", paths=_violation_paths(ctx, v),
+                         operation=op, head_moved=bool(v and v.head_moved), index_dirty=bool(v and v.index_dirty),
+                         expected_head=tip, expected_branch=branch, after_dispatch=after_dispatch, why=why)
+    _finish_leftovers(ctx, [found])
+    return found
+
+
+def _finish_leftovers(ctx: _Run, events: list[dict]) -> bool:
+    """Preserve and clear every recorded leftovers violation not yet restored (repeat-safe:
+    a workspace already clean is not preserved again, so the saved state is never replaced)."""
+    restored = {e.get("n") for e in events if e["kind"] == "violation" and _by(e) == "implementer"
+                and e.get("stage") == "restored"}
+    pending = [e for e in events if e["kind"] == "violation" and _by(e) == "implementer"
+               and e.get("stage") == "found" and e.get("n") not in restored]
+    for f in pending:
+        saved = None
+        if _operation(ctx) or detect_violation(ctx.ws, f["expected_head"], f["expected_branch"]) is not None:
+            saved = preserve_and_restore(ctx.ws, ref=f["ref"], expected_head=f["expected_head"],
+                                         expected_branch=f["expected_branch"])
+        now = _ref_snapshot(ctx)
+        append_event(ctx.paths, "violation", stage="restored", by="implementer", n=f["n"], ref=f["ref"],
+                     saved=saved or now.get(f["ref"]), after_dispatch=f.get("after_dispatch"),
+                     siblings=[s for s in (f"{f['ref']}-branch", f"{f['ref']}-autostash") if s in now])
+    return bool(pending)
+
+
+def _left_operation(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict]) -> bool:
+    """Whether implementer dispatch `d` left a Git operation in progress (now or as recorded)."""
+    if d.id in _broken_dispatches(events):
+        return True
+    if not c.branch:
+        return False
+    return _ensure_clean(ctx, events, branch=c.branch, why=f"{d.id} left an operation in progress",
+                         after_dispatch=d.id, operations_only=True) is not None
 
 
 def _end_blocked(ctx: _Run, events: list[dict], reason: str) -> None:
@@ -1185,8 +1423,9 @@ def _record_started(ctx: _Run, dispatch_id: str, worker_id: str) -> dict:
     if c.dispatch_id != dispatch_id:
         raise EngineError(f"dispatch {dispatch_id} is not card {c.number}'s current dispatch")
     deadline = _format_time(_now() + _budget_seconds(d.req))
+    # The supervisor session the worker runs under: a Claude worker dies with it.
     return append_event(ctx.paths, "worker_started", dispatch_id=dispatch_id, worker_id=worker_id,
-                        card=d.req["card"], deadline=deadline)
+                        card=d.req["card"], deadline=deadline, session=_current_session(ctx))
 
 
 def _copy_if_missing(src: Path | None, dest: Path, text: str | None = None) -> bool:

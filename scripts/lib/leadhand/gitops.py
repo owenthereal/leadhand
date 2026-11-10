@@ -251,6 +251,11 @@ def needs_integration(ws: Path, run_branch: str, card_branch: str) -> bool:
     return not _test(ws, "merge-base", "--is-ancestor", f"refs/heads/{run_branch}", f"refs/heads/{card_branch}")
 
 
+def is_ancestor(ws: Path, ancestor: str, descendant: str) -> bool:
+    """True when commit `ancestor` is in the history of `descendant` (or is it)."""
+    return _test(ws, "merge-base", "--is-ancestor", ancestor, descendant)
+
+
 def rebase_onto(ws: Path, card_branch: str, onto: str) -> list[str]:
     """Rebase `card_branch` onto `onto` in `ws`. [] on success; on conflict the rebase is
     aborted (the branch is left unchanged) and the conflicted paths are returned."""

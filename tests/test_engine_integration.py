@@ -7,6 +7,7 @@ from fakeworld import FakeWorld, card
 from gitfixture import commit, current_branch, run_git, write
 from leadhand import engine
 from leadhand.engine import EngineError
+from leadhand.state import append_event
 
 RUN = "leadhand/demo"
 CARD1 = "leadhand/demo--card-1"
@@ -17,6 +18,7 @@ def parked_world(test, *, card1_files=None, card2_files=None, **kw):
     """Card 1 asks a product question and is parked; independent card 2 is accepted, so the
     run tip moves past card 1's base."""
     w = FakeWorld(test, [card(1), card(2)], **kw)
+    w.session("supervisor-1")            # the supervisor session the workers start in
     w.start()
     w.script(1, "implement", {"status": "QUESTION", **({"files": card1_files} if card1_files else {})})
     if card2_files:
@@ -53,8 +55,8 @@ def worker_of(w, dispatch_id):
     return next(e["worker_id"] for e in w.events("worker_started") if e["dispatch_id"] == dispatch_id)
 
 
-def found(w):
-    return [e for e in w.events("violation") if e.get("stage") == "found"]
+def found(w, by="check"):
+    return [e for e in w.events("violation") if e.get("stage") == "found" and (e.get("by") or "check") == by]
 
 
 class Integration(unittest.TestCase):
@@ -356,20 +358,26 @@ class Violations(unittest.TestCase):
         self.assertEqual(run_git(w.repo, "rev-parse", f"{RUN}^"), base)
 
     def test_reviewer_creating_and_deleting_refs_is_violation(self):
+        # R14': under refs/leadhand/ only this run's namespace is watched.
         def tamper(world, ws, a):
+            run_id = world.meta()["run_id"]
             run_git(ws, "branch", "leadhand/demo--card-7")
-            run_git(ws, "update-ref", "refs/leadhand/elsewhere/note", "HEAD")
+            run_git(ws, "update-ref", f"refs/leadhand/{run_id}/elsewhere/note", "HEAD")
+            run_git(ws, "update-ref", "refs/leadhand/other-run/note", "HEAD")
             run_git(ws, "update-ref", "-d", f"refs/heads/{RUN}")
 
         w = self.world("review", tamper)
         w.run()
+        run_id = w.meta()["run_id"]
+        note = f"refs/leadhand/{run_id}/elsewhere/note"
         (v,) = found(w)
-        self.assertEqual(set(v["refs"]), {"refs/heads/leadhand/demo--card-7", "refs/leadhand/elsewhere/note",
-                                          f"refs/heads/{RUN}"})
+        self.assertEqual(set(v["refs"]), {"refs/heads/leadhand/demo--card-7", note, f"refs/heads/{RUN}"})
         self.assertIsNone(v["refs"][f"refs/heads/{RUN}"]["new"])
-        self.assertIsNone(v["refs"]["refs/leadhand/elsewhere/note"]["old"])
-        for ref in ("refs/heads/leadhand/demo--card-7", "refs/leadhand/elsewhere/note"):
+        self.assertIsNone(v["refs"][note]["old"])
+        for ref in ("refs/heads/leadhand/demo--card-7", note):
             self.assertFalse(git_ok(w.repo, "show-ref", "--verify", "--quiet", ref), ref)
+        # another run's ref is not this run's business: left alone
+        self.assertTrue(git_ok(w.repo, "show-ref", "--verify", "--quiet", "refs/leadhand/other-run/note"))
         self.check_rerun(w, "review", "c1-a1-review-1", "c1-a1-review-2")
         self.assertEqual([e["card"] for e in w.events("accepted")], [1])
 
@@ -405,6 +413,184 @@ class Violations(unittest.TestCase):
         self.assertEqual(len(found(w)), 2)
         self.assertEqual(w.events("parked"), [])
         self.assertEqual([e["card"] for e in w.events("accepted")], [1])
+
+
+class OneCardInFlight(unittest.TestCase):
+    def test_unpark_while_another_card_is_in_flight_waits(self):
+        # Review repro: unparking card 1 while card 2's review is requested must not interleave.
+        w = FakeWorld(self, [card(1), card(2)])
+        w.start()
+        w.script(1, "implement", {"status": "QUESTION"})
+        w.parks[1] = "product decision"
+        review = drive_to(w, "review", 2)
+        del w.parks[1]
+        engine.unpark(w.run_dir, card=1, note="go")
+        self.assertEqual(w.next()["dispatch_id"], review["dispatch_id"])
+        w.run()
+        ids = w.dispatch_ids()
+        accepted = w.events("accepted")
+        self.assertEqual([e["card"] for e in accepted], [2, 1])
+        # nothing for card 1 was dispatched until card 2 was accepted
+        accept2 = accepted[0]["seq"]
+        later = [e for e in w.events("dispatch_requested")
+                 if e["card"] == 1 and e["dispatch_id"] != "c1-a1-implement-1"]
+        self.assertTrue(later)
+        self.assertTrue(all(e["seq"] > accept2 for e in later), [e["dispatch_id"] for e in later])
+        self.assertEqual([e for e in w.events("violation") if e.get("by") != "implementer"], [])
+        tip = w.branch_tip(RUN)
+        self.assertEqual(tip, accepted[1]["sha"])
+        for path in ("src/card1/c1-a1-implement-1.txt", "src/card2/c2-a1-implement-1.txt"):
+            run_git(w.repo, "cat-file", "-e", f"{RUN}:{path}")
+        self.assertIn("c1-a1-verify-1", ids)
+
+    def test_engine_ref_moves_after_dispatch_are_not_violations(self):
+        def engine_moves(world, ws, a):
+            # what the engine records while the review runs: card 2 accepted on the run branch
+            other = run_git(ws, "commit-tree", "-p", world.base, "-m", "card 2",
+                            run_git(ws, "rev-parse", f"{world.base}^{{tree}}"))
+            run_git(ws, "update-ref", f"refs/heads/{RUN}", other, world.base)
+            append_event(world.paths, "accepted", card=2, sha=other)
+
+        w = FakeWorld(self, [card(1), card(2)])
+        w.start()
+        w.script(1, "review", {"tamper": engine_moves})
+        w.run()
+        self.assertEqual(w.events("violation"), [])
+        self.assertEqual(w.dispatch_ids()[:2], ["c1-a1-implement-1", "c1-a1-review-1"])
+        self.assertNotIn("c1-a1-review-2", w.dispatch_ids())
+        self.assertEqual({e["card"] for e in w.events("accepted")}, {1, 2})
+
+
+class FixRound1(unittest.TestCase):
+    def test_repeated_check_violations_park_the_card(self):
+        def tamper(world, ws, a):
+            write(ws, {"README.md": f"rewritten by {a['dispatch_id']}\n"})
+
+        w = FakeWorld(self, [card(1)])
+        w.start()
+        w.script(1, "review", *({"tamper": tamper} for _ in range(5)))
+        w.run()
+        self.assertEqual(len(found(w)), 3)
+        self.assertEqual([i for i in w.dispatch_ids() if "review" in i],
+                         ["c1-a1-review-1", "c1-a1-review-2", "c1-a1-review-3"])
+        (parked,) = w.events("parked")
+        self.assertEqual(parked["reason"], "checks change tracked files: README.md")
+        self.assertEqual(w.events("accepted"), [])
+        self.assertEqual((w.workspace() / "README.md").read_text(), "hello\n")
+
+    def test_unpark_after_relaunch_starts_fresh_attempt_with_note(self):
+        w = parked_world(self)
+        w.session("supervisor-2")           # relaunched: the parked worker died with the old session
+        engine.unpark(w.run_dir, card=1, note=NOTE)
+        a = w.next()
+        self.assertEqual((a["kind"], a["dispatch_id"], a["resume"]), ("implement", "c1-a1-implement-2", None))
+        self.assertIn(NOTE, Path(a["brief"]).read_text())
+        started = next(e for e in w.events("worker_started") if e["dispatch_id"] == "c1-a1-implement-1")
+        self.assertEqual(started["session"], "supervisor-1")
+        w.act(a)
+        w.run()
+        self.assertEqual([e["card"] for e in w.events("accepted")], [2, 1])
+
+    def test_operation_left_in_progress_is_blocked_and_preserved(self):
+        def leave_merge(world, ws, a):
+            back = current_branch(ws)
+            run_git(ws, "checkout", "--quiet", "-b", "side")
+            commit(ws, {"README.md": "side\n"}, "side change")
+            run_git(ws, "checkout", "--quiet", back)
+            run_git(ws, "merge", "--quiet", "--no-ff", "--no-commit", "side")
+
+        w = FakeWorld(self, [card(1)])
+        w.start()
+        w.script(1, "implement", {"tamper": leave_merge}, {})
+        w.run()
+        self.assertEqual(w.dispatch_ids()[:2], ["c1-a1-implement-1", "c1-a1-implement-2"])
+        (v,) = found(w, by="implementer")
+        run_id = w.meta()["run_id"]
+        self.assertEqual((v["operation"], v["after_dispatch"], v["ref"]),
+                         ("merge", "c1-a1-implement-1", f"refs/leadhand/{run_id}/leftovers/1"))
+        self.assertEqual(run_git(w.repo, "show", f"{v['ref']}:README.md"), "side")
+        ws = w.workspace()
+        self.assertFalse(git_ok(ws, "rev-parse", "--verify", "--quiet", "MERGE_HEAD"))
+        self.assertEqual(current_branch(ws), CARD1)
+        self.assertEqual([e["card"] for e in w.events("accepted")], [1])
+
+    def test_implementer_leftovers_are_preserved_before_review_without_voiding(self):
+        def leave_dirty(world, ws, a):
+            write(ws, {"README.md": "uncommitted by the implementer\n"})
+
+        w = FakeWorld(self, [card(1)])
+        w.start()
+        w.script(1, "implement", {"tamper": leave_dirty})
+        w.run()
+        self.assertEqual(w.dispatch_ids(), ["c1-a1-implement-1", "c1-a1-review-1"])
+        (v,) = found(w, by="implementer")
+        self.assertEqual(v["paths"], ["README.md"])
+        self.assertIsNone(v["operation"])
+        self.assertEqual(found(w), [])
+        self.assertEqual(run_git(w.repo, "show", f"{v['ref']}:README.md"), "uncommitted by the implementer")
+        self.assertLess(v["seq"], requested(w, "c1-a1-review-1")["seq"])
+        self.assertEqual([e["dispatch_id"] for e in w.events("verdict_recorded")], ["c1-a1-review-1"])
+        self.assertEqual([e["card"] for e in w.events("accepted")], [1])
+
+    def conflicted(self):
+        w = parked_world(self, card1_files={"src/shared.txt": "card one\n"},
+                         card2_files={"src/shared.txt": "card two\n"})
+        engine.unpark(w.run_dir, card=1, note=NOTE)
+        return w
+
+    def test_integration_keeps_the_pre_integration_tip(self):
+        w = self.conflicted()
+        w.run()
+        (intent,) = w.events("integration_started")
+        run_id = w.meta()["run_id"]
+        self.assertEqual(intent["keep"], f"refs/leadhand/{run_id}/integration/1-1")
+        self.assertEqual(run_git(w.repo, "rev-parse", intent["keep"]), intent["tip"])
+
+    def test_integrate_moving_run_branch_is_violation(self):
+        def push_run(world, ws, a):
+            run_git(ws, "update-ref", f"refs/heads/{RUN}", "HEAD")
+
+        w = self.conflicted()
+        onto = w.branch_tip(RUN)
+        w.script(1, "integrate", {"tamper": push_run}, {})
+        w.run()
+        (v,) = found(w)
+        self.assertEqual(v["dispatch_id"], "c1-a2-integrate-1")
+        self.assertEqual(v["refs"][f"refs/heads/{RUN}"]["old"], onto)
+        self.assertIn("c1-a2-integrate-2", w.dispatch_ids())
+        (rebased,) = w.events("rebased")
+        self.assertEqual(rebased["dispatch_id"], "c1-a2-integrate-2")
+        self.assertEqual([e["card"] for e in w.events("accepted")], [2, 1])
+
+    def test_integrate_dropping_card_work_escalates(self):
+        def reset_to_onto(world, ws, a):
+            run_git(ws, "reset", "--quiet", "--hard", f"refs/heads/{RUN}")
+
+        w = self.conflicted()
+        w.script(1, "integrate", {"rebase": False, "tamper": reset_to_onto})
+        w.run()
+        self.assertEqual(w.events("rebased"), [])
+        ids = w.dispatch_ids()
+        self.assertIn("c1-a3-implement-1", ids)
+        brief = Path(requested(w, "c1-a3-implement-1")["brief"]).read_text()
+        (intent,) = w.events("integration_started")
+        self.assertIn(intent["keep"], brief)
+        self.assertEqual(run_git(w.repo, "rev-parse", intent["keep"]), intent["tip"])
+        self.assertEqual([e["card"] for e in w.events("accepted")], [2, 1])
+
+    def test_integrate_question_answer_goes_through_integration(self):
+        w = self.conflicted()
+        w.script(1, "integrate", {"rebase": False, "status": "QUESTION"})
+        w.script(1, "answer", {}, {"rebase": True})     # the unpark answer, then the integrate answer
+        w.rulings[1] = ["Keep card one's version."]
+        w.run()
+        ids = w.dispatch_ids()
+        self.assertIn("c1-a2-answer-1", ids)
+        (rebased,) = w.events("rebased")
+        self.assertEqual(rebased["dispatch_id"], "c1-a2-answer-1")
+        self.assertEqual(ids[ids.index("c1-a2-answer-1") + 1], "c1-a2-rereview-1")
+        self.assertEqual(run_git(w.repo, "show", f"{RUN}:src/shared.txt"), "card one")
+        self.assertEqual([e["card"] for e in w.events("accepted")], [2, 1])
 
 
 if __name__ == "__main__":

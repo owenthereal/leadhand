@@ -9,7 +9,8 @@ does, with fake workers instead of real ones:
 - review kinds (review, rereview) write `Verdict: ...` with findings;
 - verify kinds write `Result: ...`;
 - integrate rebases the card branch onto the run tip, resolving conflicts in
-  the card's favour, and reports like an implementer.
+  the card's favour, and reports like an implementer (a step's `rebase` turns
+  that off for integrate, or on for another implementer kind such as answer).
 
 A step's `tamper(world, ws, action)` runs inside the worker before its report is
 written: a reviewer or verifier that changes the workspace or moves refs.
@@ -252,10 +253,10 @@ class FakeWorld:
     def claude_worker(self, a: dict, worker: str) -> str | None:
         step = self._take(a)
         ws = self.workspace()
-        if a["kind"] == "integrate":
+        if step.get("rebase", a["kind"] == "integrate"):
             run_tip = run_git(ws, "rev-parse", f"refs/heads/{self.meta()['branch']}")
             run_git(ws, "-c", "core.editor=true", "rebase", "--quiet", "-X", "theirs", run_tip)
-        elif a["kind"] in IMPLEMENTER_KINDS:
+        if a["kind"] in IMPLEMENTER_KINDS:
             files = step.get("files") or {f"src/card{a['card']}/{a['dispatch_id']}.txt": f"{a['dispatch_id']}\n"}
             write(ws, files)
             if step.get("crash") == "before_commit":
