@@ -498,6 +498,19 @@ class GitopsTests(unittest.TestCase):
         self.assertFalse((here / "escaped repo").exists())
         self.assertEqual(os.environ["GIT_CEILING_DIRECTORIES"], str(self.tmp.resolve().parent))
 
+    def test_git_refuses_a_missing_workspace_directory(self):
+        # Read-only commands only: before the fix, None ran them in the process cwd.
+        repo = make_repo(self.tmp)
+        not_a_dir = repo / "README.md"
+        for cwd in (None, self.tmp / "missing", not_a_dir):
+            with self.subTest(cwd=cwd):
+                with self.assertRaises(GitError):
+                    git(cwd, "rev-parse", "HEAD")
+                with self.assertRaises(GitError):
+                    head(cwd)
+                with self.assertRaises(GitError):
+                    detect_violation(cwd, "0" * 40, "main")
+
     def test_git_error_includes_stderr(self):
         repo = make_repo(self.tmp)
         with self.assertRaises(GitError) as cm:
