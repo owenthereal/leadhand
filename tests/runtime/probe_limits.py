@@ -12,20 +12,26 @@ not raised. Steps 1-3 run headless `claude -p --agent lhprobe:limits-dispatch`,
 which dispatches one probe worker. Steps 4-8 run `codex exec --json`, pinned to
 gpt-6-luna with low reasoning effort. Expect about 30 minutes of wall time.
 
-Codex home. Codex steps run with CODEX_HOME set to a temporary directory that
-holds a copy of the operator's auth.json and a minimal config.toml (which turns
-on `sandbox_workspace_write.network_access` for Step 7 and sets no
+Codex home. Codex steps run with CODEX_HOME set to a temporary directory whose
+auth.json is a symlink to the operator's auth.json, plus a minimal config.toml
+(which turns on `sandbox_workspace_write.network_access` for Step 7 and sets no
 shell_environment_policy, so Step 8 sees Codex's built-in default). The
-operator's config.toml is never touched. After every Codex run the two
-auth.json copies are synced (whichever side Codex refreshed is copied to the
-other, because refresh tokens may rotate); at cleanup the temp home is
-removed. Step 6 also runs its acceptance check against the operator's real
-home, and Step 8 adds one run with the operator's real config. Without an
-auth.json the probe falls back to the real home (see the raw file's header).
+operator's config.toml is never touched, and the probe never copies
+credentials. After every Codex run it checks the link: if Codex replaced it
+with a regular file (an atomic refresh), the file is synced back only when it
+parses as JSON with token or API-key fields, its last_refresh (if any) is newer
+than the real file's, and the real file did not change during the check; a
+symlinked real auth.json is written through to its target. Then the link is
+restored. Which path happened is recorded (never any content). At cleanup the
+temp home is removed. Step 6 also runs its acceptance check against the
+operator's real home, and Step 8 adds one run with the operator's real config;
+both pass `-c notify=[]` and have their output redacted. Without an auth.json
+the probe falls back to the real home (see the raw file's header).
 
-Step 8 output is redacted before it is written anywhere: any `GIT_*`, `GH_*`
-or `SSH_*` line whose value is not one of the probe's dummy values is replaced
-by `<redacted len=N>`, because a login shell may export real tokens.
+Step 8 output is redacted before it is written anywhere: any `NAME=value` line
+that is not one of the probe's dummy pairs (or SSH_AUTH_SOCK/SSH_AGENT_PID) has
+its value replaced by `<redacted len=N>`, because a login shell may export real
+tokens and the model may run a plain `env`.
 
 `sanitize_stream()` is importable (Task 5 reuses it): it keeps keys, numbers,
 booleans and a short allow-list of identifier fields, and replaces every other
@@ -55,7 +61,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PLUGIN_DIR = HERE / "probe-plugin"
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
-REAL_CODEX_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+REAL_CODEX_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().absolute()
+NO_NOTIFY = ["-c", "notify=[]"]   # real-home runs: never start the operator's notify program
 
 DISPATCH_AGENT = "lhprobe:limits-dispatch"
 CODEX_MODEL = "gpt-6-luna"
@@ -104,6 +111,7 @@ SET_VARS = {
 }
 ENV_PREFIX = re.compile(r"^(GIT_|GH_|SSH_)")
 ENV_LINE = re.compile(r"^((?:GIT_|GH_|SSH_)[A-Za-z0-9_]*)=(.*)$")
+ANY_ENV_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 SAFE_SSH = {"SSH_AUTH_SOCK", "SSH_AGENT_PID"}
 
 T0 = time.monotonic()
@@ -168,11 +176,12 @@ class Ctx:
         self.tmp: Path | None = None
         self.fixtures: dict[str, Path] = {}
         self.cmds: list[tuple[list[str], object]] = []
-        self.pgids: list[int] = []
+        self.pgids: list[tuple[int, str | None]] = []   # (group leader pid, ps lstart)
         self.needles: list[str] = []
         self.codex_home: Path | None = None       # temp CODEX_HOME, once set up
         self.codex_home_mode = "not set up"
-        self.auth_digest: str | None = None       # sha256 of the operator's auth.json when copied
+        self.auth_log: list[str] = []             # per Codex run: what happened to the auth link
+        self.step4_types: list[str] = []          # item types Step 4 saw for commands and the edit
         self.notes: list[str] = []                # cleanup notes for the raw file
 
     def fixture(self, label: str) -> Path:
@@ -266,6 +275,41 @@ def kill_group(pgid: int) -> None:
         time.sleep(1)
 
 
+def proc_start(pid: int) -> str | None:
+    """The process's start time from ps (None when ps fails or it is gone)."""
+    try:
+        p = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                           timeout=CMD_TIMEOUT, stdin=subprocess.DEVNULL)
+        return p.stdout.strip() or None
+    except Exception:  # noqa: BLE001 - ps may be unavailable
+        return None
+
+
+def group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def track(ctx: Ctx, pid: int) -> None:
+    ctx.pgids.append((pid, proc_start(pid)))
+
+
+def reap(ctx: Ctx, pid: int, label: str) -> None:
+    """Right after a run: kill what is left of its group, verify, stop tracking it."""
+    if group_alive(pid):
+        kill_group(pid)
+        ctx.notes.append(f"{label}: killed processes left in group {pid} after the run")
+    if group_alive(pid):
+        ctx.notes.append(f"{label}: group {pid} still alive after SIGKILL; left for cleanup")
+    else:
+        ctx.pgids = [x for x in ctx.pgids if x[0] != pid]
+
+
 def signal_group(pgid: int, sig) -> str:
     try:
         os.killpg(pgid, sig)
@@ -314,13 +358,14 @@ def run_claude(ctx: Ctx, label: str, message: str, cwd: Path, timeout: int) -> d
                              env=child_env({"PROBE_LOG": str(hook_log),
                                             "LEADHAND_RUN_ID": "probe4"}),
                              start_new_session=True)
-        ctx.pgids.append(p.pid)
+        track(ctx, p.pid)
         try:
             rc = p.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             kill_group(p.pid)
             p.wait(timeout=CMD_TIMEOUT)
             rc = "timeout"
+        reap(ctx, p.pid, label)
     ctx.cmds.append((argv, rc))
     recs = read_jsonl(stream)
     init = next((r for r in recs if r.get("type") == "system" and r.get("subtype") == "init"), {})
@@ -647,18 +692,14 @@ def setup_codex_home(ctx: Ctx) -> None:
                                "step 8 default variants use --ignore-user-config)")
         return
     home = Path(tempfile.mkdtemp(prefix="lhprobe4-codex-home-")).resolve()
-    data = auth.read_bytes()
-    ctx.auth_digest = hashlib.sha256(data).hexdigest()
-    fd = os.open(home / "auth.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
+    ctx.codex_home = home                 # first, so cleanup removes it whatever happens next
+    ctx.needles.append(str(home))
+    os.symlink(auth, home / "auth.json")  # never a copy of the credentials
     (home / "config.toml").write_text(
         "# leadhand Task 4 probe: temporary CODEX_HOME, removed at cleanup\n"
         f'model = "{CODEX_MODEL}"\n'
         'model_reasoning_effort = "low"\n'
         "\n[sandbox_workspace_write]\nnetwork_access = true\n")
-    ctx.codex_home = home
-    ctx.needles.append(str(home))
     ctx.codex_home_mode = "temp"
     progress(f"  codex: temporary CODEX_HOME {home}")
 
@@ -685,7 +726,7 @@ def run_codex(ctx: Ctx, label: str, argv: list[str], prompt: str | None, cwd: Pa
     p = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
                          stdin=subprocess.DEVNULL if prompt is None else subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True, start_new_session=True)
-    ctx.pgids.append(p.pid)
+    track(ctx, p.pid)
     try:
         out, err = p.communicate(prompt, timeout=timeout)
         rc = p.returncode
@@ -693,9 +734,10 @@ def run_codex(ctx: Ctx, label: str, argv: list[str], prompt: str | None, cwd: Pa
         kill_group(p.pid)
         out, err = p.communicate(timeout=CMD_TIMEOUT)
         rc = "timeout"
+    reap(ctx, p.pid, label)
+    check_auth(ctx, label)
     if redact:
         out, err = redact(out), redact(err)
-    sync_auth(ctx)
     (ctx.art / f"{label}-stream.jsonl").write_text(out or "")
     (ctx.art / f"{label}-stderr.txt").write_text(err or "")
     ctx.cmds.append((argv, rc))
@@ -802,6 +844,8 @@ def step4(ctx: Ctx):
                                    if str(c["role (by probe text)"]).startswith("cmd")})
     obs["item.type carrying the edit"] = sorted({c["item.type"] for c in classified
                                                  if c["role (by probe text)"] == "edit notes.txt"}) or "none"
+    ctx.step4_types = sorted({c["item.type"] for c in classified
+                              if c["role (by probe text)"] != "other" and c["item.type"]})
     obs["item.started item.type counts"] = type_counts(i.get("type") for i in items(ev, "item.started"))
     obs["item.updated item.type counts"] = type_counts(i.get("type") for i in items(ev, "item.updated"))
     obs["keys by event type"] = keys_by(ev, lambda e: e.get("type"))
@@ -843,14 +887,19 @@ def step5(ctx: Ctx):
     cwd = ctx.fixture("codex5")
     argv = codex_argv(*CODEX_WS)
     stream_path = ctx.art / "step5-stream.jsonl"
+    counted_types = tuple(ctx.step4_types) or COUNTED_ITEM_TYPES
     obs = {"prompt": step5_prompt(ctx), "codex_home": ctx.codex_home_mode,
-           "counted": f"item.completed with item.type in {list(COUNTED_ITEM_TYPES)}",
+           "counted": f"item.completed with item.type in {list(counted_types)}",
+           "counted_types_source": ("Step 4's observed command/edit item types" if ctx.step4_types
+                                    else "guess (Step 4 did not run or saw none)"),
+           "sigint_target": ("the whole process group: os.killpg(<codex pid>) with Codex started "
+                             "with process_group=0, so its pgid is its pid"),
            "stop_after_counted_items": STOP_AFTER_ITEMS}
     t0 = time.monotonic()
     err_f = open(ctx.art / "step5-stderr.txt", "w")
     p = subprocess.Popen(argv, cwd=cwd, env=codex_env(ctx), stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=err_f, text=True, process_group=0)
-    ctx.pgids.append(p.pid)
+    track(ctx, p.pid)
     p.stdin.write(step5_prompt(ctx))
     p.stdin.close()
     q: queue.Queue = queue.Queue()
@@ -886,7 +935,7 @@ def step5(ctx: Ctx):
             e = e[0] if e else {"unparsed": line}
             events.append((t, e))
             it = e.get("item") if isinstance(e.get("item"), dict) else {}
-            if e.get("type") == "item.completed" and it.get("type") in COUNTED_ITEM_TYPES:
+            if e.get("type") == "item.completed" and it.get("type") in counted_types:
                 counted.append({"t": t, "item.type": it.get("type"),
                                 "command (probe text)": str(it.get("command", ""))[:120]})
                 if len(counted) == STOP_AFTER_ITEMS and sigint_at is None:
@@ -917,7 +966,7 @@ def step5(ctx: Ctx):
     th.join(timeout=10)
     err_f.close()
     ctx.cmds.append((argv, rc))
-    sync_auth(ctx)
+    check_auth(ctx, "step5")
     try:
         group_left = [f"{r['pid']} {r['command'][:100]}" for r in ps_rows() if r["pgid"] == p.pid]
     except Exception as e:  # noqa: BLE001 - recorded
@@ -942,11 +991,7 @@ def step5(ctx: Ctx):
         "stderr_last_lines": stderr.strip().splitlines()[-5:] or "none",
         "thread_id": tid,
     })
-    for pid in [int(x.split()[0]) for x in group_left if not x.startswith("0 ")]:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+    reap(ctx, p.pid, "step5")
     rf = rollout_file(ctx, tid)
     obs["rollout_file_found"] = bool(rf)
     if rf:
@@ -985,8 +1030,9 @@ STEP6_LINES = 3200      # x 100 bytes = 320 KB, about 80K tokens
 STEP6_CHUNK = 80        # lines per sed call: 8 KB, under Codex's output truncation
 
 
-def step6_check_argv(key_value: str) -> list[str]:
-    return ["codex", "exec", "--strict-config", "-c", key_value, *CODEX_PIN, *CODEX_JSON, "reply ok"]
+def step6_check_argv(key_value: str, real: bool = False) -> list[str]:
+    return ["codex", "exec", "--strict-config", "-c", key_value, *CODEX_PIN, *CODEX_JSON,
+            *(NO_NOTIFY if real else []), "reply ok"]
 
 
 def step6_prompt() -> str:
@@ -1000,7 +1046,8 @@ def step6_prompt() -> str:
 def step6(ctx: Ctx):
     setup_codex_home(ctx)
     cwd = ctx.fixture("codex6")
-    obs = {"codex_home": ctx.codex_home_mode}
+    obs = {"codex_home": ctx.codex_home_mode,
+           "operator_config (names only)": operator_config_facts()}
     excerpt = []
     checks = [("bogus-key-control", "lhprobe_bogus_key=1", False),
               ("compact-key", "model_auto_compact_token_limit=60000", False),
@@ -1011,11 +1058,12 @@ def step6(ctx: Ctx):
             obs[name] = "same as compact-key (already the real home)"
             continue
         progress(f"  step6: {name}")
-        rr = run_codex(ctx, f"step6-{name}", step6_check_argv(kv), None, cwd,
-                       codex_env(ctx, real_home=real), timeout=180)
+        rr = run_codex(ctx, f"step6-{name}", step6_check_argv(kv, real), None, cwd,
+                       codex_env(ctx, real_home=real), timeout=180,
+                       redact=redact_stream if real else None)
         key = kv.split("=")[0]
         obs[name] = {
-            "argv": shlex.join(step6_check_argv(kv)),
+            "argv": shlex.join(step6_check_argv(kv, real)),
             "home": "operator's real CODEX_HOME" if real else ctx.codex_home_mode,
             "exit": rr["exit"],
             "stderr_lines_naming_key": [l[:200] for l in rr["stderr"].splitlines() if key in l] or "none",
@@ -1130,11 +1178,12 @@ def step8_prompt() -> str:
 
 
 def redact_env_text(text: str) -> str:
-    """Replace values of GIT_/GH_/SSH_ lines that are not the probe's dummy values."""
+    """Replace the value of every NAME=value line that is not one of the probe's dummy pairs
+    (SSH_AUTH_SOCK and SSH_AGENT_PID are kept), so even a plain `env` leaks nothing."""
     known = set(ENV_VARS.items()) | set(SET_VARS.items())
     out = []
     for line in text.split("\n"):
-        m = ENV_LINE.match(line)
+        m = ANY_ENV_LINE.match(line)
         if m and (m.group(1), m.group(2)) not in known and m.group(1) not in SAFE_SSH:
             line = f"{m.group(1)}=<redacted len={len(m.group(2))}>"
         out.append(line)
@@ -1176,7 +1225,7 @@ def step8_variants(ctx: Ctx) -> list[tuple[str, list[str], bool]]:
          ("inherit=core, env only", dflt + core, False),
          ("inherit=core, env + set", dflt + core + set_args(SET_VARS), False)]
     if temp_home(ctx):
-        v.append(("operator config, env + set", set_args(SET_VARS), True))
+        v.append(("operator config, env + set", NO_NOTIFY + set_args(SET_VARS), True))
     return v
 
 
@@ -1189,6 +1238,18 @@ def operator_env_policy() -> str:
     if not isinstance(pol, dict):
         return "no [shell_environment_policy] (Codex default)"
     return json.dumps({k: (sorted(v) if isinstance(v, dict) else v) for k, v in pol.items()})
+
+
+def operator_config_facts() -> dict | str:
+    """MCP server names and whether notify is set in the operator's config (names only)."""
+    try:
+        cfg = tomllib.loads((REAL_CODEX_HOME / "config.toml").read_text())
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        return f"unreadable ({type(e).__name__})"
+    mcp = cfg.get("mcp_servers")
+    return {"mcp_servers": sorted(mcp) if isinstance(mcp, dict) else [],
+            "notify_set": bool(cfg.get("notify")),
+            "real-home runs pass": shlex.join(NO_NOTIFY)}
 
 
 def step8(ctx: Ctx):
@@ -1206,6 +1267,7 @@ def step8(ctx: Ctx):
            "set_dummies": SET_VARS,
            "inherited_GIT_/GH_ names dropped from the process env": dropped or "none",
            "operator_config shell_environment_policy (set: names only)": operator_env_policy(),
+           "operator_config (names only)": operator_config_facts(),
            "prompt": step8_prompt()}
     excerpt, line = [], []
     for name, extra, real in step8_variants(ctx):
@@ -1271,13 +1333,15 @@ def dry_commands(ctx: Ctx, n: int) -> list[str]:
                                step3_prompt("<fixture>/big.txt"))
         return setup + [cl(msg)]
     setup_codex_home(ctx)
-    home = f"CODEX_HOME={ctx.codex_home}  (temp; auth.json copied, minimal config.toml)"
+    home = (f"CODEX_HOME={ctx.codex_home}  (temp; auth.json is a symlink to the operator's, "
+            "minimal config.toml)")
     if n == 4:
         return [home, shlex.join(codex_argv(*CODEX_WS)) + f"  < {step4_prompt(ctx)!r}",
                 "write task4-artifacts/codex-exec-stream.sanitized.jsonl"]
     if n == 5:
         return [home, shlex.join(codex_argv(*CODEX_WS)) + f"  < {step5_prompt(ctx)!r}",
-                f"  after {STOP_AFTER_ITEMS} item.completed of {list(COUNTED_ITEM_TYPES)}: "
+                f"  after {STOP_AFTER_ITEMS} item.completed of Step 4's observed types "
+                f"(else {list(COUNTED_ITEM_TYPES)}): "
                 f"kill -INT -<pgid>; {STOP_GRACE}s later kill -TERM -<pgid>; another {STOP_GRACE}s "
                 "later kill -KILL -<pgid>"]  + [
                 "  then, until one exits 0: " + shlex.join(a) + "  < 'Do not run any commands...'"
@@ -1285,7 +1349,7 @@ def dry_commands(ctx: Ctx, n: int) -> list[str]:
     if n == 6:
         return [home] + [shlex.join(step6_check_argv(kv)) + note for kv, note in (
             ("lhprobe_bogus_key=1", "  (control)"), ("model_auto_compact_token_limit=60000", ""),
-            ("model_auto_compact_token_limit=60000", "  (again with the operator's real CODEX_HOME)"))] + [
+            ("model_auto_compact_token_limit=60000", "  (again with the operator's real CODEX_HOME, plus -c notify=[])"))] + [
             "if accepted: " + shlex.join(codex_argv(*CODEX_WS, "-c", "model_auto_compact_token_limit=60000"))
             + f"  < {STEP6_LINES // STEP6_CHUNK} sed chunk reads of big80.txt ({STEP6_LINES} x 100 bytes)"]
     if n == 7:
@@ -1329,74 +1393,180 @@ def version(argv: list[str]) -> str:
 
 
 def write_private(path: Path, data: bytes) -> None:
-    """Atomically replace path with data, mode 0600 (temp file in the same directory)."""
+    """Atomically replace path with data, keeping its mode (0600 if new); staging file beside it."""
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o600
     staged = path.with_name(f".{path.name}.lhprobe4-{os.getpid()}")
-    fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(staged, path)
+    fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(staged, path)
+    finally:
+        if staged.exists():
+            staged.unlink()
 
 
-def sync_auth(ctx: Ctx) -> None:
-    """Keep the operator's auth.json and the temp copy in step after every Codex run.
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
-    Codex may refresh (and rotate) its tokens in whichever home it ran with. If
-    exactly one side changed since the last sync, copy it to the other; if both
-    changed, leave both and record it.
-    """
-    if not (ctx.codex_home and ctx.auth_digest):
+
+def iso_time(value) -> datetime | None:
+    try:
+        t = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def auth_fields_ok(data) -> bool:
+    if not isinstance(data, dict):
+        return False
+    tokens = data.get("tokens")
+    has_tokens = isinstance(tokens, dict) and bool(tokens.get("access_token")) \
+        and bool(tokens.get("refresh_token"))
+    return has_tokens or bool(data.get("OPENAI_API_KEY"))
+
+
+def guarded_sync(temp_file: Path, real: Path) -> str:
+    """Copy a regular-file temp auth.json to the real one only when it is safe. Never logs content."""
+    try:
+        raw = temp_file.read_bytes()
+        new = json.loads(raw)
+    except (OSError, ValueError) as e:
+        return f"skipped: temp file unreadable or not JSON ({type(e).__name__})"
+    if not auth_fields_ok(new):
+        return "skipped: temp file lacks token or API-key fields"
+    target = real.resolve() if real.is_symlink() else real
+    try:
+        before = target.read_bytes()
+    except OSError as e:
+        return f"skipped: real auth.json unreadable ({type(e).__name__})"
+    if before == raw:
+        return "nothing to sync: identical to the real file"
+    try:
+        cur = json.loads(before)
+    except ValueError:
+        cur = {}
+    cur_t = iso_time(cur.get("last_refresh")) if isinstance(cur, dict) else None
+    new_t = iso_time(new.get("last_refresh")) if new.get("last_refresh") is not None else None
+    if new.get("last_refresh") is not None and new_t is None:
+        return "skipped: temp last_refresh unparsable"
+    if cur_t and not new_t:
+        return "skipped: real file has last_refresh, temp file has none"
+    if cur_t and new_t and not new_t > cur_t:
+        return "skipped: temp last_refresh not newer than the real file's"
+    if sha256(target.read_bytes()) != sha256(before):     # re-hash right before the replace
+        return "skipped: real auth.json changed during the check"
+    write_private(target, raw)
+    return ("synced to the real auth.json" +
+            (" (written through its symlink to the target)" if target != real else ""))
+
+
+def relink(link: Path, real: Path) -> None:
+    staged = link.with_name(f".auth.json.relink-{os.getpid()}")
+    if staged.is_symlink() or staged.exists():
+        staged.unlink()
+    os.symlink(real, staged)
+    os.replace(staged, link)     # also removes any regular-file credential copy
+
+
+def check_auth(ctx: Ctx, label: str) -> None:
+    """After a Codex run: is the temp home's auth.json still a link to the real one?"""
+    if not (ctx.codex_home and temp_home(ctx)):
         return
-    tmp_auth, real_auth = ctx.codex_home / "auth.json", REAL_CODEX_HOME / "auth.json"
-    digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
-    t, r = digest(tmp_auth), digest(real_auth)
-    if t == ctx.auth_digest and r == ctx.auth_digest:
-        return
-    if t not in (ctx.auth_digest, None) and r == ctx.auth_digest:
-        write_private(real_auth, tmp_auth.read_bytes())
-        ctx.notes.append("auth: Codex refreshed the temp auth.json; copied back to the operator's "
-                         "auth.json (it was unchanged since the last sync)")
-        ctx.auth_digest = t
-    elif r not in (ctx.auth_digest, None) and t == ctx.auth_digest:
-        write_private(tmp_auth, real_auth.read_bytes())
-        ctx.notes.append("auth: the operator's auth.json changed (a real-home run refreshed it); "
-                         "copied into the temp home")
-        ctx.auth_digest = r
-    else:
-        ctx.notes.append(f"auth: both copies changed or one is missing (temp={t and t[:8]}, "
-                         f"real={r and r[:8]}); left as they are. Re-login if Codex reports auth "
-                         "errors")
-        ctx.auth_digest = None    # stop syncing
+    link, real = ctx.codex_home / "auth.json", REAL_CODEX_HOME / "auth.json"
+    try:
+        if link.is_symlink():
+            ctx.auth_log.append(f"{label}: link kept")
+            return
+        if link.exists():
+            outcome = f"link replaced by a regular file; {guarded_sync(link, real)}"
+        else:
+            outcome = "link missing"
+        relink(link, real)
+        ctx.auth_log.append(f"{label}: {outcome}; link restored")
+    except Exception as e:  # noqa: BLE001 - recorded, never content
+        ctx.auth_log.append(f"{label}: auth check failed ({type(e).__name__})")
+
+
+def remove_staging(ctx: Ctx) -> None:
+    real = REAL_CODEX_HOME / "auth.json"
+    dirs = {real.parent}
+    try:
+        dirs.add(real.resolve().parent)
+    except OSError:
+        pass
+    for d in dirs:
+        for f in d.glob(".auth.json.lhprobe4-*"):
+            try:
+                f.unlink()
+                ctx.notes.append(f"removed leftover staging file {f.name}")
+            except OSError as e:
+                ctx.notes.append(f"could not remove staging file {f.name} ({type(e).__name__})")
 
 
 def cleanup(ctx: Ctx) -> None:
-    for pgid in ctx.pgids:
-        kill_group(pgid)
+    """Runs with SIGINT/SIGTERM/SIGHUP ignored so a second Ctrl-C cannot skip removing the temp home."""
+    caught = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    old = {s: signal.signal(s, signal.SIG_IGN) for s in caught}
     try:
-        leftovers = [r for r in ps_rows() if any(n in r["command"] for n in ctx.needles)]
-    except Exception:  # noqa: BLE001
-        leftovers = []
-    for r in leftovers:
-        ctx.notes.append(f"killed leftover: {r['pid']} {r['command'][:120]}")
         try:
-            os.kill(r["pid"], signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    try:
-        sync_auth(ctx)
-    except Exception as e:  # noqa: BLE001 - recorded
-        ctx.notes.append(f"auth: sync failed: {e!r}")
-    if ctx.codex_home:
-        shutil.rmtree(ctx.codex_home, ignore_errors=True)
-        ctx.notes.append("removed the temporary CODEX_HOME (and its auth.json copy)")
-    if ctx.tmp:
-        shutil.rmtree(ctx.tmp, ignore_errors=True)
-    if ctx.notes and ctx.raw.exists():
-        with open(ctx.raw, "a") as f:
-            f.write("\n## Cleanup\n\n" + "".join(f"- {n}\n" for n in ctx.notes))
-    for n in ctx.notes:
-        print(f"cleanup: {n}")
+            for pgid, start in list(ctx.pgids):
+                now = proc_start(pgid) if start else None
+                if start and now == start:
+                    kill_group(pgid)
+                    ctx.notes.append(f"killed group {pgid} (leader start time matched)")
+                else:
+                    ctx.notes.append(f"group {pgid} not signalled: "
+                                     + ("start time unknown (ps failed)" if not start
+                                        else "leader gone or pid reused"))
+            try:
+                leftovers = [r for r in ps_rows() if any(n in r["command"] for n in ctx.needles)]
+            except Exception:  # noqa: BLE001
+                leftovers = []
+            for r in leftovers:
+                ctx.notes.append(f"killed leftover: {r['pid']} {r['command'][:120]}")
+                try:
+                    os.kill(r["pid"], signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        finally:
+            try:
+                check_auth(ctx, "cleanup")
+            finally:
+                if ctx.codex_home:
+                    shutil.rmtree(ctx.codex_home, ignore_errors=True)
+                    ctx.notes.append("removed the temporary CODEX_HOME" +
+                                     (" (still present!)" if ctx.codex_home.exists() else ""))
+                remove_staging(ctx)
+                if ctx.tmp:
+                    shutil.rmtree(ctx.tmp, ignore_errors=True)
+        if ctx.raw.exists() and (ctx.notes or ctx.auth_log):
+            with open(ctx.raw, "a") as f:
+                if ctx.auth_log:
+                    f.write("\n## Codex auth link\n\n" + "".join(f"- {n}\n" for n in ctx.auth_log))
+                if ctx.notes:
+                    f.write("\n## Cleanup\n\n" + "".join(f"- {n}\n" for n in ctx.notes))
+        for n in ctx.notes:
+            print(f"cleanup: {n}")
+    finally:
+        for sig, h in old.items():
+            signal.signal(sig, h)
+
+
+def exit_on_signal(signum, _frame):
+    """First SIGINT/SIGTERM/SIGHUP ends the run; any further one is ignored, so it cannot
+    interrupt the cleanup that removes the temp CODEX_HOME."""
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_IGN)
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt
+    raise SystemExit(128 + signum)
 
 
 def parse_steps(text: str | None) -> list[int]:
@@ -1435,6 +1605,9 @@ def main(argv: list[str] | None = None) -> int:
               "run it from an ordinary terminal.", file=sys.stderr)
         return 2
 
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(sig) is not signal.SIG_IGN:
+            signal.signal(sig, exit_on_signal)
     ctx.art.mkdir(parents=True, exist_ok=True)
     ctx.raw.write_text(
         f"# Task 4 raw probe results: limit enforcement and worker environment\n\n"
@@ -1447,8 +1620,8 @@ def main(argv: list[str] | None = None) -> int:
         f"- dispatcher: {DISPATCH_AGENT}; workers: lhprobe:turns-worker (maxTurns 2), "
         f"lhprobe:worker (haiku low), lhprobe:compact-worker (autoCompactWindow 100000)\n"
         f"- codex pin: {shlex.join(CODEX_PIN)}\n"
-        f"- codex home: temp CODEX_HOME with a copy of auth.json and a minimal config.toml "
-        f"(network_access = true) when {REAL_CODEX_HOME / 'auth.json'} exists "
+        f"- codex home: temp CODEX_HOME whose auth.json is a symlink to the operator's, plus a "
+        f"minimal config.toml (network_access = true), when {REAL_CODEX_HOME / 'auth.json'} exists "
         f"({'yes' if (REAL_CODEX_HOME / 'auth.json').exists() else 'no: real home fallback'}); "
         f"the operator's config.toml is never edited\n"
         f"- unique_suffix: {ctx.uniq}\n"
