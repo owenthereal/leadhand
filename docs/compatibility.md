@@ -158,4 +158,48 @@ Codex workers (`codex exec --json`):
 
 ## Interrupted usage
 
-Not yet checked.
+Tested with Claude Code 2.1.322 and codex-cli 0.167.0 on macOS.
+
+Codex:
+
+- Rollout files are `~/.codex/sessions/YYYY/MM/DD/rollout-<local time>-<thread id>.jsonl`
+  (under `CODEX_HOME` when set). A resumed thread appends to the same file; earlier lines are
+  unchanged.
+- After every model response Codex writes a top-level `token_usage_record` with
+  `payload.response_id` and three usage objects: `payload.usage` (that response),
+  `payload.turn_token_usage`, and `payload.thread_token_usage` (the whole thread, across
+  processes). The `event_msg` record with `payload.type == "token_count"` carries
+  `payload.info.total_token_usage` and `payload.info.last_token_usage`.
+- A `codex exec` killed (SIGKILL) after its first command left a `token_usage_record` for its
+  completed response but no `token_count`. After one resume, `total_token_usage` covered
+  only the resumed turn, while `thread_token_usage` equalled the killed response plus the
+  resumed turn. In a thread that was never killed, the two totals agreed at every turn.
+- Decision: Codex usage is the sum of `payload.usage` over distinct `payload.response_id` in
+  `token_usage_record` records, cross-checked against the last `payload.thread_token_usage`.
+  `token_count`'s `total_token_usage` is only a fallback for a file with no
+  `token_usage_record`, because it undercounts a killed and resumed thread. A killed attempt
+  with no usage record is unknown, not zero. A response still in flight at the kill leaves
+  no record anywhere. `input_tokens` includes `cached_input_tokens`.
+- Fixture: `tests/fixtures/codex-rollout-interrupted.jsonl` is the sanitized rollout after
+  the kill and one resume.
+
+Claude:
+
+- A worker's transcript is `~/.claude/projects/<project dir>/<session id>/subagents/agent-<agent id>.jsonl`.
+  Assistant records carry `message.id`, `message.model` and `message.usage`, with
+  `isSidechain: true` and `agentId`. One response is written as one record per content block
+  with the same `message.id`; in every repeated ID observed, the usage on those records was
+  identical (including `output_tokens`). Decision: usage is charged once per `message.id`,
+  taking the record with the largest `output_tokens`.
+- A stopped worker's transcript keeps the usage of every completed response
+  (`tests/fixtures/claude-subagent-stopped.jsonl`). A worker resumed with SendMessage appends
+  to the same file (`tests/fixtures/claude-subagent-resumed.jsonl`). Only message IDs not yet
+  charged are new.
+- The session's own transcript is `~/.claude/projects/<project dir>/<session id>.jsonl`, the
+  same path hooks receive as `transcript_path`. `CLAUDE_CODE_SESSION_ID` is set in the
+  session's Bash commands and equals the session ID. The session transcript holds no
+  sidechain or worker records, and its message IDs are disjoint from the workers'. Decision:
+  the supervisor's usage comes from the session transcript and each worker's from its own
+  file, so charging both does not double-count. The session transcript's `cost-state` record
+  and the `<usage>` summary in task notifications already include worker usage, so they are
+  never added to the charges.
