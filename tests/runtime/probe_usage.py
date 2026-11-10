@@ -155,7 +155,7 @@ class Ctx:
     def __init__(self, out: Path, dry: bool):
         self.out = out
         self.art = out / "task5-artifacts"
-        self.raw = out / "task5-raw.md"
+        self.raw = out / "task5-raw.md"   # main() picks a fresh name if this exists
         self.manifest = self.art / "fixture-sources.json"
         self.dry = dry
         self.uniq = f"{os.getpid() % 10000:04d}"
@@ -416,6 +416,21 @@ def event_kind(e: dict) -> str:
     return f"{t}/{item.get('type')}" if item else str(t)
 
 
+PROSE_ITEM_TYPES = ("agent_message", "reasoning")
+COMMAND_FIELDS = ("command", "aggregated_output")
+
+
+def is_first_command(e: dict, first: str) -> bool:
+    """The kill trigger: an item.completed whose item is not prose and holds the probe
+    text in its own command or output field (a preamble quoting the text doesn't count)."""
+    item = e.get("item") if isinstance(e.get("item"), dict) else None
+    if e.get("type") != "item.completed" or item is None:
+        return False
+    if item.get("type") in PROSE_ITEM_TYPES:
+        return False
+    return any(first in json.dumps(item.get(f)) for f in COMMAND_FIELDS if f in item)
+
+
 def run_codex(ctx: Ctx, label: str, argv: list[str], prompt: str, cwd: Path) -> dict:
     """Run one codex exec to completion in its own process group."""
     t0 = time.monotonic()
@@ -524,7 +539,8 @@ def step1(ctx: Ctx):
     obs = {"codex_home": str(CODEX_HOME),
            "codex_home_from": "CODEX_HOME" if os.environ.get("CODEX_HOME") else "default ~/.codex",
            "prompt": prompt,
-           "kill_trigger": f"first item.completed stream line holding the probe text `{first}`",
+           "kill_trigger": (f"first item.completed whose item.type is not in {list(PROSE_ITEM_TYPES)} "
+                            f"and whose own {list(COMMAND_FIELDS)} field holds `{first}`"),
            "signal": "SIGKILL to codex's process group (worst case: no chance to flush)"}
     ctx.facts = obs   # kept in the raw file even if the step fails part-way
     state: dict = {"tid": None, "copies": []}
@@ -585,7 +601,10 @@ def step1_body(ctx: Ctx, obs: dict, state: dict, argv, prompt, cwd, first):
         events.append(e)
         if not state["tid"] and e.get("thread_id"):
             state["tid"] = str(e["thread_id"])
-        if e.get("type") == "item.completed" and first in line:
+        if first in line and not is_first_command(e, first) and len(ctx.facts.setdefault(
+                "lines_with_probe_text_not_triggering", [])) < 5:
+            ctx.facts["lines_with_probe_text_not_triggering"].append(f"{t}s {event_kind(e)}")
+        if is_first_command(e, first):
             trigger = {"t": t, "event": event_kind(e),
                        "item_keys": sorted(e["item"]) if isinstance(e.get("item"), dict) else None}
             try:
@@ -657,9 +676,11 @@ def step1_body(ctx: Ctx, obs: dict, state: dict, argv, prompt, cwd, first):
     excerpt.append(f"rollout before resume: records={before['records']} "
                    f"last_total={before.get('last_cumulative_total')} path={before.get('last_cumulative_path')}")
 
-    # Resume once; try the alternative order only if the first exits non-zero.
+    # Resume once. The alternative order runs only if the first exits non-zero AND
+    # shows no sign of having resumed (no thread/turn events), so the thread gets at
+    # most one resumed turn.
     used = None
-    for name, rargv in codex_resume_variants(tid):
+    for n_try, (name, rargv) in enumerate(codex_resume_variants(tid)):
         progress(f"  step1: resume ({name})")
         rr = run_codex(ctx, f"step1-resume-{name}", rargv, RESUME_PROMPT, cwd)
         rev = rr["events"]
@@ -672,11 +693,25 @@ def step1_body(ctx: Ctx, obs: dict, state: dict, argv, prompt, cwd, first):
             "stderr_first_lines": rr["stderr"].strip().splitlines()[:5] or "none",
         }
         excerpt.append(f"resume {name}: exit={rr['exit']}")
+        started = [event_kind(e) for e in rev
+                   if e.get("thread_id") or str(e.get("type", "")).startswith("turn.")]
+        obs[f"resume {name}"]["thread_or_turn_events"] = started or "none"
         if rr["exit"] == 0:
             used = name
             break
-    obs["resume_argv_used"] = (shlex.join(dict(codex_resume_variants(tid))[used]) if used
-                               else "none exited 0")
+        if started:
+            obs["resume_retry"] = (f"not run: {name} exited {rr['exit']} but emitted {started}, so "
+                                   "it may have resumed; a second order would add a second turn")
+            used = f"{name} (non-zero exit)"
+            break
+        if n_try == 0:
+            obs["resume_retry"] = (f"{name} exited {rr['exit']} with no thread/turn events; "
+                                   "trying the alternative order")
+    obs.setdefault("resume_retry", "not needed")
+    obs["resume_argv_used"] = (shlex.join(dict(codex_resume_variants(tid))[used.split(" (")[0]])
+                               + ("" if used in dict(codex_resume_variants(tid)) else
+                                  "  (exited non-zero after starting)")
+                               if used else "none resumed")
     idle(ROLLOUT_SETTLE)
     files_after = rollout_files(tid)
     obs["rollout_files_after_resume"] = [str(f) for f in files_after] or "none"
@@ -1027,15 +1062,16 @@ def find_agent(sess: Session, token: str) -> dict:
     if listed:
         ids["directory listing (subagent file holding the token)"] = listed
     out["agent_id_sources"] = ids or "none"
-    aid, src = None, None
-    for k, v in ids.items():
-        aid, src = (v[0] if isinstance(v, list) else v), k
-        break
+    # Prefer the first candidate (in route order) whose agent-<id>.jsonl exists.
+    subs = {p.name: p for p in sess.sub_paths()}
+    cands = [(k, v) for k, vs in ids.items() for v in (vs if isinstance(vs, list) else [vs])]
+    aid, src = next(((v, k) for k, v in cands if f"agent-{v}.jsonl" in subs),
+                    (cands[0][1], cands[0][0] + " (no file yet)") if cands else (None, None))
     flat = {v for vs in ids.values() for v in (vs if isinstance(vs, list) else [vs])}
     out["agent_id"] = aid
     out["agent_id_found_by"] = src or "not found"
     out["agent_id_sources_agree"] = len(flat) <= 1
-    path = next((p for p in sess.sub_paths() if p.name == f"agent-{aid}.jsonl"), None) if aid else None
+    path = subs.get(f"agent-{aid}.jsonl") if aid else None
     out["path"] = path
     out["transcript_path"] = str(path) if path else "not found"
     out["transcript_holds_token"] = bool(path) and token in path.read_text(errors="replace")
@@ -1355,10 +1391,11 @@ def dry_commands(ctx: Ctx, n: int) -> list[str]:
         first, tok = f"lhprobe-first-{ctx.uniq}", ctx.token("120.5")
         return ([f"{shlex.join(codex_first_argv())}  < {codex_prompt(first, tok)!r}  "
                  f"(cwd=<tmp>/lhprobe5 XXXX/codex repo, process_group=0)",
-                 f"on the first item.completed line holding `{first}`: kill -KILL -<codex pgid>",
+                 f"on the first non-prose item.completed whose command/aggregated_output holds `{first}`: "
+                 f"kill -KILL -<codex pgid>",
                  f"read {CODEX_SESSIONS}/YYYY/MM/DD/*<thread_id>.jsonl; copy it"]
                 + [shlex.join(a) + f"  < {RESUME_PROMPT!r}" + ("" if i == 0 else
-                                                               "  (only if the first exits non-zero)")
+                                                               "  (only if the first exits non-zero with no thread/turn events)")
                    for i, (_, a) in enumerate(codex_resume_variants("<thread_id>"))]
                 + ["read the same rollout file again; compare record counts and cumulative totals"])
     if n == 2:
@@ -1474,6 +1511,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     ctx.art.mkdir(parents=True, exist_ok=True)
+    # Never overwrite earlier findings: a partial run (or a rerun) gets its own file.
+    if args.only or ctx.raw.exists():
+        stem = "task5-raw" + (f"-only-{'-'.join(map(str, steps))}" if args.only else "")
+        cand, i = ctx.out / f"{stem}.md", 2
+        while cand.exists():
+            cand, i = ctx.out / f"{stem}-{i}.md", i + 1
+        ctx.raw = cand
     ctx.raw.write_text(
         f"# Task 5 raw probe results: interrupted-usage recovery\n\n"
         f"- date: {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
