@@ -93,6 +93,20 @@ class SupervisorFileTests(unittest.TestCase):
             plain = re.sub(r"<[a-z_ ]+>", "", args)     # drop placeholders such as <run_dir>
             self.assertNotRegex(plain, r"[|;&<>$]|\bcd\b", f"<cli> {name}{args}")
 
+    def test_run_skill_covers_run_level_dispatches(self):
+        _, body = split(SKILL)
+        text = section(body, "### Run-level dispatches")
+        for name in (*engine.GATES, "final_fix", "card", "gate", "wave", "resume"):
+            self.assertIn(f"`{name}`", text, name)
+        self.assertIn("no `--card`", text)
+        dispatch = section(body, "### `dispatch` without `resume`")
+        self.assertIn("`card <card> <kind> (attempt <attempt>)`", dispatch)
+        self.assertIn("`run <kind> (wave <wave>)`", dispatch)
+        # `done` prints the report the action names, not a guessed path.
+        done = section(body, "### `done`")
+        self.assertIn("the action's `report`", done)
+        self.assertNotIn("report.md", done)
+
     def test_run_skill_records_started_before_waiting(self):
         _, body = split(SKILL)
         for heading in ("### `dispatch` without `resume`", "### `dispatch` with `resume`"):

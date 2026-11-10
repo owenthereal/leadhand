@@ -51,7 +51,9 @@ How to call the CLI:
    - `subagent_type`: the action's `agent`;
    - `model`: `agent_model`, and `effort`: `agent_effort`, each only when it
      is not null (a Codex route has both null: leave both out);
-   - `description`: `card <card> <kind> (attempt <attempt>)`;
+   - `description`: `card <card> <kind> (attempt <attempt>)`; for a
+     run-level dispatch (`card` is null), `run <kind> (wave <wave>)`, or
+     just `run <kind>` when `wave` is null;
    - `prompt`: the action's `message`, verbatim.
 
    It runs in the background and returns the worker's agent ID at once.
@@ -68,6 +70,19 @@ already inside the command. Dispatch it like any other worker.
 
 If `record started` fails because the dispatch already has another worker,
 stop the worker you just launched with TaskStop and run `next`.
+
+### Run-level dispatches
+
+Once every card is accepted or parked, the engine runs the end-of-run gates
+(`final_review`, `evidence`, `security` when the risk calls for it, and
+`verify`). A failing gate gets a fix wave: a `final_fix` implementer, then a
+`final_review` of its diff. These come as `dispatch` actions with `card`
+null, `gate` (the gate it runs, or null) and `wave` (the fix wave, or null),
+and never with `resume`. Handle them exactly like card dispatches, with the
+same `started`, timer, result and `stop_worker` commands; those commands take
+no `--card`. The engine judges their results itself: no `answer` or
+`check_diff` follows them, and you never rule on or park them (`--card` takes
+only a card number).
 
 ### `dispatch` with `resume`
 
@@ -150,9 +165,9 @@ Then run `next`.
 
 ### `done`
 
-Print the first ten lines of `<run_dir>/report.md` (Read tool, 10 lines). If
-that file does not exist, print the action's `outcome`, `qualifier` and
-`reasons` instead. Then stop.
+Print the first ten lines of the file the action's `report` names (Read
+tool, 10 lines). If `report` is null, print the action's `outcome`,
+`qualifier` and `reasons` instead. Then stop.
 
 ## Hygiene
 
@@ -172,8 +187,8 @@ that file does not exist, print the action's `outcome`, `qualifier` and
 
 When the operator tells you to skip a card:
 
-1. Run `next`. If it returns a `wait` for that card, stop its worker first:
-   TaskStop `worker_id`, then
+1. Run `next`. If it returns a `wait` for that card (its `dispatch_id`
+   starts with `c<card>-`), stop its worker first: TaskStop `worker_id`, then
    `<cli> record <run_dir> result --dispatch <dispatch_id> --worker <worker_id> --stopped --reply 'Status: SPENT (time limit)'`
 2. Record the card parked:
    `<cli> record <run_dir> park --card <card> --reason 'operator: skip'`
