@@ -195,8 +195,41 @@ class ChargeClaudeTests(UsageCase):
         self.assertEqual(raw[0]["usage"]["known"], True)
         self.assertEqual(raw[0]["usage"]["output"], 10)
         self.assertEqual(usage.read_charges(self.paths), [c])
-        self.assertEqual(usage.charged_checkpoint([c], "claude", "agent1"), {"message_ids": ["m1"]})
-        self.assertEqual(usage.charged_checkpoint([c], "claude", "other"), {"message_ids": []})
+        self.assertEqual(usage.charged_checkpoint([c], "claude", "agent1"), {"messages": {"m1": 10}})
+        self.assertEqual(usage.charged_checkpoint([c], "claude", "other"), {"messages": {}})
+
+    def test_charge_tops_up_message_charged_mid_stream(self):
+        f = self.tmp / "live.jsonl"
+        append_lines(f, claude_line("m1", 5, inp=100, cached=1000, w5=50))
+        c1 = self.claude_charge(1, f)
+        self.assertEqual((c1.usage.input, c1.usage.output), (100, 5))
+        append_lines(f, claude_line("m1", 40, inp=100, cached=1000, w5=50),
+                     claude_line("m2", 7, inp=3))
+        c2 = self.claude_charge(2, f)
+        # m1: only the 35 extra output (input side was charged with its first record); m2 in full
+        self.assertEqual((c2.usage.input, c2.usage.cached, c2.usage.cache_write_5m, c2.usage.output),
+                         (3, 0, 0, 35 + 7))
+        self.assertEqual(c2.checkpoint, {"messages": {"m1": 40, "m2": 7}})
+        c3 = self.claude_charge(3, f)  # nothing grew
+        self.assertEqual(c3.usage.output, 0)
+        self.assertEqual(c3.checkpoint, {"messages": {}})
+        total, _ = usage.claude_usage(f, exclude_ids=frozenset())
+        self.assertEqual(usage.totals(usage.read_charges(self.paths))["implementer"], total)
+        self.assertEqual(usage.charged_checkpoint(usage.read_charges(self.paths), "claude", "agent1"),
+                         {"messages": {"m1": 40, "m2": 7}})
+
+    def test_charge_none_path_is_unknown_and_relative_path_is_rejected(self):
+        c = usage.charge(self.paths, charge_id="d1:claude:a", source="claude", key="a",
+                         dispatch_id="d1", role="implementer", path_or_thread=None)
+        self.assertFalse(c.usage.known)
+        c2 = usage.charge(self.paths, charge_id="d1:codex:t", source="codex", key="t",
+                          dispatch_id="d1", role="implementer", path_or_thread=None)
+        self.assertFalse(c2.usage.known)
+        with self.assertRaises(ValueError):
+            usage.charge(self.paths, charge_id="d2:claude:a", source="claude", key="a",
+                         dispatch_id="d2", role="implementer",
+                         path_or_thread=Path("relative/agent.jsonl"))
+        self.assertEqual(len(usage.read_charges(self.paths)), 2)
 
     def test_repeated_charge_id_is_harmless(self):
         f = self.tmp / "t.jsonl"
@@ -219,7 +252,7 @@ class ChargeClaudeTests(UsageCase):
         self.assertFalse(c.usage.known)
         raw = json.loads(self.paths.charges.read_text().splitlines()[0])
         self.assertEqual(raw["usage"]["known"], False)
-        self.assertEqual(usage.charged_checkpoint([c], "claude", "agent1"), {"message_ids": []})
+        self.assertEqual(usage.charged_checkpoint([c], "claude", "agent1"), {"messages": {}})
         # the file appears later: everything is still chargeable
         append_lines(f, claude_line("m1", 10, inp=2))
         c2 = self.claude_charge(2, f)
@@ -285,6 +318,31 @@ class CodexTests(UsageCase):
         self.assertEqual(c3.usage.input, 0)
         total = usage.totals(usage.read_charges(self.paths))["implementer"]
         self.assertEqual(total.input, 250)
+
+    def test_charge_codex_counter_reset_charges_new_epoch_in_full(self):
+        f = rollout_path(self.sessions, "thr1")
+        append_lines(f, codex_line(100, 0, 40))
+        c1 = self.codex_charge(1)
+        append_lines(f, codex_line(250, 0, 90))
+        c2 = self.codex_charge(2)
+        self.assertEqual((c2.usage.input, c2.usage.output, c2.epoch_reset), (150, 50, False))
+        # the thread was resumed and its counter restarted below the checkpoint
+        append_lines(f, codex_line(30, 0, 5))
+        c3 = self.codex_charge(3)
+        self.assertEqual((c3.usage.input, c3.usage.output, c3.epoch_reset), (30, 5, True))
+        raw = [json.loads(line) for line in self.paths.charges.read_text().splitlines()]
+        self.assertTrue(raw[2]["epoch_reset"])
+        self.assertNotIn("epoch_reset", raw[0])
+        self.assertEqual(usage.read_charges(self.paths)[2], c3)
+        # the checkpoint is the cumulative reached (not a max): growth continues from it
+        self.assertEqual(usage.charged_checkpoint([c1, c2, c3], "codex", "thr1")["cumulative"]["input"], 30)
+        append_lines(f, codex_line(80, 0, 12))
+        c4 = self.codex_charge(4)
+        self.assertEqual((c4.usage.input, c4.usage.output, c4.epoch_reset), (50, 7, False))
+        # a single lower field is enough to count as a reset
+        append_lines(f, codex_line(500, 0, 3))
+        c5 = self.codex_charge(5)
+        self.assertEqual((c5.usage.input, c5.usage.output, c5.epoch_reset), (500, 3, True))
 
     def test_codex_stream_usage_sums_turn_completed(self):
         events = [

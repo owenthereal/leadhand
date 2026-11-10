@@ -2,7 +2,8 @@
 
 `charges.jsonl` is the source of truth. Each charge is one durable record with a
 unique `charge_id`; it holds the usage charged and the checkpoint reached (Claude:
-the message IDs newly charged; Codex: the cumulative total reached). The whole
+the output charged so far for each message ID touched; Codex: the cumulative
+total reached, with a lower total meaning the counter restarted). The whole
 `charge` sequence (does the id exist? derive the checkpoint from earlier charges,
 read the transcript or session file, compute only what is new, append) runs under
 the run's state lock, so a repeated charge is harmless, a crash between a charge
@@ -234,13 +235,9 @@ def _claude_record_usage(rec: dict) -> tuple[Usage, str] | None:
                  model=model if isinstance(model, str) else None), mid
 
 
-def claude_usage(path: Path, *, exclude_ids: frozenset[str]) -> tuple[Usage, frozenset[str]]:
-    """Sum the usage of the transcript's assistant messages, once per message ID.
-
-    The record with the largest `output_tokens` represents a message (ties keep
-    the first). IDs in `exclude_ids` are skipped. Returns the total and the IDs
-    it counted (not the excluded ones), which are the new checkpoint entries.
-    """
+def _claude_messages(path: Path) -> dict[str, Usage]:
+    """The best record per message ID: the one with the largest `output_tokens`
+    (ties keep the first). Unparseable and ID-less lines are skipped."""
     best: dict[str, Usage] = {}
     for rec in _json_lines(Path(path), needle=CLAUDE_RECORD_TYPE_ASSISTANT):
         if not isinstance(rec, dict):
@@ -249,14 +246,24 @@ def claude_usage(path: Path, *, exclude_ids: frozenset[str]) -> tuple[Usage, fro
         if parsed is None:
             continue
         u, mid = parsed
-        if mid in exclude_ids:
-            continue
         if mid not in best or u.output > best[mid].output:
             best[mid] = u
-    total = Usage()
-    for u in best.values():
-        total = add(total, u)
-    return total, frozenset(best)
+    return best
+
+
+def claude_usage(path: Path, *, exclude_ids: frozenset[str]) -> tuple[Usage, frozenset[str]]:
+    """Sum the usage of the transcript's assistant messages, once per message ID.
+
+    The record with the largest `output_tokens` represents a message. IDs in
+    `exclude_ids` are skipped. Returns the total and the IDs it counted (not the
+    excluded ones).
+    """
+    total, counted = Usage(), set()
+    for mid, u in _claude_messages(path).items():
+        if mid not in exclude_ids:
+            total = add(total, u)
+            counted.add(mid)
+    return total, frozenset(counted)
 
 
 def _codex_usage_from(d: Any) -> Usage | None:
@@ -314,19 +321,21 @@ class Charge:
     usage: Usage
     checkpoint: dict
     ts: str
+    epoch_reset: bool = False   # Codex: the cumulative counter restarted; charged in full
 
 
 def _charge_to_record(c: Charge) -> dict:
     return {"charge_id": c.charge_id, "source": c.source, "key": c.key,
             "dispatch_id": c.dispatch_id, "role": c.role,
-            "usage": _usage_to_dict(c.usage), "checkpoint": c.checkpoint, "ts": c.ts}
+            "usage": _usage_to_dict(c.usage), "checkpoint": c.checkpoint, "ts": c.ts,
+            **({"epoch_reset": True} if c.epoch_reset else {})}
 
 
 def _charge_from_record(r: dict) -> Charge:
     return Charge(charge_id=r["charge_id"], source=r["source"], key=r["key"],
                   dispatch_id=r["dispatch_id"], role=r["role"],
                   usage=_usage_from_dict(r["usage"]), checkpoint=r.get("checkpoint") or {},
-                  ts=r["ts"])
+                  ts=r["ts"], epoch_reset=bool(r.get("epoch_reset")))
 
 
 def read_charges(paths: RunPaths) -> list[Charge]:
@@ -334,71 +343,101 @@ def read_charges(paths: RunPaths) -> list[Charge]:
 
 
 def charged_checkpoint(charges: Iterable[Charge], source: str, key: str) -> dict:
-    """What earlier charges for (source, key) already cover. Claude:
-    `{"message_ids": [sorted union]}`. Codex: `{"cumulative": {field: max}}`
-    (empty when nothing was charged)."""
+    """What earlier charges for (source, key) already cover.
+
+    Claude: `{"messages": {id: output_tokens_charged}}`, the max per ID over all
+    charges (a message charged mid-stream is topped up when it grows).
+    Codex: `{"cumulative": {field: n}}`, the cumulative reached by the key's
+    latest charge (empty when nothing was charged); it is not a max, because a
+    restarted counter lowers it.
+    """
     mine = [c for c in charges if c.source == source and c.key == key]
     if source == "claude":
-        ids: set[str] = set()
+        messages: dict[str, int] = {}
         for c in mine:
-            ids.update(c.checkpoint.get("message_ids") or ())
-        return {"message_ids": sorted(ids)}
+            for mid, n in (c.checkpoint.get("messages") or {}).items():
+                messages[mid] = max(messages.get(mid, 0), _int(n))
+        return {"messages": messages}
     if source == "codex":
-        cum: dict[str, int] = {}
-        for c in mine:
-            for f, v in (c.checkpoint.get("cumulative") or {}).items():
-                cum[f] = max(cum.get(f, 0), _int(v))
-        return {"cumulative": cum}
+        cum = (mine[-1].checkpoint.get("cumulative") or {}) if mine else {}
+        return {"cumulative": {f: _int(v) for f, v in cum.items()}}
     raise ValueError(f"unknown usage source: {source!r}")
 
 
 def charge(paths: RunPaths, *, charge_id: str, source: str, key: str, dispatch_id: str,
-           role: str, path_or_thread: Path | str, sessions_dir: Path | None = None) -> Charge:
-    """Charge what is new in a transcript (source "claude", `path_or_thread` a
-    path) or Codex session (source "codex", `path_or_thread` a thread ID, found
-    under `sessions_dir`) exactly once. Runs entirely under the state lock.
+           role: str, path_or_thread: Path | str | None,
+           sessions_dir: Path | None = None) -> Charge:
+    """Charge what is new in a transcript (source "claude", `path_or_thread` an
+    absolute path) or Codex session (source "codex", `path_or_thread` a thread
+    ID, found under `sessions_dir`) exactly once. Runs entirely under the state
+    lock.
 
     A `charge_id` that already exists is returned unchanged. A missing or
-    unreadable file appends an UNKNOWN charge whose checkpoint is the one
-    already reached, so nothing is lost when the file appears later.
+    unreadable file, or a `path_or_thread` of None (no transcript known), appends
+    an UNKNOWN charge whose checkpoint is the one already reached, so nothing is
+    lost when the file appears later. A relative Claude path is a ValueError.
     """
     if source not in SOURCES:
         raise ValueError(f"unknown usage source: {source!r}")
     if not charge_id:
         raise ValueError("charge_id is required")
+    if source == "claude" and path_or_thread is not None and not Path(path_or_thread).is_absolute():
+        raise ValueError(f"transcript path must be absolute: {path_or_thread!s}")
     with state_lock(paths):
         earlier = read_charges(paths)
         for c in earlier:
             if c.charge_id == charge_id:
                 return c
         prior = charged_checkpoint(earlier, source, key)
+        epoch_reset = False
         if source == "claude":
-            used, checkpoint = _new_claude(Path(path_or_thread), prior)
+            used, checkpoint = _new_claude(
+                None if path_or_thread is None else Path(path_or_thread), prior)
         else:
-            used, checkpoint = _new_codex(str(path_or_thread), sessions_dir, prior)
+            used, checkpoint, epoch_reset = _new_codex(
+                None if path_or_thread is None else str(path_or_thread), sessions_dir, prior)
         record = Charge(charge_id=charge_id, source=source, key=key, dispatch_id=dispatch_id,
-                        role=role, usage=used, checkpoint=checkpoint, ts=_utc_now())
+                        role=role, usage=used, checkpoint=checkpoint, ts=_utc_now(),
+                        epoch_reset=epoch_reset)
         append_jsonl(paths, paths.charges, _charge_to_record(record))
         return record
 
 
-def _new_claude(path: Path, prior: dict) -> tuple[Usage, dict]:
-    charged = frozenset(prior["message_ids"])
+def _new_claude(path: Path | None, prior: dict) -> tuple[Usage, dict]:
+    """New messages are charged in full; an already-charged message that has grown
+    is charged only its extra output (its input side was charged with its first
+    record). The checkpoint lists the new or grown IDs at their output so far."""
+    if path is None:
+        return UNKNOWN, {"messages": {}}
+    charged = prior["messages"]
     try:
-        used, new_ids = claude_usage(path, exclude_ids=charged)
+        messages = _claude_messages(path)
     except OSError:
-        return UNKNOWN, {"message_ids": []}
-    return used, {"message_ids": sorted(new_ids)}
+        return UNKNOWN, {"messages": {}}
+    used, reached = Usage(), {}
+    for mid, u in messages.items():
+        if mid not in charged:
+            used, reached[mid] = add(used, u), u.output
+        elif u.output > charged[mid]:
+            used = add(used, Usage(output=u.output - charged[mid], model=u.model))
+            reached[mid] = u.output
+    return used, {"messages": reached}
 
 
-def _new_codex(thread: str, sessions_dir: Path | None, prior: dict) -> tuple[Usage, dict]:
+def _new_codex(thread: str | None, sessions_dir: Path | None,
+               prior: dict) -> tuple[Usage, dict, bool]:
+    """Charge the cumulative's difference from the checkpoint. If any field is
+    lower than the checkpoint the counter restarted (a resumed thread, a new
+    rollout file): a new epoch, charged in full. Returns (usage, checkpoint,
+    epoch_reset)."""
     reached = prior["cumulative"]
-    cumulative = codex_cumulative(thread, sessions_dir)
+    cumulative = UNKNOWN if thread is None else codex_cumulative(thread, sessions_dir)
     if not cumulative.known:
-        return UNKNOWN, {"cumulative": dict(reached)}
-    delta = subtract(cumulative, Usage(**reached))
+        return UNKNOWN, {"cumulative": dict(reached)}, False
     now = _tokens_dict(cumulative)
-    return delta, {"cumulative": {f: max(now[f], reached.get(f, 0)) for f in _TOKEN_FIELDS}}
+    epoch_reset = any(now[f] < reached.get(f, 0) for f in _TOKEN_FIELDS)
+    delta = cumulative if epoch_reset else subtract(cumulative, Usage(**reached))
+    return delta, {"cumulative": now}, epoch_reset
 
 
 _GROUPS = {"role": "role", "dispatch": "dispatch_id", "dispatch_id": "dispatch_id",
