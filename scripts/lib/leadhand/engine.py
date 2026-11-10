@@ -24,11 +24,13 @@ Actions (`next_action`):
                  question. Record a ruling, or park the card.
     check_diff   {card, dispatch_id, diff, findings, paths}: a fix touched only tests and
                  docs. Read the diff and record a diff check.
-    done         {outcome, qualifier, reasons} when the run ended; with outcome None and
-                 per-card `cards` when every card is settled (end-of-run steps follow).
+    done         {outcome, qualifier, reasons, report, cards}: the run ended (the report,
+                 handoff and runs.md line are written before this is returned).
 
 Dispatch IDs are `c<card>-a<attempt>-<kind>-<n>`, `n` counting that kind within the
-card's attempt.
+card's attempt. Run-level dispatches (card None) are `run-<kind>-<n>` for the end-of-run
+gates and `run-w<wave>-<kind>-<n>` for a fix wave; their dispatch actions also carry
+`gate` and `wave`.
 
 Integration before acceptance: a card is accepted only by fast-forwarding the run branch
 to a tip that contains the run tip. When the card branch does not, the engine rebases it
@@ -42,6 +44,10 @@ their dispatches records the card tip and branch it must leave in place and a sn
 the run's refs; after the result, any change is a `violation`: preserved under
 `refs/leadhand/<run_id>/violations/`, restored, the result voided and the same kind
 dispatched again on the same route.
+
+End of run: once every card is accepted, parked, or waits on a parked card, the
+commit-bound gates run on the run head (see `_end_of_run`), then the outcome, the
+report, a handoff when blocked, and one line in `<docs_dir>/runs.md`.
 """
 from __future__ import annotations
 
@@ -55,7 +61,7 @@ import shutil
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -66,12 +72,13 @@ from leadhand.briefs import CODEX_AGENT, agent_for, dispatch_message, parse_repo
 from leadhand.config import VENDORS, Config, ConfigError, Route, docs_dir_for, load_config
 from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, parse_deck
 from leadhand.gitops import (GitError, card_branch_name, changed_paths, cut_card_branch, default_base,
-                             detect_violation, fast_forward, git, head, is_ancestor, is_test_or_doc_path,
-                             needs_integration, prepare_workspace, preserve_and_restore, rebase_onto)
+                             detect_violation, ensure_excluded, fast_forward, git, head, is_ancestor,
+                             is_test_or_doc_path, needs_integration, prepare_workspace, preserve_and_restore,
+                             rebase_onto)
 from leadhand.route import LadderExhausted, PinnedVendorMissing, Resolution, resolve
-from leadhand.state import (CardState, RunPaths, utc_now, append_attempt, append_event, crash_point,
-                            decide_outcome, fold_cards, new_run_dir, read_attempts, read_events, run_paths,
-                            state_lock, write_json_atomic)
+from leadhand.state import (CardState, RunPaths, utc_now, allowed_next_step, append_attempt, append_event,
+                            crash_point, decide_outcome, fold_cards, new_run_dir, read_attempts, read_events,
+                            run_paths, state_lock, write_json_atomic)
 
 ACTIONS = ("dispatch", "wait", "check_diff", "answer", "stop_worker", "done")
 RECORD_KINDS = ("started", "result", "ruling", "park", "diff-check")
@@ -271,9 +278,11 @@ def _fix_round(events: list[dict], card: int, attempt: int, before_seq: int | No
     return rounds[-1] if rounds else None
 
 
-def _done_action(outcome: dict) -> dict:
+def _done_action(ctx: "_Run", outcome: dict, events: list[dict]) -> dict:
+    report = ctx.paths.report
     return {"action": "done", "outcome": outcome["outcome"], "qualifier": outcome.get("qualifier", ""),
-            "reasons": outcome.get("reasons", [])}
+            "reasons": outcome.get("reasons", []), "report": str(report) if report.is_file() else None,
+            "cards": _card_summary(ctx, fold_cards(events, ctx.numbers))}
 
 
 # --------------------------------------------------------------------------
@@ -405,7 +414,8 @@ def _next_action(run_dir: Path) -> dict:
         events = read_events(ctx.paths)
         ended = _ended(events)
         if ended is not None:
-            return _done_action(ended)
+            _wrap_up(ctx, ended, events)
+            return _done_action(ctx, ended, read_events(ctx.paths))
         action = _step(ctx, events)
         if action is not None:
             return action
@@ -461,11 +471,15 @@ def _step(ctx: _Run, events: list[dict]) -> dict | None:
     if _finish_leftovers(ctx, events):
         return None
     cards = fold_cards(events, ctx.numbers)
+    index = _dispatches(events)
+    open_run = [d for d in _run_dispatches(index) if d.result is None]
+    if open_run:
+        # A gate or fix wave worker is using the workspace (a card unparked meanwhile waits).
+        return _in_flight(ctx, open_run[-1])
     n = _pick(ctx, cards, events)
     if n is None:
-        return _end_of_run(ctx, cards)
+        return _end_of_run(ctx, cards, events)
     c = cards[n]
-    index = _dispatches(events)
     if c.state == "pending":
         _no_open_dispatch(ctx, events, n)
         current = _current_branch(ctx)
@@ -500,9 +514,8 @@ def _step(ctx: _Run, events: list[dict]) -> dict | None:
     return _after_result(ctx, c, d, events, index)
 
 
-def _end_of_run(ctx: _Run, cards: dict[int, CardState]) -> dict:
-    """Every card is accepted, parked, or waits on a parked card. End-of-run steps
-    (final review, gates, outcome) come after this; until then the run reports where it stands."""
+def _card_summary(ctx: _Run, cards: dict[int, CardState]) -> list[dict]:
+    """Each card's state, with why a card that is not accepted stopped (parked, or waits on a parked card)."""
     out = []
 
     def waits_on(n: int, seen: frozenset = frozenset()) -> list[int]:
@@ -527,8 +540,7 @@ def _end_of_run(ctx: _Run, cards: dict[int, CardState]) -> dict:
             reason = (f"waits on parked card{'s' if len(blockers) > 1 else ''} {', '.join(map(str, blockers))}"
                       if blockers else "waits on its dependencies")
             out.append({"card": n, "state": c.state, "reason": reason})
-    return {"action": "done", "outcome": None, "qualifier": "", "cards": out,
-            "reasons": [f"card {x['card']} {x['state']}: {x['reason']}" for x in out if x["reason"]]}
+    return out
 
 
 # -- dispatching -----------------------------------------------------------
@@ -579,6 +591,14 @@ def _request(ctx: _Run, c: CardState, events: list[dict], *, kind: str, attempt:
     if notes:
         with open(brief, "a", encoding="utf-8") as f:
             f.write("\n" + notes.rstrip("\n") + "\n")
+    return _append_request(ctx, did, card=c.number, attempt=attempt, kind=kind, role=role, route=route,
+                           brief=brief, report=report, extra=extra, notes=notes, resume=resume, **guard)
+
+
+def _append_request(ctx: _Run, did: str, *, card: int | None, attempt: int, kind: str, role: str, route: Route,
+                    brief: Path, report: Path, extra: dict, notes: str, resume: _Dispatch | None,
+                    **more: Any) -> dict:
+    """Append `dispatch_requested` for a brief already written (with the notes appended)."""
     # No worker can have written this dispatch's report yet: one already there is left over
     # from an earlier run that used the same workspace.
     Path(report).unlink(missing_ok=True)
@@ -592,11 +612,11 @@ def _request(ctx: _Run, c: CardState, events: list[dict], *, kind: str, attempt:
         minutes = dsp.limits_for(ctx.config, role).minutes
     except ConfigError as e:
         raise EngineError(str(e)) from None
-    return append_event(ctx.paths, "dispatch_requested", dispatch_id=did, card=c.number, attempt=attempt,
+    return append_event(ctx.paths, "dispatch_requested", dispatch_id=did, card=card, attempt=attempt,
                         dispatch_kind=kind, role=role, vendor=route.vendor, model=route.model,
                         effort=route.effort, brief=str(brief), report=str(report), extra=extra, notes=notes,
                         resumes=resume.id if resume is not None else None, resume_worker=resume_worker,
-                        resume_session=resume_session, minutes=minutes, **guard)
+                        resume_session=resume_session, minutes=minutes, **more)
 
 
 def _current_branch(ctx: _Run) -> str | None:
@@ -620,13 +640,16 @@ def _check_out(ctx: _Run, events: list[dict], card: int, branch: str) -> None:
 
 
 def _no_open_dispatch(ctx: _Run, events: list[dict], card: int) -> None:
-    """Refuse to touch the workspace for `card` while another card's worker may be using it."""
+    """Refuse to touch the workspace for `card` while another card's worker, or (for a card)
+    a run-level gate or fix wave worker, may be using it."""
     cards = fold_cards(events, ctx.numbers)
     for d in _dispatches(events).values():
         other = d.req.get("card")
         if (d.result is None and other != card and other in cards
                 and cards[other].state not in ("parked", "accepted") and cards[other].dispatch_id == d.id):
             raise EngineError(f"card {other} has dispatch {d.id} open; card {card} must wait for it")
+        if d.result is None and other is None and card is not None:
+            raise EngineError(f"the run's dispatch {d.id} is open; card {card} must wait for it")
 
 
 def _card_base(ctx: _Run, c: CardState, events: list[dict]) -> str:
@@ -644,7 +667,8 @@ def _budget_seconds(req: dict) -> float:
 
 def _codex_command(ctx: _Run, req: dict) -> list[str]:
     cmd = [str(dsp.CLI_PATH), "dispatch", "--run", str(ctx.root), "--dispatch-id", req["dispatch_id"],
-           "--card", str(req["card"]), "--attempt", str(req["attempt"]), "--role", req["role"],
+           *(["--card", str(req["card"])] if req["card"] is not None else []),
+           "--attempt", str(req["attempt"]), "--role", req["role"],
            "--model", req["model"], "--effort", req["effort"], "--brief", req["brief"],
            "--report", req["report"], "--cwd", str(ctx.ws)]
     if req.get("resume_session"):
@@ -661,12 +685,15 @@ def _dispatch_action(ctx: _Run, req: dict) -> dict:
         agent, agent_model, agent_effort = agent_for(req["role"], "claude"), req["model"], req["effort"]
         resume = {"worker_id": req["resume_worker"]} if req.get("resume_worker") else None
         message = dispatch_message(agent, brief, report)
-    return {"action": "dispatch", "dispatch_id": req["dispatch_id"], "kind": req["dispatch_kind"],
-            "card": req["card"], "attempt": req["attempt"], "role": req["role"], "agent": agent,
-            "agent_model": agent_model, "agent_effort": agent_effort,
-            "route": {"vendor": req["vendor"], "model": req["model"], "effort": req["effort"]},
-            "message": message, "brief": req["brief"], "report": req["report"], "resume": resume,
-            "deadline": _format_time(_now() + _budget_seconds(req))}
+    action = {"action": "dispatch", "dispatch_id": req["dispatch_id"], "kind": req["dispatch_kind"],
+              "card": req["card"], "attempt": req["attempt"], "role": req["role"], "agent": agent,
+              "agent_model": agent_model, "agent_effort": agent_effort,
+              "route": {"vendor": req["vendor"], "model": req["model"], "effort": req["effort"]},
+              "message": message, "brief": req["brief"], "report": req["report"], "resume": resume,
+              "deadline": _format_time(_now() + _budget_seconds(req))}
+    if req["card"] is None:
+        action.update(gate=req.get("gate"), wave=req.get("wave"))
+    return action
 
 
 def _in_flight(ctx: _Run, d: _Dispatch) -> dict:
@@ -676,7 +703,7 @@ def _in_flight(ctx: _Run, d: _Dispatch) -> dict:
     deadline = d.started["deadline"]
     if _now() < _parse_time(deadline):
         return {"action": "wait", "dispatch_id": d.id, "worker_id": worker, "deadline": deadline,
-                "reason": f"{d.kind} worker for card {d.req['card']} is running"}
+                "reason": f"{d.kind} worker for {_whose(d.req)} is running"}
     if d.req["vendor"] == "codex":
         result = _cancel_codex(ctx, d)
         # A runner that finished before the cancel keeps its own status (the proxy only hung).
@@ -686,6 +713,10 @@ def _in_flight(ctx: _Run, d: _Dispatch) -> dict:
                 "record_result": False}
     return {"action": "stop_worker", "dispatch_id": d.id, "worker_id": worker, "vendor": "claude",
             "record_result": True}
+
+
+def _whose(req: dict) -> str:
+    return "the run" if req.get("card") is None else f"card {req['card']}"
 
 
 def _cancel_codex(ctx: _Run, d: _Dispatch) -> dsp.DispatchResult:
@@ -838,12 +869,7 @@ def _worker_failed(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
             _end_blocked(ctx, events, "provider capacity")
             return None
         # The budget restarts only after an ending the run was resumed from, not on every relaunch.
-        since, ending = 0, None
-        for e in events:
-            if e["kind"] == "outcome":
-                ending = e["seq"]
-            elif e["kind"] == "resumed" and ending is not None:
-                since = ending
+        since = _reopened_since(events)
         voided = _voided(events)
         same = [x for x in _card_dispatches(index, c.number, attempt=d.req["attempt"], kinds=(d.kind,))
                 if x.result is not None and x.result["seq"] > since and x.id not in voided]
@@ -1185,18 +1211,8 @@ def _workspace_kept(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict]) -
 
     Two phases: `violation{stage: found}` is written before anything is moved, so a crash
     mid-way still voids the result; `violation{stage: restored}` follows the restore."""
-    mine = [e for e in events if e["kind"] == "violation" and _by(e) != "implementer"
-            and e.get("dispatch_id") == d.id]
-    if not mine:
-        found = _find_violation(ctx, d, events)
-        if found is None:
-            return True
-        mine = [found]
-    found = next(e for e in mine if e.get("stage") == "found")
-    if not any(e.get("stage") == "restored" for e in mine):
-        saved, siblings = _restore_violation(ctx, found)
-        append_event(ctx.paths, "violation", stage="restored", by="check", dispatch_id=d.id, card=c.number,
-                     n=found["n"], ref=found["ref"], saved=saved, siblings=siblings, preserved=found["preserved"])
+    if not _void(ctx, d, events):
+        return True
     events = read_events(ctx.paths)
     since = max((e["seq"] for e in events if e["kind"] == "unparked" and e.get("card") == c.number), default=0)
     count = [e for e in events if e["kind"] == "violation" and _by(e) != "implementer"
@@ -1210,12 +1226,7 @@ def _workspace_kept(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict]) -
         # R32: unparking re-runs this kind (the card's work was not the problem).
         append_event(ctx.paths, "parked", card=c.number, reason=reason, cap_dispatch=d.id, cap_kind=d.kind)
         return False
-    notes = d.req.get("notes") or ""
-    if VOIDED_NOTE not in notes:
-        notes = (notes.rstrip("\n") + "\n\n" if notes else "") + VOIDED_NOTE + (
-            "\n\nAn earlier worker on this step changed the workspace or moved a branch it must "
-            "leave alone, so its result was voided. Never stage or commit what this brief does not "
-            "ask for, check out another branch, or create, move or delete any other ref.")
+    notes = _voided_notes(d.req.get("notes") or "")
     # R33: a check (review, rereview, verify, and any later check kind) runs again with a fresh
     # worker, never the one whose result was voided. An implementer-side step keeps the voided
     # dispatch's resume chain, so its guard and routing carry over (an answer to an integrate
@@ -1224,6 +1235,36 @@ def _workspace_kept(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict]) -
     _request(ctx, c, events, kind=d.kind, attempt=d.req["attempt"], role=d.req["role"], route=d.route,
              extra=d.req.get("extra") or {}, notes=notes, resume=resume)
     return False
+
+
+def _void(ctx: _Run, d: _Dispatch, events: list[dict]) -> bool:
+    """Whether the check dispatch `d` changed what its dispatch guards (now or as recorded):
+    then the change is recorded (`found`), preserved and undone (`restored`), and its result
+    is void. Repeat-safe after a crash between the two phases."""
+    mine = [e for e in events if e["kind"] == "violation" and _by(e) != "implementer"
+            and e.get("dispatch_id") == d.id]
+    if not mine:
+        found = _find_violation(ctx, d, events)
+        if found is None:
+            return False
+        mine = [found]
+    found = next(e for e in mine if e.get("stage") == "found")
+    if not any(e.get("stage") == "restored" for e in mine):
+        saved, siblings = _restore_violation(ctx, found)
+        append_event(ctx.paths, "violation", stage="restored", by="check", dispatch_id=d.id,
+                     card=d.req.get("card"), n=found["n"], ref=found["ref"], saved=saved, siblings=siblings,
+                     preserved=found["preserved"])
+    return True
+
+
+def _voided_notes(notes: str) -> str:
+    """The brief notes for the re-run of a voided check (the warning is added once)."""
+    if VOIDED_NOTE in notes:
+        return notes
+    return (notes.rstrip("\n") + "\n\n" if notes else "") + VOIDED_NOTE + (
+        "\n\nAn earlier worker on this step changed the workspace or moved a branch it must "
+        "leave alone, so its result was voided. Never stage or commit what this brief does not "
+        "ask for, check out another branch, or create, move or delete any other ref.")
 
 
 def _engine_writes(ctx: _Run, events: list[dict], after: int) -> tuple[dict[str, str | None], set[str]]:
@@ -1396,13 +1437,482 @@ def _left_operation(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict]) -
                          after_dispatch=d.id, operations_only=True) is not None
 
 
-def _end_blocked(ctx: _Run, events: list[dict], reason: str) -> None:
+def _end_blocked(ctx: _Run, events: list[dict], reason: str, why: tuple[str, ...] = ()) -> None:
+    _end(ctx, events, blocked_reason=reason, why=why)
+
+
+# --------------------------------------------------------------------------
+# End of run: commit-bound gates, fix waves, the outcome and the wrap-up
+
+GATES = ("final_review", "evidence", "security", "verify")
+# gate -> (role to resolve, security review); security resolves to reviewer_hard.
+GATE_ROLES = {"final_review": ("final_reviewer", False), "evidence": ("verifier", False),
+              "security": ("reviewer", True), "verify": ("verifier", False)}
+REVIEW_GATES = ("final_review", "security")
+# Run-level kinds that may build but must leave the workspace and the run's refs alone.
+RUN_CHECK_KINDS = ("final_review", "evidence", "security", "verify")
+MAX_FINAL_FIX_WAVES = 2
+FINAL = "final"               # the fix waves' card branch suffix, and the `card` of their accept events
+RISKS = ("low", "medium", "high")
+
+SENSITIVE_PATHS: tuple[re.Pattern[str], ...] = tuple(re.compile(p, re.IGNORECASE) for p in (
+    # CI
+    r"^\.github/(workflows|actions)/", r"^\.gitlab-ci\.ya?ml$", r"^\.circleci/", r"^\.buildkite/",
+    r"(^|/)Jenkinsfile$", r"^azure-pipelines\.ya?ml$", r"^\.travis\.ya?ml$",
+    # release and install scripts
+    r"(^|/)(install|installer|release|publish|deploy|bootstrap)([._-][^/]*)?$",
+    r"(^|/)(release|releases|packaging)/",
+    # infrastructure
+    r"(^|/)(infra|infrastructure|terraform|k8s|kubernetes|helm|ansible|deploy|deployment|deployments)/",
+    r"\.(tf|tfvars)$", r"(^|/)Dockerfile[^/]*$", r"(^|/)docker-compose[^/]*\.ya?ml$",
+    # auth and secrets
+    r"(^|/)(auth|authn|authz|oauth|login|session|sessions|permission|permissions|secret|secrets|"
+    r"credential|credentials|crypto|security)([/._-]|$)",
+    r"(^|/)\.env(\.[^/]*)?$", r"\.(pem|key|p12|pfx|jks|keystore)$",
+    # migrations
+    r"(^|/)migrations?/", r"(^|/)(db|database)/migrate/", r"(^|/)alembic/",
+))
+"""Changed paths that make the security gate required whatever the cards' risk.
+
+The same families as the deck's risk rule (Risk: high for auth, secrets, CI, release
+or install scripts and data migrations), plus infrastructure: CI workflows, release
+and install scripts, infrastructure as code and container files, auth, sessions,
+permissions, secrets and key files, and database migrations. Matched against
+repo-relative POSIX paths, case-insensitively; a false match only costs one review."""
+
+
+def is_sensitive_path(path: str) -> bool:
+    return any(p.search(path) for p in SENSITIVE_PATHS)
+
+
+def _final_branch(ctx: _Run) -> str:
+    return card_branch_name(ctx.branch, FINAL)
+
+
+def _run_head(ctx: _Run) -> str:
+    return head(ctx.ws, f"refs/heads/{ctx.branch}")
+
+
+def _reopened_since(events: list[dict]) -> int:
+    """The seq of the latest ending a `resumed` followed (0 when none): failures recorded
+    before it are retried; a relaunch without an ending keeps them."""
+    since, ending = 0, None
+    for e in events:
+        if e["kind"] == "outcome":
+            ending = e["seq"]
+        elif e["kind"] == "resumed" and ending is not None:
+            since = ending
+    return since
+
+
+def _run_dispatches(index: dict[str, _Dispatch]) -> list[_Dispatch]:
+    return sorted((d for d in index.values() if d.req.get("card") is None), key=lambda d: d.req["seq"])
+
+
+def _accepted_cards(ctx: _Run, cards: dict[int, CardState]) -> list[Card]:
+    return [ctx.card(n) for n in dependency_order(ctx.deck) if cards[n].state == "accepted"]
+
+
+def _risk_card(accepted: list[Card]) -> Card:
+    """The accepted card with the highest risk, stripped of Hard and route pins: run-level
+    routes follow the run's highest risk only."""
+    top = max(accepted, key=lambda c: RISKS.index(c.risk) if c.risk in RISKS else 1)
+    return replace(top, hard=False, hard_reason="", route_pin=None)
+
+
+def _required_gates(ctx: _Run, accepted: list[Card], head_sha: str) -> list[str]:
+    """Every gate, with security only when the highest accepted risk is medium or high or a
+    path changed since the base is sensitive."""
+    risky = any(c.risk in ("medium", "high") for c in accepted)
+    security = risky or any(is_sensitive_path(p) for p in changed_paths(ctx.ws, ctx.meta["base_sha"], head_sha))
+    return [g for g in GATES if g != "security" or security]
+
+
+def _gate_results(events: list[dict], head_sha: str, since: int) -> dict[str, dict]:
+    """Each gate's last result on `head_sha`. A failure recorded before the ending a resume
+    followed is not counted (the gate runs again); a pass stays current while the head stays."""
+    out: dict[str, dict] = {}
+    for e in events:
+        if (e["kind"] == "gate_result" and e.get("examined_sha") == head_sha
+                and (e.get("passed") or e["seq"] > since)):
+            out[e["gate"]] = e
+    return out
+
+
+def _resolve_run(ctx: _Run, role: str, accepted: list[Card], *, security: bool = False) -> Resolution:
+    try:
+        return resolve(ctx.config, role=role, card=_risk_card(accepted), attempt=1, installed=installed_vendors(),
+                       security=security, profile=ctx.deck.profile)
+    except (LadderExhausted, ConfigError) as e:
+        raise EngineError(f"no route for the run's {role}: {e}") from None
+
+
+def _end_of_run(ctx: _Run, cards: dict[int, CardState], events: list[dict]) -> dict | None:
+    """Every card is accepted, parked, or waits on a parked card: run the gates, then end.
+
+    A gate passes only for the commit it examined: each `gate_result` records `gate`,
+    `examined_sha` and `passed`, and a gate is current only when its last result on the
+    run head passed. The loop runs the first required gate that is not current. A failing
+    gate gets a fix wave while fewer than MAX_FINAL_FIX_WAVES have run: an implementer
+    (`final_fix`) on the final branch cut from the run head, a review of its diff, and, when
+    clean, a fast-forward of the run branch to the fix, which makes every gate stale. Once
+    the waves are spent, a failing gate is settled: a review gate leaves open findings,
+    verify fails the run, and an evidence gap is a hold (`evidence = "record"`) or ends the
+    run blocked for a decision (`evidence = "block"`). When every required gate has a
+    result on the head, the outcome is decided. With no card accepted, no gate runs."""
+    if os.environ.get("LEADHAND_TESTING") == "1" and os.environ.get("LEADHAND_TEST_CARD_LOOP_ONLY") == "1":
+        # Card-loop tests: stop where the card loop ends (no gates, no outcome event).
+        summary = _card_summary(ctx, cards)
+        return {"action": "done", "outcome": None, "qualifier": "", "cards": summary, "report": None,
+                "reasons": [f"card {x['card']} {x['state']}: {x['reason']}" for x in summary if x["reason"]]}
+    accepted = _accepted_cards(ctx, cards)
+    if not accepted:
+        _end(ctx, events, gates_current=False)
+        return None
+    index = _dispatches(events)
+    runs = _run_dispatches(index)
+    if runs:
+        last = runs[-1]
+        if last.result is None:
+            return _in_flight(ctx, last)
+        acted, action = _after_run_result(ctx, last, events, index, accepted)
+        if acted:
+            return action
+    head_sha = _run_head(ctx)
+    results = _gate_results(events, head_sha, _reopened_since(events))
+    waves = len({d.req.get("wave") for d in runs if d.kind == "final_fix"})
+    settled: dict[str, dict] = {}
+    for gate in _required_gates(ctx, accepted, head_sha):
+        r = results.get(gate)
+        if r is None:
+            _request_gate(ctx, events, gate, head_sha, accepted)
+            return None
+        if r["passed"]:
+            continue
+        if waves < MAX_FINAL_FIX_WAVES:
+            _start_wave(ctx, events, waves + 1, r, head_sha, accepted)
+            return None
+        settled[gate] = r
+        if gate == "evidence" and ctx.config.run.evidence == "block":
+            _end(ctx, events, blocked_reason="decision needed",
+                 why=(f"evidence gaps on {head_sha[:12]} after {waves} fix waves: {r.get('findings') or ''}",))
+            return None
+    holds = ((f"evidence gaps on {head_sha[:12]}: {settled['evidence'].get('findings') or ''}",)
+             if "evidence" in settled else ())
+    _end(ctx, events, gates_current=True, open_findings=any(g in settled for g in REVIEW_GATES),
+         holds=holds, verification_failed="verify" in settled)
+    return None
+
+
+def _request_gate(ctx: _Run, events: list[dict], gate: str, head_sha: str, accepted: list[Card]) -> None:
+    role, security = GATE_ROLES[gate]
+    res = _resolve_run(ctx, role, accepted, security=security)
+    extra: dict[str, str] = {}
+    if gate in REVIEW_GATES:
+        extra["diff_range"] = f"{ctx.meta['base_sha']}..{head_sha}"
+    if gate == "evidence":
+        extra["base_worktree"] = str(_base_worktree(ctx))
+    _request_run(ctx, events, kind=gate, gate=gate, attempt=1, role=res.role, route=res.route,
+                 extra=extra, accepted=accepted)
+
+
+def _base_worktree(ctx: _Run) -> Path:
+    """`<repo>/.worktrees/<run dir name>--base`, detached at the run's base commit, for the
+    evidence gate. Idempotent: an existing registered worktree is reused. It is kept after the
+    run (beside the run's own worktree) so the evidence can be re-checked; `git worktree
+    remove` deletes it."""
+    repo = Path(ctx.meta["repo"])
+    path = repo / ".worktrees" / f"{ctx.root.name}--base"
+    listed = git(repo, "worktree", "list", "--porcelain").splitlines()
+    registered = {Path(ln[len("worktree "):]).resolve() for ln in listed if ln.startswith("worktree ")}
+    if path.exists():
+        if path.resolve() in registered:
+            return path
+        raise EngineError(f"{path} exists but is not a worktree of {repo}; move it aside")
+    ensure_excluded(repo, ".worktrees/")
+    git(repo, "worktree", "add", "--quiet", "--detach", str(path), ctx.meta["base_sha"])
+    return path
+
+
+def _start_wave(ctx: _Run, events: list[dict], wave: int, failing: dict, head_sha: str,
+                accepted: list[Card]) -> None:
+    """Cut the final branch at the run head (keeping an earlier wave's unaccepted commits on
+    refs/leadhand/<run_id>/final/<wave>), then request the wave's implementer."""
+    branch = _final_branch(ctx)
+    cut = [e for e in events if e["kind"] == "card_cut" and e.get("card") == FINAL and e.get("wave") == wave]
+    if not cut:
+        _check_out(ctx, events, None, ctx.branch)          # off the final branch before it moves
+        ref = f"refs/heads/{branch}"
+        old = _ref_value(ctx, ref)
+        if old != head_sha:
+            if old is not None:
+                git(ctx.ws, "update-ref", "-m", "leadhand: keep an unaccepted fix wave",
+                    f"refs/leadhand/{ctx.meta['run_id']}/final/{wave - 1}", old)
+            git(ctx.ws, "update-ref", "-m", "leadhand: cut the final fix branch", ref, head_sha, old or "")
+        append_event(ctx.paths, "card_cut", card=FINAL, branch=branch, base=head_sha, wave=wave)
+        return
+    res = _resolve_run(ctx, "implementer", accepted)
+    _request_run(ctx, events, kind="final_fix", wave=wave, attempt=wave, role=res.role, route=res.route,
+                 extra={"gate": failing["gate"], "findings": failing.get("findings") or "(no report kept)",
+                        "branch": branch, "base": head_sha},
+                 accepted=accepted)
+
+
+def _ref_value(ctx: _Run, ref: str) -> str | None:
+    out = git(ctx.ws, "for-each-ref", "--format=%(objectname)", ref)
+    return out.strip() or None
+
+
+def _request_run(ctx: _Run, events: list[dict], *, kind: str, attempt: int, role: str, route: Route,
+                 extra: dict[str, str], accepted: list[Card], gate: str | None = None, wave: int | None = None,
+                 notes: str = "") -> dict:
+    """Write a run-level brief and append its `dispatch_requested` (card None). Gates run on
+    the run branch; a wave's implementer and review on the final branch. Checks are guarded
+    like card checks (R14'); a gate also records `gate_started` with the commit it examines.
+    Deterministic, like `_request`."""
+    n = 1 + sum(1 for e in events if e["kind"] == "dispatch_requested" and e.get("card") is None
+                and e.get("dispatch_kind") == kind and e.get("wave") == wave)
+    did = f"run-{kind}-{n}" if wave is None else f"run-w{wave}-{kind}-{n}"
+    branch = ctx.branch if wave is None else _final_branch(ctx)
+    _check_out(ctx, events, None, branch)
+    guard: dict[str, Any] = {}
+    if kind in RUN_CHECK_KINDS:
+        _ensure_clean(ctx, events, branch=branch, why=f"before {kind} {did}")
+        guard = {"expected_branch": branch, "expected_head": head(ctx.ws, f"refs/heads/{branch}"),
+                 "refs": _ref_snapshot(ctx)}
+    full = {"base": ctx.meta["base_sha"], "branch": ctx.branch, "test_first": ctx.config.run.test_first,
+            "cards": ",".join(str(c.number) for c in accepted), **extra}
+    if gate is not None and not any(e["kind"] == "gate_started" and e.get("dispatch_id") == did for e in events):
+        append_event(ctx.paths, "gate_started", gate=gate, examined_sha=guard["expected_head"], dispatch_id=did)
+    brief, report = write_brief(kind, ws=ctx.ws, deck=ctx.deck, card=None, attempt=attempt, dispatch_id=did,
+                                extra=full)
+    if notes:
+        with open(brief, "a", encoding="utf-8") as f:
+            f.write("\n" + notes.rstrip("\n") + "\n")
+    return _append_request(ctx, did, card=None, attempt=attempt, kind=kind, role=role, route=route, brief=brief,
+                           report=report, extra=extra, notes=notes, resume=None, gate=gate, wave=wave, **guard)
+
+
+def _usable(d: _Dispatch) -> bool:
+    """Whether a run-level result can be acted on: a verdict, a pass/fail, or an implementer status."""
+    r = d.result or {}
+    if d.kind in ("final_review", "security"):
+        return r.get("verdict") in ("clean", "defects")
+    if d.kind in ("evidence", "verify"):
+        return r.get("result") in ("pass", "fail")
+    return r.get("status") in ("READY", "QUESTION", "SPENT")
+
+
+def _after_run_result(ctx: _Run, d: _Dispatch, events: list[dict], index: dict[str, _Dispatch],
+                      accepted: list[Card]) -> tuple[bool, dict | None]:
+    """Act on the latest run-level dispatch's result. (True, action or None) when something
+    was done; (False, None) when the result is settled and the gate loop decides what's next."""
+    r, req = d.result, d.req
+    if req.get("gate"):
+        if any(e["kind"] == "gate_result" and e.get("dispatch_id") == d.id for e in events):
+            return False, None
+        if "refs" in req and _run_check_voided(ctx, d, events, accepted):
+            return True, None
+        if not _usable(d):
+            _run_worker_failed(ctx, d, events, index, accepted)
+            return True, None
+        passed = r.get("verdict") == "clean" or r.get("result") == "pass"
+        crash_point("before_gate_record")
+        append_event(ctx.paths, "gate_result", gate=req["gate"], examined_sha=req["expected_head"],
+                     passed=passed, dispatch_id=d.id, findings=_report_copy(d))
+        return True, None
+    wave = req.get("wave")
+    if d.kind == "final_fix":
+        if r["status"] == "READY":
+            base, tip = req["extra"]["base"], r.get("tip")
+            if not tip or tip == base or base != _run_head(ctx):
+                return False, None                  # changed nothing, or the run head moved: spent
+            res = _resolve_run(ctx, "final_reviewer", accepted)
+            notes = ("## Fix wave\n\n"
+                     f"This reviews fix wave {wave} for the failed \"{req['extra']['gate']}\" gate, whose "
+                     f"findings are in {req['extra']['findings']}. The fix's report: {_report_copy(d)}. "
+                     f"Review only the fix's diff {base}..{tip}: it must fix the findings without undoing "
+                     "any card's \"Done when\" or reaching outside the cards' allowed paths. `Verdict: clean` "
+                     "lets it onto the run branch.")
+            _request_run(ctx, events, kind="final_review", wave=wave, attempt=wave, role=res.role,
+                         route=res.route, extra={"diff_range": f"{base}..{tip}", "base": base,
+                                                 "branch": _final_branch(ctx)},
+                         accepted=accepted, notes=notes)
+            return True, None
+        if r["status"] == "BLOCKED":
+            _run_worker_failed(ctx, d, events, index, accepted)
+            return True, None
+        return False, None                          # QUESTION or SPENT: the wave is spent
+    # The review of a fix wave.
+    verdict = next((e for e in events if e["kind"] == "verdict_recorded" and e.get("dispatch_id") == d.id), None)
+    if verdict is None:
+        if "refs" in req and _run_check_voided(ctx, d, events, accepted):
+            return True, None
+        if not _usable(d):
+            _run_worker_failed(ctx, d, events, index, accepted)
+            return True, None
+        append_event(ctx.paths, "verdict_recorded", card=FINAL, wave=wave, verdict=r["verdict"],
+                     findings=_report_copy(d), dispatch_id=d.id)
+        return True, None
+    if verdict["verdict"] != "clean":
+        return False, None                          # rejected: the wave is spent, the run head stays
+    if any(e["kind"] == "accepted" and e.get("card") == FINAL and e.get("dispatch_id") == d.id for e in events):
+        return False, None
+    target = req["expected_head"]
+    started = any(e["kind"] == "accept_started" and e.get("dispatch_id") == d.id for e in events)
+    if not started and not is_ancestor(ctx.ws, f"refs/heads/{ctx.branch}", target):
+        return False, None                          # a card was accepted meanwhile: the wave is stale
+    if not started:
+        append_event(ctx.paths, "accept_started", card=FINAL, wave=wave, target=target, dispatch_id=d.id)
+        crash_point("before_fast_forward")
+    fast_forward(ctx.ws, ctx.branch, target)
+    crash_point("after_fast_forward")
+    append_event(ctx.paths, "accepted", card=FINAL, wave=wave, sha=target, dispatch_id=d.id)
+    return True, None
+
+
+def _run_check_voided(ctx: _Run, d: _Dispatch, events: list[dict], accepted: list[Card]) -> bool:
+    """A run-level check that changed what it guards: preserved, undone and run again with a
+    fresh worker (R33). Past VIOLATION_CAP voided runs of the kind since the run was last
+    resumed, the run ends blocked for a decision instead (there is no card to park)."""
+    if not _void(ctx, d, events):
+        return False
+    events = read_events(ctx.paths)
+    since = _reopened_since(events)
+    count = [e for e in events if e["kind"] == "violation" and _by(e) != "implementer"
+             and e.get("stage") == "found" and e.get("card") is None
+             and e.get("dispatch_kind") == d.kind and e["seq"] > since]
+    if len(count) > VIOLATION_CAP:
+        paths = sorted({p for e in count for p in e.get("paths") or []})
+        refs = sorted({r for e in count for r in e.get("refs") or {}})
+        what = (f"change tracked files: {', '.join(paths)}" if paths else f"move refs: {', '.join(refs)}")
+        _end(ctx, events, blocked_reason="decision needed", why=(f"{d.kind} workers {what}",))
+        return True
+    _rerun(ctx, d, events, accepted, notes=_voided_notes(d.req.get("notes") or ""))
+    return True
+
+
+def _rerun(ctx: _Run, d: _Dispatch, events: list[dict], accepted: list[Card], *, notes: str) -> None:
+    """The same run-level dispatch again, on the same route with a fresh worker."""
+    req = d.req
+    _request_run(ctx, events, kind=d.kind, gate=req.get("gate"), wave=req.get("wave"), attempt=req["attempt"],
+                 role=req["role"], route=d.route, extra=req.get("extra") or {}, accepted=accepted, notes=notes)
+
+
+def _run_worker_failed(ctx: _Run, d: _Dispatch, events: list[dict], index: dict[str, _Dispatch],
+                       accepted: list[Card]) -> None:
+    """A run-level worker ended BLOCKED or without a verdict or result: provider capacity
+    ends the run blocked at once; otherwise it is dispatched again, and a second such ending
+    for the same step (since the run was last resumed) ends the run blocked (environment)."""
+    r, req = d.result, d.req
+    if not any(e["kind"] == "outcome" and e["seq"] > r["seq"] for e in events):
+        if r["status"] == "BLOCKED" and r.get("blocked_by") == "usage limit":
+            _end_blocked(ctx, events, "provider capacity")
+            return
+        since, voided = _reopened_since(events), _voided(events)
+        same = [x for x in _run_dispatches(index)
+                if x.kind == d.kind and x.req.get("wave") == req.get("wave") and x.req.get("gate") == req.get("gate")
+                and x.req.get("expected_head") == req.get("expected_head") and x.result is not None
+                and x.result["seq"] > since and x.id not in voided and not _usable(x)]
+        if len(same) >= 2:
+            _end_blocked(ctx, events, "environment",
+                         why=(f"{d.kind} ended {r['status']} twice without a usable report",))
+            return
+    _rerun(ctx, d, events, accepted, notes=req.get("notes") or "")
+
+
+def _end(ctx: _Run, events: list[dict], *, blocked_reason: str | None = None, open_findings: bool = False,
+         holds: tuple[str, ...] = (), gates_current: bool = False, verification_failed: bool = False,
+         why: tuple[str, ...] = ()) -> dict:
+    """Decide the outcome and append it, with the allowed next step and the run head. The
+    wrap-up (handoff, report, runs.md) follows in `_wrap_up`.
+
+    `gates_current` means every required gate has a result on the run head; a gate that
+    failed there for good is reported through `open_findings`, `holds` or
+    `verification_failed` instead."""
     cards = fold_cards(events, ctx.numbers)
-    decision = decide_outcome(cards, removed=frozenset(), open_findings=False, holds=(), gates_current=False,
-                              verification_failed=False, cancelled=False, blocked_reason=reason,
-                              unreconciled=None)
-    append_event(ctx.paths, "outcome", outcome=decision.outcome.value, qualifier=decision.qualifier,
-                 reasons=list(decision.reasons))
+    decision = decide_outcome(cards, removed=frozenset(), open_findings=open_findings, holds=holds,
+                              gates_current=gates_current, verification_failed=verification_failed,
+                              cancelled=False, blocked_reason=blocked_reason, unreconciled=None)
+    return append_event(ctx.paths, "outcome", outcome=decision.outcome.value, qualifier=decision.qualifier,
+                        reasons=[*decision.reasons, *why],
+                        next_step=allowed_next_step(decision, ctx.config.after_run), head=_run_head(ctx))
+
+
+def _wrap_up(ctx: _Run, ended: dict, events: list[dict]) -> None:
+    """After an outcome: the handoff (blocked runs), report.md, the runs.md line, then
+    `report_written`. Repeat-safe; done once per outcome."""
+    if any(e["kind"] == "report_written" and e["seq"] > ended["seq"] for e in events):
+        return
+    if ended.get("outcome") == "blocked":
+        _write_handoff(ctx, ended, events)
+    from leadhand import report as report_mod
+    path = report_mod.write_report(ctx.root)
+    _record_run_line(ctx, ended, events)
+    append_event(ctx.paths, "report_written", report=str(path), outcome=ended.get("outcome"),
+                 outcome_seq=ended["seq"])
+
+
+def _write_handoff(ctx: _Run, ended: dict, events: list[dict]) -> None:
+    cards = fold_cards(events, ctx.numbers)
+    accepted = sum(1 for c in cards.values() if c.state == "accepted")
+    parked = [n for n in sorted(cards) if cards[n].state == "parked"]
+    index = _dispatches(events)
+    last = max(index.values(), key=lambda d: d.req["seq"]) if index else None
+    qualifier = ended.get("qualifier") or ""
+    lines = [f"# Handoff: {ctx.deck.title}", "",
+             f"Outcome: blocked{f' ({qualifier})' if qualifier else ''}", "",
+             "## Where it stopped", "",
+             f"- Run branch: {ctx.branch} at {ended.get('head') or _run_head(ctx)}",
+             f"- Workspace: {ctx.ws}",
+             f"- Cards: {accepted} of {len(cards)} accepted"
+             + (f"; parked: {', '.join(map(str, parked))}" if parked else ""),
+             f"- Last step: {last.kind} {last.id} ({_whose(last.req)})" if last else "- Last step: none"]
+    lines += ["", "## Why", "", *(f"- {r}" for r in ended.get("reasons") or ["no reason recorded"])]
+    lines += ["", "## What to do", "",
+              f"1. Read the report: {ctx.paths.report}",
+              "2. Settle what the reasons above name: a decision (record it in the decisions file or "
+              "`leadhand unpark` a card with a note), capacity coming back, or the environment fixed.",
+              f"3. Resume the run with `leadhand run \"{ctx.root}\"` (`leadhand launch-line \"{ctx.root}\"` "
+              "prints the exact command). Gates that passed on the same commit are not run again."]
+    _write_bytes_atomic(ctx.paths.handoff, ("\n".join(lines) + "\n").encode("utf-8"))
+
+
+def _md_cell(text: str) -> str:
+    return " ".join(str(text).split()).replace("|", "\\|")
+
+
+def _record_run_line(ctx: _Run, ended: dict, events: list[dict]) -> None:
+    """One line per run in `<docs_dir>/runs.md`, replaced in place when the run ends again
+    (a resumed blocked run), so a run never has two lines."""
+    from leadhand import status as st
+    cards = fold_cards(events, ctx.numbers)
+    accepted = sum(1 for c in cards.values() if c.state == "accepted")
+    usd = st.usage_summary(st.load(ctx.root))["estimated_usd"]
+    qualifier = ended.get("qualifier") or ""
+    outcome = f"{ended.get('outcome')}" + (f" ({qualifier})" if qualifier else "")
+    run_cell = f"| {_md_cell(ctx.root)} |"
+    line = (f"| {date.today().isoformat()} | {_md_cell(ctx.deck.title)} | {outcome} | "
+            f"{accepted}/{len(cards)} cards | {'unknown' if usd is None else f'${usd:.2f}'} {run_cell}")
+    docs = docs_dir_for(ctx.config, Path(ctx.meta["repo"]))
+    path = docs / "runs.md"
+    try:
+        old = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        old = ["# Runs", "", "| Date | Deck | Outcome | Cards | Estimated cost | Run |",
+               "| --- | --- | --- | --- | --- | --- |"]
+    new, placed = [], False
+    for ln in old:
+        if ln.rstrip().endswith(run_cell):
+            if not placed:
+                new.append(line)
+                placed = True
+            continue
+        new.append(ln)
+    if not placed:
+        new.append(line)
+    docs.mkdir(parents=True, exist_ok=True)
+    _write_bytes_atomic(path, ("\n".join(new) + "\n").encode("utf-8"))
 
 
 # --------------------------------------------------------------------------
@@ -1464,9 +1974,14 @@ def _record_started(ctx: _Run, dispatch_id: str, worker_id: str) -> dict:
             return d.started
         raise EngineError(f"dispatch {dispatch_id} already started worker {d.started['worker_id']}")
     _not_ended(events)
-    c = _card_state(ctx, events, d.req["card"])
-    if c.dispatch_id != dispatch_id:
-        raise EngineError(f"dispatch {dispatch_id} is not card {c.number}'s current dispatch")
+    if d.req["card"] is None:
+        current = max(_run_dispatches(_dispatches(events)), key=lambda x: x.req["seq"])
+        if current.id != dispatch_id:
+            raise EngineError(f"dispatch {dispatch_id} is not the run's current dispatch")
+    else:
+        c = _card_state(ctx, events, d.req["card"])
+        if c.dispatch_id != dispatch_id:
+            raise EngineError(f"dispatch {dispatch_id} is not card {c.number}'s current dispatch")
     deadline = _format_time(_now() + _budget_seconds(d.req))
     # The supervisor session the worker runs under: a Claude worker dies with it.
     return append_event(ctx.paths, "worker_started", dispatch_id=dispatch_id, worker_id=worker_id,
@@ -1543,6 +2058,8 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str, stop
     if d.kind in IMPLEMENTER_KINDS:
         card_branch = _card_state(ctx, events, n).branch or card_branch_name(ctx.branch, n)
         tip = head(ctx.ws, f"refs/heads/{card_branch}")
+    elif d.kind == "final_fix":
+        tip = head(ctx.ws, f"refs/heads/{_final_branch(ctx)}")
     crash_point("after_result_files")
 
     role = req["role"] if req["vendor"] == "claude" else "proxy"

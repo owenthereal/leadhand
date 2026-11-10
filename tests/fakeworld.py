@@ -3,17 +3,28 @@
 `FakeWorld` drives `engine.next_action` / `engine.record` the way the supervisor
 does, with fake workers instead of real ones:
 
-- implement-type kinds (implement, fix, answer, continue) write files in the
-  workspace, commit them on the checked-out card branch and write a report whose
-  first line is the scripted `Status:`;
-- review kinds (review, rereview) write `Verdict: ...` with findings;
-- verify kinds write `Result: ...`;
+- implement-type kinds (implement, fix, answer, continue, final_fix) write files in
+  the workspace, commit them on the checked-out branch (a card branch, or the final
+  fix branch) and write a report whose first line is the scripted `Status:`;
+- review kinds (review, rereview, final_review, security) write `Verdict: ...` with
+  findings;
+- verify kinds (verify, evidence) write `Result: ...`;
 - integrate rebases the card branch onto the run tip, resolving conflicts in
   the card's favour, and reports like an implementer (a step's `rebase` turns
   that off for integrate, or on for another implementer kind such as answer).
 
 A step's `tamper(world, ws, action)` runs inside the worker before its report is
 written: a reviewer or verifier that changes the workspace or moves refs.
+
+Steps are scripted per (card, kind). Run-level dispatches (the end-of-run gates and
+fix waves) have card None: script them as (None, "final_review"), (None, "evidence"),
+(None, "security"), (None, "verify"), (None, "final_fix"), and (None, "fix_review")
+for the review of a fix wave (a final_review dispatch that carries a `wave`).
+
+By default the world is the card loop only: the engine ends a run when every card
+is settled, without gates or an outcome (LEADHAND_TEST_CARD_LOOP_ONLY, honoured only
+under LEADHAND_TESTING). `FakeWorld(..., gates=True)` runs the real end of run.
+`started` holds card dispatches; run-level ones are in `run_started`.
 
 Claude routes run in-process: the world records `started` with a fake agent ID,
 does the work, appends a usage record to that agent's fake transcript and
@@ -54,8 +65,8 @@ from leadhand.usage import read_charges
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts" / "leadhand"
 FAKES = ROOT / "tests" / "fakes"
-IMPLEMENTER_KINDS = ("implement", "fix", "answer", "continue")
-REVIEW_KINDS = ("review", "rereview")
+IMPLEMENTER_KINDS = ("implement", "fix", "answer", "continue", "final_fix")
+REVIEW_KINDS = ("review", "rereview", "final_review", "security")
 PROJECT = "-fake-project"
 MAIN_SESSION = "fake-main-session"
 
@@ -76,7 +87,7 @@ def card(number, *, title=None, risk="low", hard=False, depends=(), role="implem
 
 
 class FakeWorld:
-    def __init__(self, test, cards, *, config="", installed=("claude",), title="Demo deck"):
+    def __init__(self, test, cards, *, config="", installed=("claude",), title="Demo deck", gates=False):
         hermetic(test)
         self.test = test
         self.tmp = Path(tempfile.mkdtemp(prefix="lh engine "))
@@ -91,7 +102,8 @@ class FakeWorld:
             "LEADHAND_TESTING": "1", "LEADHAND_CONFIG": str(self.config_file),
             "LEADHAND_INSTALLED_VENDORS": ",".join(installed),
             "CLAUDE_CONFIG_DIR": str(self.claude_home), "CODEX_HOME": str(self.codex_home),
-            "FAKE_CODEX_LOG": str(self.tmp / "codex log.jsonl")})
+            "FAKE_CODEX_LOG": str(self.tmp / "codex log.jsonl"),
+            "LEADHAND_TEST_CARD_LOOP_ONLY": "" if gates else "1"})
         env.start()
         test.addCleanup(env.stop)
         for name in ("CLAUDE_CODE_SESSION_ID", "LEADHAND_CRASH_AT", "LEADHAND_MINUTE_SECONDS",
@@ -112,6 +124,7 @@ class FakeWorld:
         self.parks: dict[int, str] = {}
         self.diff_checks: dict[int, list[tuple[bool, str]]] = {}
         self.started: list[dict] = []
+        self.run_started: list[dict] = []
         self.proxies: list[subprocess.Popen] = []
         self._ids = itertools.count(1)
         self._messages = itertools.count(1)
@@ -167,6 +180,9 @@ class FakeWorld:
     def dispatch_ids(self) -> list[str]:
         return [a["dispatch_id"] for a in self.started]
 
+    def run_dispatch_ids(self) -> list[str]:
+        return [a["dispatch_id"] for a in self.run_started]
+
     def branch_tip(self, branch: str) -> str:
         return run_git(self.repo, "rev-parse", f"refs/heads/{branch}")
 
@@ -211,7 +227,7 @@ class FakeWorld:
         else:
             worker = f"agent{next(self._ids):04d}"
         engine.record(self.run_dir, "started", dispatch_id=a["dispatch_id"], worker_id=worker)
-        self.started.append(a)
+        (self.started if a["card"] is not None else self.run_started).append(a)
         return worker
 
     def perform(self, a: dict, worker: str) -> str | None:
@@ -226,7 +242,8 @@ class FakeWorld:
     # -- workers --------------------------------------------------------------
 
     def _take(self, a: dict) -> dict:
-        queue = self.steps.get((a["card"], a["kind"])) or []
+        kind = "fix_review" if a["card"] is None and a["kind"] == "final_review" and a.get("wave") else a["kind"]
+        queue = self.steps.get((a["card"], kind)) or []
         return queue.pop(0) if queue else {}
 
     def report_text(self, a: dict, step: dict) -> str:
@@ -257,7 +274,7 @@ class FakeWorld:
             run_tip = run_git(ws, "rev-parse", f"refs/heads/{self.meta()['branch']}")
             run_git(ws, "-c", "core.editor=true", "rebase", "--quiet", "-X", "theirs", run_tip)
         if a["kind"] in IMPLEMENTER_KINDS:
-            files = step.get("files") or {f"src/card{a['card']}/{a['dispatch_id']}.txt": f"{a['dispatch_id']}\n"}
+            files = step.get("files") or {self.default_file(a): f"{a['dispatch_id']}\n"}
             write(ws, files)
             if step.get("crash") == "before_commit":
                 return None
@@ -274,6 +291,11 @@ class FakeWorld:
             report.write_text(text, encoding="utf-8")
         self._append_message(self.subagent_transcript(worker), "claude-sonnet-4")
         return step.get("reply") or f"{text.splitlines()[0]}\nReport: {report}"
+
+    @staticmethod
+    def default_file(a: dict) -> str:
+        folder = "final" if a["card"] is None else f"card{a['card']}"
+        return f"src/{folder}/{a['dispatch_id']}.txt"
 
     def subagent_transcript(self, worker: str) -> Path:
         return (self.claude_home / "projects" / PROJECT / MAIN_SESSION / "subagents"
@@ -293,7 +315,7 @@ class FakeWorld:
         if step.get("sleep"):
             lines.append({"action": "sleep", "seconds": step["sleep"]})
         if a["kind"] in IMPLEMENTER_KINDS:
-            files = step.get("files") or {f"src/card{a['card']}/{a['dispatch_id']}.txt": f"{a['dispatch_id']}\n"}
+            files = step.get("files") or {self.default_file(a): f"{a['dispatch_id']}\n"}
             lines += [{"action": "write_file", "path": p, "text": t} for p, t in files.items()]
             lines.append({"action": "commit", "message": f"work for {a['dispatch_id']}"})
         text = self.report_text(a, step)
