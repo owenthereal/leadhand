@@ -1,7 +1,10 @@
 """`report.md`: the run's account of itself, rendered from recorded state only."""
 from __future__ import annotations
 
+import contextlib
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 from leadhand import status as st
@@ -43,17 +46,39 @@ def _result(snap: st.Snapshot) -> list[str]:
     return out
 
 
+def _run_head(snap: st.Snapshot) -> str:
+    """The run branch tip as recorded: the last accepted commit, else the base."""
+    shas = [e.get("sha") for e in snap.events if e.get("kind") == "accepted" and e.get("sha")]
+    return shas[-1] if shas else str(snap.meta.get("base_sha") or "")
+
+
 def _evidence(snap: st.Snapshot) -> list[str]:
-    out = []
+    """The last result of each gate and the commit it examined; stale if that is not the run head."""
+    last: dict[str, dict] = {}
     for e in snap.events:
         if e.get("kind") == "gate_result":
-            verdict = "passed" if e.get("passed") else "failed"
-            out.append(f"- {e.get('gate', 'gate')}: {verdict} on commit {_short(e.get('examined_sha'))}")
+            last[str(e.get("gate", "gate"))] = e
+    head = _run_head(snap)
+    out = []
+    for gate, e in last.items():
+        verdict = "passed" if e.get("passed") else "failed"
+        line = f"- {gate}: {verdict} on commit {_short(e.get('examined_sha'))}"
+        if e.get("examined_sha") != head:
+            line += f" (stale: the run head is {_short(head)})"
+        out.append(line)
     return out
 
 
 def _unresolved(snap: st.Snapshot) -> list[str]:
     out = []
+    for n in sorted(snap.cards):
+        c = snap.cards[n]
+        if c.state == "parked":
+            out.append(f"- Card {n} (branch {c.branch or 'not cut'}) parked, decision deferred: "
+                       f"{c.park_reason or 'no reason recorded'}")
+        elif c.state != "accepted" and c.verdict == "defects":
+            out.append(f"- Card {n} (branch {c.branch or 'not cut'}) has open review findings: "
+                       f"{c.findings or 'see the review'}")
     for reason in (snap.outcome or {}).get("reasons") or []:
         if not (isinstance(reason, str) and reason.startswith("card ") and " parked" in reason):
             out.append(f"- {reason}")
@@ -156,9 +181,17 @@ def render_report(run_dir: Path, sessions_dir: Path | None = None) -> str:
 def write_report(run_dir: Path, sessions_dir: Path | None = None) -> Path:
     path = run_paths(Path(run_dir)).report
     text = render_report(run_dir, sessions_dir)
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
     return path
 
 

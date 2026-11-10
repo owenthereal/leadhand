@@ -45,11 +45,12 @@ class StatusTests(unittest.TestCase):
         w.dispatch(2)
         s = status.build_status(w.root, sessions_dir=w.sessions)
         self.assertEqual(s["headline"], "Needs your decision on card 5; independent work continues")
-        self.assertIn("Card 5 parked: needs a design decision", s["attention"])
+        self.assertIn(f"Card 5 parked: needs a design decision — next: leadhand unpark {w.root} --card 5 "
+                      "--note '…'", s["attention"])
         text = status.render_status(s)
         lines = text.splitlines()
         self.assertEqual(lines[0], s["headline"])
-        self.assertEqual(lines[1], "Card 5 parked: needs a design decision")
+        self.assertTrue(lines[1].startswith("Card 5 parked: needs a design decision — next: leadhand unpark"))
         self.assertTrue(any(l.startswith("Card 5") or l.startswith("5 ") or " 5 " in l for l in lines[2:]))
         self.assertIn("Usage", lines[-1])
 
@@ -134,6 +135,57 @@ class StatusTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"LEADHAND_CONFIG": str(cfg)}):
             self.assertEqual(status._latest_unfinished(docs), runs / "2026-01-02-live")
             self.assertIsNone(status._latest_unfinished(docs / "nothing"))
+
+
+class FixRoundTests(unittest.TestCase):
+    def test_attention_lists_violations_with_preserved_ref_and_next_action(self):
+        w = RunWorld(self, cards=2)
+        w.ev("violation", stage="found", by="check", dispatch_id="c1-a1-review-1", card=1,
+             dispatch_kind="review", n=1, ref="refs/leadhand/abc123/violations/1", preserved={})
+        w.ev("violation", stage="found", by="implementer", n=1, ref="refs/leadhand/abc123/leftovers/1",
+             after_dispatch="c2-a1-implement-1", card=2)
+        att = status.build_status(w.root, sessions_dir=w.sessions)["attention"]
+        self.assertTrue(any("review worker on card 1" in a and "refs/leadhand/abc123/violations/1" in a
+                            and "next: inspect refs/leadhand/abc123/violations/1" in a for a in att), att)
+        self.assertTrue(any("refs/leadhand/abc123/leftovers/1" in a for a in att), att)
+
+    def test_meter_before_is_taken_once_even_when_null(self):
+        w = RunWorld(self, cards=1)
+        status.write_status(w.root, sessions_dir=w.sessions)
+        self.assertEqual(json.loads((w.root / status.METER_START).read_text()), {"percent": None,
+                                                                                 "observed_at": None})
+        w.rate_limit(40.0)
+        status.write_status(w.root, sessions_dir=w.sessions)
+        self.assertEqual(status.read_meter_start(w.root), (None, None))
+
+    def test_meter_is_not_scanned_at_every_checkpoint(self):
+        w = RunWorld(self, cards=1)
+        w.rate_limit(10.0)
+        status.write_status(w.root, sessions_dir=w.sessions)
+        with mock.patch.object(status, "codex_meter", side_effect=AssertionError("scanned")):
+            status.write_status(w.root, sessions_dir=w.sessions)
+            self.assertEqual(json.loads(w.paths.status.read_text())["usage"]["codex_meter"]["percent"], 10.0)
+        w.ev("outcome", outcome="complete", qualifier="", reasons=[])
+        with mock.patch.object(status, "codex_meter", return_value=(11.0, "t")) as m:
+            status.write_status(w.root, sessions_dir=w.sessions)
+            m.assert_called()
+
+    def test_meter_scan_is_capped_to_newest_files(self):
+        w = RunWorld(self, cards=1)
+        w.rate_limit(5.0, name="rollout-0-old.jsonl")
+        old = w.sessions / "2026" / "01" / "02" / "rollout-0-old.jsonl"
+        os.utime(old, (1, 1))
+        for i in range(status.METER_SCAN_FILES):
+            d = w.sessions / "x"
+            d.mkdir(exist_ok=True)
+            (d / f"rollout-{i}.jsonl").write_text("{}\n")
+        self.assertEqual(status.codex_meter(w.sessions), (None, None))
+
+    def test_unreadable_log_is_an_attention_line(self):
+        w = RunWorld(self, cards=1)
+        with mock.patch("leadhand.status.read_events", side_effect=PermissionError("denied")):
+            s = status.build_status(w.root, sessions_dir=w.sessions)
+        self.assertTrue(any("event log could not be read" in a for a in s["attention"]), s["attention"])
 
 
 class EngineStatusTests(unittest.TestCase):

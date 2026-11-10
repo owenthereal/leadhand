@@ -33,7 +33,7 @@ class RunWorld:
         test.addCleanup(shutil.rmtree, self.root.parent, True)
         cfg = self.root.parent / "user config.toml"
         cfg.write_text("", encoding="utf-8")
-        patcher = mock.patch.dict(os.environ, {"LEADHAND_CONFIG": str(cfg)})
+        patcher = mock.patch.dict(os.environ, {"LEADHAND_CONFIG": str(cfg), "CODEX_HOME": str(self.root.parent / "codex home")})
         patcher.start()
         test.addCleanup(patcher.stop)
         self.paths = state.run_paths(self.root)

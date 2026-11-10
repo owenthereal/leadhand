@@ -20,6 +20,7 @@ from leadhand.state import (CardState, RunPaths, fold_cards, read_attempts, read
                             utc_now, write_json_atomic, _read_bytes)
 
 METER_START = "meter-start.json"
+METER_SCAN_FILES = 20
 IMPLEMENTER_VERBS = {"implement": "Implementing", "continue": "Continuing", "fix": "Fixing",
                      "answer": "Answering a question on", "integrate": "Integrating",
                      "conflict": "Resolving conflicts on"}
@@ -37,7 +38,10 @@ def _tolerant_lines(file: Path, label: str, problems: list[str]) -> list[dict]:
     """Every parseable complete line; each unreadable one adds a problem naming where it is."""
     try:
         raw = _read_bytes(file)
-    except OSError:
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        problems.append(f"{label} could not be read: {e}")
         return []
     out: list[dict] = []
     last_seq = 0
@@ -64,7 +68,10 @@ def _read(reader: Callable[[RunPaths], list[dict]], paths: RunPaths, file: Path,
         return reader(paths)
     except ValueError:
         return _tolerant_lines(file, label, problems)
-    except OSError:
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        problems.append(f"{label} could not be read: {e}")
         return []
 
 
@@ -145,7 +152,7 @@ def codex_meter(sessions_dir: Path | None = None) -> tuple[float | None, str | N
     except OSError:
         return None, None
     best: tuple[str, float] | None = None
-    for f in files[:50]:
+    for f in files[:METER_SCAN_FILES]:
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -194,7 +201,7 @@ def _prices(snap: Snapshot) -> dict:
         return {}
 
 
-def usage_summary(snap: Snapshot, sessions_dir: Path | None = None) -> dict:
+def usage_summary(snap: Snapshot, sessions_dir: Path | None = None, meter: tuple | None = None) -> dict:
     """Totals from the charge log (the source of truth), with cost per charge so models mix correctly."""
     prices = _prices(snap)
     by_role: dict[str, dict] = {}
@@ -222,7 +229,7 @@ def usage_summary(snap: Snapshot, sessions_dir: Path | None = None) -> dict:
             incomplete.add(c.dispatch_id)
     unknown = {(a.get("dispatch"), a.get("role")) for a in snap.attempts if a.get("usage_known") is False}
     unknown |= {(c.dispatch_id, c.role) for c in snap.charges if not c.usage.known}
-    percent, observed = codex_meter(sessions_dir)
+    percent, observed = codex_meter(sessions_dir) if meter is None else meter
     return {"estimated_usd": round(total, 6) if priced_any else None,
             "unknown_attempts": len(unknown), "by_role": by_role, "by_vendor": by_vendor,
             "undercounted_attempts": len(incomplete),
@@ -231,6 +238,21 @@ def usage_summary(snap: Snapshot, sessions_dir: Path | None = None) -> dict:
 
 # --------------------------------------------------------------------------
 # Status
+
+def violation_lines(events: list[dict]) -> list[str]:
+    """One attention line per recorded violation, with the ref that holds the preserved work."""
+    out = []
+    for e in events:
+        if e.get("kind") != "violation" or e.get("stage") != "found":
+            continue
+        who = e.get("dispatch_kind") or e.get("by") or "worker"
+        card = f" on card {e['card']}" if e.get("card") is not None else ""
+        refs = [r for r in [e.get("ref"), *(e.get("preserved") or {}).values()] if r]
+        where = refs[0] if refs else "no ref recorded"
+        out.append(f"Violation by a {who} worker{card} (dispatch {e.get('dispatch_id') or e.get('after_dispatch') or 'unknown'}): "
+                   f"its changes were preserved at {where} — next: inspect {where}")
+    return out
+
 
 def _requests(events: list[dict]) -> dict[str, dict]:
     out: dict[str, dict] = {}
@@ -263,7 +285,7 @@ def _number_list(numbers: list[int]) -> str:
     return "cards " + ", ".join(map(str, numbers[:-1])) + f" and {numbers[-1]}"
 
 
-def build_status(run_dir: Path, sessions_dir: Path | None = None) -> dict:
+def build_status(run_dir: Path, sessions_dir: Path | None = None, meter: tuple | None = None) -> dict:
     snap = load(run_dir)
     requests = _requests(snap.events)
     cards = snap.cards
@@ -273,7 +295,9 @@ def build_status(run_dir: Path, sessions_dir: Path | None = None) -> dict:
     active = [n for n in sorted(cards) if cards[n].state not in IDLE_STATES]
     outcome = snap.outcome
 
-    attention = [f"Card {n} parked: {cards[n].park_reason or 'no reason recorded'}" for n in parked]
+    attention = [f"Card {n} parked: {cards[n].park_reason or 'no reason recorded'}"
+                 f" — next: leadhand unpark {snap.root} --card {n} --note '…'" for n in parked]
+    attention.extend(violation_lines(snap.events))
     state_name = "running"
     activity = ""
     progress_text = f"{accepted} of {total} accepted"
@@ -310,7 +334,7 @@ def build_status(run_dir: Path, sessions_dir: Path | None = None) -> dict:
         card_rows.append({"number": n, "title": snap.titles.get(n, ""), "state": c.state,
                           "attempt": c.attempt, "route": route_text(requests.get(c.dispatch_id)),
                           "note": note})
-    summary = usage_summary(snap, sessions_dir)
+    summary = usage_summary(snap, sessions_dir, meter)
     return {"run_id": snap.meta.get("run_id", ""), "deck": snap.title, "state": state_name,
             "headline": headline, "activity": activity,
             "progress": {"accepted": accepted, "total": total}, "attention": attention,
@@ -322,12 +346,22 @@ def build_status(run_dir: Path, sessions_dir: Path | None = None) -> dict:
 
 
 def write_status(run_dir: Path, sessions_dir: Path | None = None) -> dict:
-    """Rewrite status.json atomically; the first observed Codex meter is kept as the run's 'before'."""
-    s = build_status(run_dir, sessions_dir)
+    """Rewrite status.json atomically. The Codex meter is read on the first write (kept in
+    meter-start.json as the run's 'before', even when there is no reading) and once the run has
+    ended; other checkpoints carry the last reading forward instead of scanning rollout files."""
     root = Path(run_dir)
-    meter = s["usage"]["codex_meter"]
-    if meter["percent"] is not None and not (root / METER_START).exists():
-        write_json_atomic(root / METER_START, meter)
+    first = not (root / METER_START).exists()
+    ended = load(root).outcome is not None
+    meter = None
+    if not (first or ended):
+        try:
+            previous = json.loads((root / "status.json").read_text(encoding="utf-8"))["usage"]["codex_meter"]
+            meter = (previous.get("percent"), previous.get("observed_at"))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            meter = None
+    s = build_status(root, sessions_dir, meter)
+    if first:
+        write_json_atomic(root / METER_START, s["usage"]["codex_meter"])
     write_json_atomic(root / "status.json", s)
     return s
 
