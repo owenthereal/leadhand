@@ -140,6 +140,15 @@ class DeckTests(unittest.TestCase):
         c = parse_deck(self.write(text)).cards[0]
         self.assertEqual(c.context, "- Files: src/a.py")
 
+    def test_unknown_key_bullet_warns(self):
+        text = deck_text([(1, "implementer", "no", "none")]) + "\n- Dependson: 2\n- Files: src/a.py\n"
+        p = self.write(text)
+        base = len(text.splitlines()) - 1
+        msgs = self.messages(parse_deck(p))
+        self.assertIn(("warning", f'card 1: line {base}: "Dependson" is not a card field; treated as context'), msgs)
+        self.assertIn(("warning", f'card 1: line {base + 1}: "Files" is not a card field; treated as context'), msgs)
+        self.assertFalse([m for l, m in msgs if l == "error" and "card field" in m])
+
     def test_scout_card_rejected_in_this_version(self):
         d = parse_deck(self.write(deck_text([(1, "scout", "no", "none")])))
         self.assertTrue(any("not supported in this version: scout cards" in m for l, m in self.messages(d) if l == "error"))

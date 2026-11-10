@@ -5,7 +5,7 @@ import hashlib
 import heapq
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from leadhand.config import Config, ConfigError, Route, load_config, parse_route, unsupported_settings
@@ -45,6 +45,7 @@ class Card:
     context: str
     missing: tuple[str, ...] = ()  # required fields absent or empty
     line: int = 0
+    unknown_keys: tuple[tuple[int, str], ...] = ()  # (line, key) of context bullets
 
 
 @dataclass(frozen=True)
@@ -209,6 +210,7 @@ def parse_deck(path: Path) -> Deck:
             i += 1
             fields = []
             ctx: list[str] = []
+            unknown: list[tuple[int, str]] = []
             in_ctx = False
             while i < n and not lines[i].startswith("## "):
                 text = lines[i]
@@ -217,6 +219,8 @@ def parse_deck(path: Path) -> Deck:
                     fields.append((fm.group(1), fm.group(2).strip(), i + 1))
                     i += 1
                     continue
+                if fm:
+                    unknown.append((i + 1, fm.group(1)))
                 if text.strip():
                     in_ctx = True
                 if in_ctx:
@@ -225,7 +229,8 @@ def parse_deck(path: Path) -> Deck:
             context = "\n".join(ctx).strip()
             if context.startswith("Context:"):
                 context = context[len("Context:"):].strip()
-            cards.append(_parse_card(int(m.group(1)), m.group(2), ln, fields, context))
+            cards.append(replace(_parse_card(int(m.group(1)), m.group(2), ln, fields, context),
+                                 unknown_keys=tuple(unknown)))
             continue
         if line.strip():
             raise DeckError(f"unexpected text {line.strip()!r}", ln)
@@ -311,6 +316,8 @@ def check_deck(deck: Deck, repo: Path, config: Config) -> list[Problem]:
         for d in c.depends_on:
             if d not in numbers:
                 err(f"{p}depends on unknown card {d}", c.number)
+        for ln, key in c.unknown_keys:
+            warn(f'{p}line {ln}: "{key}" is not a card field; treated as context', c.number)
         for path in c.allowed_paths:
             if not (repo / path).exists():
                 warn(f"{p}allowed path {path} does not exist yet", c.number)
