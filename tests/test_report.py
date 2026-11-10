@@ -1,6 +1,8 @@
 import re
+import shlex
 import unittest
 
+from leadhand.dispatch import CLI_PATH
 from leadhand import cli, report, state, status
 from runworld import RunWorld
 
@@ -120,7 +122,9 @@ class FixRoundTests(unittest.TestCase):
         w.ev("card_cut", card=1, branch="b", base="b")
         w.ev("parked", card=1, reason="why")
         text = report.render_report(w.root, sessions_dir=w.sessions)
-        self.assertIn("next: leadhand unpark", text.split("## Result")[0])
+        expected = (f"- Card 1 parked: why — next: {shlex.quote(str(CLI_PATH))} unpark "
+                    f"{shlex.quote(str(w.root))} --card 1 --note '…'")
+        self.assertIn(expected, text.split("## Needs your attention")[1].split("## Result")[0].splitlines())
 
     def test_evidence_shows_last_result_per_gate_and_marks_stale(self):
         w = RunWorld(self, cards=2)

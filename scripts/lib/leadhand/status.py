@@ -7,6 +7,7 @@ reported as an attention line, and a missing file is an empty log.
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ from typing import Any, Callable
 
 from leadhand import usage as usage_mod
 from leadhand.config import ConfigError, docs_dir_for, load_config
+from leadhand.dispatch import CLI_PATH
 from leadhand.deck import DeckError, parse_deck
 from leadhand.state import (CardState, RunPaths, fold_cards, read_attempts, read_events, run_paths,
                             utc_now, write_json_atomic, _read_bytes)
@@ -296,7 +298,8 @@ def build_status(run_dir: Path, sessions_dir: Path | None = None, meter: tuple |
     outcome = snap.outcome
 
     attention = [f"Card {n} parked: {cards[n].park_reason or 'no reason recorded'}"
-                 f" — next: leadhand unpark {snap.root} --card {n} --note '…'" for n in parked]
+                 f" — next: {shlex.quote(str(CLI_PATH))} unpark {shlex.quote(str(snap.root.absolute()))}"
+                 f" --card {n} --note '…'" for n in parked]
     attention.extend(violation_lines(snap.events))
     state_name = "running"
     activity = ""

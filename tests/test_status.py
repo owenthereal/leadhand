@@ -2,10 +2,12 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import unittest
 from unittest import mock
 
 from leadhand import cli, state, status
+from leadhand.dispatch import CLI_PATH
 from leadhand.state import run_paths
 from runworld import RunWorld
 
@@ -45,12 +47,14 @@ class StatusTests(unittest.TestCase):
         w.dispatch(2)
         s = status.build_status(w.root, sessions_dir=w.sessions)
         self.assertEqual(s["headline"], "Needs your decision on card 5; independent work continues")
-        self.assertIn(f"Card 5 parked: needs a design decision — next: leadhand unpark {w.root} --card 5 "
-                      "--note '…'", s["attention"])
+        unpark = (f"Card 5 parked: needs a design decision — next: {shlex.quote(str(CLI_PATH))} unpark "
+                  f"{shlex.quote(str(w.root))} --card 5 --note '…'")
+        self.assertIn(" ", str(w.root))
+        self.assertIn(unpark, s["attention"])
         text = status.render_status(s)
         lines = text.splitlines()
         self.assertEqual(lines[0], s["headline"])
-        self.assertTrue(lines[1].startswith("Card 5 parked: needs a design decision — next: leadhand unpark"))
+        self.assertEqual(lines[1], unpark)
         self.assertTrue(any(l.startswith("Card 5") or l.startswith("5 ") or " 5 " in l for l in lines[2:]))
         self.assertIn("Usage", lines[-1])
 
