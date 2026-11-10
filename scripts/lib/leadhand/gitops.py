@@ -3,10 +3,13 @@
 A run works on a run branch. Each card gets a card branch cut from the run tip;
 accepted cards are fast-forwarded into the run branch. Nothing here pushes, and
 nothing here touches the shared stash stack.
+
+Requires git 2.36 or newer (`git worktree list --porcelain -z`).
 """
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -140,16 +143,22 @@ def _origin_default_branch(repo: Path) -> str:
 
 
 def _local_default_branch(repo: Path) -> str:
+    """init.defaultBranch, main, master (the first that exists), then the main
+    worktree's branch, then the only branch. The main worktree's branch comes late
+    because after a run without a worktree it is the run branch."""
+    # Ref names cannot contain newlines.
+    branches = [r.removeprefix("refs/heads/")
+                for r in git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/").splitlines()]
+    configured = _run(repo, ("config", "--get", "init.defaultBranch")).stdout.strip()
+    for candidate in (configured, "main", "master"):
+        if candidate and candidate in branches:
+            return candidate
     worktrees = _worktrees(repo)
     ref = worktrees[0].get("branch", "") if worktrees else ""
-    if ref.startswith("refs/heads/") and _ref_exists(repo, ref):
+    if ref.startswith("refs/heads/") and ref.removeprefix("refs/heads/") in branches:
         return ref.removeprefix("refs/heads/")
-    branches = _nul_list(git(repo, "for-each-ref", "--format=%(refname:short)%00", "refs/heads/"))
     if len(branches) == 1:
         return branches[0]
-    for candidate in ("main", "master"):
-        if candidate in branches:
-            return candidate
     raise GitError(f"cannot determine the local default branch (in {repo})")
 
 
@@ -181,8 +190,16 @@ def ensure_excluded(repo: Path, pattern: str) -> None:
 
 def prepare_workspace(repo: Path, *, run_branch: str, base_sha: str, slug: str, use_worktree: bool) -> Path:
     """Idempotent: create `run_branch` at `base_sha` when missing (an existing one is
-    left as is), then a worktree at <repo>/.worktrees/<slug> or a checkout in `repo`."""
+    left as is), then a worktree at <repo>/.worktrees/<slug> or a checkout in `repo`.
+    Without a worktree, a repo with uncommitted tracked changes is refused (unless it is
+    already on the run branch, i.e. a resumed run)."""
     _check_branch_name(repo, run_branch)
+    if not slug or "/" in slug or "\0" in slug or slug.startswith("."):
+        raise GitError(f"not a valid workspace slug: {slug!r}")
+    if not use_worktree and _current_branch(repo) != run_branch and _has_changes(repo):
+        # Checking out the run branch would carry them into the run.
+        raise GitError(f"uncommitted changes to tracked files in {repo}; "
+                       "commit or set them aside before a run without a worktree")
     ensure_excluded(repo, ".worktrees/")
     ensure_excluded(repo, ".leadhand/")
     ref = f"refs/heads/{run_branch}"
@@ -232,7 +249,7 @@ def needs_integration(ws: Path, run_branch: str, card_branch: str) -> bool:
 def rebase_onto(ws: Path, card_branch: str, onto: str) -> list[str]:
     """Rebase `card_branch` onto `onto` in `ws`. [] on success; on conflict the rebase is
     aborted (the branch is left unchanged) and the conflicted paths are returned."""
-    r = _run(ws, (*NO_SIGN, "rebase", "--quiet", "--no-autostash", "--no-update-refs",
+    r = _run(ws, (*NO_SIGN, "-c", "rebase.updateRefs=false", "rebase", "--quiet", "--no-autostash",
                   onto, card_branch))
     if r.returncode == 0:
         return []
@@ -244,11 +261,23 @@ def rebase_onto(ws: Path, card_branch: str, onto: str) -> list[str]:
     return sorted(set(conflicts))
 
 
+def _git_path(ws: Path, name: str) -> Path:
+    return Path(git(ws, "rev-parse", "--path-format=absolute", "--git-path", name))
+
+
 def _rebase_in_progress(ws: Path) -> bool:
-    for state in ("rebase-merge", "rebase-apply"):
-        if Path(git(ws, "rev-parse", "--path-format=absolute", "--git-path", state)).exists():
-            return True
-    return False
+    return _git_path(ws, "rebase-merge").exists() or _git_path(ws, "rebase-apply").exists()
+
+
+def _clear_operations(ws: Path) -> None:
+    """Forget an in-progress rebase, am, cherry-pick or revert. HEAD, the index and
+    files are untouched; merge and pick heads go with the following hard reset."""
+    if (_git_path(ws, "rebase-apply") / "applying").exists():
+        git(ws, "am", "--quit")
+    elif _rebase_in_progress(ws):
+        git(ws, "rebase", "--quit")
+    if _git_path(ws, "sequencer").exists():
+        git(ws, "cherry-pick", "--quit")
 
 
 def fast_forward(ws: Path, run_branch: str, to_sha: str) -> str:
@@ -279,6 +308,19 @@ def changed_paths(ws: Path, a: str, b: str) -> list[str]:
 # -- workspace violations --------------------------------------------------
 
 
+def _index_dirty(ws: Path) -> bool:
+    return not _test(ws, "diff", "--cached", "--quiet", "--no-ext-diff", "HEAD", "--")
+
+
+def _unstaged_paths(ws: Path) -> list[str]:
+    # --name-only rather than --quiet: it ignores stat-only changes.
+    return _nul_list(git(ws, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--"))
+
+
+def _has_changes(ws: Path) -> bool:
+    return _index_dirty(ws) or bool(_unstaged_paths(ws))
+
+
 @dataclass(frozen=True)
 class Violation:
     head_moved: bool  # HEAD is not `expected_head` on `expected_branch`
@@ -290,8 +332,8 @@ def detect_violation(ws: Path, expected_head: str, expected_branch: str) -> Viol
     """None when `ws` is on `expected_branch` at `expected_head` with a clean index and
     clean tracked files. Untracked files (build output) are not a violation."""
     head_moved = _current_branch(ws) != expected_branch or head(ws) != expected_head
-    index_dirty = not _test(ws, "diff", "--cached", "--quiet", "--no-ext-diff", "HEAD", "--")
-    tracked = tuple(_nul_list(git(ws, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--")))
+    index_dirty = _index_dirty(ws)
+    tracked = tuple(_unstaged_paths(ws))
     if head_moved or index_dirty or tracked:
         return Violation(head_moved, index_dirty, tracked)
     return None
@@ -303,17 +345,56 @@ def preserve_and_restore(ws: Path, *, ref: str, expected_head: str, expected_bra
 
     The saved commit comes from `git stash create`: its first parent is HEAD (so moved
     commits stay reachable), its second parent holds the index, and its tree holds the
-    tracked working tree. With nothing to stash, the saved commit is HEAD itself.
-    `refs/stash` is never touched. Untracked files are left alone."""
+    tracked working tree. With nothing to stash, the saved commit is HEAD itself. With
+    an unmerged index (a conflicted merge, rebase or cherry-pick), stash cannot record
+    the index, so the saved commit holds the tracked working tree (conflict markers
+    included) with HEAD and, during a merge, MERGE_HEAD as parents.
+
+    When `expected_branch` itself moved to a commit the saved commit does not contain
+    (HEAD was elsewhere), that tip is kept on the sibling ref `<ref>-branch`. A deleted
+    `expected_branch` is recreated. In-progress rebase, am, cherry-pick and merge states
+    are cleared. `refs/stash` is never touched. Untracked files are left alone."""
     if not ref.startswith("refs/") or _run(ws, ("check-ref-format", ref)).returncode != 0:
         raise GitError(f"not a valid ref to preserve under: {ref!r}")
-    saved = git(ws, *NO_SIGN, "stash", "create", "leadhand: preserved workspace").strip() or head(ws)
+    _check_branch_name(ws, expected_branch)
+    r = _run(ws, (*NO_SIGN, "stash", "create", "leadhand: preserved workspace"))
+    if r.returncode == 0:
+        saved = r.stdout.strip() or head(ws)
+    elif _nul_list(git(ws, "ls-files", "--unmerged", "-z")):
+        saved = _snapshot_conflicted(ws)
+    else:
+        raise _fail(r, ws)
     git(ws, "update-ref", "-m", "leadhand: preserve workspace", ref, saved)
-    if _rebase_in_progress(ws):
-        git(ws, "rebase", "--quit")
-    git(ws, "checkout", "--quiet", "--force", expected_branch, "--")
+    branch_ref = f"refs/heads/{expected_branch}"
+    if _ref_exists(ws, branch_ref):
+        tip = head(ws, branch_ref)
+        if not (_test(ws, "merge-base", "--is-ancestor", tip, saved)
+                or _test(ws, "merge-base", "--is-ancestor", tip, expected_head)):
+            git(ws, "update-ref", "-m", "leadhand: preserve moved branch", f"{ref}-branch", tip)
+    _clear_operations(ws)
+    git(ws, "checkout", "--quiet", "--force", "-B", expected_branch, expected_head, "--")
     git(ws, "reset", "--quiet", "--hard", expected_head)
     return saved
+
+
+def _snapshot_conflicted(ws: Path) -> str:
+    """Commit the tracked working tree of a workspace whose index has conflicts,
+    using a copy of the index so the real one is untouched."""
+    index = _git_path(ws, "index")
+    fd, tmp = tempfile.mkstemp(dir=index.parent, prefix="leadhand-index.")
+    os.close(fd)
+    try:
+        shutil.copyfile(index, tmp)
+        env = {"GIT_INDEX_FILE": tmp}
+        git(ws, "add", "--update", env=env)
+        tree = git(ws, "write-tree", env=env)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    parents = ["-p", head(ws)]
+    merge = _run(ws, ("rev-parse", "--verify", "--quiet", "MERGE_HEAD^{commit}"))
+    if merge.returncode == 0:
+        parents += ["-p", merge.stdout.strip()]
+    return git(ws, *NO_SIGN, "commit-tree", tree, *parents, "-m", "leadhand: preserved conflicted workspace")
 
 
 # -- paths -----------------------------------------------------------------
@@ -321,15 +402,20 @@ def preserve_and_restore(ws: Path, *, ref: str, expected_head: str, expected_bra
 _TEST_DOC_DIRS = frozenset({"tests", "test", "spec", "docs"})
 _TEST_NAMES = ("test_*", "*_test.*", "*.test.*", "*.spec.*")
 _DOC_SUFFIXES = (".md", ".rst", ".txt")
+_PRODUCTION_NAMES = ("requirements*.txt", "constraints*.txt", "cmakelists.txt")  # matched lowercased
 
 
 def is_test_or_doc_path(path: str) -> bool:
-    """Under a tests/, test/, spec/ or docs/ directory (at any depth); or named test_*,
-    *_test.*, *.test.* or *.spec.*; or a *.md, *.rst or *.txt file."""
+    """Under a top-level tests/, test/, spec/ or docs/ directory; or named test_*,
+    *_test.*, *.test.* or *.spec.*; or a *.md, *.rst or *.txt file. Dependency and
+    build inputs (requirements*.txt, constraints*.txt, CMakeLists.txt) are production
+    anywhere. Narrow on purpose: a wrong "test or doc" verdict skips re-review."""
     parts = PurePosixPath(path).parts
     if not parts:
         return False
-    if any(p in _TEST_DOC_DIRS for p in parts[:-1]):
-        return True
     name = parts[-1]
+    if any(fnmatchcase(name.lower(), pat) for pat in _PRODUCTION_NAMES):
+        return False
+    if len(parts) > 1 and parts[0] in _TEST_DOC_DIRS:
+        return True
     return name.lower().endswith(_DOC_SUFFIXES) or any(fnmatchcase(name, pat) for pat in _TEST_NAMES)

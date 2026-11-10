@@ -285,6 +285,138 @@ class GitopsTests(unittest.TestCase):
         run_git(ws, "add", "a.txt")
         preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=a)
 
+    def ref_exists(self, cwd, ref):
+        return run_git(cwd, "rev-parse", "--verify", "--quiet", ref, check=False) != ""
+
+    def git_path_exists(self, ws, name):
+        return Path(run_git(ws, "rev-parse", "--path-format=absolute", "--git-path", name)).exists()
+
+    def test_preserve_keeps_a_moved_branch_tip_when_head_is_detached(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h = self.card(ws, 1, {"f.txt": "orig\n"})
+        stray = commit(ws, {"f.txt": "stray\n"}, "reviewer commit on the card branch")
+        run_git(ws, "checkout", "--quiet", "--detach", h)
+        saved = preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=branch)
+        self.assertEqual(saved, h)
+        self.assertEqual(run_git(ws, "rev-parse", "refs/leadhand/saved/1-branch"), stray)
+        self.assertEqual(current_branch(ws), branch)
+        self.assertEqual(head(ws, branch), h)
+        self.assertIsNone(detect_violation(ws, h, branch))
+
+    def test_preserve_keeps_a_moved_branch_tip_when_another_branch_is_checked_out(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h = self.card(ws, 1, {"f.txt": "orig\n"})
+        stray = commit(ws, {"f.txt": "stray\n"}, "reviewer commit on the card branch")
+        run_git(ws, "checkout", "--quiet", RUN)
+        saved = preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=branch)
+        self.assertEqual(saved, head(ws, RUN))
+        self.assertEqual(run_git(ws, "rev-parse", "refs/leadhand/saved/1-branch"), stray)
+        self.assertEqual(current_branch(ws), branch)
+        self.assertEqual(head(ws), h)
+
+    def test_preserve_recreates_a_deleted_branch(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h = self.card(ws, 1, {"f.txt": "orig\n"})
+        run_git(ws, "checkout", "--quiet", RUN)
+        run_git(ws, "branch", "--quiet", "-D", branch)
+        preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=branch)
+        self.assertEqual(current_branch(ws), branch)
+        self.assertEqual(head(ws, branch), h)
+        self.assertFalse(self.ref_exists(ws, "refs/leadhand/saved/1-branch"))
+        self.assertIsNone(detect_violation(ws, h, branch))
+
+    def test_preserve_does_not_keep_a_branch_tip_already_in_the_saved_commit(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h = self.card(ws, 1, {"f.txt": "orig\n"})
+        moved = commit(ws, {"f.txt": "committed\n"}, "reviewer commit")
+        write(ws, {"f.txt": "dirty\n"})
+        saved = preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=branch)
+        self.assertEqual(run_git(ws, "rev-parse", f"{saved}^1"), moved)
+        self.assertFalse(self.ref_exists(ws, "refs/leadhand/saved/1-branch"))
+
+    def test_preserve_saves_and_clears_a_conflicted_merge(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h0 = self.card(ws, 1, {"f.txt": "orig\n"})
+        run_git(ws, "checkout", "--quiet", "-b", "side")
+        side = commit(ws, {"f.txt": "side\n"}, "side")
+        run_git(ws, "checkout", "--quiet", branch)
+        h = commit(ws, {"f.txt": "card\n"}, "card")
+        # Signing must not be attempted for the fallback commit either.
+        run_git(repo, "config", "commit.gpgsign", "true")
+        run_git(repo, "config", "gpg.program", "false")
+        run_git(ws, "merge", "--no-edit", "side", check=False)
+        self.assertTrue(run_git(ws, "ls-files", "-u"))  # unmerged index
+
+        saved = preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=branch)
+        self.assertEqual(run_git(ws, "rev-parse", "refs/leadhand/saved/1"), saved)
+        self.assertEqual(run_git(ws, "rev-parse", f"{saved}^1"), h)
+        self.assertEqual(run_git(ws, "rev-parse", f"{saved}^2"), side)
+        self.assertIn("<<<<<<<", run_git(ws, "show", f"{saved}:f.txt"))
+        self.assertFalse(self.git_path_exists(ws, "MERGE_HEAD"))
+        self.assertEqual(current_branch(ws), branch)
+        self.assertIsNone(detect_violation(ws, h, branch))
+        self.assertEqual((ws / "f.txt").read_text(), "card\n")
+        self.assertEqual(run_git(ws, "stash", "list"), "")
+
+    def test_preserve_saves_and_clears_a_conflicted_rebase_and_cherry_pick(self):
+        repo, ws, _ = self.workspace()
+        branch, _, h = self.card(ws, 1, {"f.txt": "card\n"})
+        run_git(ws, "checkout", "--quiet", "-b", "other", RUN)
+        pick1 = commit(ws, {"f.txt": "other\n"}, "other 1")
+        pick2 = commit(ws, {"g.txt": "g\n"}, "other 2")
+        run_git(ws, "checkout", "--quiet", branch)
+
+        run_git(ws, "rebase", "other", check=False)
+        self.assertTrue(self.git_path_exists(ws, "rebase-merge") or self.git_path_exists(ws, "rebase-apply"))
+        saved = preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=h, expected_branch=branch)
+        self.assertIn("<<<<<<<", run_git(ws, "show", f"{saved}:f.txt"))
+        self.assertFalse(self.git_path_exists(ws, "rebase-merge"))
+        self.assertFalse(self.git_path_exists(ws, "rebase-apply"))
+        self.assertEqual(current_branch(ws), branch)
+        self.assertIsNone(detect_violation(ws, h, branch))
+
+        run_git(ws, "cherry-pick", pick1, pick2, check=False)
+        self.assertTrue(self.git_path_exists(ws, "sequencer"))
+        saved = preserve_and_restore(ws, ref="refs/leadhand/saved/2", expected_head=h, expected_branch=branch)
+        self.assertIn("<<<<<<<", run_git(ws, "show", f"{saved}:f.txt"))
+        self.assertFalse(self.git_path_exists(ws, "sequencer"))
+        self.assertFalse(self.git_path_exists(ws, "CHERRY_PICK_HEAD"))
+        self.assertIsNone(detect_violation(ws, h, branch))
+
+    def test_prepare_workspace_without_worktree_refuses_uncommitted_changes(self):
+        repo = make_repo(self.tmp)
+        base = run_git(repo, "rev-parse", "HEAD")
+        write(repo, {"README.md": "local edit\n"})
+        with self.assertRaises(GitError):
+            prepare_workspace(repo, run_branch=RUN, base_sha=base, slug="run-1", use_worktree=False)
+        run_git(repo, "add", "README.md")
+        write(repo, {"README.md": "hello\n"})  # staged only
+        with self.assertRaises(GitError):
+            prepare_workspace(repo, run_branch=RUN, base_sha=base, slug="run-1", use_worktree=False)
+        self.assertEqual(current_branch(repo), "main")
+        self.assertFalse(self.ref_exists(repo, f"refs/heads/{RUN}"))
+
+    def test_prepare_workspace_rejects_unsafe_slugs(self):
+        repo = make_repo(self.tmp)
+        base = run_git(repo, "rev-parse", "HEAD")
+        for slug in ("", "a/b", ".hidden", "..", "../escape"):
+            with self.subTest(slug=slug), self.assertRaises(GitError):
+                prepare_workspace(repo, run_branch=RUN, base_sha=base, slug=slug, use_worktree=True)
+        self.assertFalse((repo / ".worktrees").exists())
+        self.assertFalse(self.ref_exists(repo, f"refs/heads/{RUN}"))
+
+    def test_default_base_after_a_run_without_worktree(self):
+        repo, ws, base = self.workspace(use_worktree=False)
+        self.assertEqual(current_branch(repo), RUN)
+        self.assertEqual(default_base(repo), ("main", base))
+
+        repo = make_repo(self.tmp, name="trunk repo", default_branch="trunk")
+        trunk = run_git(repo, "rev-parse", "HEAD")
+        run_git(repo, "config", "init.defaultBranch", "trunk")
+        run_git(repo, "branch", "main")  # init.defaultBranch outranks main
+        prepare_workspace(repo, run_branch=RUN, base_sha=trunk, slug="run-1", use_worktree=False)
+        self.assertEqual(default_base(repo), ("trunk", trunk))
+
     # -- misc ------------------------------------------------------------
 
     def test_paths_with_spaces(self):
@@ -308,11 +440,17 @@ class GitopsTests(unittest.TestCase):
 
     def test_is_test_or_doc_path(self):
         yes = [
-            "tests/test_x.py", "test/a.c", "spec/a_spec.rb", "docs/guide.html", "pkg/tests/helper.py",
+            "tests/test_x.py", "test/a.c", "spec/a_spec.rb", "docs/guide.html", "tests/deep/helper.py",
             "test_foo.py", "src/foo_test.go", "src/foo.test.ts", "src/foo.spec.js",
-            "README.md", "notes/usage.rst", "requirements.txt",
+            "README.md", "notes/usage.rst", "notes/todo.txt",
         ]
-        no = ["src/main.py", "scripts/build.sh", "src/contest.py", "src/latest.py", "docs", "tests", "src/tester.py"]
+        # Ruling R13: directory rules are top-level only; dependency and build inputs are production.
+        no = [
+            "src/main.py", "scripts/build.sh", "src/contest.py", "src/latest.py", "docs", "tests", "src/tester.py",
+            "pkg/tests/helper.py", "pkg/spec/x.py", "app/docs/views.py",
+            "requirements.txt", "requirements-dev.txt", "tests/requirements.txt", "constraints.txt",
+            "CMakeLists.txt", "src/CMakeLists.txt",
+        ]
         for p in yes:
             self.assertTrue(is_test_or_doc_path(p), p)
         for p in no:
