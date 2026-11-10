@@ -28,9 +28,12 @@ worker while another one is running.
 
 How to call the CLI:
 
-- Every call is one plain command: `<cli>` and its arguments, written out
-  literally. No pipes, redirects, `&&` or `;`, no `cd`, no variables or `$`.
-  The CLI runs outside the sandbox only when the command is plain.
+- Every call is one plain command on one line: `<cli>` and its arguments,
+  written out literally. No pipes, redirects, heredocs, `&&` or `;`, no
+  `cd`, no variables or `$`. The CLI runs outside the sandbox only when the
+  command is plain.
+- Write `<cli>` as given, and put every other path (the run directory, a
+  reply file) in single quotes: paths may contain spaces.
 - Free text for `--text`, `--reason` and `--note` goes in single quotes, and
   the text itself must contain no single quote and no line break: write
   do not, not don't, and rephrase any quote or line break from a copied
@@ -57,7 +60,7 @@ How to call the CLI:
    - `prompt`: the action's `message`, verbatim.
 
    It runs in the background and returns the worker's agent ID at once.
-   Remember the `dispatch_id` you launched it for.
+   Remember the `dispatch_id` and `reply_file` you launched it for.
 2. Immediately record the start with that ID:
    `<cli> record <run_dir> started --dispatch <dispatch_id> --worker <agent id>`
 3. Start the timer with the Bash tool and `run_in_background: true`:
@@ -88,7 +91,7 @@ only a card number).
 
 1. SendMessage to `resume.worker_id` with the action's `message`, verbatim.
    This resumes that finished worker in its own transcript. Remember the
-   `dispatch_id` you resumed it for.
+   `dispatch_id` and `reply_file` you resumed it for.
 2. Record the start, where `<agent id>` is `resume.worker_id`:
    `<cli> record <run_dir> started --dispatch <dispatch_id> --worker <agent id>`
 3. Start the timer with the Bash tool and `run_in_background: true`:
@@ -97,19 +100,17 @@ only a card number).
 
 ### A worker's completion notice
 
-When a worker's completion notice arrives, record its reply: the notice's
-result text, verbatim, never a summary. Record it against the `dispatch_id`
-you remembered when you launched or resumed that worker. Only if you have
-lost it, run `next`: a `wait` names `dispatch_id` and `worker_id`.
+When a worker's completion notice arrives, record its reply against the
+`dispatch_id` and `reply_file` you remembered when you launched or resumed
+that worker. Only if you have lost them, run `next`: a `wait` names
+`dispatch_id`, `worker_id` and `reply_file`.
 
-```
-<cli> record <run_dir> result --dispatch <dispatch_id> --worker <agent id> --reply - <<'LEADHAND_REPLY'
-<the worker's reply, verbatim>
-LEADHAND_REPLY
-```
-
-This quoted heredoc is the only multi-line command you ever run. Then run
-`next`.
+1. Write the worker's reply to `reply_file` with the Write tool: the notice's
+   result text, verbatim, never a summary. If the Write tool refuses because
+   the file already exists, Read it, then write it.
+2. Record it with one plain command:
+   `<cli> record <run_dir> result --dispatch <dispatch_id> --worker <agent id> --reply-file '<reply_file>'`
+3. Run `next`.
 
 A notice with status `killed` is a worker you stopped. Its result is already
 recorded; do nothing.

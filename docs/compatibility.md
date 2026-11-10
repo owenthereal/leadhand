@@ -37,6 +37,13 @@ Tested with Claude Code 2.1.322 and tmux 3.8 on macOS.
   arguments, no redirection, pipes or command chains). Not established: whether the overlay
   merges with or replaces the user's own `excludedCommands` (the user-exclusion control used
   a command with a redirection, which ran sandboxed even without the overlay).
+- In the first end-to-end run, the `"<cli path> *"` exclusion matched every plain
+  `<cli> …` invocation, including ones whose run-directory argument was single-quoted because
+  it contained spaces, but not a command with a heredoc (`<cli> record … --reply - <<'EOF'`):
+  that one ran sandboxed and could not write the run directory. Decision: the supervisor
+  never uses heredocs, pipes or redirects. It writes a worker's reply to the dispatch's
+  `reply_file` (a git-ignored file in the workspace) with its Write tool and records it with
+  the plain command `<cli> record <run dir> result … --reply-file '<path>'`.
 - Not established: whether the `"<cli path> *"` exclusion matches when the CLI's path contains
   spaces (the supervisor then has to quote it). Until an end-to-end run shows it does,
   `leadhand run` warns when the CLI path contains whitespace: install leadhand under a path

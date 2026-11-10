@@ -68,7 +68,8 @@ from typing import Any
 
 from leadhand import dispatch as dsp
 from leadhand import usage
-from leadhand.briefs import CODEX_AGENT, agent_for, dispatch_message, parse_report_head, write_brief
+from leadhand.briefs import (CODEX_AGENT, agent_for, dispatch_message, parse_report_head, scratch_dir,
+                             write_brief)
 from leadhand.config import VENDORS, Config, ConfigError, Route, docs_dir_for, load_config
 from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, parse_deck
 from leadhand.gitops import (GitError, card_branch_name, changed_paths, cut_card_branch, default_base,
@@ -94,6 +95,7 @@ OPERATIONS = (("rebase-merge", "rebase"), ("rebase-apply", "rebase"), ("MERGE_HE
               ("CHERRY_PICK_HEAD", "cherry-pick"), ("REVERT_HEAD", "revert"), ("sequencer", "sequencer"))
 CODEX_GRACE_MINUTES = 5       # the Codex runner enforces its own limit; the proxy gets this much more
 TIMER_INTERVAL = 10.0
+REPLY_FILE = "reply.txt"      # in the dispatch's scratch folder (R38)
 MAX_STEPS = 200               # mechanical steps in one next_action call
 SLUG_MAX = 40
 _TURN_LIMIT = re.compile(r"stopped at its \d+-turn limit", re.IGNORECASE)
@@ -605,9 +607,10 @@ def _append_request(ctx: _Run, did: str, *, card: int | None, attempt: int, kind
                     brief: Path, report: Path, extra: dict, notes: str, resume: _Dispatch | None,
                     **more: Any) -> dict:
     """Append `dispatch_requested` for a brief already written (with the notes appended)."""
-    # No worker can have written this dispatch's report yet: one already there is left over
-    # from an earlier run that used the same workspace.
+    # No worker can have written this dispatch's report yet, nor the supervisor its reply file:
+    # one already there is left over from an earlier run that used the same workspace.
     Path(report).unlink(missing_ok=True)
+    _reply_file(ctx, card, did).unlink(missing_ok=True)
     resume_worker = resume_session = None
     if resume is not None:
         if route.vendor == "claude":
@@ -682,6 +685,23 @@ def _codex_command(ctx: _Run, req: dict) -> list[str]:
     return cmd
 
 
+def _reply_file(ctx: _Run, card: int | None, dispatch_id: str) -> Path:
+    """Where the supervisor writes a worker's reply for `record result --reply-file` (R38): in
+    the dispatch's scratch folder inside the workspace, which is git-ignored, so the supervisor
+    writes it with its Write tool and records it with a plain command (no heredoc)."""
+    return scratch_dir(ctx.ws, card, dispatch_id) / REPLY_FILE
+
+
+def _read_reply_file(path: str) -> str:
+    """The reply file's text. A missing or unreadable file gives a note instead; the status then
+    comes from the report head, as for any reply without a status line."""
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return (f"(leadhand: the reply file {path} could not be read: {e.strerror or e}; "
+                "the status comes from the report)\n")
+
+
 def _dispatch_action(ctx: _Run, req: dict) -> dict:
     brief, report = Path(req["brief"]), Path(req["report"])
     if req["vendor"] == "codex":
@@ -696,6 +716,7 @@ def _dispatch_action(ctx: _Run, req: dict) -> dict:
               "agent_model": agent_model, "agent_effort": agent_effort,
               "route": {"vendor": req["vendor"], "model": req["model"], "effort": req["effort"]},
               "message": message, "brief": req["brief"], "report": req["report"], "resume": resume,
+              "reply_file": str(_reply_file(ctx, req["card"], req["dispatch_id"])),
               "deadline": _format_time(_now() + _budget_seconds(req))}
     if req["card"] is None:
         action.update(gate=req.get("gate"), wave=req.get("wave"))
@@ -709,6 +730,7 @@ def _in_flight(ctx: _Run, d: _Dispatch) -> dict:
     deadline = d.started["deadline"]
     if _now() < _parse_time(deadline):
         return {"action": "wait", "dispatch_id": d.id, "worker_id": worker, "deadline": deadline,
+                "reply_file": str(_reply_file(ctx, d.req["card"], d.id)),
                 "reason": f"{d.kind} worker for {_whose(d.req)} is running"}
     if d.req["vendor"] == "codex":
         result = _cancel_codex(ctx, d)
@@ -2148,7 +2170,10 @@ def _head(report: str | None, reply: str, codex: dsp.DispatchResult | None, stop
             "source": "unparsed", "raw_kept": True}
 
 
-def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str, stopped: bool = False) -> dict:
+def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str = "", stopped: bool = False,
+                   reply_file: str | None = None) -> dict:
+    if reply_file is not None and reply:
+        raise EngineError("record result takes a reply or a reply file, not both")
     events = read_events(ctx.paths)
     d = _known_dispatch(events, dispatch_id)
     if d.result is not None:
@@ -2157,7 +2182,7 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str, stop
         raise EngineError(f"dispatch {dispatch_id} has no started worker; record started first")
     if d.started["worker_id"] != worker_id:
         raise EngineError(f"dispatch {dispatch_id} started worker {d.started['worker_id']}, not {worker_id}")
-    reply = reply or ""
+    reply = _read_reply_file(reply_file) if reply_file is not None else (reply or "")
     crash_point("before_result_record")
     req, n = d.req, d.req["card"]
     folder = ctx.card_dir(n, dispatch_id)
@@ -2337,7 +2362,7 @@ def _cmd_record(args) -> int:
         event = record(run_dir, "started", dispatch_id=args.dispatch, worker_id=args.worker)
     elif args.kind == "result":
         event = record(run_dir, "result", dispatch_id=args.dispatch, worker_id=args.worker,
-                       reply=_stdin_or(args.reply) or "", stopped=args.stopped)
+                       reply=_stdin_or(args.reply) or "", stopped=args.stopped, reply_file=args.reply_file)
     elif args.kind == "ruling":
         event = record(run_dir, "ruling", card=args.card, text=_stdin_or(args.text))
     elif args.kind == "park":
@@ -2370,7 +2395,9 @@ def add_commands(sub) -> None:
     p.add_argument("kind", choices=RECORD_KINDS)
     p.add_argument("--dispatch", help="dispatch ID (started, result)")
     p.add_argument("--worker", help="the worker's agent ID (started, result)")
-    p.add_argument("--reply", help="the worker's reply (result); - reads stdin")
+    replies = p.add_mutually_exclusive_group()
+    replies.add_argument("--reply", help="the worker's reply (result); - reads stdin")
+    replies.add_argument("--reply-file", help="a file holding the worker's reply (result)")
     p.add_argument("--stopped", action="store_true", help="the worker was stopped at its deadline (result)")
     p.add_argument("--card", type=int, help="card number (ruling, park, diff-check)")
     p.add_argument("--text", help="the ruling (ruling); - reads stdin")
