@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A fake `claude` for leadhand's launcher tests. Never touches the network.
 
-Appends one JSON line to $FAKE_CLAUDE_LOG when it starts: its argv, cwd, pid and
+Appends one JSON line to $FAKE_CLAUDE_LOG when it starts: its argv, cwd, pid, ppid and
 the LEADHAND_* environment variables the launcher sets (null when unset). Then
 it sleeps $FAKE_CLAUDE_SLEEP seconds (default 0) and exits $FAKE_CLAUDE_EXIT
 (default 0).
@@ -35,7 +35,7 @@ def on_signal(signum, _frame) -> None:
 def main() -> int:
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
-    log({"pid": os.getpid(), "argv": sys.argv, "cwd": os.getcwd(),
+    log({"pid": os.getpid(), "ppid": os.getppid(), "argv": sys.argv, "cwd": os.getcwd(),
          "env": {name: os.environ.get(name) for name in ENV_NAMES}})
     deadline = time.monotonic() + float(os.environ.get("FAKE_CLAUDE_SLEEP", "0") or 0)
     while (left := deadline - time.monotonic()) > 0:

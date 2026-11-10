@@ -7,6 +7,7 @@ process through `launch.run`; the rest run in-process.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -378,6 +379,106 @@ class OwnershipTests(LaunchTestCase):
         # The lock was released: a new launch owns the run.
         code, _, err = self.run_inprocess()
         self.assertEqual(code, 0, err)
+
+
+# --------------------------------------------------------------------------
+# Review follow-ups: R27 keep-awake beside the child, R28 CLI path with spaces,
+# guarded forwarding, recorded plugin_dir, busy lock with a dead recorded supervisor
+
+FAKE_INHIBIT = """#!/usr/bin/env python3
+import json, os, signal, sys, time
+def bye(*_):
+    sys.exit(0)
+signal.signal(signal.SIGTERM, bye)
+with open(os.environ["FAKE_INHIBIT_LOG"], "a", encoding="utf-8") as f:
+    f.write(json.dumps({"pid": os.getpid(), "ppid": os.getppid(), "argv": sys.argv}) + "\\n")
+time.sleep(60)
+"""
+
+
+class FollowUpTests(LaunchTestCase):
+    def test_linux_inhibitor_runs_beside_claude_which_stays_the_direct_child(self):
+        bindir = self.tmp / "fake bin"
+        bindir.mkdir()
+        inhibit = bindir / "systemd-inhibit"
+        inhibit.write_text(FAKE_INHIBIT, encoding="utf-8")
+        inhibit.chmod(0o755)
+        inhibit_log = self.tmp / "inhibit.log"
+        env = {"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
+               "FAKE_INHIBIT_LOG": str(inhibit_log), "FAKE_CLAUDE_SLEEP": "1"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(launch, "PLATFORM", "linux"):
+            code, _, err = self.run_inprocess()
+        self.assertEqual(code, 0, err)
+        start = self.starts()[0]
+        self.assertEqual(start["argv"][0], str(FAKE_CLAUDE))
+        self.assertEqual(start["ppid"], os.getpid())
+        self.assertEqual(self.holder()["supervisor_pid"], start["pid"])
+        rec = json.loads(inhibit_log.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(rec["ppid"], os.getpid())
+        self.assertEqual(rec["argv"][1:], ["--what=idle", "--why=leadhand run",
+                                           "tail", f"--pid={start['pid']}", "-f", "/dev/null"])
+        self.assertIsNone(procs.process_start_time(rec["pid"]), "inhibitor left running")
+
+    def test_cli_path_with_spaces_warns_sandbox_exclusion_may_not_match(self):
+        with mock.patch.object(launch, "CLI_PATH", Path("/opt/lead hand/scripts/leadhand")):
+            code, _, err = self.run_inprocess()
+        self.assertEqual(code, 0, err)
+        self.assertIn("the sandbox exclusion may not match; install leadhand under a path "
+                      "without spaces", err)
+        argv = self.starts()[0]["argv"]
+        self.assertEqual(json.loads(argv[argv.index("--settings") + 1]),
+                         {"sandbox": {"excludedCommands": ["/opt/lead hand/scripts/leadhand *"]}})
+        with mock.patch.object(launch, "CLI_PATH", Path("/opt/leadhand/scripts/leadhand")):
+            code, _, err = self.run_inprocess()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("may not match", err)
+
+    def test_signal_after_child_exit_is_not_forwarded(self):
+        real_wait = subprocess.Popen.wait
+        kills = []
+
+        def wait(popen, *a, **kw):
+            code = real_wait(popen, *a, **kw)
+            if popen.args and popen.args[0] == str(FAKE_CLAUDE):
+                handler = signal.getsignal(signal.SIGTERM)
+                with mock.patch("os.kill", side_effect=lambda pid, sig: kills.append((pid, sig))):
+                    handler(signal.SIGTERM, None)
+            return code
+
+        with mock.patch.object(subprocess.Popen, "wait", wait):
+            code, _, err = self.run_inprocess()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(kills, [])
+
+    def test_launch_line_defaults_to_recorded_plugin_dir(self):
+        plugin = self.tmp / "dev plugin"
+        code, _, err = self.run_inprocess(plugin_dir=plugin)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.holder()["plugin_dir"], str(plugin))
+        self.assertEqual(shlex.split(launch.launch_line(self.run_dir)),
+                         [str(CLI), "run", str(self.paths.deck), "--plugin-dir", str(plugin)])
+        other = self.tmp / "other plugin"
+        self.assertEqual(shlex.split(launch.launch_line(self.paths.deck, plugin_dir=other))[-1],
+                         str(other))
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("plugin_dir", self.holder())
+
+    def test_busy_lock_with_dead_recorded_supervisor_says_not_running(self):
+        gone = subprocess.Popen([sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL)
+        gone.wait(timeout=WAIT)
+        write_json_atomic(self.paths.holder, {
+            "run_id": RUN_ID, "launcher_pid": gone.pid, "supervisor_pid": gone.pid,
+            "supervisor_start": "long gone", "started_at": "2026-11-10T00:00:00.000Z"})
+        fd = os.open(self.paths.lock, os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 3)
+        self.assertIn(f"lock held by another process (supervisor pid {gone.pid} recorded, "
+                      "not running)", err)
+        self.assertNotIn("since", err)
+        self.assertEqual(self.starts(), [])
 
 
 if __name__ == "__main__":

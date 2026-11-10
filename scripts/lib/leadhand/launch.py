@@ -45,7 +45,8 @@ from .state import RunPaths, append_event, read_events, run_paths, write_json_at
 SUPERVISOR_AGENT = "leadhand:supervisor"
 CLI_PATH = Path(__file__).resolve().parents[2] / "leadhand"   # scripts/leadhand
 EXIT_REFUSED = 3
-CAFFEINATE_TIMEOUT = 10.0
+PLATFORM = sys.platform        # read at launch time; tests inject another platform
+KEEP_AWAKE_TIMEOUT = 10.0
 FORWARDED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 ATTENDED_WARNING = (
@@ -54,6 +55,10 @@ ATTENDED_WARNING = (
     "leadhand: the supervisor runs with --permission-mode auto. Its --settings overlay holds one "
     "sandbox.excludedCommands entry, the leadhand CLI ({cli} *); whether it merges with or "
     "replaces your own excludedCommands is not established."
+)
+SPACES_WARNING = (
+    "leadhand: warning: the leadhand CLI path contains whitespace ({cli}); the sandbox exclusion "
+    "may not match; install leadhand under a path without spaces."
 )
 
 
@@ -64,12 +69,21 @@ class LaunchError(RuntimeError):
 class OwnershipError(RuntimeError):
     """Someone else owns the run. `holder` is holder.json's content (maybe empty)."""
 
-    def __init__(self, holder: dict, run_id: str):
+    def __init__(self, holder: dict, run_id: str, *, supervisor_alive: bool = True):
         self.holder = holder
-        pid = holder.get("supervisor_pid") or holder.get("launcher_pid") or "unknown"
-        since = holder.get("started_at") or "unknown"
-        super().__init__(f"Run already in progress: supervisor pid {pid} since {since} "
-                         f"(run {holder.get('run_id') or run_id})")
+        run = holder.get("run_id") or run_id
+        pid = holder.get("supervisor_pid")
+        if supervisor_alive:
+            pid = pid or holder.get("launcher_pid") or "unknown"
+            since = holder.get("started_at") or "unknown"
+            msg = f"Run already in progress: supervisor pid {pid} since {since} (run {run})"
+        elif pid:
+            msg = (f"Run already in progress: lock held by another process "
+                   f"(supervisor pid {pid} recorded, not running) (run {run})")
+        else:
+            msg = (f"Run already in progress: lock held by another process "
+                   f"(no supervisor recorded) (run {run})")
+        super().__init__(msg)
 
 
 def _utc_now() -> str:
@@ -122,7 +136,9 @@ class RunLock:
         except OSError as e:
             os.close(fd)
             if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
-                raise OwnershipError(self._holder(), self.run_id) from None
+                holder = self._holder()
+                raise OwnershipError(holder, self.run_id,
+                                     supervisor_alive=self._supervisor_alive(holder)) from None
             raise
         holder = self._holder()
         if self._supervisor_alive(holder):
@@ -132,17 +148,21 @@ class RunLock:
         self.fd = fd
         return fd
 
-    def record_supervisor(self, pid: int) -> None:
-        """Write holder.json: launcher pid and start, supervisor pid and start, run_id, started_at."""
+    def record_supervisor(self, pid: int, *, plugin_dir: Path | None = None) -> None:
+        """Write holder.json: launcher pid and start, supervisor pid and start, run_id,
+        started_at, and plugin_dir when the session loads the plugin from a directory."""
         me = os.getpid()
-        write_json_atomic(self.paths.holder, {
+        holder = {
             "run_id": self.run_id,
             "launcher_pid": me,
             "launcher_start": process_start_time(me),
             "supervisor_pid": pid,
             "supervisor_start": process_start_time(pid),
             "started_at": _utc_now(),
-        })
+        }
+        if plugin_dir is not None:
+            holder["plugin_dir"] = str(plugin_dir)
+        write_json_atomic(self.paths.holder, holder)
 
     def detach(self) -> None:
         """Close this process's descriptor without unlocking: the supervisor's
@@ -179,19 +199,23 @@ def launch_argv(*, claude_bin: str, agent: str, first_message: str, plugin_dir: 
 
 
 def keep_awake_prefix(platform: str) -> list[str]:
-    """Linux with systemd-inhibit: wrap the child in it. macOS: [] (`caffeinate -w`
-    runs beside the child instead). Anything else: []."""
+    """The keep-awake command for Linux with systemd-inhibit; macOS: [] (`caffeinate
+    -w` is used instead); anything else: []. It never wraps the supervisor: `run`
+    starts it beside the child (`prefix + tail --pid=<child> -f /dev/null`), so
+    claude stays the launcher's direct child and keeps the inherited run.lock."""
     if platform.startswith("linux") and shutil.which("systemd-inhibit"):
         return ["systemd-inhibit", "--what=idle", "--why=leadhand run"]
     return []
 
 
-def cli_settings(cli: Path = CLI_PATH) -> str:
+def cli_settings(cli: Path | None = None) -> str:
     """The --settings overlay: only the leadhand CLI's sandbox exclusion."""
+    cli = CLI_PATH if cli is None else cli
     return json.dumps({"sandbox": {"excludedCommands": [f"{cli} *"]}})
 
 
-def first_message(run_dir: Path, cli: Path = CLI_PATH) -> str:
+def first_message(run_dir: Path, cli: Path | None = None) -> str:
+    cli = CLI_PATH if cli is None else cli
     return (f"Run the leadhand deck in {run_dir}. leadhand CLI: {cli}. "
             "First invoke the Skill tool with leadhand:run, then follow it.")
 
@@ -232,27 +256,37 @@ def _workspace(meta: dict) -> Path:
     return Path(ws)
 
 
-def _start_caffeinate(pid: int) -> subprocess.Popen | None:
-    exe = shutil.which("caffeinate")
-    if exe is None:
+def _keep_awake_argv(platform: str, pid: int) -> list[str]:
+    """What runs beside the supervisor `pid` and ends with it: `caffeinate -i -w` on
+    macOS, `systemd-inhibit ... tail --pid=<pid> -f /dev/null` on Linux."""
+    if platform == "darwin":
+        exe = shutil.which("caffeinate")
+        return [exe, "-i", "-w", str(pid)] if exe else []
+    prefix = keep_awake_prefix(platform)
+    return prefix + ["tail", f"--pid={pid}", "-f", "/dev/null"] if prefix else []
+
+
+def _start_keep_awake(platform: str, pid: int) -> subprocess.Popen | None:
+    argv = _keep_awake_argv(platform, pid)
+    if not argv:
         return None
-    try:
-        return subprocess.Popen([exe, "-i", "-w", str(pid)], stdin=subprocess.DEVNULL,
+    try:     # close_fds (the default): it never holds run.lock
+        return subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         return None
 
 
-def _stop_caffeinate(proc: subprocess.Popen | None) -> None:
+def _stop_keep_awake(proc: subprocess.Popen | None) -> None:
     if proc is None:
         return
     if proc.poll() is None:
         proc.terminate()
     try:
-        proc.wait(timeout=CAFFEINATE_TIMEOUT)
+        proc.wait(timeout=KEEP_AWAKE_TIMEOUT)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait(timeout=CAFFEINATE_TIMEOUT)
+        proc.wait(timeout=KEEP_AWAKE_TIMEOUT)
 
 
 def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "claude") -> int:
@@ -291,19 +325,22 @@ def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "cla
             append_event(paths, "resumed", run_id=run_id)
 
         plugin = Path(os.path.abspath(plugin_dir)) if plugin_dir is not None else None
-        argv = keep_awake_prefix(sys.platform) + launch_argv(
+        argv = launch_argv(
             claude_bin=claude_bin, agent=SUPERVISOR_AGENT, first_message=first_message(root),
             plugin_dir=plugin, settings=cli_settings(), model=model, effort=effort)
         env = {**os.environ, "LEADHAND_RUN_ID": run_id, "LEADHAND_RUN_DIR": str(root),
                "LEADHAND_CLI": str(CLI_PATH)}
         print(ATTENDED_WARNING.format(cli=CLI_PATH), file=sys.stderr, flush=True)
+        if any(c.isspace() for c in str(CLI_PATH)):
+            print(SPACES_WARNING.format(cli=CLI_PATH), file=sys.stderr, flush=True)
         sys.stdout.flush()
-        return _supervise(lock, fd, argv, workspace, env)
+        return _supervise(lock, fd, argv, workspace, env, plugin_dir=plugin)
     finally:
         lock.release()
 
 
-def _supervise(lock: RunLock, fd: int, argv: list[str], workspace: Path, env: dict) -> int:
+def _supervise(lock: RunLock, fd: int, argv: list[str], workspace: Path, env: dict, *,
+               plugin_dir: Path | None = None) -> int:
     """Start the child holding the lock fd, forward SIGINT/SIGTERM, wait for it.
 
     Returns only after the child has exited; the caller then releases the lock.
@@ -317,13 +354,15 @@ def _supervise(lock: RunLock, fd: int, argv: list[str], workspace: Path, env: di
         if child is None:
             pending.append(signum)
             return
+        if child.returncode is not None:     # reaped: its pid may belong to someone else now
+            return
         try:
             os.kill(child.pid, signum)
         except ProcessLookupError:
             pass
 
     previous = {s: signal.signal(s, forward) for s in FORWARDED_SIGNALS}
-    caffeinate = None
+    keep_awake = None
     try:
         if pending:
             return 128 + pending[0]
@@ -335,11 +374,10 @@ def _supervise(lock: RunLock, fd: int, argv: list[str], workspace: Path, env: di
         for signum in pending:
             forward(signum, None)
         try:
-            lock.record_supervisor(child.pid)
+            lock.record_supervisor(child.pid, plugin_dir=plugin_dir)
         except OSError as e:
             print(f"warning: could not write {lock.paths.holder}: {e}", file=sys.stderr)
-        if sys.platform == "darwin":
-            caffeinate = _start_caffeinate(child.pid)
+        keep_awake = _start_keep_awake(PLATFORM, child.pid)
         code = child.wait()
         return 128 - code if code < 0 else code
     finally:
@@ -347,12 +385,19 @@ def _supervise(lock: RunLock, fd: int, argv: list[str], workspace: Path, env: di
             lock.detach()       # never unlock under a live supervisor
         for s, h in previous.items():
             signal.signal(s, h)
-        _stop_caffeinate(caffeinate)
+        _stop_keep_awake(keep_awake)
 
 
 def launch_line(run_dir: Path, *, plugin_dir: Path | None = None) -> str:
-    """The exact command that launches (or resumes) the run, every argument quoted."""
+    """The exact command that launches (or resumes) the run, every argument quoted.
+
+    Without `plugin_dir`, the plugin directory recorded by the last launch (in
+    holder.json) is kept, so a relaunch loads the plugin the same way.
+    """
     root = resolve_run_dir(run_dir)
+    if plugin_dir is None:
+        recorded = RunLock(run_paths(root), "")._holder().get("plugin_dir")
+        plugin_dir = Path(recorded) if isinstance(recorded, str) and recorded else None
     argv = [str(CLI_PATH), "run", str(root / "deck.md")]
     if plugin_dir is not None:
         argv += ["--plugin-dir", os.path.abspath(plugin_dir)]

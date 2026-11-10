@@ -37,6 +37,10 @@ Tested with Claude Code 2.1.322 and tmux 3.8 on macOS.
   arguments, no redirection, pipes or command chains). Not established: whether the overlay
   merges with or replaces the user's own `excludedCommands` (the user-exclusion control used
   a command with a redirection, which ran sandboxed even without the overlay).
+- Not established: whether the `"<cli path> *"` exclusion matches when the CLI's path contains
+  spaces (the supervisor then has to quote it). Until an end-to-end run shows it does,
+  `leadhand run` warns when the CLI path contains whitespace: install leadhand under a path
+  without spaces.
 - With Claude Code's sandbox on, its Bash tool refused foreground `sleep N` and `ps` was not
   permitted; supervisor and worker instructions must not depend on either.
 
