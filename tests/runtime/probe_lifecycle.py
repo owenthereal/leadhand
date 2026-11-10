@@ -83,6 +83,46 @@ DIALOG_PATTERNS = [
     r"Do you want to proceed\?",
 ]
 READY_PATTERN = re.compile(r"for shortcuts|auto mode on|⏵⏵")
+
+MENU_MAX_MOVES = 6
+MENU_HIGHLIGHT = re.compile(r"^\s*❯\s*(.*)$", re.M)
+MENU_WANTED = re.compile(r"\b(Yes|Proceed|Continue)\b")
+MENU_FORBIDDEN = re.compile(r"\b(No|exit)\b", re.I)
+
+
+def select_menu_option(capture, send_key):
+    """Highlight the wanted option of a menu dialog before Enter is sent.
+
+    Menu dialogs mark the highlighted option with a leading "❯" (the trust
+    dialog defaults to "No, exit"). Returns (ok, highlighted_line, keys_sent);
+    Enter is sent only when the highlighted line is a wanted option and not a
+    "No"/"exit" one. Non-menu dialogs (no "❯" line, or no "Yes"-type option)
+    just get Enter, as before. ok=False means the option could not be highlighted
+    and no Enter was sent.
+    """
+    pane = capture()
+    keys: list[str] = []
+    for move in range(MENU_MAX_MOVES + 1):
+        m = MENU_HIGHLIGHT.search(pane)
+        has_yes = any(MENU_WANTED.search(line) for line in pane.splitlines())
+        if not m or not has_yes:
+            if m and MENU_FORBIDDEN.search(m.group(1)):
+                return False, m.group(1).strip(), keys
+            send_key("Enter")
+            keys.append("Enter")
+            return True, m.group(1).strip() if m else None, keys
+        line = m.group(1).strip()
+        if MENU_WANTED.search(line) and not MENU_FORBIDDEN.search(line):
+            send_key("Enter")
+            keys.append("Enter")
+            return True, line, keys
+        if move == MENU_MAX_MOVES:
+            return False, line, keys
+        send_key("Down")
+        keys.append("Down")
+        time.sleep(0.5)
+        pane = capture()
+    return False, None, keys
 GIT_SAFE = ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
             "-c", "user.name=probe", "-c", "user.email=probe@example.invalid"]
 
@@ -369,6 +409,7 @@ class Session:
         self.cwd = ctx.fixture(label)
         self.hook_log = ctx.art / f"{label}-hooks.jsonl"
         self.answered: list[str] = []
+        self.selections: list[dict] = []
         self.pane = ""
         self.started = 0.0
         self.sid: str | None = None
@@ -407,7 +448,13 @@ class Session:
                 if self.answered.count(pat) >= 4:
                     break  # give up on a dialog Enter does not pass
                 self.answered.append(pat)
-                tmux(self.ctx, "send-keys", "-t", self.name, "Enter")
+                ok, hl, keys = select_menu_option(
+                    self.capture, lambda k: tmux(self.ctx, "send-keys", "-t", self.name, k))
+                self.selections.append({"dialog": pat, "highlighted_at_enter": hl if ok else None,
+                                        "last_highlighted": hl, "keys": keys, "ok": ok})
+                if not ok:  # could not highlight the wanted option: stop retrying this dialog
+                    self.answered.extend([pat] * 4)
+                    break
                 time.sleep(2)
                 self.pane = self.capture()
                 break
@@ -482,7 +529,8 @@ class Session:
         for key, fn in (("session_id", self.session_id),
                         ("session_id_source", lambda: self.sid_source),
                         ("transcripts_found", lambda: self.copy_transcripts() or "none"),
-                        ("dialogs_answered", lambda: self.answered or "none")):
+                        ("dialogs_answered", lambda: self.answered or "none"),
+                        ("dialog_selections", lambda: self.selections or "none")):
             try:
                 out[key] = fn()
             except Exception as e:  # noqa: BLE001 - recorded, not fatal

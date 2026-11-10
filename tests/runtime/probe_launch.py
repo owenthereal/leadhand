@@ -71,6 +71,46 @@ DIALOG_PATTERNS = [
 ]
 READY_PATTERN = re.compile(r"for shortcuts|auto mode on|⏵⏵")
 
+MENU_MAX_MOVES = 6
+MENU_HIGHLIGHT = re.compile(r"^\s*❯\s*(.*)$", re.M)
+MENU_WANTED = re.compile(r"\b(Yes|Proceed|Continue)\b")
+MENU_FORBIDDEN = re.compile(r"\b(No|exit)\b", re.I)
+
+
+def select_menu_option(capture, send_key):
+    """Highlight the wanted option of a menu dialog before Enter is sent.
+
+    Menu dialogs mark the highlighted option with a leading "❯" (the trust
+    dialog defaults to "No, exit"). Returns (ok, highlighted_line, keys_sent);
+    Enter is sent only when the highlighted line is a wanted option and not a
+    "No"/"exit" one. Non-menu dialogs (no "❯" line, or no "Yes"-type option)
+    just get Enter, as before. ok=False means the option could not be highlighted
+    and no Enter was sent.
+    """
+    pane = capture()
+    keys: list[str] = []
+    for move in range(MENU_MAX_MOVES + 1):
+        m = MENU_HIGHLIGHT.search(pane)
+        has_yes = any(MENU_WANTED.search(line) for line in pane.splitlines())
+        if not m or not has_yes:
+            if m and MENU_FORBIDDEN.search(m.group(1)):
+                return False, m.group(1).strip(), keys
+            send_key("Enter")
+            keys.append("Enter")
+            return True, m.group(1).strip() if m else None, keys
+        line = m.group(1).strip()
+        if MENU_WANTED.search(line) and not MENU_FORBIDDEN.search(line):
+            send_key("Enter")
+            keys.append("Enter")
+            return True, line, keys
+        if move == MENU_MAX_MOVES:
+            return False, line, keys
+        send_key("Down")
+        keys.append("Down")
+        time.sleep(0.5)
+        pane = capture()
+    return False, None, keys
+
 
 # ---------------------------------------------------------------- context
 
@@ -613,6 +653,8 @@ def step3(ctx: Ctx):
         p = tmux(sock, "display-message", "-p", "-t", name, "dead=#{pane_dead} status=#{pane_dead_status}")
         return p.stdout.strip() if p.returncode == 0 else f"rc={p.returncode} {p.stderr.strip()}"
 
+    selections: list[dict] = []
+
     def answer_dialog(pane: str, answered: list) -> bool:
         """Press Enter on a known dialog; False once the same dialog has gone stale."""
         for pat in DIALOG_PATTERNS:
@@ -620,7 +662,13 @@ def step3(ctx: Ctx):
                 if answered.count(pat) >= DIALOG_REPEAT_LIMIT:
                     return False
                 answered.append(pat)
-                tmux(sock, "send-keys", "-t", name, "Enter")
+                ok, hl, keys = select_menu_option(
+                    capture, lambda k: tmux(sock, "send-keys", "-t", name, k))
+                selections.append({"dialog": pat, "highlighted_at_enter": hl if ok else None,
+                                   "last_highlighted": hl, "keys": keys, "ok": ok})
+                if not ok:  # could not highlight the wanted option: stop retrying this dialog
+                    answered.extend([pat] * DIALOG_REPEAT_LIMIT)
+                    return False
                 time.sleep(2)
                 return True
         return False
@@ -642,7 +690,8 @@ def step3(ctx: Ctx):
                 break  # stale dialog: answering it again won't help
             time.sleep(2)
     (ctx.art / "interactive-pane-startup.txt").write_text(pane)
-    obs = {"dialogs_answered": answered or "none", "pane_state": pane_state(),
+    obs = {"dialogs_answered": answered or "none", "dialog_selections": selections or "none",
+           "pane_state": pane_state(),
            "capture_errors": capture_errors or "none"}
     if ready_s is None:
         obs["pane_last_lines"] = pane.rstrip().splitlines()[-10:]
@@ -678,6 +727,7 @@ def step3(ctx: Ctx):
     ctx.cache["interactive"] = {"hooks": hooks}
     obs.update({
         "dialogs_answered": answered or "none",
+        "dialog_selections": selections or "none",
         "pane_state": pane_state(),
         "capture_errors": capture_errors or "none",
         "probe_log_lines": len(hooks),
