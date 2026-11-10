@@ -69,36 +69,45 @@ class RunCollisions(unittest.TestCase):
         self.assertEqual(again, first)
         self.assertIn(f"existing run: {first}", out.getvalue())
 
-    def test_new_run_refuses_a_branch_owned_by_another_run(self):
+    def test_new_run_suffixes_a_branch_owned_by_another_run(self):
         w = FakeWorld(self, card_list())
         first = w.start()
-        with self.assertRaises(EngineError) as cm:
-            with contextlib.redirect_stdout(io.StringIO()):
-                engine.start(w.deck_path, repo=w.repo, new=True)
-        self.assertIn(str(first), str(cm.exception))
-        self.assertIn("Branch:", str(cm.exception))
-        self.assertEqual([p.name for p in (w.docs / "runs").iterdir()], [first.name])
-
-        w.write_deck(card_list(), branch="leadhand/demo-2")
-        with contextlib.redirect_stdout(io.StringIO()):
+        first_meta = json.loads((first / "run.json").read_text())
+        self.assertEqual((first_meta["branch"], first_meta["branch_requested"]), ("leadhand/demo", "leadhand/demo"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
             second = engine.start(w.deck_path, repo=w.repo, new=True)
         self.assertNotEqual(second, first)
         meta = json.loads((second / "run.json").read_text())
-        self.assertEqual(meta["branch"], "leadhand/demo-2")
-        self.assertNotEqual(meta["workspace"], json.loads((first / "run.json").read_text())["workspace"])
+        self.assertEqual((meta["branch"], meta["branch_requested"]), ("leadhand/demo-2", "leadhand/demo"))
+        self.assertIn("run branch: leadhand/demo-2", out.getvalue())
+        self.assertNotEqual(meta["workspace"], first_meta["workspace"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            third = engine.start(w.deck_path, repo=w.repo, new=True)
+        self.assertEqual(json.loads((third / "run.json").read_text())["branch"], "leadhand/demo-3")
 
-    def test_start_refuses_a_branch_left_by_a_finished_run(self):
+        # the suffixed run works on its own branches and leaves the first run's alone
+        w.run_dir = second
+        before = w.branch_tip("leadhand/demo")
+        w.run()
+        self.assertEqual(w.branch_tip("leadhand/demo"), before)
+        (accepted,) = w.events("accepted")
+        self.assertEqual(w.branch_tip("leadhand/demo-2"), accepted["sha"])
+        self.assertEqual(w.events("card_cut")[0]["branch"], "leadhand/demo-2--card-1")
+
+    def test_start_after_a_finished_run_suffixes_its_branch(self):
         w = FakeWorld(self, card_list())
         first = w.start()
         w.run()
         append_event(w.paths, "outcome", outcome="complete", qualifier="", reasons=[])
-        with self.assertRaises(EngineError) as cm:
-            with contextlib.redirect_stdout(io.StringIO()):
-                engine.start(w.deck_path, repo=w.repo)
-        self.assertIn(str(first), str(cm.exception))
+        finished_tip = w.branch_tip("leadhand/demo")
         r = w.cli("start", w.deck_path, "--repo", w.repo)
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("already belongs to the run", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("run branch: leadhand/demo-2", r.stdout)
+        self.assertNotIn("existing run", r.stdout)
+        self.assertIn(f"run: {first}-2\n", r.stdout)
+        self.assertEqual(w.branch_tip("leadhand/demo"), finished_tip)
+        self.assertEqual(w.branch_tip("leadhand/demo-2"), w.base)
 
     def test_new_run_without_worktree_ignores_a_stale_scratch_report(self):
         w = FakeWorld(self, card_list(), config="[run]\nworktree = false\n")

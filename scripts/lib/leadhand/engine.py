@@ -259,9 +259,9 @@ def _done_action(outcome: dict) -> dict:
 
 def start(deck_path: Path, *, repo: Path, config: Config | None = None, new: bool = False) -> Path:
     """Start a run for the deck, or return the unfinished run already started from it."""
-    root, existing = _start(Path(deck_path), Path(repo), config, new)
-    if existing:
-        print(f"existing run: {root}")
+    root, _, note = _start(Path(deck_path), Path(repo), config, new)
+    if note:
+        print(note)
     return root
 
 
@@ -293,25 +293,20 @@ def _find_unfinished(docs: Path, source: str, digest: str) -> Path | None:
     return max(found)[2] if found else None
 
 
-def _check_branch_free(docs: Path, repo: Path, branch: str) -> None:
-    """A new run never takes over another run's branch (R26): its card branches, worktree and
-    scratch files would be mistaken for the new run's."""
-    for root, meta in _runs(docs):
-        if meta.get("branch") == branch and meta.get("repo") == str(repo):
-            raise EngineError(f"run branch {branch} already belongs to the run in {root}; "
-                              "give the deck a different Branch: to start a new run")
+def _free_branch(docs: Path, repo: Path, requested: str) -> str:
+    """The deck's branch, or its first free numeric suffix (`-2`, `-3`, ...) when another run
+    of this repo owns it: a new run never reuses another run's branch, card branches or
+    worktree (R26')."""
+    taken = {meta.get("branch") for _, meta in _runs(docs) if meta.get("repo") == str(repo)}
+    branch, n = requested, 1
+    while branch in taken:
+        n += 1
+        branch = f"{requested}-{n}"
+    return branch
 
 
-def _check_worktree_free(docs: Path, root: Path, ws: Path) -> None:
-    owner = next((r for r, meta in _runs(docs) if meta.get("workspace") == str(ws) and r != root), None)
-    if owner is not None or ws.exists():
-        root.rmdir()
-        raise EngineError(f"worktree {ws} already exists"
-                          + (f" and belongs to the run in {owner}" if owner else "")
-                          + "; remove it or start the run again")
-
-
-def _start(deck_path: Path, repo: Path, config: Config | None, new: bool) -> tuple[Path, bool]:
+def _start(deck_path: Path, repo: Path, config: Config | None, new: bool) -> tuple[Path, bool, str]:
+    """(run directory, whether it is an existing run, a line to print or "")."""
     deck_path, repo = deck_path.resolve(), repo.resolve()
     try:
         raw = deck_path.read_bytes()
@@ -328,31 +323,32 @@ def _start(deck_path: Path, repo: Path, config: Config | None, new: bool) -> tup
     if not new:
         existing = _find_unfinished(docs, str(deck_path), deck.digest)
         if existing is not None:
-            return existing, True
+            return existing, True, f"existing run: {existing}"
 
-    _check_branch_free(docs, repo, deck.branch)
+    branch = _free_branch(docs, repo, deck.branch)
     slug = _slug(deck.title)
     root = new_run_dir(docs, slug, date.today())
-    # The worktree is named after the run directory, which is unique, so no two runs share it.
-    if config.run.worktree:
-        _check_worktree_free(docs, root, repo / ".worktrees" / root.name)
     paths = run_paths(root)
     _write_bytes_atomic(paths.deck, raw)
     if deck.base_sha:
         base_ref, base_sha = deck.base_ref, head(repo, deck.base_sha)
     else:
         base_ref, base_sha = default_base(repo)
-    ws = prepare_workspace(repo, run_branch=deck.branch, base_sha=base_sha, slug=root.name,
+    # The worktree is named after the run directory, which is unique, so no two runs share it.
+    ws = prepare_workspace(repo, run_branch=branch, base_sha=base_sha, slug=root.name,
                            use_worktree=config.run.worktree)
     meta = {
         "run_id": secrets.token_hex(6), "repo": str(repo), "deck_source": str(deck_path),
-        "deck_digest": deck.digest, "base_ref": base_ref, "base_sha": base_sha, "branch": deck.branch,
+        "deck_digest": deck.digest, "base_ref": base_ref, "base_sha": base_sha, "branch": branch,
+        "branch_requested": deck.branch,
         "workspace": str(Path(ws).absolute()), "slug": slug, "created_at": utc_now(),
         "supervisor_sessions": [],
     }
     write_json_atomic(paths.run_json, meta)
-    append_event(paths, "run_started", run_id=meta["run_id"], base_sha=base_sha, branch=deck.branch)
-    return root, False
+    append_event(paths, "run_started", run_id=meta["run_id"], base_sha=base_sha, branch=branch)
+    note = (f"run branch: {branch} ({deck.branch} belongs to another run)"
+            if branch != deck.branch else "")
+    return root, False, note
 
 
 # --------------------------------------------------------------------------
@@ -1041,8 +1037,11 @@ def _guard(fn):
 
 
 def _cmd_start(args) -> int:
-    root, existing = _start(Path(args.deck), Path(args.repo), None, args.new)
-    print(f"existing run: {root}" if existing else f"run: {root}")
+    root, existing, note = _start(Path(args.deck), Path(args.repo), None, args.new)
+    if note:
+        print(note)
+    if not existing:
+        print(f"run: {root}")
     return 0
 
 
