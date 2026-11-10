@@ -56,7 +56,53 @@ Tested with Claude Code 2.1.322, print mode and interactive (`--permission-mode 
 
 ## Worker lifecycle
 
-Not yet checked.
+Tested with Claude Code 2.1.322 and codex-cli 0.167.0 on macOS.
+
+Claude workers:
+
+- Claude Code runs each Bash command in its own process group, as a child of `claude`. When
+  the session exits on SIGTERM, it kills its workers' running commands within about 5 s; a
+  worker's transcript then just stops after its last `tool_use` record. Decision: after a
+  supervisor crash or exit, every Claude worker without a recorded result counts as
+  interrupted.
+- TaskStop with the agent ID returned at launch stops a background worker and kills its
+  running command within a few seconds. The worker's transcript ends with a rejected
+  `tool_result` and the user text `[Request interrupted by user for tool use]`, with no final
+  assistant message; the task notification has status `killed`. Decision: such a worker is
+  recorded as stopped (no status line), and its usage is still charged from its transcript.
+- SendMessage to a finished worker's agent ID resumes it: it answers from its history,
+  appends to the same transcript, and produces another task notification with the same task
+  ID. Decision: resume uses SendMessage on the recorded agent ID, and the reply is read from
+  the worker's own hand-back.
+
+Codex workers and the runner:
+
+- A process started by a worker's Bash command survives a SIGKILL of `claude` (it is
+  orphaned, not signalled), but not an orderly exit, SIGTERM or TaskStop. A runner detached
+  into a new session (double fork, `start_new_session`) is not a descendant of `claude` and
+  survives all of them, keeps running and writes its result. Decision: the dispatcher hands
+  each Codex worker to a detached runner. The runner writes `runner.json` (runner pid, pgid
+  and process start time; Codex pid and pgid) before starting Codex and `result.json` when
+  Codex exits. Restart treats the runner as alive only if its pid exists and its start time
+  matches; `result.json` means finished; neither means interrupted.
+- Codex starts each tool command and each helper process (MCP server processes, its
+  code-mode host) in its own process group, as a direct child of Codex; their children stay
+  in those groups. Signalling Codex's process group does not reach them. On SIGINT Codex
+  shut them all down itself. On SIGKILL it cannot, and they would be orphaned.
+- Decision: the runner confirms that Codex and its tool processes have all stopped. It
+  snapshots Codex's descendants by walking parent pids from the process table (`ps` on
+  macOS, `/proc` on Linux; the runner runs outside Claude Code's sandbox, where `ps` is
+  allowed). It records each as (pid, pgid, start time), before the first signal and again
+  before each escalation, because orphans are reparented to init and can no longer be found
+  by the walk. The ladder is SIGINT to Codex's group, up to 5 s, SIGTERM to Codex's group
+  and to each recorded descendant's group (never the runner's own), 5 s, then SIGKILL to
+  whatever remains. Stopped means Codex has been reaped and no recorded (pid, start time) is
+  still alive. Recovery re-checks the recorded set before re-dispatching.
+- The thread ID is in `thread.started.thread_id`. `codex exec` accepts options before or
+  after `resume` and after the thread ID; `-m` and `-c` are honoured on resume (resumed
+  turns ran on the requested model and effort, not the user's configured default). Decision:
+  `codex_argv` for a resume is
+  `codex exec <the same options as the first run> resume <thread id> -`, prompt on stdin.
 
 ## Limits
 
