@@ -8,7 +8,8 @@ Tested with Claude Code 2.1.322 and tmux 3.8 on macOS.
   (`-p --output-format stream-json --verbose`) and interactively. Decision:
   `SUPERVISOR_AGENT = "leadhand:supervisor"`.
 - For the main-session agent, frontmatter `model` is applied but frontmatter `effort` is not
-  (the session ran at the default effort), and `skills` preloading did not put the skill body
+  (the session ran at medium effort although the frontmatter said low; where medium came
+  from was not established), and `skills` preloading did not put the skill body
   in context under either the bare or the plugin-qualified name; the skill is listed only as
   `<plugin>:<skill>`. Decisions: the launcher passes `--model` and `--effort` explicitly;
   `agents/supervisor.md` sets `skills: [leadhand:run]` but does not rely on it — its body,
@@ -23,7 +24,9 @@ Tested with Claude Code 2.1.322 and tmux 3.8 on macOS.
   second `result` record (`result_index` 1, `origin.kind` `task-notification`) is written
   before the process exits. Decision: end-to-end tests drive the supervisor headless, read
   the stream until the process exits, and use the result with the highest `result_index`.
-  Only one background worker was observed at a time.
+  Only one background worker was observed at a time, and it finished about 1.2 s after the
+  main turn ended. Open check for Tasks 20 and 22: `-p` with a worker that outlives the main
+  turn by tens of seconds or more.
 - Interactive launch in tmux works. The workspace trust dialog's default choice is
   "No, exit"; a driver must select "Yes, I trust this folder" (Down, then Enter) after
   checking the highlighted line.
@@ -34,8 +37,8 @@ Tested with Claude Code 2.1.322 and tmux 3.8 on macOS.
   arguments, no redirection, pipes or command chains). Not established: whether the overlay
   merges with or replaces the user's own `excludedCommands` (the user-exclusion control used
   a command with a redirection, which ran sandboxed even without the overlay).
-- Claude Code's Bash tool refuses foreground `sleep N`, and `ps` is not permitted inside its
-  sandbox; supervisor and worker instructions must not depend on either.
+- With Claude Code's sandbox on, its Bash tool refused foreground `sleep N` and `ps` was not
+  permitted; supervisor and worker instructions must not depend on either.
 
 ## Hook identity
 
@@ -77,10 +80,12 @@ Claude workers:
 
 Codex workers and the runner:
 
-- A process started by a worker's Bash command survives a SIGKILL of `claude` (it is
-  orphaned, not signalled), but not an orderly exit, SIGTERM or TaskStop. A runner detached
-  into a new session (double fork, `start_new_session`) is not a descendant of `claude` and
-  survives all of them, keeps running and writes its result. Decision: the dispatcher hands
+- A process started by a worker's Bash command survived a SIGKILL of `claude` (it was
+  orphaned, not signalled), but not SIGTERM or TaskStop (observed); an orderly exit is
+  inferred to behave like SIGTERM. A runner detached into a new session (double fork,
+  `start_new_session`) is not a descendant of `claude`; it survived the SIGKILL, kept running
+  and wrote its result. That it also survives SIGTERM, an orderly exit and TaskStop is
+  inferred from it not being a descendant, not observed. Decision: the dispatcher hands
   each Codex worker to a detached runner. The runner writes `runner.json` (runner pid, pgid
   and process start time; Codex pid and pgid) before starting Codex and `result.json` when
   Codex exits. Restart treats the runner as alive only if its pid exists and its start time
@@ -97,10 +102,14 @@ Codex workers and the runner:
   by the walk. The ladder is SIGINT to Codex's group, up to 5 s, SIGTERM to Codex's group
   and to each recorded descendant's group (never the runner's own), 5 s, then SIGKILL to
   whatever remains. Stopped means Codex has been reaped and no recorded (pid, start time) is
-  still alive. Recovery re-checks the recorded set before re-dispatching.
+  still alive. Recovery re-checks the recorded set before re-dispatching. Only the SIGINT
+  step was exercised (nothing was left after it); the SIGTERM/SIGKILL escalation to
+  descendant groups is design, not observation.
 - The thread ID is in `thread.started.thread_id`. `codex exec` accepts options before or
-  after `resume` and after the thread ID; `-m` and `-c` are honoured on resume (resumed
-  turns ran on the requested model and effort, not the user's configured default). Decision:
+  after `resume` and after the thread ID, and `-m` and `-c` are accepted with `resume`.
+  Resumed turns ran on the requested model and effort, which were also the thread's original
+  ones; every resume passed the same `-m`/`-c` as the first run. Whether resume honours a
+  different `-m`/`-c` is untested. Decision:
   `codex_argv` for a resume is
   `codex exec <the same options as the first run> resume <thread id> -`, prompt on stdin.
 
@@ -115,9 +124,9 @@ Claude workers:
   `completed`); it is marked only in text — the result begins "NOTE: this agent stopped at
   its 2-turn limit before finishing" and the notification summary says "stopped at its
   2-turn limit (partial result; ...)". The agent can be continued with SendMessage.
-  Decision: such a reply has no status line, so it is handled by the no-status-line rule
-  (BLOCKED, raw reply kept); the dispatcher also recognises the
-  `stopped at its <N>-turn limit` text and records the worker status as `SPENT`.
+  Decision: the worker status is `SPENT` when the dispatcher recognises the
+  `stopped at its <N>-turn limit` text, otherwise `BLOCKED` (the no-status-line rule, raw
+  reply kept).
 - Per-dispatch Agent `model` and `effort` override the subagent's frontmatter (a haiku/low
   worker dispatched with `model: "sonnet"`, `effort: "medium"` ran as sonnet at medium).
   Decision: the dispatcher sets model and effort on every Agent call.
