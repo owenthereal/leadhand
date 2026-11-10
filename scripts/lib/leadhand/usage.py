@@ -97,6 +97,9 @@ CODEX_INPUT_INCLUDES_CACHED = True
 
 PRICE_FAMILIES = ("opus", "sonnet", "haiku", "fable")
 SOURCES = ("claude", "codex")
+# Stored source of a Codex charge taken from the `--json` stream because the session
+# file was missing or unreadable (see `charge`, `fallback`).
+CODEX_STREAM_SOURCE = "codex-stream"
 
 
 def _dig(obj: Any, path: tuple[str, ...]) -> Any:
@@ -428,7 +431,8 @@ def charged_checkpoint(charges: Iterable[Charge], source: str, key: str) -> dict
 
 def charge(paths: RunPaths, *, charge_id: str, source: str, key: str, dispatch_id: str,
            role: str, path_or_thread: Path | str | None,
-           sessions_dir: Path | None = None, possibly_incomplete: bool = False) -> Charge:
+           sessions_dir: Path | None = None, possibly_incomplete: bool = False,
+           fallback: Usage | None = None) -> Charge:
     """Charge what is new in a transcript (source "claude", `path_or_thread` an
     absolute path) or Codex session (source "codex", `path_or_thread` a thread
     ID, found under `sessions_dir`) exactly once. Runs entirely under the state
@@ -439,6 +443,13 @@ def charge(paths: RunPaths, *, charge_id: str, source: str, key: str, dispatch_i
     an UNKNOWN charge whose checkpoint is the one already reached, so nothing is
     lost when the file appears later. A relative Claude path is a ValueError.
     `possibly_incomplete` marks the charge of an attempt that was stopped.
+
+    `fallback` (Codex only): usage taken from the `--json` stream. When the session
+    file gives UNKNOWN and the fallback is known, the charge records the fallback
+    with source CODEX_STREAM_SOURCE instead; it moves no Codex checkpoint (the
+    checkpoint stays the one already reached). If the session file appears later
+    and the same thread is charged again from it, the turns already charged from
+    the stream are charged again: the stream carries no response IDs to skip.
     """
     if source not in SOURCES:
         raise ValueError(f"unknown usage source: {source!r}")
@@ -459,7 +470,10 @@ def charge(paths: RunPaths, *, charge_id: str, source: str, key: str, dispatch_i
         else:
             used, checkpoint, mismatch = _new_codex(
                 None if path_or_thread is None else str(path_or_thread), sessions_dir, prior)
-        record = Charge(charge_id=charge_id, source=source, key=key, dispatch_id=dispatch_id,
+        stored_source = source
+        if source == "codex" and not used.known and fallback is not None and fallback.known:
+            used, stored_source = fallback, CODEX_STREAM_SOURCE
+        record = Charge(charge_id=charge_id, source=stored_source, key=key, dispatch_id=dispatch_id,
                         role=role, usage=used, checkpoint=checkpoint, ts=_utc_now(),
                         possibly_incomplete=possibly_incomplete, mismatch=mismatch)
         append_jsonl(paths, paths.charges, _charge_to_record(record))

@@ -1,4 +1,5 @@
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -7,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -463,6 +465,172 @@ class CancelTests(Base):
         saved = json.loads((self.worker_dir() / "result.json").read_text())
         self.assertIn(child, [p["pid"] for p in saved["stopped"]])
         self.assertEqual(len(read_attempts(run_paths(self.run_dir))), 1)
+
+
+class FixRoundTests(Base):
+    """Review fix round 1."""
+
+    def cli_args(self, req):
+        return [sys.executable, str(CLI), "dispatch", "--run", str(self.run_dir), "--dispatch-id", req.dispatch_id,
+                "--card", "1", "--attempt", "1", "--role", "implementer", "--model", "gpt-6-luna",
+                "--effort", "low", "--brief", str(req.brief), "--report", str(req.report), "--cwd", str(self.repo)]
+
+    def stop_runner(self):
+        pid = self.runner_json()["runner"]["pid"]
+        os.kill(pid, signal.SIGSTOP)
+        self.addCleanup(self.signal_quietly, pid, signal.SIGCONT)
+        return pid
+
+    def age_heartbeat(self):
+        old = time.time() - 120
+        os.utime(self.worker_dir() / "heartbeat", (old, old))
+
+    def test_run_id_passed_through_shell_policy(self):
+        self.scenario("ready")
+        dispatch(self.request())
+        start = self.records("start")[0]
+        self.assertEqual(start["policy_set"]["LEADHAND_RUN_ID"], self.run_dir.name)
+        self.assertEqual(start["env"]["LEADHAND_RUN_ID"], self.run_dir.name)
+
+    def test_stream_usage_is_charged_when_session_missing(self):
+        thread = "22222222-2222-4333-8444-555555555555"
+        self.scenario("ready", thread=thread)
+        result = dispatch(self.request())
+        [c] = [json.loads(l) for l in (self.run_dir / "charges.jsonl").read_text().splitlines()]
+        self.assertEqual((c["charge_id"], c["source"], c["key"]), (f"d1:codex:{thread}", "codex-stream", thread))
+        self.assertTrue(c["usage"]["known"])
+        [attempt] = read_attempts(run_paths(self.run_dir))
+        self.assertEqual(attempt["usage"], c["usage"])
+        self.assertEqual(c["usage"]["output"], result.usage.output)
+
+    def test_usage_limit_text_does_not_override_clean_ready_reply(self):
+        self.scenario("ready-limit-warning")
+        result = dispatch(self.request())
+        self.assertEqual((result.status, result.blocked_by, result.exit_reason), ("READY", "", "completed"))
+
+    def test_runner_exception_is_blocked_environment(self):
+        self.assertEqual(dsp._classify("error", None, "", [], "")[:3], ("BLOCKED", "environment", "error"))
+
+    def test_unknown_codex_start_time_still_enforced(self):
+        p = subprocess.Popen(["sleep", "30"], start_new_session=True, stdin=subprocess.DEVNULL)
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        wd = self.worker_dir()
+        wd.mkdir(parents=True)
+        tracker = dsp._Tracker(wd, {"pid": p.pid, "pgid": p.pid, "start": None}, proc=p)
+        self.assertTrue(tracker.codex_alive())
+        self.assertEqual(tracker.stop(deadline=time.monotonic() + 15), [])
+        self.assertIsNotNone(p.poll())
+
+    def test_runner_record_without_start_time_is_not_dead_while_lock_held(self):
+        wd = self.worker_dir()
+        wd.mkdir(parents=True)
+        (wd / "runner.json").write_text(json.dumps(
+            {"runner": {"pid": os.getpid(), "pgid": os.getpgid(0), "start": None}, "codex": None, "generation": 1}))
+        (wd / "heartbeat").touch()
+        fd = os.open(wd / "runner.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.assertEqual(dsp._owner_state(wd), "running")
+
+    def test_launch_intent_recorded_before_codex_starts(self):
+        self.scenario("ready")
+        os.environ["LEADHAND_CRASH_AT"] = "before_worker_launch"
+        with self.assertRaises(DispatchError):
+            dispatch(self.request(), wait=20)
+        runner = self.runner_json()
+        self.assertIsNone(runner["codex"])
+        self.assertTrue(runner.get("launching"))
+        self.assertEqual(self.records("start"), [])
+
+    def test_launch_rechecks_cancel_immediately_before_starting(self):
+        wd = self.worker_dir()
+        wd.mkdir(parents=True)
+        record = {"runner": {"pid": os.getpid(), "pgid": os.getpgid(0), "start": None}, "codex": None,
+                  "generation": 1}
+        proc = dsp._launch(wd, record, [str(FAKE)], dict(os.environ), self.repo, cancelled=lambda: True)
+        self.assertIsNone(proc)
+        self.assertEqual(self.records("start"), [])
+        saved = json.loads((wd / "runner.json").read_text())
+        self.assertTrue(saved.get("launching"))
+        self.assertIsNone(saved["codex"])
+
+    def test_cancel_requested_during_orphan_is_not_resurrected(self):
+        self.scenario("slow")
+        req = self.request()
+        codex = self.start_detached(req)
+        runner_pid = self.runner_json()["runner"]["pid"]
+        os.kill(runner_pid, signal.SIGKILL)
+        wait_for(lambda: not alive(runner_pid))
+        # stop-dispatch has made its request (step 1) and is still stopping Codex.
+        (self.worker_dir() / "cancel").write_text(json.dumps({"requested_at": "earlier"}))
+        result = dispatch(req, wait=20)
+        self.assertEqual((result.status, result.exit_reason), ("SPENT", "cancelled"))
+        self.assertFalse(alive(codex["pid"]))
+        self.assertEqual(len(self.records("start")), 1)
+        self.assertFalse((self.worker_dir() / "superseded").exists())
+
+    def test_ready_result_landing_during_replacement_cancel_is_kept(self):
+        self.scenario("ready", delay=1)
+        req = self.request()
+        codex = self.start_detached(req)
+        runner_pid = self.stop_runner()
+        wait_for(lambda: [r for r in self.records("exit") if r["pid"] == codex["pid"]])
+        self.age_heartbeat()
+        wd = self.worker_dir()
+
+        def resume_when_cancel_requested():
+            with contextlib.suppress(AssertionError):
+                wait_for(lambda: (wd / "cancel").exists(), timeout=60, step=0.01)
+            self.signal_quietly(runner_pid, signal.SIGCONT)
+
+        t = threading.Thread(target=resume_when_cancel_requested, daemon=True)
+        t.start()
+        result = dispatch(req, wait=60)
+        t.join(70)
+        self.assertEqual((result.status, result.exit_reason), ("READY", "completed"))
+        self.assertEqual(len(self.records("start")), 1)
+        self.assertFalse((wd / "superseded").exists())
+
+    def test_heartbeat_refreshed_before_second_look_is_not_hung(self):
+        self.scenario("slow")
+        req = self.request()
+        self.start_detached(req)
+        runner_pid = self.stop_runner()
+        self.age_heartbeat()
+        timer = threading.Timer(0.5, self.signal_quietly, (runner_pid, signal.SIGCONT))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        with self.assertRaises(DispatchStillRunning):
+            dispatch(req, wait=8)
+        self.assertFalse((self.worker_dir() / "cancel").exists())
+        self.assertEqual(self.runner_json()["runner"]["pid"], runner_pid)
+        self.assertTrue(alive(runner_pid))
+        self.assertEqual(len(self.records("start")), 1)
+
+    def test_concurrent_dispatches_start_one_runner(self):
+        self.scenario("ready", delay=2)
+        req = self.request()
+        env = dict(os.environ, PATH=f"{FAKES}{os.pathsep}{os.environ['PATH']}")
+        procs_ = [subprocess.Popen(self.cli_args(req), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True) for _ in range(2)]
+        outs = [p.communicate(timeout=60) for p in procs_]
+        for p, (out, err) in zip(procs_, outs):
+            self.assertEqual(p.returncode, 0, err)
+            self.assertEqual(out.splitlines()[0], "Status: READY")
+        self.assertEqual(len(self.records("start")), 1)
+        self.assertEqual(len(read_attempts(run_paths(self.run_dir))), 1)
+        self.assertFalse((self.worker_dir() / "superseded").exists())
+
+    def test_second_runner_refuses_while_first_holds_lock(self):
+        self.scenario("slow")
+        req = self.request()
+        self.start_detached(req)
+        before = (self.worker_dir() / "runner.json").read_text()
+        r = subprocess.run([sys.executable, str(CLI), "dispatch-runner", str(self.worker_dir())],
+                           capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual((self.worker_dir() / "runner.json").read_text(), before)
+        self.assertEqual(len(self.records("start")), 1)
 
 
 if __name__ == "__main__":

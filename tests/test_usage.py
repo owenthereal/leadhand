@@ -319,6 +319,31 @@ class CodexTests(UsageCase):
         total = usage.totals(usage.read_charges(self.paths))["implementer"]
         self.assertEqual(total.input, 250)
 
+    def test_codex_stream_fallback_charged_when_session_missing(self):
+        stream_usage = Usage(input=70, cached=30, output=25, reasoning=8)
+        c = usage.charge(self.paths, charge_id="d1:codex:thr9", source="codex", key="thr9",
+                         dispatch_id="d1", role="implementer", path_or_thread="thr9",
+                         sessions_dir=self.sessions, fallback=stream_usage)
+        self.assertEqual(c.source, "codex-stream")
+        self.assertEqual(c.usage, stream_usage)
+        self.assertEqual(usage.read_charges(self.paths), [c])
+        self.assertEqual(usage.totals(usage.read_charges(self.paths))["implementer"], stream_usage)
+        self.assertEqual(usage.unknown_count(usage.read_charges(self.paths)), 0)
+        # A stream charge moves no Codex checkpoint: a later session file is charged from its records.
+        self.assertEqual(usage.charged_checkpoint([c], "codex", "thr9"), {"responses": [], "cumulative": {}})
+        # An unknown fallback (no turn completed) still gives an UNKNOWN codex charge.
+        u = usage.charge(self.paths, charge_id="d2:codex:thr8", source="codex", key="thr8",
+                         dispatch_id="d2", role="implementer", path_or_thread="thr8",
+                         sessions_dir=self.sessions, fallback=UNKNOWN)
+        self.assertEqual((u.source, u.usage.known), ("codex", False))
+        # With a session file the fallback is ignored.
+        f = rollout_path(self.sessions, "thr1")
+        append_lines(f, codex_line(100, 0, 0))
+        s = usage.charge(self.paths, charge_id="d3:codex:thr1", source="codex", key="thr1",
+                         dispatch_id="d3", role="implementer", path_or_thread="thr1",
+                         sessions_dir=self.sessions, fallback=stream_usage)
+        self.assertEqual((s.source, s.usage.input), ("codex", 100))
+
     def test_codex_stream_usage_sums_turn_completed(self):
         events = [
             {"type": "thread.started", "thread_id": "thr1"},

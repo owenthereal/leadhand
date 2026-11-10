@@ -1,0 +1,6 @@
+{"type": "thread.started", "thread_id": "{thread}"}
+{"type": "turn.started"}
+{"type": "error", "message": "Heads up: you are close to your usage limit."}
+{"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": "Status: READY\nReport: report.md"}}
+{"action": "last_message", "text": "Status: READY\nReport: report.md\n"}
+{"type": "turn.completed", "usage": {"input_tokens": 300, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 12, "reasoning_output_tokens": 0}}

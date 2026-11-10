@@ -118,6 +118,23 @@ class WorkerEnvTests(unittest.TestCase):
         self.assertFalse(helper_marker.exists(), "the parent's credential helper ran")
         self.assertRegex(r.stderr, r"terminal prompts disabled|Authentication failed|could not read Username")
 
+    def test_configured_askpass_is_not_run(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Answer401)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}/owner/repo.git"
+        marker = self.tmp / "askpass was called"
+        askpass = self.tmp / "ask pass.sh"
+        askpass.write_text(f"#!/bin/sh\ntouch '{marker}'\necho secret\n")
+        askpass.chmod(0o755)
+        # The user's Git config names an askpass program (here through the parent's GIT_CONFIG_*).
+        env = self.env(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.askPass", GIT_CONFIG_VALUE_0=str(askpass),
+                       NO_PROXY="127.0.0.1", no_proxy="127.0.0.1")
+        r = self.git(env, "push", url, "HEAD:refs/heads/x", timeout=10)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(marker.exists(), "the configured askpass program ran")
+
     @unittest.skipUnless(shutil.which("gh"), "gh is not installed")
     def test_gh_reports_no_login_with_parent_token(self):
         env = self.env(GH_TOKEN="ghp_parenttokenvalue0000000000000000000000")

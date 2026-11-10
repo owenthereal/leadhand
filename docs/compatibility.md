@@ -165,6 +165,20 @@ Codex workers (`codex exec --json`):
 - `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=credential.helper`, `GIT_CONFIG_VALUE_0=` adds an
   empty `credential.helper` entry after the user's helpers, which resets Git's helper list.
 
+Known limits of the Codex worker environment. Leadhand removes the token variables, the SSH
+agent socket and the askpass variables, resets `credential.helper` and `core.askPass`, points
+`gh` at an empty config folder and makes SSH fail. Credentials that reach Git by other paths
+are not blocked:
+
+- `~/.netrc` (or `_netrc`): Git's HTTP layer reads it for matching hosts.
+- `http.extraHeader` (or `http.<url>.extraHeader`) in the user's Git config, for example an
+  `Authorization` header.
+- Remote URLs that embed a token (`https://<token>@host/...`) in the repository's config.
+- Hooks: the worker can write the repository's common Git directory (it is a writable
+  folder for commits), so it can plant hooks that later run in the operator's own Git
+  commands.
+- A push to a local path needs no credentials and still works.
+
 ## Interrupted usage
 
 Tested with Claude Code 2.1.322 and codex-cli 0.167.0 on macOS.

@@ -11,15 +11,19 @@ Worker folder `<run>/workers/<dispatch_id>/`:
 
     request.json     the DispatchRequest (written once by `dispatch`)
     spawn.json       pid and start time of the runner `dispatch` spawned
-    runner.json      the runner's own pid/pgid/start, then Codex's (written by the runner)
-    heartbeat        touched by the runner every HEARTBEAT_EVERY seconds
+    runner.json      the runner's own pid/pgid/start, then the launch intent, then Codex's
+                     pid/pgid/start (written by the runner)
+    heartbeat        touched by the runner every HEARTBEAT_EVERY wall-clock seconds
     procs.json       Codex's live descendants (pid, pgid, start), refreshed while it runs
     stream.jsonl     Codex's `--json` stdout; codex.stderr its stderr
     last-message.md  Codex's `-o` file (the reply)
     reply.raw.md     the reply, kept when it has no parseable status line
-    cancel           cancel request (atomic); stopping.json the runner's acknowledgement
+    cancel           cancel request (atomic, with the requester's token); stopping.json
+                     the runner's acknowledgement
     result.json      the final result (written last)
     runner.out/.err  the runner's own output
+    owner.lock       flock held around each ownership decision and each cancel
+    runner.lock      flock a runner holds for its whole life (held = a runner is alive)
     gh-config/       the empty GH_CONFIG_DIR the worker gets
     superseded/<n>/  the files of a generation that was cancelled and replaced
 
@@ -53,6 +57,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from types import MappingProxyType
@@ -63,7 +68,7 @@ from leadhand.briefs import parse_report_head, worker_prompt
 from leadhand.gitops import GitError, git_common_dir
 from leadhand.state import (_utc_now, append_attempt, crash_point, read_attempts, run_paths, state_lock,
                             write_json_atomic)
-from leadhand.usage import UNKNOWN, Usage, charge, codex_usage_from_stream, estimate_cost
+from leadhand.usage import CODEX_STREAM_SOURCE, UNKNOWN, Usage, charge, codex_usage_from_stream, estimate_cost
 
 STEP_ITEM_TYPES: frozenset[str] = frozenset({"command_execution", "file_change"})
 CREDENTIAL_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
@@ -72,11 +77,18 @@ CREDENTIAL_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_EN
 # GIT_CONFIG_COUNT/KEY/VALUE entries that reset credential.helper after any existing ones.
 BLOCKING_ENV: Mapping[str, str] = MappingProxyType({"GIT_SSH_COMMAND": "false", "GIT_TERMINAL_PROMPT": "0"})
 CREDENTIAL_HELPER_RESET = ("credential.helper", "")
+# Appended to GIT_CONFIG_PARAMETERS (command-line config, read after the GIT_CONFIG_*
+# entries): an empty core.askPass stops Git running an askpass program named in the
+# user's config, and also stops it falling back to SSH_ASKPASS.
+ASKPASS_RESET = "'core.askPass='"
 
 FOREGROUND_WAIT = 540.0     # the proxy's Bash call is capped at 10 minutes
 EXIT_STILL_RUNNING = 75
-HEARTBEAT_EVERY = 15.0
+HEARTBEAT_EVERY = 1.0       # wall-clock seconds between heartbeat touches
 HEARTBEAT_STALE = 60.0
+HUNG_RECHECK = 5.0          # a stale heartbeat must stay unchanged this long before "hung"
+CANCEL_TIMEOUT = 30.0
+RUNNER_LOCK_RETRY = 2.0
 SIGNAL_STEP = 5.0           # SIGINT -> SIGTERM -> SIGKILL spacing
 KILL_RETRY = 5.0            # after SIGKILL, re-send this often until confirmed
 CANCEL_ACK = 5.0            # a runner that does not acknowledge a cancel this fast is hung
@@ -91,6 +103,7 @@ CLI_PATH = Path(__file__).resolve().parents[2] / "leadhand"
 REQUEST, SPAWN, RUNNER, HEARTBEAT, PROCS = "request.json", "spawn.json", "runner.json", "heartbeat", "procs.json"
 STREAM, STDERR, LAST, RAW = "stream.jsonl", "codex.stderr", "last-message.md", "reply.raw.md"
 CANCEL, STOPPING, RESULT, FINALIZE_LOCK = "cancel", "stopping.json", "result.json", "finalize.lock"
+OWNER_LOCK, RUNNER_LOCK = "owner.lock", "runner.lock"
 RUNNER_OUT, RUNNER_ERR, GH_DIR, SUPERSEDED = "runner.out", "runner.err", "gh-config", "superseded"
 GENERATION_FILES = (SPAWN, RUNNER, HEARTBEAT, PROCS, STREAM, STDERR, LAST, RAW, CANCEL, STOPPING, RESULT,
                     RUNNER_OUT, RUNNER_ERR)
@@ -99,6 +112,7 @@ _USAGE_LIMIT = re.compile(r"usage[\s_-]*limit", re.IGNORECASE)
 _STATUS_BLOCKED = re.compile(r"^[\s*_`#>]*status[\s*_`]*:[\s*_`]*blocked\b", re.IGNORECASE)
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SPAWNED: list[subprocess.Popen] = []
+_RUNNER_LOCK_FD: int | None = None
 
 
 @dataclass(frozen=True)
@@ -226,8 +240,9 @@ def _mtime(path: Path) -> float | None:
 
 def blocking_env(parent: Mapping[str, str], *, gh_config_dir: Path) -> dict[str, str]:
     """The variables that block credential use: BLOCKING_ENV, an empty GH_CONFIG_DIR,
-    and every GIT_CONFIG_* entry: the parent's, kept in order, then credential.helper
-    reset to empty (Git's "clear the helper list"). The whole set is also passed
+    every GIT_CONFIG_* entry (the parent's, kept in order, then credential.helper reset
+    to empty: Git's "clear the helper list"), and GIT_CONFIG_PARAMETERS with the
+    parent's entries followed by an empty core.askPass. The whole set is also passed
     through `shell_environment_policy.set`, so the count and its entries always agree."""
     out = dict(BLOCKING_ENV)
     out["GH_CONFIG_DIR"] = str(gh_config_dir)
@@ -240,6 +255,8 @@ def blocking_env(parent: Mapping[str, str], *, gh_config_dir: Path) -> dict[str,
         out[f"GIT_CONFIG_VALUE_{i}"] = parent.get(f"GIT_CONFIG_VALUE_{i}", "")
     out[f"GIT_CONFIG_KEY_{count}"], out[f"GIT_CONFIG_VALUE_{count}"] = CREDENTIAL_HELPER_RESET
     out["GIT_CONFIG_COUNT"] = str(count + 1)
+    params = (parent.get("GIT_CONFIG_PARAMETERS") or "").strip()
+    out["GIT_CONFIG_PARAMETERS"] = f"{params} {ASKPASS_RESET}" if params else ASKPASS_RESET
     return out
 
 
@@ -367,10 +384,17 @@ class _Tracker:
         self.seen.setdefault(key, rec)
 
     def codex_alive(self) -> bool:
-        if self.proc is not None and self.proc.poll() is not None:
-            return False
+        if self.proc is not None:
+            # Our own unreaped child: its pid (and group) cannot be reused until we reap
+            # it, so it is identified even when its start time could not be read.
+            return self.proc.poll() is None
         c = self.codex
         return bool(c) and procs.same_process(c.get("pid"), c.get("start"))
+
+    def _verified(self, t: dict) -> bool:
+        if t is self.codex and self.proc is not None:
+            return self.proc.poll() is None
+        return procs.same_process(t.get("pid"), t.get("start"))
 
     def snapshot(self) -> None:
         if self.codex_alive():
@@ -395,13 +419,13 @@ class _Tracker:
         groups: set[int] = set()
         for t in targets:   # groups whose leader is a verified recorded process
             pid, pgid = int(t["pid"]), int(t["pgid"])
-            if pid == pgid and pgid not in own and pgid not in groups and procs.same_process(pid, t["start"]):
+            if pid == pgid and pgid not in own and pgid not in groups and self._verified(t):
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(pgid, sig)
                 groups.add(pgid)
         for t in targets:   # anything else: the process itself, verified
             pid = int(t["pid"])
-            if int(t["pgid"]) not in groups and pid != os.getpid() and procs.same_process(pid, t["start"]):
+            if int(t["pgid"]) not in groups and pid != os.getpid() and self._verified(t):
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.kill(pid, sig)
 
@@ -419,7 +443,7 @@ class _Tracker:
                 return False
             if beat is not None:
                 with contextlib.suppress(OSError):
-                    if now - (_mtime(beat) or 0) >= HEARTBEAT_EVERY:
+                    if time.time() - (_mtime(beat) or 0) >= HEARTBEAT_EVERY:
                         _touch(beat)
             time.sleep(0.05)
 
@@ -473,9 +497,14 @@ def _has_status_line(reply: str) -> bool:
 def _classify(stopped_for: str | None, codex_exit: int | None, reply: str,
               errors: list[str], stderr: str) -> tuple[str, str, str, bool]:
     """(status, blocked_by, exit_reason, keep_raw)."""
+    if stopped_for == "error":
+        return "BLOCKED", "environment", "error", False    # the runner itself failed
     if stopped_for:
         return "SPENT", "", stopped_for, False
-    if any(_USAGE_LIMIT.search(t) for t in errors) or _USAGE_LIMIT.search(stderr):
+    clean = codex_exit == 0 and bool(reply.strip()) and _has_status_line(reply)
+    # A usage-limit message counts only when Codex did not finish cleanly with a status:
+    # a READY reply after a clean exit stands, whatever warnings came before it.
+    if not clean and (any(_USAGE_LIMIT.search(t) for t in errors) or _USAGE_LIMIT.search(stderr)):
         return "BLOCKED", "usage limit", "usage_limit", False
     if codex_exit is not None and codex_exit < 0 and not reply.strip():
         return "SPENT", "", "interrupted", False    # killed by a signal leadhand did not send
@@ -501,14 +530,15 @@ def _charge_usage(req: DispatchRequest, wd: Path, *, thread: str | None, launche
         cid, key = f"{req.dispatch_id}:codex:{thread}{suffix}", thread
     else:
         cid, key = f"{req.dispatch_id}:codex:unknown{suffix}", f"dispatch:{req.dispatch_id}"
+    # charges.jsonl is the source of truth: when the session file is missing, the
+    # charge itself is taken from the stream (source "codex-stream"), so it and the
+    # attempt record agree. UNKNOWN only when neither has usage.
     c = charge(paths, charge_id=cid, source="codex", key=key, dispatch_id=req.dispatch_id,
-               role=req.role, path_or_thread=thread, possibly_incomplete=stopped)
-    if c.usage.known:
-        return c.usage, [cid], "session"
-    from_stream = codex_usage_from_stream(stream.events)
-    if from_stream.known:
-        return from_stream, [cid], "stream"
-    return UNKNOWN, [cid], "unknown"
+               role=req.role, path_or_thread=thread, possibly_incomplete=stopped,
+               fallback=codex_usage_from_stream(stream.events))
+    if not c.usage.known:
+        return UNKNOWN, [cid], "unknown"
+    return c.usage, [cid], ("stream" if c.source == CODEX_STREAM_SOURCE else "session")
 
 
 def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_exit: int | None,
@@ -519,7 +549,9 @@ def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_
             return existing
         runner = _read_json(wd / RUNNER) or {}
         generation = int(runner.get("generation") or 1)
-        launched = bool(runner.get("codex"))
+        launch = runner.get("launching") or {}
+        # Two-phase launch: an intent without a recorded Codex may still have started one.
+        launched = bool(runner.get("codex")) or (bool(launch) and not launch.get("aborted"))
         stream = _Stream(wd / STREAM)
         stream.poll()
         try:
@@ -568,6 +600,8 @@ def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_
             "usage": _usage_dict(usage), "usage_known": usage.known, "usage_source": source,
             "exit_reason": exit_reason, "codex_exit": codex_exit, "charge_ids": charge_ids,
             "generation": generation, "stopped": stopped, "confirmed_at": time.time(),
+            "cancel_token": ((_read_json(wd / CANCEL) or {}).get("token")
+                             if exit_reason == "cancelled" else None),
             "started_at": started_at, "ended_at": ended_at,
         }
         write_json_atomic(wd / RESULT, result)
@@ -587,13 +621,63 @@ def _feed(pipe, data: bytes) -> None:
             pipe.close()
 
 
+def _take_runner_lock(wd: Path) -> int | None:
+    """The runner's lifetime lock. A probe by `_runner_locked` holds it for an instant,
+    so a starting runner retries briefly before concluding another runner owns it."""
+    fd = os.open(wd / RUNNER_LOCK, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    until = time.monotonic() + RUNNER_LOCK_RETRY
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= until:
+                os.close(fd)
+                return None
+            time.sleep(0.02)
+
+
+def _launch(wd: Path, record: dict, argv: list[str], env: Mapping[str, str], cwd: Path,
+            cancelled) -> subprocess.Popen | None:
+    """Two-phase launch: record the intent, re-check for a cancel, start Codex in a new
+    process group, record it. None when a cancel arrived first (nothing started)."""
+    record["launching"] = {"at": _utc_now()}
+    write_json_atomic(wd / RUNNER, record)
+    crash_point("before_worker_launch")
+    if cancelled():
+        record["launching"]["aborted"] = True
+        write_json_atomic(wd / RUNNER, record)
+        return None
+    try:
+        with open(wd / STREAM, "wb") as out, open(wd / STDERR, "wb") as err:
+            proc = subprocess.Popen(argv, cwd=cwd, env=dict(env), stdin=subprocess.PIPE, stdout=out,
+                                    stderr=err, start_new_session=True, close_fds=True)
+    except OSError:
+        record["launching"]["aborted"] = True
+        write_json_atomic(wd / RUNNER, record)
+        raise
+    info = procs.process_info(proc.pid)
+    record["codex"] = {"pid": proc.pid, "pgid": info.pgid if info else proc.pid,
+                       "start": info.start if info else None}
+    write_json_atomic(wd / RUNNER, record)
+    crash_point("after_worker_launch")
+    return proc
+
+
 def run_runner(worker_dir: Path) -> int:
     """The detached runner's body: launch Codex, watch it, stop it at a limit or a
-    cancel, then finalize. Exits 0 once result.json is written."""
+    cancel, then finalize. Exits 0 once result.json is written; 3 when another runner
+    already owns the dispatch (it then touches nothing)."""
+    global _RUNNER_LOCK_FD
     wd = Path(worker_dir)
     term = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: term.set())
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    fd = _take_runner_lock(wd)
+    if fd is None:
+        print(f"leadhand: another runner owns {wd}", file=sys.stderr)
+        return 3
+    _RUNNER_LOCK_FD = fd               # held until this process exits
     if _load_result(wd) is not None:
         return 0
     req = _load_request(wd)
@@ -618,34 +702,31 @@ def run_runner(worker_dir: Path) -> int:
         gh_dir.mkdir(exist_ok=True)
         run_id = _run_id(req.run_dir)
         env = worker_env(os.environ, run_id=run_id, gh_config_dir=gh_dir)
-        argv = codex_argv(req, wd / LAST, git_common_dir(req.cwd), blocking_env(os.environ, gh_config_dir=gh_dir))
+        overrides = {**blocking_env(os.environ, gh_config_dir=gh_dir), "LEADHAND_RUN_ID": run_id}
+        argv = codex_argv(req, wd / LAST, git_common_dir(req.cwd), overrides)
         prompt = worker_prompt(req.role, req.brief, req.report).encode("utf-8")
     except (GitError, OSError, ValueError) as e:
         (wd / STDERR).write_text(f"leadhand: cannot prepare the Codex worker: {e}\n", encoding="utf-8")
         _finalize(wd, req, stopped_for=None, codex_exit=None, tracker=tracker, started_at=started_at)
         return 0
 
-    crash_point("before_worker_launch")
     try:
-        with open(wd / STREAM, "wb") as out, open(wd / STDERR, "wb") as err:
-            proc = subprocess.Popen(argv, cwd=req.cwd, env=env, stdin=subprocess.PIPE, stdout=out, stderr=err,
-                                    start_new_session=True, close_fds=True)
+        proc = _launch(wd, record, argv, env, req.cwd, cancelled)
     except OSError as e:
         (wd / STDERR).write_text(f"leadhand: cannot start {req.codex_bin}: {e}\n", encoding="utf-8")
         _finalize(wd, req, stopped_for=None, codex_exit=None, tracker=tracker, started_at=started_at)
         return 0
-    info = procs.process_info(proc.pid)
-    record["codex"] = {"pid": proc.pid, "pgid": info.pgid if info else proc.pid,
-                       "start": info.start if info else None}
-    write_json_atomic(wd / RUNNER, record)
-    crash_point("after_worker_launch")
+    if proc is None:
+        _finalize(wd, req, stopped_for="cancelled", codex_exit=None, tracker=tracker, started_at=started_at)
+        return 0
     threading.Thread(target=_feed, args=(proc.stdin, prompt), daemon=True).start()
     tracker = _Tracker(wd, record["codex"], proc=proc)
 
     stream = _Stream(wd / STREAM)
-    t0 = time.monotonic()
+    t0 = time.monotonic()               # the time limit counts time awake
     limit = req.minutes * _minute_seconds()
-    last_beat = last_snap = t0
+    last_snap = t0
+    last_beat = time.time()             # the heartbeat is wall-clock, like its mtime
     stopped_for: str | None = None
     try:
         while proc.poll() is None:
@@ -659,9 +740,9 @@ def run_runner(worker_dir: Path) -> int:
                 stopped_for = "time_limit"
             if stopped_for:
                 break
-            if now - last_beat >= HEARTBEAT_EVERY:
+            if time.time() - last_beat >= HEARTBEAT_EVERY:
                 _touch(wd / HEARTBEAT)
-                last_beat = now
+                last_beat = time.time()
             if now - last_snap >= SNAPSHOT_EVERY:
                 tracker.snapshot()
                 last_snap = now
@@ -683,6 +764,44 @@ def run_runner(worker_dir: Path) -> int:
 
 # --------------------------------------------------------------------------
 # Ownership: who owns a dispatch, cancel, dispatch
+#
+# Every ownership decision (look at the folder -> cancel -> supersede -> spawn) and
+# every cancel runs under the worker folder's owner.lock, held only for that step,
+# never while waiting for a runner to finish. A runner holds runner.lock for its
+# whole life: a held lock means a live runner, whatever its recorded pid says.
+
+@contextlib.contextmanager
+def _owner_lock(wd: Path, deadline: float | None = None):
+    fd = os.open(wd / OWNER_LOCK, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise DispatchError(f"another leadhand process is handling {wd.name}") from None
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _runner_locked(wd: Path) -> bool:
+    try:
+        fd = os.open(wd / RUNNER_LOCK, os.O_RDWR | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
 
 def _live(rec: Mapping[str, Any] | None) -> dict | None:
     if rec and procs.same_process(rec.get("pid"), rec.get("start")):
@@ -690,25 +809,38 @@ def _live(rec: Mapping[str, Any] | None) -> dict | None:
     return None
 
 
-def _live_runner(wd: Path) -> dict | None:
+def _starting_runner(wd: Path) -> dict | None:
+    """A spawned runner that has not written runner.json yet."""
+    return _live(_read_json(wd / SPAWN)) if not (wd / RUNNER).exists() else None
+
+
+def _runner_alive(wd: Path) -> bool:
+    return _runner_locked(wd) or _starting_runner(wd) is not None
+
+
+def _runner_target(wd: Path) -> dict | None:
+    """The runner as a signal target: only when its pid and start time match."""
     runner = _read_json(wd / RUNNER)
     if runner is not None:
         return _live(runner.get("runner"))
     return _live(_read_json(wd / SPAWN))
 
 
+def _beat(wd: Path) -> float:
+    return _mtime(wd / HEARTBEAT) or _mtime(wd / RUNNER) or _mtime(wd / SPAWN) or 0.0
+
+
 def _owner_state(wd: Path) -> str:
-    """running | hung | orphaned | dead | none."""
-    runner_json = _read_json(wd / RUNNER)
+    """running | stale | orphaned | dead | none. `stale`: a live runner whose
+    heartbeat is old; `dispatch` looks again before calling it hung."""
     now = time.time()
-    if runner_json is None:
-        spawn = _read_json(wd / SPAWN)
-        if _live(spawn):
-            return "running" if now - float(spawn.get("at") or 0) < SPAWN_GRACE else "hung"
+    if _runner_locked(wd):
+        return "stale" if now - _beat(wd) > HEARTBEAT_STALE else "running"
+    spawn = _starting_runner(wd)
+    if spawn is not None:
+        return "running" if now - float(spawn.get("at") or 0) < SPAWN_GRACE else "stale"
+    if not (wd / RUNNER).exists():
         return "none"
-    if _live(runner_json.get("runner")):
-        beat = _mtime(wd / HEARTBEAT) or _mtime(wd / RUNNER) or 0
-        return "hung" if now - beat > HEARTBEAT_STALE else "running"
     if _Tracker.load(wd).alive():
         return "orphaned"
     return "dead"
@@ -746,20 +878,19 @@ def _reap() -> None:
             _SPAWNED.remove(p)
 
 
-def cancel(worker_dir: Path, *, timeout: float = 30.0) -> DispatchResult:
-    """Stop a dispatch, confirm that Codex and its processes are gone, finalize.
-    Raises DispatchError after `timeout` naming what is still alive."""
-    wd = Path(worker_dir)
-    deadline = time.monotonic() + timeout
+def _cancel_locked(wd: Path, *, deadline: float, token: str | None) -> DispatchResult:
+    """`cancel`'s body; the caller holds owner.lock. A None token keeps a cancel
+    request that is already there."""
     done = _load_result(wd)
     if done is not None:
         return done
     req = _load_request(wd)
-    write_json_atomic(wd / CANCEL, {"requested_at": _utc_now(), "by_pid": os.getpid()})
-    runner = _live_runner(wd)
-    if runner:
+    if token is not None or not (wd / CANCEL).exists():
+        write_json_atomic(wd / CANCEL, {"requested_at": _utc_now(), "by_pid": os.getpid(), "token": token})
+    target = _runner_target(wd)
+    if target and _runner_alive(wd):
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(int(runner["pid"]), signal.SIGTERM)
+            os.kill(int(target["pid"]), signal.SIGTERM)
     crash_point("after_cancel_request")
     ack_by = time.monotonic() + CANCEL_ACK
     while True:
@@ -767,16 +898,17 @@ def cancel(worker_dir: Path, *, timeout: float = 30.0) -> DispatchResult:
         done = _load_result(wd)
         if done is not None:
             return done
-        runner = _live_runner(wd)
-        if runner is None:
+        if not _runner_alive(wd):
             break
         if not (wd / STOPPING).exists() and time.monotonic() >= ack_by:
             # Alive but not acknowledging: hung. Kill it (verified), then stop Codex here.
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                if procs.same_process(runner["pid"], runner["start"]):
-                    os.kill(int(runner["pid"]), signal.SIGKILL)
+            target = _runner_target(wd)
+            if target:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(int(target["pid"]), signal.SIGKILL)
         if time.monotonic() >= deadline:
-            raise DispatchError(f"cancel timed out; runner pid {runner['pid']} still alive")
+            raise DispatchError(f"cancel timed out; the runner of {wd.name} is still alive"
+                                + (f" (pid {target['pid']})" if target else ""))
         time.sleep(POLL)
     # The runner is gone: stop what it left, then finalize.
     tracker = _Tracker.load(wd)
@@ -786,6 +918,18 @@ def cancel(worker_dir: Path, *, timeout: float = 30.0) -> DispatchResult:
                             + ", ".join(f"pid {r['pid']} (group {r['pgid']})" for r in left))
     started_at = (_read_json(wd / RUNNER) or {}).get("started_at")
     return _finalize(wd, req, stopped_for="cancelled", codex_exit=None, tracker=tracker, started_at=started_at)
+
+
+def cancel(worker_dir: Path, *, timeout: float = 30.0) -> DispatchResult:
+    """Stop a dispatch, confirm that Codex and its processes are gone, finalize.
+    Raises DispatchError after `timeout` naming what is still alive."""
+    wd = Path(worker_dir)
+    deadline = time.monotonic() + timeout
+    done = _load_result(wd)
+    if done is not None:
+        return done
+    with _owner_lock(wd, deadline):
+        return _cancel_locked(wd, deadline=deadline, token=uuid.uuid4().hex)
 
 
 def _write_request(wd: Path, req: DispatchRequest) -> None:
@@ -809,31 +953,57 @@ def dispatch(req: DispatchRequest, *, wait: float | None = None) -> DispatchResu
         raise DispatchError(f"bad dispatch id {req.dispatch_id!r}")
     wd = Path(req.run_dir) / "workers" / req.dispatch_id
     wd.mkdir(parents=True, exist_ok=True)
-    _write_request(wd, req)
+    with _owner_lock(wd):
+        _write_request(wd, req)
     deadline = time.monotonic() + wait
     mine: subprocess.Popen | None = None
+    suspect: tuple[float, float] | None = None     # (heartbeat mtime, when first seen stale)
     while True:
         _reap()
         done = _load_result(wd)
         if done is not None:
             return done
-        state = _owner_state(wd)
-        if state in ("dead", "none") and (wd / RESULT).exists():
-            continue                       # it finished between the two checks
-        if state in ("hung", "orphaned"):
-            cancel(wd)                     # confirms the old runner and Codex are gone
-            _supersede(wd)
-            continue
-        if state in ("dead", "none"):
-            if mine is not None:
-                raise DispatchError(f"the runner exited without a result; see {wd / RUNNER_ERR}")
-            if state == "dead":
+        with _owner_lock(wd):
+            done = _load_result(wd)
+            if done is not None:
+                return done
+            state = _owner_state(wd)
+            if state in ("orphaned", "dead", "none") and (wd / RESULT).exists():
+                continue                   # the runner finished and exited between the checks
+            if state == "stale":
+                # Hung only if the heartbeat stays the same across a second look: after a
+                # laptop sleep the runner refreshes it as soon as it runs again.
+                beat, now = _beat(wd), time.time()
+                if suspect is None or suspect[0] != beat:
+                    suspect = (beat, now)
+                state = "hung" if now - suspect[1] >= HUNG_RECHECK else "running"
+            else:
+                suspect = None
+            if state != "running" and (wd / CANCEL).exists():
+                # A stop was requested (stop-dispatch, run cancel): finish it, never replace.
+                return _cancel_locked(wd, deadline=time.monotonic() + CANCEL_TIMEOUT, token=None)
+            if state in ("hung", "orphaned"):
+                token = uuid.uuid4().hex
+                result = _cancel_locked(wd, deadline=time.monotonic() + CANCEL_TIMEOUT, token=token)
+                if result.exit_reason != "cancelled" or (_read_json(wd / RESULT) or {}).get("cancel_token") != token:
+                    return result          # it finished on its own meanwhile: keep that
+                _supersede(wd)
+                suspect, state, mine = None, "none", None   # the replaced runner was not a failure
+            elif state == "dead":
+                if mine is not None:
+                    raise DispatchError(f"the runner exited without a result; see {wd / RUNNER_ERR}")
                 runner = _read_json(wd / RUNNER) or {}
-                if runner.get("codex"):    # it died mid-attempt: record what it used
+                launch = runner.get("launching") or {}
+                if runner.get("codex") or (launch and not launch.get("aborted")):
+                    # It died mid-attempt: record what it used before replacing it.
                     _finalize(wd, req, stopped_for="interrupted", codex_exit=None,
                               tracker=_Tracker.load(wd), started_at=runner.get("started_at"))
                 _supersede(wd)
-            mine = _spawn_runner(wd)
+                state = "none"
+            if state == "none":
+                if mine is not None:       # ours died before even writing runner.json
+                    raise DispatchError(f"the runner exited without a result; see {wd / RUNNER_ERR}")
+                mine = _spawn_runner(wd)
         if time.monotonic() >= deadline:
             raise DispatchStillRunning(f"dispatch {req.dispatch_id} is still running")
         time.sleep(POLL)
