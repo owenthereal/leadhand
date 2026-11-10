@@ -266,14 +266,70 @@ def kill_group(pgid: int) -> None:
         time.sleep(1)
 
 
-def group_owned(g: dict, rows: list[dict]) -> bool:
-    """True only while the recorded group still provably belongs to this probe."""
+def proc_start(pid: int) -> str | None:
+    """The process's start time (`ps -o lstart=`), or None if it is gone."""
+    p = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                       timeout=CMD_TIMEOUT)
+    return p.stdout.strip() or None
+
+
+def group_evidence(g: dict, rows: list[dict], needles: list[str],
+                   allow_parent: bool = True) -> str | None:
+    """Why the recorded group still belongs to this probe, or None if it can't be shown.
+
+    g: {"pgid", "leader", "lstart"} plus optional {"parent", "parent_needle"}. A pgid
+    with members is ours only if (a) its recorded leader is still in it with the same
+    start time, (b) a member's command holds a probe needle, or (c) when allow_parent,
+    a member is the child of the recorded runner whose command still holds its run dir.
+    A recycled pgid fails all three.
+    """
     members = [r for r in rows if r["pgid"] == g["pgid"]]
-    if "needle" in g:
-        return any(g["needle"] in r["command"] for r in members)
-    parent = row_of(g["parent"], rows)
-    return (parent is not None and g["parent_needle"] in parent["command"]
-            and any(r["ppid"] == g["parent"] for r in members))
+    if not members:
+        return None
+    if (g.get("lstart") and any(r["pid"] == g["leader"] for r in members)
+            and proc_start(g["leader"]) == g["lstart"]):
+        return "recorded leader pid + start time"
+    if any(n in r["command"] for r in members for n in needles):
+        return "member command holds a probe needle"
+    if allow_parent and g.get("parent"):
+        parent = row_of(g["parent"], rows)
+        if (parent and g["parent_needle"] in parent["command"]
+                and any(r["ppid"] == g["parent"] for r in members)):
+            return "child of the probe's runner"
+    return None
+
+
+def kill_owned_groups(groups: list[dict], needles: list[str]) -> list[str]:
+    """SIGTERM every provably owned group (evidence from one snapshot, in list order),
+    then SIGKILL those still provably owned by leader+start time or needle."""
+    rows = ps_rows()
+    owned = []
+    log = []
+    for g in groups:
+        ev = group_evidence(g, rows, needles)
+        log.append(f"pgid {g['pgid']} ({g.get('role', '?')}): "
+                   f"{'owned: ' + ev if ev else 'not signalled: no ownership evidence'}")
+        if ev:
+            owned.append(g)
+    for g in owned:
+        try:
+            os.killpg(g["pgid"], signal.SIGTERM)
+            log.append(f"pgid {g['pgid']}: SIGTERM sent")
+        except (ProcessLookupError, PermissionError) as e:
+            log.append(f"pgid {g['pgid']}: SIGTERM failed ({type(e).__name__})")
+    if owned:
+        time.sleep(1)
+    rows = ps_rows()
+    for g in owned:
+        ev = group_evidence(g, rows, needles, allow_parent=False)
+        if not ev:
+            continue
+        try:
+            os.killpg(g["pgid"], signal.SIGKILL)
+            log.append(f"pgid {g['pgid']}: SIGKILL sent ({ev})")
+        except (ProcessLookupError, PermissionError) as e:
+            log.append(f"pgid {g['pgid']}: SIGKILL failed ({type(e).__name__})")
+    return log
 
 
 def kill_pid(pid: int, sig=signal.SIGKILL) -> None:
@@ -1002,9 +1058,14 @@ def start_codex_runner(ctx: Ctx, label: str, prompt: str) -> dict:
         raise StepFail(f"{label}: runner wrote no runner.json",
                        (rdir / "runner.log").read_text(errors="replace").splitlines()[-10:]
                        if (rdir / "runner.log").exists() else [])
-    ctx.groups += [{"pgid": runner["runner_pid"], "needle": str(rdir)},
-                   {"pgid": runner["codex_pgid"] or runner["codex_pid"],
-                    "parent": runner["runner_pid"], "parent_needle": str(rdir)}]
+    # Codex first: cleanup signals in this order, and Codex must not outlive its runner.
+    ctx.groups[:0] = [
+        {"role": "codex", "pgid": runner["codex_pgid"] or runner["codex_pid"],
+         "leader": runner["codex_pid"], "lstart": proc_start(runner["codex_pid"]),
+         "parent": runner["runner_pid"], "parent_needle": str(rdir)},
+        {"role": "runner", "pgid": runner["runner_pid"], "leader": runner["runner_pid"],
+         "lstart": proc_start(runner["runner_pid"])},
+    ]
     rrow = row_of(runner["runner_pid"])
     info.update({"runner": runner,
                  "runner_alive_after_launcher_exit": rrow is not None,
@@ -1344,15 +1405,13 @@ def cleanup(ctx: Ctx) -> None:
             tmux(ctx, "kill-server")
         except Exception:  # noqa: BLE001
             pass
-    for g in ctx.groups:  # re-checked before each signal, so a recycled pgid is never hit
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                if not group_owned(g, ps_rows()):
-                    break
-                os.killpg(g["pgid"], sig)
-            except Exception:  # noqa: BLE001 - gone, not ours, or ps failed
-                break
-            time.sleep(1)
+    if ctx.groups:
+        try:
+            glog = kill_owned_groups(ctx.groups, ctx.needles)
+        except Exception as e:  # noqa: BLE001 - recorded, cleanup continues
+            glog = [f"group cleanup error: {type(e).__name__}: {e}"]
+        with open(ctx.raw, "a") as f:
+            f.write("\n## Cleanup: process groups\n\n" + "".join(f"- {l}\n" for l in glog))
     try:
         leftovers = [r for r in ps_rows() if any(n in r["command"] for n in ctx.needles)]
     except Exception:  # noqa: BLE001
