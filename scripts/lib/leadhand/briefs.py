@@ -40,8 +40,25 @@ TEST_FIRST = ("when-cheap", "always", "off")
 
 # Kinds that are about one card and cannot be written without it.
 CARD_KINDS = frozenset({"implement", "fix", "answer", "continue", "integrate", "review", "rereview"})
-# Template variables write_brief fills itself; every other one must come from `extra`.
-_COMPUTED = frozenset({"context", "card_list", "build", "test"})
+# Keys each kind needs in `extra`. Card kinds also need `base` and `branch`.
+REQUIRED: Mapping[str, tuple[str, ...]] = MappingProxyType({
+    "implement": (),
+    "fix": ("findings", "round"),
+    "answer": ("ruling",),
+    "continue": (),
+    "integrate": ("run_tip", "conflicts", "card_intent", "run_intent"),
+    "review": ("diff_range",),
+    "rereview": ("diff_range", "findings"),
+    "final_review": ("diff_range",),
+    "final_fix": ("gate", "findings", "branch"),
+    "security": ("diff_range",),
+    "evidence": ("base_worktree", "cards"),
+    "verify": (),
+})
+CARD_REQUIRED = ("base", "branch")
+# Reviews need the implementer's report unless test_first is off.
+REPORT_KINDS = frozenset({"review", "rereview"})
+CONTRACT_POINTER = "Your worker contract and report format are in your instructions."
 
 STATUS_VALUES = ("READY", "QUESTION", "BLOCKED", "SPENT")
 HEAD_VALUES = {"Status": STATUS_VALUES, "Verdict": ("clean", "defects"), "Result": ("pass", "fail")}
@@ -49,6 +66,7 @@ _HEAD = re.compile(r"^(status|verdict|result)\s*:\s*([A-Za-z]+)\s*$", re.IGNOREC
 _BLOCKED_BY = re.compile(r"^blocked by\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _MARKUP = re.compile(r"[*_`]")
 _UNPARSED = ("Status", "BLOCKED", "")
+BLOCKED_REASONS = ("environment", "usage limit")
 _BLOCKED_BY_LINES = 5
 
 
@@ -111,7 +129,21 @@ def _selected_cards(deck: Deck, spec: str | None) -> list[Card]:
 
 
 def _card_list(cards: list[Card]) -> str:
-    return "\n".join(f"- Card {c.number}: {c.title}\n  Done when: {c.done_when}" for c in cards) or "- (none)"
+    out = []
+    for c in cards:
+        out.append(f"- Card {c.number}: {c.title}")
+        out.append(f"  Allowed paths: {', '.join(c.allowed_paths) or '(none)'}")
+        if c.out_of_scope:
+            out.append(f"  Out of scope: {c.out_of_scope}")
+        out.append(f"  Done when: {c.done_when}")
+    return "\n".join(out) or "- (none)"
+
+
+def _union_paths(cards: list[Card]) -> str:
+    seen: dict[str, None] = {}
+    for c in cards:
+        seen.update(dict.fromkeys(c.allowed_paths))
+    return ", ".join(seen) or "(none)"
 
 
 def _context(deck: Deck, card: Card | None, *, attempt: int, base: str, branch: str,
@@ -132,9 +164,11 @@ def _context(deck: Deck, card: Card | None, *, attempt: int, base: str, branch: 
     parts = [
         "## Where things are",
         "",
+        CONTRACT_POINTER,
+        "",
         *pointers,
         f"- Base commit: {base}",
-        f"- Branch: {branch}",
+        f"- {'Card branch' if card is not None else 'Branch'}: {branch}",
         f"- Attempt: {attempt}",
         f"- This brief: {brief}",
         f"- Report file: {report}",
@@ -162,11 +196,14 @@ def write_brief(kind: str, *, ws: Path, deck: Deck, card: Card | None, attempt: 
                 extra: Mapping[str, str]) -> tuple[Path, Path]:
     """Write the brief for `kind` and return (brief, report) paths.
 
-    `extra` supplies the kind's template variables (for example `findings` and
-    `round` for `fix`) plus optional `base` (default the deck's base commit),
-    `branch` (default the deck's run branch), `test_first` (default
-    `when-cheap`) and `cards` (comma-separated card numbers for final_review and
-    evidence; default every card in the deck)."""
+    `extra` supplies the keys in REQUIRED[kind]; card kinds also need `base` and
+    `branch` (the card's base commit and card branch), and review/rereview need
+    `implementer_report` unless `test_first` is `off`. Optional: `test_first`
+    (default `when-cheap`), `cards` (comma-separated accepted card numbers;
+    required for evidence, default every deck card elsewhere), `allowed_paths`
+    for final_fix (default the union of those cards' allowed paths), and, for
+    run-level kinds, `base`/`branch` (default the deck's base commit and run
+    branch)."""
     if kind not in BRIEF_KINDS:
         raise ValueError(f"unknown brief kind {kind!r}")
     if kind in CARD_KINDS and card is None:
@@ -174,25 +211,36 @@ def write_brief(kind: str, *, ws: Path, deck: Deck, card: Card | None, attempt: 
     test_first = extra.get("test_first") or "when-cheap"
     if test_first not in TEST_FIRST:
         raise ValueError(f"test_first must be one of {', '.join(TEST_FIRST)}, got {test_first!r}")
-    template = Template((TEMPLATES / f"brief-{kind}.md").read_text(encoding="utf-8"))
-    needed = set(template.get_identifiers()) - _COMPUTED
-    missing = sorted(k for k in needed if not str(extra.get(k, "")).strip())
+    needed = list(REQUIRED[kind])
+    if kind in CARD_KINDS:
+        needed += CARD_REQUIRED
+    if kind in REPORT_KINDS and test_first != "off":
+        needed.append("implementer_report")
+    missing = sorted({k for k in needed if not str(extra.get(k, "")).strip()})
     if missing:
         raise ValueError(f"{kind} brief needs {', '.join(missing)}")
+    template = Template((TEMPLATES / f"brief-{kind}.md").read_text(encoding="utf-8"))
 
     ws = Path(ws)
     folder = scratch_dir(ws, None if card is None else card.number, dispatch_id)
     brief, report = folder / "brief.md", folder / "report.md"
+    cards = _selected_cards(deck, extra.get("cards"))
     values = {k: str(v) for k, v in extra.items()}
     values.update(
         context=_context(deck, card, attempt=attempt, base=extra.get("base") or deck.base_sha,
                          branch=extra.get("branch") or deck.branch, brief=brief, report=report,
                          test_first=test_first),
-        card_list=_card_list(_selected_cards(deck, extra.get("cards"))),
-        build=deck.build or "(none given)",
-        test=deck.test or "(none given)",
+        card_list=_card_list(cards),
+        allowed_paths=extra.get("allowed_paths") or _union_paths(cards),
+        build=deck.build or "(none given; skip it)",
+        test=deck.test or "(none given; skip it)",
+        ruling_quoted="\n".join(f"> {ln}".rstrip() for ln in str(extra.get("ruling", "")).splitlines()),
+        implementer_report_line=extra.get("implementer_report") or "(none; test_first is off)",
     )
-    text = template.substitute(values)
+    try:
+        text = template.substitute(values)
+    except (KeyError, ValueError) as e:
+        raise ValueError(f"brief-{kind}.md: cannot fill {e}") from None
     ensure_excluded(ws, f"{SCRATCH}/")
     folder.mkdir(parents=True, exist_ok=True)
     _atomic_write(brief, text.rstrip("\n") + "\n")
@@ -225,7 +273,10 @@ def dispatch_message(agent: str, brief: Path, report: Path, *, codex_command: li
     if agent == CODEX_AGENT:
         if not codex_command:
             raise ValueError("the Codex proxy needs codex_command")
-        return " ".join(shlex.quote(str(a)) for a in codex_command)
+        args = [str(a) for a in codex_command]
+        if any("\n" in a or "\r" in a for a in args):
+            raise ValueError("codex_command arguments must not contain newlines")
+        return " ".join(shlex.quote(a) for a in args)
     if codex_command is not None:
         raise ValueError(f"codex_command is only for {CODEX_AGENT}")
     if agent not in ROLE_AGENT.values():
@@ -265,6 +316,7 @@ def parse_report_head(text: str) -> tuple[str, str, str]:
         for ln in lines[1:_BLOCKED_BY_LINES]:
             b = _BLOCKED_BY.match(ln)
             if b:
-                blocked_by = b.group(1).lower()
+                reason = b.group(1).lower()
+                blocked_by = next((r for r in BLOCKED_REASONS if reason.startswith(r)), "")
                 break
     return key, value, blocked_by

@@ -58,7 +58,8 @@ class AgentTests(unittest.TestCase):
 
     def test_reviewer_rules(self):
         _, body = split(AGENTS / "reviewer.md")
-        for phrase in ("Done when", "allowed paths", "Never edit", "Verdict: clean", "Report: <path of the report file>"):
+        for phrase in ("Done when", "allowed paths", "Never edit", "Verdict: clean", "Report: <path of the report file>",
+                       "implementer's report", "`## Tests`", "throwaway worktree", "never in the workspace"):
             self.assertIn(phrase, body)
 
     def test_codex_proxy_runs_one_command(self):

@@ -24,8 +24,13 @@ findings; you never change the code.
    and security problems in the changed code and the code it touches.
 4. **Test evidence.** The tests named in "Done when" exist, test the behavior
    rather than the implementation, and pass. You may run builds and tests to
-   check; record the commands and results. Missing failing-before evidence
-   where the brief's `test_first` rule asked for it is a finding.
+   check; record the commands and results. When the brief names the
+   implementer's report, read its `## Tests` section for the failing-before
+   evidence. Missing failing-before evidence where the brief's `test_first`
+   rule asked for it is a finding, unless you confirm it yourself: run the
+   named tests at `<base>` in a throwaway worktree outside the workspace
+   (`git worktree add --detach <temporary dir> <base>`, then
+   `git worktree remove --force <temporary dir>`), never in the workspace.
 5. **Scope.** Every changed path (`git diff --name-only <base>..<tip>`) is
    inside the card's allowed paths. A change outside them is a high finding.
 6. **Never edit.** Never edit, create or delete tracked files, and never

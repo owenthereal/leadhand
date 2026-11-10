@@ -5,6 +5,7 @@ saying for each whether it is fixed, then review the whole diff again.
 
 - Diff range: $diff_range
 - Findings to recheck: $findings
+- Implementer's report: $implementer_report_line
 
 Never edit. Write your report (`Verdict:` first line) to the report file.
 

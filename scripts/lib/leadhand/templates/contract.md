@@ -20,7 +20,10 @@ says.
    development skill is installed, use it.
 5. **Never** push, merge, rebase a shared branch (the run branch or the base
    branch), use `git stash`, rewrite history that existed before you started,
-   or start subagents or other agent processes. Do the work yourself.
+   or start subagents or other agent processes. Do the work yourself. The one
+   exception: when your brief explicitly tells you to rebase the card branch
+   onto a named commit, do exactly that rebase of the card branch, and nothing
+   else that rewrites history.
 6. **Stay in scope.** Do what the card asks and nothing it lists as out of
    scope. If its "Stop if" condition happens, stop and report SPENT. If a
    decision is needed that the brief does not settle, do not guess: report

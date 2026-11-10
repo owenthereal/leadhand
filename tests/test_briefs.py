@@ -2,11 +2,12 @@ import shlex
 import shutil
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from gitfixture import hermetic, make_repo, run_git
 from leadhand.briefs import (
-    BRIEF_KINDS, ROLE_AGENT, TEMPLATES, agent_for, dispatch_message, parse_report_head,
+    BRIEF_KINDS, CONTRACT_POINTER, ROLE_AGENT, TEMPLATES, agent_for, dispatch_message, parse_report_head,
     scratch_dir, worker_prompt, write_brief,
 )
 from leadhand.config import Route
@@ -44,12 +45,13 @@ def make_deck(path, cards):
 EXTRA = {
     "fix": {"findings": "/x/findings.md", "round": "2"},
     "answer": {"ruling": "Use option B: keep the old byte order."},
-    "integrate": {"conflicts": "src/widget/header.py", "card_intent": "add a field",
+    "integrate": {"run_tip": "c" * 40, "conflicts": "src/widget/header.py", "card_intent": "add a field",
                   "run_intent": "rename the struct"},
-    "review": {"diff_range": "abc123..def456"},
-    "rereview": {"diff_range": "abc123..def456", "findings": "/x/findings.md"},
+    "review": {"diff_range": "abc123..def456", "implementer_report": "/x/impl report.md"},
+    "rereview": {"diff_range": "abc123..def456", "findings": "/x/findings.md",
+                 "implementer_report": "/x/impl report.md"},
     "final_review": {"diff_range": "base0..tip9", "cards": "3"},
-    "final_fix": {"gate": "security", "findings": "/x/security.md"},
+    "final_fix": {"gate": "security", "findings": "/x/security.md", "branch": "leadhand/widget"},
     "security": {"diff_range": "base0..tip9"},
     "evidence": {"base_worktree": "/x/base tree", "cards": "3"},
 }
@@ -95,7 +97,8 @@ class BriefTests(unittest.TestCase):
             card = None if kind in ("final_review", "final_fix", "security", "evidence", "verify") else self.card
             brief, _ = self.brief(kind, card=card)
             text = brief.read_text(encoding="utf-8")
-            self.assertNotIn("$", text.replace("$$", ""), kind)
+            self.assertNotIn("$", text, kind)
+            self.assertIn(CONTRACT_POINTER, text, kind)
             for value in EXTRA.get(kind, {}).values():
                 if kind in ("final_review", "evidence") and value == "3":
                     continue
@@ -110,6 +113,65 @@ class BriefTests(unittest.TestCase):
         verify = text("verify", card=None)
         self.assertIn("make build", verify)
         self.assertIn("make test", verify)
+
+    def test_card_briefs_require_card_base_and_branch(self):
+        for kind in ("implement", "fix", "review", "integrate"):
+            for key in ("base", "branch"):
+                extra = {"base": "b" * 40, "branch": "x--card-3", **EXTRA.get(kind, {})}
+                del extra[key]
+                with self.assertRaisesRegex(ValueError, key):
+                    write_brief(kind, ws=self.ws, deck=self.deck, card=self.card, attempt=1,
+                                dispatch_id=f"{kind}-1", extra=extra)
+        text = self.brief("implement")[0].read_text(encoding="utf-8")
+        self.assertIn("- Card branch: leadhand/widget--card-3", text)
+
+    def test_review_needs_implementer_report_unless_test_first_off(self):
+        for kind in ("review", "rereview"):
+            extra = {k: v for k, v in EXTRA[kind].items() if k != "implementer_report"}
+            with self.assertRaisesRegex(ValueError, "implementer_report"):
+                self.brief(kind, **{**extra, "implementer_report": ""})
+            brief, _ = self.brief(kind, implementer_report="", test_first="off")
+            self.assertIn("(none; test_first is off)", brief.read_text(encoding="utf-8"))
+        text = self.brief("review")[0].read_text(encoding="utf-8")
+        self.assertIn("/x/impl report.md", text)
+        self.assertIn("## Tests", text)
+
+    def test_integrate_permits_rebase_onto_run_tip(self):
+        text = self.brief("integrate")[0].read_text(encoding="utf-8")
+        self.assertIn("c" * 40, text)
+        self.assertIn("rebase the card branch", text)
+        self.assertIn("rebase the card branch onto a named commit", " ".join(CONTRACT.split()))
+
+    def test_final_briefs_list_scope(self):
+        other = make_card(number=5, title="Second", allowed_paths=("lib/b.py", "src/widget/**"),
+                          out_of_scope="Docs.", depends_on=(), route_pin=None)
+        self.deck = make_deck(self.deck.path, [self.card, other])
+        review = self.brief("final_review", card=None, cards="3, 5")[0].read_text(encoding="utf-8")
+        for value in ("Second", "lib/b.py", "Docs.", self.card.out_of_scope):
+            self.assertIn(value, review)
+        fix = self.brief("final_fix", card=None)[0].read_text(encoding="utf-8")
+        self.assertIn("- Commit on: leadhand/widget", fix)
+        self.assertIn("- Allowed paths: src/widget/**, tests/test_widget.py, lib/b.py", fix)
+        only = self.brief("final_fix", card=None, cards="5")[0].read_text(encoding="utf-8")
+        self.assertIn("- Allowed paths: lib/b.py, src/widget/**\n", only)
+        with self.assertRaisesRegex(ValueError, "branch"):
+            write_brief("final_fix", ws=self.ws, deck=self.deck, card=None, attempt=1,
+                        dispatch_id="ff", extra=EXTRA["final_fix"] | {"branch": ""})
+
+    def test_evidence_requires_cards(self):
+        with self.assertRaisesRegex(ValueError, "cards"):
+            write_brief("evidence", ws=self.ws, deck=self.deck, card=None, attempt=1,
+                        dispatch_id="ev", extra={"base_worktree": "/x"})
+
+    def test_answer_quotes_every_ruling_line(self):
+        text = self.brief("answer", ruling="Use B.\nKeep the old order.")[0].read_text(encoding="utf-8")
+        self.assertIn("> Use B.\n> Keep the old order.\n", text)
+
+    def test_verify_says_skip_for_empty_commands(self):
+        self.deck = replace(self.deck, build="")
+        text = self.brief("verify", card=None)[0].read_text(encoding="utf-8")
+        self.assertIn("- Build: (none given; skip it)", text)
+        self.assertIn("- Test: make test", text)
 
     def test_missing_extra_and_unknown_kind_raise(self):
         with self.assertRaises(ValueError):
@@ -166,6 +228,8 @@ class BriefTests(unittest.TestCase):
         self.assertIn(" ", str(brief))
         with self.assertRaises(ValueError):
             dispatch_message("leadhand:codex", brief, report)
+        with self.assertRaises(ValueError):
+            dispatch_message("leadhand:codex", brief, report, codex_command=["run", "a\nb"])
 
     def test_worker_prompt_for_codex_workers(self):
         brief, report = self.brief("implement")
@@ -185,6 +249,9 @@ class BriefTests(unittest.TestCase):
             "Status: BLOCKED\nBlocked by: usage limit\n": ("Status", "BLOCKED", "usage limit"),
             "**Status: BLOCKED**\n**Blocked by:** environment\n": ("Status", "BLOCKED", "environment"),
             "Status: spent\n": ("Status", "SPENT", ""),
+            "Status: BLOCKED\nBlocked by: Environment — no network\n": ("Status", "BLOCKED", "environment"),
+            "Status: BLOCKED\nBlocked by: usage limits hit\n": ("Status", "BLOCKED", "usage limit"),
+            "Status: BLOCKED\nBlocked by: a hard bug\n": ("Status", "BLOCKED", ""),
             "Verdict: defects\n## Findings\n1. [high] a.py:3 — x — y\n": ("Verdict", "defects", ""),
             "Verdict: Clean\n": ("Verdict", "clean", ""),
             "Result: pass\n## Checks\n": ("Result", "pass", ""),
