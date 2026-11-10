@@ -60,7 +60,55 @@ Not yet checked.
 
 ## Limits
 
-Not yet checked.
+Tested with Claude Code 2.1.322 and codex-cli 0.167.0 on macOS.
+
+Claude workers:
+
+- `maxTurns` in a subagent's frontmatter is a hard cap: with `maxTurns: 2` the worker made
+  exactly two assistant turns. The stop is not an error (notification `status` is
+  `completed`); it is marked only in text — the result begins "NOTE: this agent stopped at
+  its 2-turn limit before finishing" and the notification summary says "stopped at its
+  2-turn limit (partial result; ...)". The agent can be continued with SendMessage.
+  Decision: such a reply has no status line, so it is handled by the no-status-line rule
+  (BLOCKED, raw reply kept); the dispatcher also recognises the
+  `stopped at its <N>-turn limit` text and records the worker status as `SPENT`.
+- Per-dispatch Agent `model` and `effort` override the subagent's frontmatter (a haiku/low
+  worker dispatched with `model: "sonnet"`, `effort: "medium"` ran as sonnet at medium).
+  Decision: the dispatcher sets model and effort on every Agent call.
+- `autoCompactWindow`: unverified. The check did not reach the window (the Read tool refuses
+  reads over 25,000 tokens, so context stayed under 8K). Leadhand does not rely on it.
+
+Codex workers (`codex exec --json`):
+
+- Event types: `thread.started`, `turn.started`, `item.started`, `item.completed`,
+  `turn.completed`. Shell commands complete as `command_execution` items (`command`,
+  `aggregated_output`, `exit_code`, `status`); edits as `file_change` items (`changes` with
+  `path` and `kind`, `status`). Decision:
+  `STEP_ITEM_TYPES = ("command_execution", "file_change")`, counted on `item.completed`.
+  A sanitized recorded stream is in `tests/fixtures/codex-exec-stream.jsonl`.
+- `turn.completed.usage` fields: `input_tokens`, `cached_input_tokens`,
+  `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`.
+- Step stop: SIGINT to Codex's process group (Codex started in its own group) ends it in
+  well under a second with exit code 1 and no `turn.completed`, so the interrupted turn has
+  no usage record in the stream. SIGTERM after 5 s remains the fallback.
+  `codex exec [options] resume <thread id> -` continues the same thread afterwards.
+- `--strict-config` rejects unknown `-c` keys and accepts
+  `model_auto_compact_token_limit`. No compaction was observed (the check never exceeded the
+  limit), so Codex context control is unverified; leadhand may set the key but does not rely
+  on it.
+- `-c sandbox_workspace_write.network_access=false` overrides a user config that enables
+  network access (the worker's `curl` failed to resolve the host). Decision: the dispatcher
+  always passes it.
+- Worker environment: with Codex's default `shell_environment_policy`, process-environment
+  variables reached the shell, including names containing `KEY` and `TOKEN`; with
+  `inherit = "core"` (a setting users do use) none of them did. Values given with
+  `-c shell_environment_policy.set.<NAME>=<value>` reached the shell under both policies and
+  override a same-named process variable. Decision: the dispatcher delivers worker
+  variables through `shell_environment_policy.set`. Under the default policy, other
+  variables from the launching environment (for example `SSH_AUTH_SOCK`) also reach the
+  worker shell.
+- `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=credential.helper`, `GIT_CONFIG_VALUE_0=` adds an
+  empty `credential.helper` entry after the user's helpers, which resets Git's helper list.
 
 ## Interrupted usage
 
