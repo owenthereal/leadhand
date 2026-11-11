@@ -371,6 +371,12 @@ def _start(deck_path: Path, repo: Path, config: Config | None, new: bool) -> tup
         raise EngineError("the deck has errors: " + "; ".join(errors))
     for msg in unsupported_warnings(config):
         print(f"warning: {msg}", file=sys.stderr)
+    if not config.run.worktree:
+        # An in-place run's workspace is the repository itself (L6); `run` checks every launch.
+        from leadhand.launch import tools_inside
+        problem = tools_inside(repo)
+        if problem:
+            raise EngineError(problem)
     docs = docs_dir_for(config, repo)
     if not new:
         existing = _find_unfinished(docs, str(deck_path), deck.digest)
@@ -824,11 +830,26 @@ def _reply_file(ctx: _Run, card: int | None, dispatch_id: str) -> Path:
     return scratch_dir(ctx.ws, card, dispatch_id) / REPLY_FILE
 
 
+def _check_reply_file(ctx: _Run, d: _Dispatch, path: str) -> None:
+    """Only the dispatch's own reply file is read (security review L1): the CLI runs outside the
+    sandbox, so any other path would copy a file the worker cannot read into the run."""
+    expected = _reply_file(ctx, d.req["card"], d.id)
+    if os.path.abspath(path) != os.path.abspath(expected):
+        raise EngineError(f"refused: --reply-file must be dispatch {d.id}'s reply file {expected}")
+    if os.path.islink(expected) or not resolves_in_place(ctx.ws, expected):
+        raise EngineError(f"refused: the reply file {expected} is a symlink or lies behind one")
+
+
 def _read_reply_file(path: str) -> str:
     """The reply file's text. A missing or unreadable file gives a note instead; the status then
-    comes from the report head, as for any reply without a status line."""
+    comes from the report head, as for any reply without a status line. Never follows a symlink
+    and reads only a regular file."""
     try:
-        return Path(path).read_text(encoding="utf-8", errors="replace")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                raise OSError(0, "not a regular file")
+            return f.read().decode("utf-8", errors="replace")
     except OSError as e:
         return (f"(leadhand: the reply file {path} could not be read: {e.strerror or e}; "
                 "the status comes from the report)\n")
@@ -2860,6 +2881,8 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str = "",
         raise EngineError("record result takes a reply or a reply file, not both")
     events = read_events(ctx.paths)
     d = _known_dispatch(events, dispatch_id)
+    if reply_file is not None:
+        _check_reply_file(ctx, d, reply_file)
     if d.result is not None:
         return d.result
     if d.started is None:

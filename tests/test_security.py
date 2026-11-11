@@ -14,8 +14,9 @@ from unittest import mock
 from fakeworld import FakeWorld, card
 from gitfixture import make_repo, run_git, write
 from leadhand import dispatch as dsp
-from leadhand import engine, gitops, procs
+from leadhand import engine, gitops, launch, procs
 from test_dispatch import CARD_BRANCH, CLI, FAKES, Base, alive
+from test_launch import LaunchTestCase
 
 
 def marker_script(path: Path, marker: Path) -> Path:
@@ -374,6 +375,86 @@ class M3SymlinkedBaseWorktree(unittest.TestCase):
         with self.assertRaises(gitops.GitError):
             gitops.prepare_workspace(repo, run_branch="leadhand/sym", base_sha=base, slug="slug", use_worktree=True)
         self.assert_other_untouched()
+
+
+class L1ReplyFile(unittest.TestCase):
+    """L1: `record result --reply-file` reads only the dispatch's own reply file."""
+
+    def setUp(self):
+        self.w = FakeWorld(self, [card(1)])
+        self.w.start()
+        self.a = self.w.next()
+        self.worker = self.w.launch(self.a)
+        self.w.perform(self.a, self.worker)
+        self.secret = self.w.tmp / "id_secret"
+        self.secret.write_text("SECRET-KEY-MATERIAL\n")
+
+    def record(self, path):
+        return self.w.cli("record", self.w.run_dir, "result", "--dispatch", self.a["dispatch_id"],
+                          "--worker", self.worker, "--reply-file", path)
+
+    def assert_nothing_copied(self, r):
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("refused", r.stderr)
+        self.assertEqual(self.w.events("result_recorded"), [])
+        for f in self.w.run_dir.rglob("*"):
+            if f.is_file():
+                self.assertNotIn("SECRET-KEY-MATERIAL", f.read_text(errors="replace"), f)
+
+    def test_another_path_is_refused(self):
+        self.assert_nothing_copied(self.record(self.secret))
+
+    def test_the_reply_file_as_a_symlink_is_refused(self):
+        link = Path(self.a["reply_file"])
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.unlink(missing_ok=True)
+        link.symlink_to(self.secret)
+        self.assert_nothing_copied(self.record(link))
+
+    def test_a_symlinked_scratch_folder_is_refused(self):
+        reply = Path(self.a["reply_file"])
+        folder = reply.parent
+        elsewhere = self.w.tmp / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / reply.name).write_text("Status: READY\nSECRET-KEY-MATERIAL\n")
+        for f in folder.iterdir():
+            os.replace(f, elsewhere / f.name) if not (elsewhere / f.name).exists() else f.unlink()
+        folder.rmdir()
+        folder.symlink_to(elsewhere)
+        self.assert_nothing_copied(self.record(reply))
+
+
+class L6ToolsInsideTheWorkspace(LaunchTestCase):
+    """L6: workers can edit their workspace, so neither the CLI (which runs outside the sandbox)
+    nor the plugin the supervisor loads may live in it."""
+
+    def test_run_refuses_a_cli_inside_the_workspace(self):
+        with mock.patch.object(launch, "CLI_PATH", self.workspace / "scripts" / "leadhand"):
+            code, _, err = self.run_inprocess()
+        self.assertEqual(code, 1)
+        self.assertIn("inside the run's workspace", err)
+        self.assertEqual(self.starts(), [])
+
+    def test_run_refuses_a_plugin_dir_inside_the_workspace(self):
+        code, _, err = self.run_inprocess(plugin_dir=self.workspace / "plugin")
+        self.assertEqual(code, 1)
+        self.assertIn("inside the run's workspace", err)
+        self.assertEqual(self.starts(), [])
+
+    def test_run_accepts_a_plugin_dir_outside_the_workspace(self):
+        code, _, err = self.run_inprocess(plugin_dir=self.elsewhere)
+        self.assertEqual(code, 0, err)
+
+
+class L6StartInPlace(unittest.TestCase):
+    def test_start_refuses_an_in_place_run_of_the_repository_holding_the_cli(self):
+        w = FakeWorld(self, [card(1)], config="[run]\nworktree = false\n")
+        with mock.patch.object(launch, "CLI_PATH", w.repo / "scripts" / "leadhand"):
+            with self.assertRaises(engine.EngineError) as cm:
+                w.start()
+        self.assertIn("inside the run's workspace", str(cm.exception))
+        self.assertFalse((w.docs / "runs").exists() and any((w.docs / "runs").iterdir()))
+        self.assertEqual(run_git(w.repo, "branch", "--list", "leadhand/*"), "")
 
 
 if __name__ == "__main__":

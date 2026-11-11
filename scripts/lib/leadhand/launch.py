@@ -288,6 +288,21 @@ def _workspace(meta: dict) -> Path:
     return Path(ws)
 
 
+def tools_inside(workspace: Path, plugin_dir: Path | None = None) -> str | None:
+    """Why a run in `workspace` must not launch, or None: the leadhand CLI (which runs outside
+    the sandbox) or the plugin directory the supervisor loads lies inside the workspace, where
+    workers can edit it (security review L6)."""
+    ws = os.path.realpath(workspace)
+    for what, path in (("the leadhand CLI", CLI_PATH), ("--plugin-dir", plugin_dir)):
+        if path is None:
+            continue
+        real = os.path.realpath(path)
+        if real == ws or real.startswith(ws.rstrip(os.sep) + os.sep):
+            return (f"{what} ({path}) lies inside the run's workspace {workspace}, where workers can "
+                    "edit it; install leadhand outside that repository, or run in a worktree")
+    return None
+
+
 def _keep_awake_argv(platform: str, pid: int) -> list[str]:
     """What runs beside the supervisor `pid` and ends with it: `caffeinate -i -w` on
     macOS, `systemd-inhibit ... tail --pid=<pid> -f /dev/null` on Linux."""
@@ -357,6 +372,9 @@ def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "cla
             return 1
         try:
             workspace = _workspace(meta)
+            problem = tools_inside(workspace, plugin_dir)
+            if problem:
+                raise LaunchError(problem)
             model, effort = _supervisor_route(meta, root)
             if shutil.which(claude_bin) is None:
                 raise LaunchError(f"{claude_bin} not found on PATH")
