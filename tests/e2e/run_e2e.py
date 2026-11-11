@@ -2,7 +2,7 @@
 """Task 20: the first complete leadhand run, end to end, with the real `claude` and `codex`.
 
     python3 tests/e2e/run_e2e.py --out DIR [--mode headless|tmux] [--skip-push-probe]
-                                 [--budget-minutes 45] [--keep] [--dry-run]
+                                 [--budget-minutes 45] [--keep] [--dry-run] [--interrupt]
 
 Run it once, in an ordinary terminal outside Claude Code (it refuses when CLAUDECODE is
 set). One command runs everything unattended:
@@ -34,9 +34,14 @@ DIR/e2e-artifacts/. Exits 0 even when checks fail (failures are findings); 2 on 
 error or under CLAUDECODE. Cleans up every process it started (checked by pid and start
 time) and removes the temp folder unless --keep.
 
-Extension point (Task 22, `--interrupt`): `Driver.poll_hooks` are called on every poll
-with the driver and the current snapshot; a hook can signal the Codex process named in a
-runner record or the current session (`Session.signal`) and the relaunch loop takes over.
+--interrupt (Task 22): the fixture's card 2 gets more work (so its Codex worker runs long
+enough), and the `Interrupter` poll hook (polling every 0.5 s while a trigger is pending)
+SIGKILLs card 2's Codex process once it is running, then, when card 2's next attempt runs,
+tries the exact launch-line relaunch under the live supervisor (it must be refused, exit 3)
+and SIGKILLs the supervisor (holder.json's claude pid; every kill is pid + start-time
+checked). The relaunch loop then relaunches with launch-line, retrying refusals, and polls
+to the end; the Task 22 Step 2 checks are added to e2e-raw.md. It implies
+--skip-push-probe (Step 1 belongs to Task 20).
 """
 from __future__ import annotations
 
@@ -438,6 +443,197 @@ class Check:
     excerpt: list[str] = field(default_factory=list)
 
 
+# ---------------------------------------------------------------- Task 22: --interrupt
+
+INTERRUPT_POLL_S = 0.5           # trigger polling while an interrupt is pending
+KILL_AFTER_FIRST_STEP_S = 15.0   # kill card 2's Codex at its first completed item, or this long after it started
+PREKILL_RELAUNCH_WAIT_S = 20.0
+FAST_AFTER_KILL_S = 300.0   # how long the relaunch attempted under a live supervisor may take to be refused
+
+
+def rollout_total(path: Path) -> dict | None:
+    """A Codex rollout's usage, summed over distinct `token_usage_record` response IDs (P12),
+    in leadhand's charge fields (input excludes cached)."""
+    seen, tot = set(), {"input": 0, "cached": 0, "output": 0}
+    for rec in read_jsonl(path):
+        if rec.get("type") != "token_usage_record":
+            continue
+        pl = rec.get("payload") or {}
+        rid, u = pl.get("response_id"), pl.get("usage") or {}
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        cached = int(u.get("cached_input_tokens") or 0)
+        tot["input"] += max(0, int(u.get("input_tokens") or 0) - cached)
+        tot["cached"] += cached
+        tot["output"] += int(u.get("output_tokens") or 0)
+    return {**tot, "responses": len(seen)} if seen else None
+
+
+def lock_holders(lock: Path) -> list[str]:
+    """Processes holding the run lock open, from `lsof` (pid and command)."""
+    if not shutil.which("lsof") or not lock.exists():
+        return []
+    try:
+        r = subprocess.run(["lsof", "-Fpc", "--", str(lock)], capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        return ["lsof timed out"]
+    out, pid = [], None
+    for line in r.stdout.splitlines():
+        if line.startswith("p"):
+            pid = line[1:]
+        elif line.startswith("c") and pid:
+            out.append(f"{pid} {line[1:]}")
+    return out
+
+
+class Interrupter:
+    """The --interrupt poll hook. Phase 1: when card 2's Codex implementer is running (runner.json
+    names a live codex pid), SIGKILL that codex process at its first completed item (or after
+    KILL_AFTER_FIRST_STEP_S). Phase 2: when card 2's next attempt is running (its worker started;
+    for Codex, its runner's codex is live), try the exact relaunch while the old supervisor lives
+    (it must be refused), then SIGKILL the supervisor (holder.json's claude pid). The driver's
+    relaunch loop then relaunches with launch-line until the lock is free."""
+
+    def __init__(self, driver: "Driver"):
+        self.d = driver
+        self.phase = "wait card 2 codex"
+        self.facts: dict = {}
+        self.killed_dispatch: str | None = None
+        self.next_dispatch: str | None = None
+        self.codex_live_since: float | None = None
+
+    @property
+    def pending(self) -> bool:
+        return self.phase.startswith("wait")
+
+    @property
+    def fast(self) -> bool:
+        """Poll fast while a trigger is pending and for a while after the supervisor kill
+        (so a short-lived reconciliation headline is sampled)."""
+        t = (self.facts.get("supervisor killed") or {}).get("t")
+        return self.pending or (isinstance(t, (int, float)) and time.time() - t < FAST_AFTER_KILL_S)
+
+    def note(self, key: str, value) -> None:
+        self.facts[key] = value
+        self.d.log(f"interrupt: {key}: {value if isinstance(value, str) else json.dumps(value, default=str)}")
+
+    def _card2_dispatches(self, events: list[dict]) -> list[dict]:
+        return [e for e in events if e.get("kind") == "dispatch_requested" and e.get("card") == 2]
+
+    def _state(self, events: list[dict], did: str) -> tuple[bool, bool]:
+        started = any(e.get("kind") == "worker_started" and e.get("dispatch_id") == did for e in events)
+        result = any(e.get("kind") == "result_recorded" and e.get("dispatch_id") == did for e in events)
+        return started, result
+
+    def __call__(self, d: "Driver", snap: dict) -> None:
+        events = snap["events"]
+        if self.phase == "wait card 2 codex":
+            self._phase1(events)
+        elif self.phase == "wait card 2 next attempt":
+            self._phase2(events)
+
+    def _phase1(self, events: list[dict]) -> None:
+        reqs = [e for e in self._card2_dispatches(events)
+                if e.get("vendor") == "codex" and e.get("dispatch_kind") == "implement"]
+        if not reqs:
+            return
+        did = reqs[0]["dispatch_id"]
+        wd = self.d.run_dir / "workers" / did
+        if (wd / "result.json").exists() or self._state(events, did)[1]:
+            self.note("too fast to interrupt", f"{did} finished before its codex process could be killed")
+            self.phase = "skipped: too fast to interrupt"
+            return
+        codex = runner_processes(wd / "runner.json").get("codex")
+        if not codex or not isinstance(codex.get("start"), str) or not lh_procs.same_process(codex["pid"], codex["start"]):
+            return
+        now = time.time()
+        if self.codex_live_since is None:
+            self.codex_live_since = now
+            self.note("card 2 codex seen", {"dispatch": did, "pid": codex["pid"], "utc": utc_now()})
+        steps = sum(1 for e in read_jsonl(wd / "stream.jsonl") if e.get("type") == "item.completed")
+        if steps == 0 and now - self.codex_live_since < KILL_AFTER_FIRST_STEP_S:
+            return
+        killed = kill_runner_processes(wd / "runner.json", signal.SIGKILL, roles=("codex",))
+        self.killed_dispatch = did
+        self.note("codex killed", {"dispatch": did, "pid": codex["pid"], "signalled": killed, "utc": utc_now(),
+                                   "t": round(now, 3), "completed items before the kill": steps,
+                                   "runner": runner_processes(wd / "runner.json").get("runner")})
+        self.phase = "wait card 2 next attempt"
+
+    def _phase2(self, events: list[dict]) -> None:
+        killed_seq = next((e["seq"] for e in events if e.get("kind") == "dispatch_requested"
+                           and e.get("dispatch_id") == self.killed_dispatch), 0)
+        nxt = [e for e in self._card2_dispatches(events)
+               if e["seq"] > killed_seq and e.get("dispatch_id") != self.killed_dispatch]
+        if not nxt:
+            return
+        req = nxt[0]
+        did = req["dispatch_id"]
+        started, result = self._state(events, did)
+        if result:
+            self.note("next attempt finished before the supervisor kill", did)
+            self.phase = "skipped: next attempt too fast"
+            return
+        if not started:
+            return
+        runner = None
+        if req.get("vendor") == "codex":
+            procs_ = runner_processes(self.d.run_dir / "workers" / did / "runner.json")
+            codex = procs_.get("codex")
+            if not codex or not isinstance(codex.get("start"), str) or not lh_procs.same_process(codex["pid"], codex["start"]):
+                return
+            runner = procs_.get("runner")
+        self.next_dispatch = did
+        self.note("card 2 next attempt running", {"dispatch": did, "vendor": req.get("vendor"),
+                                                 "kind": req.get("dispatch_kind"), "attempt": req.get("attempt"),
+                                                 "runner at kill": runner, "utc": utc_now()})
+        self._prekill_relaunch()
+        holder = read_json(self.d.run_dir / "holder.json")
+        pid, start = holder.get("supervisor_pid"), holder.get("supervisor_start")
+        alive = isinstance(pid, int) and isinstance(start, str) and lh_procs.same_process(pid, start)
+        done = False
+        if alive:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                done = True
+            except ProcessLookupError:
+                pass
+        self.note("supervisor killed", {"pid": pid, "was alive (pid + start match)": alive, "signalled": done,
+                                       "utc": utc_now(), "t": round(time.time(), 3),
+                                       "events before the kill": len(events)})
+        self.phase = "done" if done else "failed: supervisor not found"
+
+    def _prekill_relaunch(self) -> None:
+        argv = self.d.relaunch_argv()
+        if argv is None:
+            self.note("relaunch under a live supervisor", "launch-line failed")
+            return
+        before = len(self.d.events())
+        holders = lock_holders(self.d.run_dir / "run.lock")
+        out_dir = self.d.art / "interrupt"
+        out_dir.mkdir(exist_ok=True)
+        with open(out_dir / "prekill-relaunch.stdout", "wb") as o, open(out_dir / "prekill-relaunch.stderr", "wb") as e:
+            p = subprocess.Popen(argv, cwd=self.d.fx["elsewhere"], env=self.d.env, stdin=subprocess.DEVNULL,
+                                 stdout=o, stderr=e, start_new_session=True)
+            self.d.commands.append((shlex.join(argv), "(pre-kill relaunch)", self.d.fx["elsewhere"]))
+            try:
+                code = p.wait(timeout=PREKILL_RELAUNCH_WAIT_S)
+            except subprocess.TimeoutExpired:
+                code = "still running: NOT refused"
+                p.send_signal(signal.SIGTERM)      # forwarded to its claude
+                try:
+                    p.wait(timeout=STOP_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    os.killpg(p.pid, signal.SIGKILL)
+                    p.wait(timeout=10)
+        err = (out_dir / "prekill-relaunch.stderr").read_text(encoding="utf-8", errors="replace").strip()
+        self.note("relaunch under a live supervisor", {
+            "argv": shlex.join(argv), "exit": code, "stderr": short(err, 300),
+            "events added by the attempt": len(self.d.events()) - before, "lock holders": holders})
+
+
+
 class Driver:
     def __init__(self, args):
         self.out = Path(args.out).expanduser().absolute()
@@ -446,7 +642,8 @@ class Driver:
         self.mode = args.mode
         self.budget_s = args.budget_minutes * 60
         self.keep = args.keep
-        self.skip_push_probe = args.skip_push_probe
+        self.interrupt = getattr(args, "interrupt", False)
+        self.skip_push_probe = args.skip_push_probe or self.interrupt
         self.tmp: Path | None = None
         self.fx: dict = {}
         self.run_dir: Path | None = None
@@ -458,6 +655,10 @@ class Driver:
         self.facts: dict = {}
         self.errors: list[str] = []
         self.poll_hooks: list[Callable[["Driver", dict], None]] = []
+        self.interrupter: Interrupter | None = None
+        if self.interrupt:
+            self.interrupter = Interrupter(self)
+            self.poll_hooks.append(self.interrupter)
         self.tmux_sock = f"lhe2e-{os.getpid()}"
         self.t0 = time.time()
         self.outcome_seen_at: float | None = None
@@ -530,8 +731,19 @@ class Driver:
         print(f"   session exits without an outcome -> record open dispatches, relaunch with "
               f"`{CLI} launch-line <run dir>`" + (" + --print" if self.mode == "headless" else ""))
         print(f"5. after: {CLI} status <run dir>; {CLI} report <run dir> (only if report.md is missing)")
+        if self.interrupt:
+            print("   --interrupt (Task 22): fixture card 2 gets more work (make_fixture --slow-card2); "
+                  f"triggers poll every {INTERRUPT_POLL_S}s")
+            print("   a. card 2's Codex implementer live (workers/<id>/runner.json codex pid + start match):")
+            print(f"      SIGKILL that codex pid at its first item.completed or {KILL_AFTER_FIRST_STEP_S:.0f}s after; "
+                  "if it already finished: record 'too fast to interrupt'")
+            print("   b. card 2's next attempt running (worker_started; Codex: its runner's codex live):")
+            print(f"      run `{CLI} launch-line <run dir>` (+ --print) while the supervisor lives -> must exit 3;")
+            print("      lsof the run lock; SIGKILL holder.json's supervisor pid (start-time checked)")
+            print("   c. the relaunch loop relaunches via launch-line, retrying refusals (exit 3) every "
+                  f"{REFUSED_RETRY_S:.0f}s; fast polling continues {FAST_AFTER_KILL_S:.0f}s after the kill")
         print("6. checks:")
-        for name, how in CHECK_DOCS:
+        for name, how in CHECK_DOCS + (INTERRUPT_CHECK_DOCS if self.interrupt else []):
             print(f"   - {name}: {how}")
         print(f"7. write {self.raw} and {self.art}/; stop sessions, runners and tmux; remove the temp dir")
 
@@ -564,7 +776,7 @@ class Driver:
 
     def setup(self) -> bool:
         self.tmp = Path(tempfile.mkdtemp(prefix="lh e2e "))
-        self.fx = make_fixture.make_fixture(self.tmp)
+        self.fx = make_fixture.make_fixture(self.tmp, slow_card2=self.interrupt)
         self.env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
         self.env["LEADHAND_CONFIG"] = self.fx["user_config"]
         (self.art / "fixture.json").write_text(json.dumps(self.fx, indent=2), encoding="utf-8")
@@ -731,7 +943,8 @@ class Driver:
                     # The run lock is still held (an earlier supervisor lives): not a lack of progress.
                     session.notes["refused"] = True
                     self.facts.setdefault("refused launches (exit 3, lock held)", []).append(
-                        f"session {session.n} at {session.exited_utc}")
+                        {"session": session.n, "utc": session.exited_utc,
+                         "lock holders": lock_holders(self.run_dir / "run.lock")})
                     time.sleep(REFUSED_RETRY_S)
                     argv = self.relaunch_argv()
                     if argv is None:
@@ -761,7 +974,7 @@ class Driver:
             if now >= deadline:
                 self.stop_reason = "budget ended"
                 break
-            time.sleep(POLL_S)
+            time.sleep(INTERRUPT_POLL_S if self.interrupter and self.interrupter.fast else POLL_S)
         self.log(f"stopping: {self.stop_reason}")
         self.sample_status(force=True)
 
@@ -853,7 +1066,7 @@ class Driver:
     # -------------------------------------------------------------- checks
 
     def add(self, name: str, verdict: str, facts: dict, excerpt: list[str] | None = None) -> None:
-        how = dict(CHECK_DOCS).get(name, "")
+        how = dict(CHECK_DOCS + INTERRUPT_CHECK_DOCS).get(name, "")
         self.checks.append(Check(name, verdict, how, facts, excerpt or []))
 
     def run_checks(self) -> None:
@@ -871,6 +1084,10 @@ class Driver:
                  self.c_elapsed, self.c_print_wait, self.c_sandbox, self.c_agent_models, self.c_skill]
         ctx = dict(events=events, meta=meta, attempts=attempts, charges=charges, branch=branch, head=head,
                    main_recs=main_recs, sub_recs=sub_recs)
+        if self.interrupter is not None:
+            steps += [self.i_accepted_once, self.i_no_duplicates, self.i_relaunch, self.i_runner,
+                      self.i_killed_attempt, self.i_thread_usage, self.i_report_unknown, self.i_headline,
+                      self.i_timings]
         for fn in steps:
             try:
                 fn(**ctx)
@@ -1153,6 +1370,136 @@ class Driver:
         self.add("open check: leadhand:run loaded through the Skill tool", "PASS" if ok else "FAIL",
                  {"skill calls": calls or "none", "body marker": marker, "body marker found in transcript": bool(loaded)})
 
+    # -------------------------------------------------------------- Task 22 checks
+
+    def i_accepted_once(self, events, **_):
+        counts = {c: sum(1 for e in events if e.get("kind") == "accepted" and e.get("card") == c) for c in (1, 2)}
+        self.add("interrupt: each card accepted exactly once", "PASS" if all(v == 1 for v in counts.values()) else "FAIL",
+                 {"accepted events per card": counts})
+
+    def i_no_duplicates(self, branch, **_):
+        shas = self.git("rev-list", "--no-merges", f"{self.fx['base_sha']}..refs/heads/{branch}").split()
+        pids, keys, rows = {}, {}, []
+        for sha in shas:
+            show = self.cmd(["git", "-C", self.fx["repo"], "show", sha], record=False).stdout
+            r = subprocess.run(["git", "patch-id", "--stable"], input=show, capture_output=True, text=True,
+                               cwd=self.fx["repo"], timeout=60)
+            pid = (r.stdout.split() or [""])[0]
+            subj_tree = self.git("show", "-s", "--format=%s%x00%T", sha)
+            rows.append((sha[:12], pid[:12], subj_tree.split("\x00")[0]))
+            if pid:
+                pids.setdefault(pid, []).append(sha[:12])
+            keys.setdefault(subj_tree, []).append(sha[:12])
+        dup_p = [v for v in pids.values() if len(v) > 1]
+        dup_k = [v for v in keys.values() if len(v) > 1]
+        self.add("interrupt: no duplicate commits on the run branch", "PASS" if shas and not dup_p and not dup_k else "FAIL",
+                 {"commits (sha, patch-id, subject)": rows or "none", "same patch-id": dup_p or "none",
+                  "same subject and tree": dup_k or "none"})
+
+    def i_relaunch(self, **_):
+        f = self.interrupter.facts
+        pre = f.get("relaunch under a live supervisor") or {}
+        kill_t = (f.get("supervisor killed") or {}).get("t")
+        after = [s for s in self.sessions if kill_t and s.started_at > kill_t]
+        refused_after = [s.n for s in after if s.exit_code == EXIT_REFUSED]
+        ok_after = [s for s in after if s.exit_code != EXIT_REFUSED and (
+            s.notes.get("events_added") or s.notes.get("run_had_outcome_at_exit") or s.exited_at is None)]
+        refused = isinstance(pre, dict) and pre.get("exit") == EXIT_REFUSED and pre.get("events added by the attempt") == 0
+        self.add("interrupt: relaunch refused while the old supervisor lived, succeeded after",
+                 "PASS" if refused and ok_after else "FAIL",
+                 {"relaunch under the live supervisor": pre or "not attempted",
+                  "sessions after the kill": [(s.n, s.how, s.exit_code, s.started_utc) for s in after] or "none",
+                  "refused after the kill (lock still held)": refused_after or "none",
+                  "first successful session after the kill": ok_after[0].n if ok_after else "none",
+                  "refusals recorded": self.facts.get("refused launches (exit 3, lock held)", "none")})
+
+    def i_runner(self, events, **_):
+        f = self.interrupter.facts
+        did = self.interrupter.next_dispatch
+        nxt = f.get("card 2 next attempt running") or {}
+        facts = {"dispatch": did or "none", "vendor": nxt.get("vendor")}
+        if not did or nxt.get("vendor") != "codex":
+            self.add("interrupt: the runner that outlived the supervisor recorded its result, not restarted",
+                     "INCONCLUSIVE", {**facts, "why": "no Codex next attempt was running at the supervisor kill"})
+            return
+        wd = self.run_dir / "workers" / did
+        res = wd / "result.json"
+        kill_t = (f.get("supervisor killed") or {}).get("t") or 0
+        runner_end = runner_processes(wd / "runner.json").get("runner")
+        rj = read_json(wd / "runner.json")
+        superseded = sorted(p.name for p in (wd / "superseded").iterdir()) if (wd / "superseded").is_dir() else []
+        recorded = any(e.get("kind") == "result_recorded" and e.get("dispatch_id") == did for e in events)
+        facts.update({"runner at the kill": nxt.get("runner at kill"), "runner at the end": runner_end,
+                      "generation": rj.get("generation"), "superseded": superseded or "none",
+                      "result.json present": res.exists(),
+                      "result.json written after the kill": res.exists() and res.stat().st_mtime > kill_t,
+                      "result_recorded event": recorded,
+                      "result exit_reason": read_json(res).get("exit_reason")})
+        same = (nxt.get("runner at kill") or {}).get("pid") == (runner_end or {}).get("pid")
+        ok = (res.exists() and rj.get("generation") == 1 and not superseded and same and recorded
+              and facts["result.json written after the kill"])
+        self.add("interrupt: the runner that outlived the supervisor recorded its result, not restarted",
+                 "PASS" if ok else "FAIL", facts)
+
+    def i_killed_attempt(self, attempts, charges, **_):
+        did = self.interrupter.killed_dispatch
+        mine = [a for a in attempts if a.get("dispatch") == did and a.get("vendor") == "codex"]
+        ch = [c for c in charges if c.get("dispatch_id") == did and c.get("source") == "codex"]
+        facts = {"dispatch": did or "none (no kill)",
+                 "attempts": [{k: a.get(k) for k in ("status", "exit_reason", "usage_known", "usage_source", "usage",
+                                                      "worker_id", "steps")} for a in mine] or "none",
+                 "codex charges": [{k: c.get(k) for k in ("charge_id", "possibly_incomplete", "usage")} for c in ch] or "none"}
+        known_ok = bool(mine) and all((a.get("usage_known") and a.get("usage_source")) or a.get("usage_known") is False
+                                      for a in mine)
+        flagged = bool(ch) and all(c.get("possibly_incomplete") for c in ch)
+        no_charge_unknown = not ch and mine and all(a.get("usage_known") is False for a in mine)
+        facts["charges marked possibly_incomplete"] = flagged
+        self.add("interrupt: the killed Codex attempt is recorded (usage recovered or unknown, possibly_incomplete)",
+                 "PASS" if known_ok and (flagged or no_charge_unknown) else "FAIL", facts)
+
+    def i_thread_usage(self, charges, **_):
+        threads: dict[str, list[dict]] = {}
+        for c in charges:
+            if c.get("source") == "codex" and c.get("key"):
+                threads.setdefault(c["key"], []).append(c)
+        facts, ok = {}, bool(threads)
+        for thread, cs in threads.items():
+            charged = {k: sum(int((c.get("usage") or {}).get(k) or 0) for c in cs) for k in ("input", "cached", "output")}
+            path = lh_usage.codex_session_file(thread)
+            rollout = rollout_total(path) if path else None
+            match = rollout is not None and all(charged[k] == rollout[k] for k in charged)
+            facts[thread] = {"charges": len(cs), "charged": charged, "rollout (distinct response_id)": rollout,
+                             "responses": rollout and rollout.get("responses"), "equal": match}
+            ok = ok and match
+        self.add("interrupt: charged Codex usage per thread equals the rollout total", "PASS" if ok else "FAIL",
+                 facts or {"codex threads": "none"})
+
+    def i_report_unknown(self, attempts, **_):
+        text = (self.run_dir / "report.md").read_text(encoding="utf-8") if (self.run_dir / "report.md").exists() else ""
+        m = re.search(r"Attempts with unknown usage:\s*(\d+)", text)
+        unknown = sum(1 for a in attempts if a.get("usage_known") is False)
+        self.add("interrupt: the report's Usage counts unknown attempts",
+                 "PASS" if m and int(m.group(1)) == unknown else "FAIL",
+                 {"report line": m.group(0) if m else "missing", "attempts with usage_known false": unknown})
+
+    def i_headline(self, **_):
+        heads = [s["headline"] for s in self.status_samples]
+        resumed = [h for h in heads if re.search(r"\bResumed at\b", h, re.I)]
+        self.add("interrupt: a reconciliation headline appeared", "PASS" if resumed else "FAIL",
+                 {"matching headlines": resumed or "none", "distinct headlines": list(dict.fromkeys(heads))[:30]})
+
+    def i_timings(self, events, **_):
+        f = self.interrupter.facts
+        kill_t = (f.get("supervisor killed") or {}).get("t")
+        after = [s for s in self.sessions if kill_t and s.started_at > kill_t and s.exit_code != EXIT_REFUSED]
+        text = (self.run_dir / "report.md").read_text(encoding="utf-8") if (self.run_dir / "report.md").exists() else ""
+        cost = re.search(r"Estimated API-equivalent cost[^\n]*", text)
+        self.add("interrupt: timings and estimated cost", "OBSERVED", {
+            "interrupter phase": self.interrupter.phase, "interrupter facts": f,
+            "supervisor kill -> successful relaunch (s)": round(after[0].started_at - kill_t, 1) if after else None,
+            "report cost line": cost.group(0) if cost else "missing",
+            "session costs from the stream (USD)": [s.notes.get("last_result_cost_usd") for s in self.sessions]})
+
     # -------------------------------------------------------------- output
 
     def write_raw(self, started: str, push_summary: list[str] | None) -> None:
@@ -1266,6 +1613,30 @@ CHECK_DOCS = [
 ]
 
 
+INTERRUPT_CHECK_DOCS = [
+    ("interrupt: each card accepted exactly once", "events.jsonl has exactly one `accepted` event for card 1 and card 2"),
+    ("interrupt: no duplicate commits on the run branch", "non-merge commits base..run branch: no two share a "
+     "`git patch-id --stable`, and no two share subject + tree"),
+    ("interrupt: relaunch refused while the old supervisor lived, succeeded after", "the launch-line relaunch tried "
+     "under the live supervisor exited 3 and added no event; a session started after the SIGKILL was not refused "
+     "and made progress (refusals after the kill, with lsof lock holders, are listed)"),
+    ("interrupt: the runner that outlived the supervisor recorded its result, not restarted", "card 2's next "
+     "(Codex) dispatch: result.json present and written after the kill, runner.json generation 1, no superseded/, "
+     "same runner pid as at the kill, a result_recorded event"),
+    ("interrupt: the killed Codex attempt is recorded (usage recovered or unknown, possibly_incomplete)",
+     "attempts.jsonl has the killed dispatch's Codex attempt with usage_known + usage_source, or usage_known "
+     "false; its Codex charges carry possibly_incomplete"),
+    ("interrupt: charged Codex usage per thread equals the rollout total", "per Codex thread: the sum of "
+     "charges.jsonl usage (input, cached, output) equals the rollout's token_usage_record sum over distinct "
+     "response_id (input excludes cached)"),
+    ("interrupt: the report's Usage counts unknown attempts", "report.md's `Attempts with unknown usage: N` equals "
+     "the attempts with usage_known false"),
+    ("interrupt: a reconciliation headline appeared", "a status sample headline contains `Resumed at`"),
+    ("interrupt: timings and estimated cost", "interrupter facts (kill times, pids, relaunch attempts), kill -> "
+     "successful relaunch, the report's cost line, per-session stream cost"),
+]
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -1275,6 +1646,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--skip-push-probe", action="store_true", help="do not run codex_push_probe.py first")
     ap.add_argument("--keep", action="store_true", help="keep the temp fixture folder")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and exit; runs nothing")
+    ap.add_argument("--interrupt", action="store_true",
+                    help="Task 22: kill card 2's Codex worker, then the supervisor during card 2's next attempt, "
+                         "relaunch, and check recovery (implies --skip-push-probe; card 2 gets more work)")
     args = ap.parse_args(argv)
     if args.budget_minutes < 1:
         ap.error("--budget-minutes must be at least 1")

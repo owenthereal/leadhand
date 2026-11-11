@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the end-to-end fixture: a small Git repo, its bare origin, a deck and the config.
 
-    python3 tests/e2e/make_fixture.py ROOT
+    python3 tests/e2e/make_fixture.py ROOT [--slow-card2]
 
 ROOT is created (it must not exist, or be empty). Everything the fixture needs lives
 under it, and several of its paths contain spaces on purpose (Review Focus 2):
@@ -19,6 +19,9 @@ Routes are the cheapest ones (Claude haiku/sonnet at low or medium, Codex gpt-6-
 only); the two cards pin their implementer routes in the deck. Fixture commits are made
 with commit signing off, and the repo's local config turns signing off for the run's
 commits too. Standard library only; the only binary used is `git`.
+
+--slow-card2 (used by run_e2e.py --interrupt) gives card 2 more work, so its Codex worker
+runs long enough to be interrupted.
 
 Prints a JSON object with the paths (also returned by `make_fixture`).
 """
@@ -67,6 +70,15 @@ A tiny calculator used as leadhand's end-to-end fixture.
 
 GITIGNORE = "__pycache__/\n*.pyc\n"
 
+# The interrupted run (run_e2e.py --interrupt) needs card 2's Codex worker to live long
+# enough to be killed, so its variant asks for more work on card 2. The default deck
+# (tests/e2e/fixture-deck.md) is left unchanged.
+CARD2_CONTEXT_END = "and a unittest test for it in tests/test_calc.py."
+SLOW_CARD2_EXTRA = (" Write the tests first and run the suite after each one: separate test methods for "
+                    "positive numbers, negative numbers, zero, floats (assertAlmostEqual), large integers and "
+                    "the identity multiply(x, 1) == x; give multiply() a docstring with two examples; run "
+                    "`python3 -m unittest discover -s tests -v` at the end and quote its last line in your report.")
+
 # Cheapest routes. Every Codex route is gpt-6-luna. The deck pins card 1 to
 # `claude sonnet low` and card 2 to `codex gpt-6-luna medium`.
 ROLES = {
@@ -106,7 +118,7 @@ def git(cwd: Path, *args: str) -> str:
     return r.stdout.strip()
 
 
-def make_fixture(root: Path) -> dict:
+def make_fixture(root: Path, *, slow_card2: bool = False) -> dict:
     root = Path(os.path.abspath(root))
     if root.exists() and any(root.iterdir()):
         raise RuntimeError(f"{root} exists and is not empty")
@@ -145,21 +157,29 @@ def make_fixture(root: Path) -> dict:
     text = DECK_TEMPLATE.read_text(encoding="utf-8")
     if text.count(BASE_TOKEN) != 1:
         raise RuntimeError(f"{DECK_TEMPLATE} must contain {BASE_TOKEN} exactly once")
-    deck.write_text(text.replace(BASE_TOKEN, base_sha), encoding="utf-8")
+    text = text.replace(BASE_TOKEN, base_sha)
+    if slow_card2:
+        if text.count(CARD2_CONTEXT_END) != 2:     # card 1's context ends the same way; card 2's is last
+            raise RuntimeError(f"{DECK_TEMPLATE}: card 2's context ending not found")
+        head, sep, tail = text.rpartition(CARD2_CONTEXT_END)
+        text = head + sep + SLOW_CARD2_EXTRA + tail
+    deck.write_text(text, encoding="utf-8")
 
     return {"root": str(root), "repo": str(repo), "origin": str(origin), "docs_dir": str(docs),
             "runs_dir": str(docs / repo.name / "runs"), "deck": str(deck),
             "user_config": str(user_config), "elsewhere": str(elsewhere), "base_sha": base_sha,
-            "branch": "leadhand/calc-e2e"}
+            "branch": "leadhand/calc-e2e", "slow_card2": slow_card2}
 
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
+    slow = "--slow-card2" in args
+    args = [a for a in args if a != "--slow-card2"]
     if len(args) != 1 or args[0] in ("-h", "--help"):
         print(__doc__.strip())
         return 0 if args and args[0] in ("-h", "--help") else 2
     try:
-        info = make_fixture(Path(args[0]))
+        info = make_fixture(Path(args[0]), slow_card2=slow)
     except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
