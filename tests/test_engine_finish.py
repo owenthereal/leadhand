@@ -569,7 +569,7 @@ class NothingAccepted(unittest.TestCase):
         w.parks[1] = "product decision"
         done = w.run()[-1]
         self.assertEqual(w.run_started, [])
-        self.assertEqual(done["outcome"], "incomplete")
+        self.assertEqual((done["outcome"], done["qualifier"]), ("blocked", "decision needed"))
         self.assertTrue(w.paths.report.is_file())
 
 
