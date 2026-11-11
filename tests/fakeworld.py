@@ -317,7 +317,8 @@ class FakeWorld:
         if a["kind"] in IMPLEMENTER_KINDS:
             files = step.get("files") or {self.default_file(a): f"{a['dispatch_id']}\n"}
             lines += [{"action": "write_file", "path": p, "text": t} for p, t in files.items()]
-            lines.append({"action": "commit", "message": f"work for {a['dispatch_id']}"})
+            if step.get("commit", True):         # False: leave it to the runner, like real Codex
+                lines.append({"action": "commit", "message": f"work for {a['dispatch_id']}"})
         text = self.report_text(a, step)
         reply = step.get("reply") or f"{text.splitlines()[0]}\nReport: {a['report']}"
         if step.get("report", True):

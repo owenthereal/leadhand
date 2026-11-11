@@ -733,12 +733,61 @@ class RunnerCommitTests(Base):
         self.assertNotEqual(late["committed"], self.base_sha)
         self.assertEqual(run_git(self.repo, "rev-list", "--count", f"{self.base_sha}..HEAD"), "1")
 
+    def test_failed_commit_is_blocked_environment_with_reason(self):
+        for name in ("EMAIL", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+            os.environ.pop(name, None)
+        run_git(self.repo, "config", "--unset", "user.name")
+        run_git(self.repo, "config", "--unset", "user.email")
+        run_git(self.repo, "config", "user.useConfigOnly", "true")
+        req = self.commit_request()
+        self.edits(req)
+        result = dispatch(req)
+        self.assertEqual((result.status, result.blocked_by, result.exit_reason), ("BLOCKED", "environment", "error"))
+        self.assertIn("could not commit", result.reply)
+        saved = json.loads((self.worker_dir() / "result.json").read_text())
+        self.assertIsNone(saved["committed"])
+        self.assertTrue(saved["commit_error"])
+        self.assertIn(saved["commit_error"].splitlines()[0][:40], result.reply)
+        self.assertEqual(run_git(self.repo, "rev-parse", "HEAD"), self.base_sha)
+        self.assertIn("src/", run_git(self.repo, "status", "--porcelain"))
+        self.assertEqual(read_attempts(run_paths(self.run_dir))[0]["status"], "BLOCKED")
+
+    def test_unlocatable_git_path_is_an_error_not_an_operation(self):
+        req = self.commit_request()
+        wd = self.worker_dir()
+        wd.mkdir(parents=True)
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "widget.py").write_text("WIDGET = 1\n")
+        real = dsp._git
+
+        def failing(ws, *args, **kw):
+            if "--git-path" in args:
+                return subprocess.CompletedProcess(["git", *args], 128, "", "fatal: broken repository\n")
+            return real(ws, *args, **kw)
+
+        with mock.patch.object(dsp, "_git", failing):
+            out = dsp._commit_work(wd, req)
+        self.assertIsNone(out["committed"])
+        self.assertNotIn("in progress", out.get("commit_skipped") or "")
+        self.assertIn("broken repository", out["commit_error"])
+
+    def test_commit_respects_the_cancel_deadline(self):
+        req = self.commit_request()
+        wd = self.worker_dir()
+        wd.mkdir(parents=True)
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "widget.py").write_text("WIDGET = 1\n")
+        out = dsp._commit_work(wd, req, deadline=time.monotonic() - 1)
+        self.assertIsNone(out["committed"])
+        self.assertIn("deadline", out["commit_error"])
+        self.assertEqual(run_git(self.repo, "rev-parse", "HEAD"), self.base_sha)
+
     def test_wrong_branch_is_not_committed(self):
         req = self.commit_request()
         run_git(self.repo, "checkout", "--quiet", "-b", "somewhere-else")
         self.edits(req)
         result = dispatch(req)
-        self.assertEqual(result.status, "READY")
+        self.assertEqual((result.status, result.blocked_by), ("BLOCKED", "environment"))
         saved = json.loads((self.worker_dir() / "result.json").read_text())
         self.assertIsNone(saved["committed"])
         self.assertIn("somewhere-else", saved["commit_skipped"])

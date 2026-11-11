@@ -1,4 +1,5 @@
 """Engine: integration before acceptance, unparking, and reviewer/verifier violations."""
+import os
 import shlex
 import unittest
 from unittest import mock
@@ -697,6 +698,24 @@ class CodexIntegrate(unittest.TestCase):
         (rebased,) = w.events("rebased")
         self.assertEqual(rebased["dispatch_id"], "c1-a2-integrate-1")
         self.assertEqual([e["card"] for e in w.events("accepted")], [2, 1])
+
+    def test_failed_runner_commit_is_recorded_blocked_environment(self):
+        w = FakeWorld(self, [card(1)], installed=("claude", "codex"))
+        for name in ("EMAIL", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+            os.environ.pop(name, None)
+        run_git(w.repo, "config", "--unset", "user.name")
+        run_git(w.repo, "config", "--unset", "user.email")
+        run_git(w.repo, "config", "user.useConfigOnly", "true")
+        w.start()
+        w.script(1, "implement", {"commit": False})
+        a = w.next()
+        self.assertEqual(a["agent"], "leadhand:codex")
+        w.act(a)
+        (recorded,) = w.events("result_recorded")
+        self.assertEqual((recorded["status"], recorded["blocked_by"]), ("BLOCKED", "environment"))
+        self.assertIsNone(recorded["committed"])
+        self.assertTrue(recorded["commit_error"])
+        self.assertIn("src/card1/", run_git(w.workspace(), "status", "--porcelain", "--untracked-files=all"))
 
     def test_integrate_without_claude_parks_the_card(self):
         w = parked_world(self, card1_files={"src/shared.txt": "card one\n"},

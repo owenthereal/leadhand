@@ -2217,10 +2217,16 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str = "",
             files[name] = str(folder / f"{name}.md")
     _copy_if_missing(None, folder / "reply.md", text=reply)
     files["reply"] = str(folder / "reply.md")
-    codex = None
+    codex, commit = None, {}
     if req["vendor"] == "codex":
         codex = dsp.load_result(ctx.root / "workers" / dispatch_id)
+        commit = dsp.load_commit(ctx.root / "workers" / dispatch_id)
     head_info = _head(_read_text(folder / "report.md"), reply, codex, stopped)
+    if dsp.commit_failed(commit):
+        # The runner could not commit the worker's changes (ruling R39): whatever the report
+        # says, the work is not on the branch, so the card must not go on as if it were.
+        head_info = {**head_info, "status": "BLOCKED", "blocked_by": "environment", "head": "Status",
+                     "verdict": None, "result": None, "source": "runner commit"}
     tip = None
     if d.kind in IMPLEMENTER_KINDS:
         card_branch = _card_state(ctx, events, n).branch or card_branch_name(ctx.branch, n)
@@ -2260,7 +2266,9 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str = "",
         return append_event(ctx.paths, "result_recorded", dispatch_id=dispatch_id, card=n,
                             attempt=req["attempt"], dispatch_kind=d.kind, worker_id=worker_id, tip=tip,
                             session_id=codex.session_id if codex else None, files=files, stopped=bool(stopped),
-                            charge_ids=[charge_id], **head_info)
+                            charge_ids=[charge_id], **head_info,
+                            **({k: commit.get(k) for k in ("committed", "commit_error", "commit_skipped")}
+                               if req["vendor"] == "codex" else {}))
 
 
 def _record_ruling(ctx: _Run, card: Any, text: str) -> dict:

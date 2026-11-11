@@ -265,8 +265,8 @@ CODEX_NO_COMMIT = (
     "## Commits (Codex workers)\n\n"
     "This overrides the contract's rule to commit on the card branch. Do not run git commit,\n"
     "git add, or any command that writes under .git; leave your changes in the working tree\n"
-    "and list the changed files in your report. leadhand commits them on the card branch\n"
-    "after you finish.")
+    "and list the changed files in your report. leadhand commits them on your branch after\n"
+    "you finish.")
 
 
 def worker_prompt(role: str, brief: Path, report: Path) -> str:

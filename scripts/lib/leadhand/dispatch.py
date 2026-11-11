@@ -88,6 +88,7 @@ HEARTBEAT_EVERY = 1.0       # wall-clock seconds between heartbeat touches
 HEARTBEAT_STALE = 60.0
 HUNG_RECHECK = 5.0          # a stale heartbeat must stay unchanged this long before "hung"
 CANCEL_TIMEOUT = 30.0
+CANCEL_FINISH_MARGIN = 2.0  # of a cancel's deadline, kept for charging and writing the result
 RUNNER_LOCK_RETRY = 2.0
 SIGNAL_STEP = 5.0           # SIGINT -> SIGTERM -> SIGKILL spacing
 KILL_RETRY = 5.0            # after SIGKILL, re-send this often until confirmed
@@ -209,6 +210,13 @@ def _result_from(d: Mapping[str, Any]) -> DispatchResult:
                           session_id=d.get("session_id"), reply=d.get("reply") or "",
                           steps=int(d.get("steps") or 0), usage=_usage_from(d.get("usage")),
                           exit_reason=d["exit_reason"])
+
+
+def load_commit(wd: Path) -> dict:
+    """The runner's commit outcome from result.json: committed, changes, commit_error,
+    commit_skipped (each None when absent)."""
+    d = _read_json(Path(wd) / RESULT) or {}
+    return {k: d.get(k) for k in ("committed", "changes", "commit_error", "commit_skipped")}
 
 
 def load_result(wd: Path) -> DispatchResult | None:
@@ -578,62 +586,92 @@ def _commit_subject(req: DispatchRequest) -> str:
     return text if len(text) <= 100 else text[:99].rstrip() + "…"
 
 
-def _git(ws: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _git(ws: Path, *args: str, timeout: float = COMMIT_TIMEOUT) -> subprocess.CompletedProcess[str]:
     env = {k: v for k, v in os.environ.items() if k not in _REPO_VARS}
     env["GIT_TERMINAL_PROMPT"] = "0"
     return subprocess.run(["git", *args], cwd=ws, env=env, capture_output=True, text=True,
-                          stdin=subprocess.DEVNULL, timeout=COMMIT_TIMEOUT)
+                          stdin=subprocess.DEVNULL, timeout=timeout)
 
 
-def _commit_work(wd: Path, req: DispatchRequest) -> dict:
+class _CommitProblem(Exception):
+    pass
+
+
+def _commit_work(wd: Path, req: DispatchRequest, *, deadline: float | None = None) -> dict:
     """Commit what the Codex worker left in the workspace, on `req.branch` (ruling R39).
 
-    Returns {"committed": sha or None} plus "commit_skipped" (why nothing was committed)
-    or "commit_error". Two-phase: commit.json records the intent and HEAD before; a
-    restart that finds HEAD moved to a commit carrying this dispatch's trailer does not
-    commit again. Never commits off the expected branch or during a Git operation."""
+    Returns {"committed": sha or None, "changes": bool} plus "commit_skipped" (why nothing
+    was committed) or "commit_error". Two-phase: commit.json records the intent and HEAD
+    before; a restart that finds HEAD moved to a commit carrying this dispatch's trailer
+    does not commit again. Never commits off the expected branch or during a Git
+    operation. `deadline` (time.monotonic) bounds every Git call, for a cancel."""
     if req.kind not in COMMIT_KINDS or not req.branch:
-        return {"committed": None, "commit_skipped": f"{req.kind or 'this'} dispatch does not commit"}
+        return {"committed": None, "changes": False,
+                "commit_skipped": f"{req.kind or 'this'} dispatch does not commit"}
     ws = Path(req.cwd)
+
+    def run(*args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
+        timeout = COMMIT_TIMEOUT
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                raise _CommitProblem("no time left before the cancel deadline")
+        try:
+            r = _git(ws, *args, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise _CommitProblem(f"git {args[0]} timed out"
+                                 + (" before the cancel deadline" if deadline is not None else "")) from None
+        if ok and r.returncode != 0:
+            raise _CommitProblem(f"git {' '.join(args)} failed: {(r.stderr or r.stdout).strip()}")
+        return r
+
+    changes = False
     try:
-        r = _git(ws, "symbolic-ref", "--quiet", "--short", "HEAD")
+        changes = bool(run("status", "--porcelain=v1", "--untracked-files=all").stdout.strip())
+        r = run("symbolic-ref", "--quiet", "--short", "HEAD", ok=False)
         current = r.stdout.strip() if r.returncode == 0 else None
         if current != req.branch:
-            return {"committed": None,
+            return {"committed": None, "changes": changes,
                     "commit_skipped": f"workspace is on {current or 'a detached HEAD'}, not {req.branch}"}
         for name in _GIT_OPERATIONS:
-            path = Path(_git(ws, "rev-parse", "--path-format=absolute", "--git-path", name).stdout.strip())
-            if path.exists():
-                return {"committed": None, "commit_skipped": f"a Git operation is in progress ({name})"}
-        head_now = _git(ws, "rev-parse", "--verify", "HEAD").stdout.strip()
+            where = run("rev-parse", "--path-format=absolute", "--git-path", name).stdout.strip()
+            if not where:
+                raise _CommitProblem(f"git rev-parse --git-path {name} gave no path")
+            if Path(where).exists():
+                return {"committed": None, "changes": changes,
+                        "commit_skipped": f"a Git operation is in progress ({name})"}
+        head_now = run("rev-parse", "--verify", "HEAD", ok=False).stdout.strip()
         intent = _read_json(wd / COMMIT_INTENT)
         if intent is not None and head_now and head_now != intent.get("head_before"):
-            body = _git(ws, "log", "-1", "--format=%B", "HEAD").stdout
+            body = run("log", "-1", "--format=%B", "HEAD").stdout
             if f"{TRAILER}: {req.dispatch_id}" in body.splitlines():
-                return {"committed": head_now}          # committed before a restart
-        status = _git(ws, "status", "--porcelain=v1", "--untracked-files=all")
-        if status.returncode != 0:
-            return {"committed": None, "commit_error": status.stderr.strip()}
-        if not status.stdout.strip():
-            return {"committed": None, "commit_skipped": "no changes"}
+                return {"committed": head_now, "changes": changes}    # committed before a restart
+        if not changes:
+            return {"committed": None, "changes": False, "commit_skipped": "no changes"}
         if intent is None:
             write_json_atomic(wd / COMMIT_INTENT, {"at": utc_now(), "branch": req.branch, "head_before": head_now})
-        add = _git(ws, "add", "-A")
-        if add.returncode != 0:
-            return {"committed": None, "commit_error": add.stderr.strip()}
+        run("add", "-A")
         # Unsigned (signing may prompt) and without hooks: this is leadhand's own bookkeeping.
-        done = _git(ws, "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--quiet",
-                    "--no-verify",
-                    "-m", _commit_subject(req), "-m", f"{TRAILER}: {req.dispatch_id}")
-        if done.returncode != 0:
-            return {"committed": None, "commit_error": (done.stderr or done.stdout).strip()}
-        return {"committed": _git(ws, "rev-parse", "--verify", "HEAD").stdout.strip()}
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return {"committed": None, "commit_error": str(e)}
+        run("-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "--no-verify",
+            "-m", _commit_subject(req), "-m", f"{TRAILER}: {req.dispatch_id}")
+        return {"committed": run("rev-parse", "--verify", "HEAD").stdout.strip(), "changes": True}
+    except _CommitProblem as e:
+        return {"committed": None, "changes": changes, "commit_error": str(e)}
+    except OSError as e:
+        return {"committed": None, "changes": changes, "commit_error": str(e)}
+
+
+def commit_failed(result: Mapping[str, Any]) -> str | None:
+    """Why a dispatch's changes were left uncommitted, or None. A result whose worker left
+    changes that the runner could not commit (an error, the wrong branch, a Git operation
+    in progress) must not pass for finished work: the card would go on without it."""
+    if result.get("committed") or not result.get("changes"):
+        return None
+    return result.get("commit_error") or result.get("commit_skipped") or None
 
 
 def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_exit: int | None,
-              tracker: _Tracker, started_at: str | None) -> DispatchResult:
+              tracker: _Tracker, started_at: str | None, deadline: float | None = None) -> DispatchResult:
     with _finalize_lock(wd):
         existing = load_result(wd)
         if existing is not None:
@@ -661,7 +699,16 @@ def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_
             blocked_by = "environment"     # Codex could not be started at all
         if keep_raw:
             (wd / RAW).write_text(reply, encoding="utf-8")
-        commit = _commit_work(wd, req) if launched else {"committed": None, "commit_skipped": "Codex never ran"}
+        commit = (_commit_work(wd, req, deadline=deadline) if launched
+                  else {"committed": None, "changes": False, "commit_skipped": "Codex never ran"})
+        failed = commit_failed(commit)
+        if failed:
+            # The work is still in the tree but not on the branch: an environment problem.
+            worker = (f"\n\nWorker reply ({exit_reason}):\n{reply}" if reply.strip() else "")
+            reply = (f"Status: BLOCKED\nBlocked by: environment\n"
+                     f"leadhand could not commit the worker's changes on {req.branch}: {failed}{worker}")
+            commit["worker_status"], commit["worker_exit_reason"] = status, exit_reason
+            status, blocked_by, exit_reason = "BLOCKED", "environment", "error"
         usage, charge_ids, source = _charge_usage(req, wd, thread=stream.thread_id, launched=launched,
                                                   generation=generation, stopped=stopped_for is not None,
                                                   stream=stream)
@@ -756,6 +803,14 @@ def _launch(wd: Path, record: dict, argv: list[str], env: Mapping[str, str], cwd
     return proc
 
 
+def _cancel_deadline(wd: Path) -> float | None:
+    """The canceller's deadline (time.monotonic), from the cancel request, less a margin."""
+    wall = (_read_json(wd / CANCEL) or {}).get("deadline_wall")
+    if not isinstance(wall, (int, float)):
+        return None
+    return time.monotonic() + (wall - time.time()) - CANCEL_FINISH_MARGIN
+
+
 def run_runner(worker_dir: Path) -> int:
     """The detached runner's body: launch Codex, watch it, stop it at a limit or a
     cancel, then finalize. Exits 0 once result.json is written; 3 when another runner
@@ -848,7 +903,7 @@ def run_runner(worker_dir: Path) -> int:
     tracker.stop(beat=wd / HEARTBEAT)      # also clears leftovers after a normal exit
     proc.wait()
     _finalize(wd, req, stopped_for=stopped_for, codex_exit=proc.returncode, tracker=tracker,
-              started_at=started_at)
+              started_at=started_at, deadline=_cancel_deadline(wd) if stopped_for == "cancelled" else None)
     if raise_later:
         raise raise_later[1]
     return 0
@@ -978,7 +1033,8 @@ def _cancel_locked(wd: Path, *, deadline: float, token: str | None) -> DispatchR
         return done
     req = _load_request(wd)
     if token is not None or not (wd / CANCEL).exists():
-        write_json_atomic(wd / CANCEL, {"requested_at": utc_now(), "by_pid": os.getpid(), "token": token})
+        write_json_atomic(wd / CANCEL, {"requested_at": utc_now(), "by_pid": os.getpid(), "token": token,
+                                        "deadline_wall": time.time() + (deadline - time.monotonic())})
     target = _runner_target(wd)
     if target and _runner_alive(wd):
         with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -1009,7 +1065,8 @@ def _cancel_locked(wd: Path, *, deadline: float, token: str | None) -> DispatchR
         raise DispatchError("cancel timed out; still alive: "
                             + ", ".join(f"pid {r['pid']} (group {r['pgid']})" for r in left))
     started_at = (_read_json(wd / RUNNER) or {}).get("started_at")
-    return _finalize(wd, req, stopped_for="cancelled", codex_exit=None, tracker=tracker, started_at=started_at)
+    return _finalize(wd, req, stopped_for="cancelled", codex_exit=None, tracker=tracker, started_at=started_at,
+                     deadline=deadline - CANCEL_FINISH_MARGIN)
 
 
 def cancel(worker_dir: Path, *, timeout: float = 30.0) -> DispatchResult:
