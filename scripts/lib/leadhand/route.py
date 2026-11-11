@@ -81,7 +81,8 @@ def resolve(config: Config, *, role: str, card: Card | None = None, attempt: int
     step. Attempt 3 uses implementer_hard with the profile and risk steps, plus
     one more step when the card was already Hard or pinned. Attempt 4 uses
     implementer_hard on the vendor other than attempt 3's, with the same effort
-    computation as attempt 3. Attempt 5 or later, or no other vendor for attempt
+    computation as attempt 3; for attempt 4, last_implementer_vendor is attempt 3's
+    actual vendor (when None, attempt 3's vendor is recomputed). Attempt 5 or later, or no other vendor for attempt
     4, raises LadderExhausted.
     """
     if attempt < 1:
@@ -128,7 +129,9 @@ def resolve(config: Config, *, role: str, card: Card | None = None, attempt: int
     # Step 2: vendor.
     vendor, why = _pick_vendor(spec, installed, last_implementer_vendor, key)
     if is_impl and attempt == 4:
-        third, _ = _pick_vendor(spec, installed, last_implementer_vendor, key)  # attempt 3's vendor
+        # Attempt 3's vendor: the one it actually ran on when the caller knows it; recomputing
+        # it from last_implementer_vendor would be wrong under prefer = "other".
+        third = last_implementer_vendor or _pick_vendor(spec, installed, None, key)[0]
         others = [v for v in _available(spec, installed) if v != third]
         if not others:
             raise LadderExhausted("attempt 4: no other vendor is installed with an implementer_hard route")

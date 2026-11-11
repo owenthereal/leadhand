@@ -111,6 +111,16 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(self.r(card=hard, attempt=3).route.effort, "xhigh")
         self.assertEqual(self.r(card=hard, attempt=4).route.effort, "xhigh")
 
+    def test_attempt_4_with_prefer_other_switches_from_attempt_3s_actual_vendor(self):
+        # implementer_hard prefers "other": attempt 4 must leave the vendor attempt 3 really
+        # ran on (passed as last_implementer_vendor), not a recomputed guess.
+        self.config = self.cfg('[roles.implementer_hard]\nprefer = "other"\n')
+        for third, fourth in (("claude", "codex"), ("codex", "claude")):
+            with self.subTest(attempt_3=third):
+                res = self.r(attempt=4, last_implementer_vendor=third)
+                self.assertEqual(res.route.vendor, fourth)
+                self.assertIn(f"vendor {fourth}: other than {third}", res.reasons)
+
     def test_claude_only_install_exhausts_at_attempt_4(self):
         only = frozenset({"claude"})
         res = self.r(attempt=1, installed=only)
