@@ -130,7 +130,12 @@ behavior | test | base result | branch result | counts
 <behavior>: no — <why>
 ```
 
-A behavior holds when its test fails (or is absent) on the base worktree and
-passes on the branch, or when the brief says why the base result does not
-matter for it. Your reply starts with the same first line as the report and
-ends with `Report: <path of the report file>`.
+A behavior holds only when its test fails on the base by an assertion (the
+test ran and checked the old behavior) and passes on the branch, or when the
+brief says why the base result does not matter for it. A test the base does
+not have may be copied into the base worktree as a new, untracked file to run
+it there. A compile error, an import error, a missing module or file, or a
+harness failure on the base means the test did not run: that is not proof,
+so the behavior does not hold (`<behavior>: no — the test did not run on the
+base: <the error>`). Your reply starts with the same first line as the report
+and ends with `Report: <path of the report file>`.

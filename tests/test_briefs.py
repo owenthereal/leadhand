@@ -109,6 +109,10 @@ class BriefTests(unittest.TestCase):
         self.assertIn("continue from the branch as it stands and write your report", text("continue"))
         self.assertIn("security-review skill", text("security", card=None))
         self.assertIn(self.card.done_when, text("evidence", card=None))
+        evidence = text("evidence", card=None)
+        self.assertIn("by an assertion", evidence)          # R46: compile or import errors do not count
+        self.assertIn("import", evidence)
+        self.assertNotIn("fail (or do not\nexist) on the base", evidence)
         self.assertIn(self.card.title, text("final_review", card=None))
         verify = text("verify", card=None)
         self.assertIn("make build", verify)

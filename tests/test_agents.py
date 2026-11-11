@@ -63,6 +63,14 @@ class AgentTests(unittest.TestCase):
                        "implementer's report", "`## Tests`", "throwaway worktree", "never in the workspace"):
             self.assertIn(phrase, body)
 
+    def test_verifier_evidence_rule_follows_the_spec(self):
+        # Ruling R46: only a failing assertion on the base counts as failing-before.
+        _, body = split(AGENTS / "verifier.md")
+        self.assertIn("fails on the base by an assertion", body)
+        for phrase in ("compile", "import", "missing module", "did not run"):
+            self.assertIn(phrase, body)
+        self.assertNotIn("fails (or is absent) on the base", body)
+
     def test_codex_proxy_runs_one_command(self):
         _, body = split(AGENTS / "codex.md")
         for phrase in ("exactly the one command", "verbatim", "Never run another command",
