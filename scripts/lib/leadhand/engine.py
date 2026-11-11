@@ -206,6 +206,8 @@ class _Run:
 
 
 def _load(run_dir: Path | str, *, check_digest: bool) -> _Run:
+    """The run, with its frozen deck (`<run>/deck.md`) and configuration snapshot; with
+    `check_digest`, refused when the source deck no longer matches (see `_deck_problem`)."""
     root = Path(run_dir).absolute()
     paths = run_paths(root)
     try:
@@ -214,21 +216,31 @@ def _load(run_dir: Path | str, *, check_digest: bool) -> _Run:
         raise EngineError(f"not a run directory (no run.json): {root}") from None
     except ValueError as e:
         raise EngineError(f"run.json is unreadable: {e}") from None
-    if check_digest:
-        source = Path(meta["deck_source"])
-        try:
-            digest = hashlib.sha256(source.read_bytes()).hexdigest()
-        except OSError as e:
-            raise EngineError(f"cannot read the deck {source}: {e}") from None
-        if digest != meta["deck_digest"]:
-            raise EngineError(f"deck changed since start (expected {meta['deck_digest']})")
     try:
         deck = parse_deck(paths.deck)
         config = load_run_config(root, Path(meta["repo"]))      # the snapshot from start (I5)
     except (DeckError, ConfigError, OSError) as e:
         raise EngineError(str(e)) from None
-    return _Run(root=root, paths=paths, meta=meta, deck=deck, config=config,
-                ws=Path(meta["workspace"]), branch=meta["branch"])
+    ctx = _Run(root=root, paths=paths, meta=meta, deck=deck, config=config,
+               ws=Path(meta["workspace"]), branch=meta["branch"])
+    problem = _deck_problem(ctx) if check_digest else None
+    if problem:
+        raise EngineError(problem)
+    return ctx
+
+
+def _deck_problem(ctx: _Run) -> str | None:
+    """Why the source deck no longer matches the one the run started from (edited, moved or
+    deleted), or None. It blocks every new step; reconciliation, a pause and a cancel run on
+    the frozen deck regardless, so the operator can always stop a run."""
+    source = Path(ctx.meta["deck_source"])
+    try:
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    except OSError as e:
+        return f"cannot read the deck {source}: {e}"
+    if digest != ctx.meta["deck_digest"]:
+        return f"deck changed since start (expected {ctx.meta['deck_digest']})"
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -441,7 +453,8 @@ def _write_status(run_dir: Path) -> None:
 
 def _next_action(run_dir: Path) -> dict:
     """Perform every mechanical step that is due, then return the supervisor's next action."""
-    ctx = _load(run_dir, check_digest=True)
+    ctx = _load(run_dir, check_digest=False)
+    deck_problem = _deck_problem(ctx)
     _charge_supervisor(ctx)
     for _ in range(MAX_STEPS):
         events = read_events(ctx.paths)
@@ -459,6 +472,8 @@ def _next_action(run_dir: Path) -> dict:
             action = _cancel_step(ctx, read_events(ctx.paths))
         elif _pause_requested(ctx, events):
             action = _pause_step(ctx, read_events(ctx.paths))
+        elif deck_problem:
+            raise EngineError(deck_problem)
         else:
             action = _step(ctx, events)
         if action is not None:

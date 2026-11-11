@@ -419,6 +419,45 @@ class PauseCancel(unittest.TestCase):
         self.assertIn("this run has ended: incomplete (cancelled)", err.getvalue())
         self.assertEqual(w.events("resumed"), [])
 
+    def test_cancel_works_after_the_source_deck_was_edited(self):
+        w = FakeWorld(self, [card(1), card(2)])
+        w.session("supervisor-1")
+        w.start()
+        a = w.next()
+        worker = w.launch(a)
+        with open(w.deck_path, "a", encoding="utf-8") as f:
+            f.write("\nContext: edited after the start.\n")
+        r = w.cli("cancel", w.run_dir)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        stop = w.next()
+        self.assertEqual((stop["action"], stop["dispatch_id"], stop["worker_id"]),
+                         ("stop_worker", a["dispatch_id"], worker))
+        engine.record(w.run_dir, "result", dispatch_id=a["dispatch_id"], worker_id=worker,
+                      reply="Status: SPENT (time limit)", stopped=True)
+        done = w.next()
+        self.assertEqual((done["action"], done["outcome"], done["qualifier"]), ("done", "incomplete", "cancelled"))
+        self.assertEqual(len(w.events("dispatch_requested")), 1)
+
+    def test_pause_works_after_the_source_deck_was_deleted_but_nothing_new_starts(self):
+        w = FakeWorld(self, [card(1), card(2)])
+        w.session("supervisor-1")
+        w.start()
+        a = w.next()
+        worker = w.launch(a)
+        reply = w.perform(a, worker)
+        w.deck_path.unlink()
+        # without a pause, the changed deck still blocks the next step
+        with self.assertRaises(engine.EngineError) as cm:
+            engine.record(w.run_dir, "result", dispatch_id=a["dispatch_id"], worker_id=worker, reply=reply)
+            w.next()
+        self.assertIn("cannot read the deck", str(cm.exception))
+        self.assertEqual(len(w.events("dispatch_requested")), 1)
+        r = w.cli("pause", w.run_dir)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        done = w.next()
+        self.assertEqual((done["action"], done["outcome"], done["qualifier"]), ("done", "blocked", "paused"))
+        self.assertEqual(len(w.events("dispatch_requested")), 1)              # nothing new started
+
     def test_cancel_survives_a_relaunch_before_it_finished(self):
         w = FakeWorld(self, [card(1), card(2)])
         w.session("supervisor-1")
