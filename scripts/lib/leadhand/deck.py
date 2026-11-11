@@ -7,7 +7,8 @@ import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from leadhand.config import Config, ConfigError, Route, load_config, parse_route, unsupported_settings
+from leadhand.config import (Config, ConfigError, Route, load_config, parse_route, unsupported_settings,
+                             unsupported_warnings)
 from leadhand.gitops import GitError, git
 
 HEADER_KEYS = ("Source", "Base", "Branch", "Build", "Test", "Profile", "Finish")
@@ -281,6 +282,8 @@ def check_deck(deck: Deck, repo: Path, config: Config) -> list[Problem]:
 
     for msg in unsupported_settings(config):
         err(msg)
+    for msg in unsupported_warnings(config):
+        warn(msg)
     if deck.finish not in (None, "none"):
         err(f"not supported in this version: Finish: {deck.finish}")
     if not deck.build.strip():

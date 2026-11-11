@@ -64,7 +64,9 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -78,7 +80,7 @@ from leadhand import usage
 from leadhand.briefs import (CODEX_AGENT, agent_for, dispatch_message, parse_report_head, scratch_dir,
                              write_brief)
 from leadhand.config import (SNAPSHOT, VENDORS, Config, ConfigError, Route, config_to_dict, docs_dir_for,
-                             load_config, load_run_config)
+                             load_config, load_run_config, unsupported_warnings)
 from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, parse_deck
 from leadhand.gitops import (GitError, card_branch_name, changed_paths, cut_card_branch, default_base,
                              detect_violation, ensure_excluded, fast_forward, git, head, is_ancestor,
@@ -328,7 +330,11 @@ def _find_unfinished(docs: Path, source: str, digest: str) -> Path | None:
     for root, meta in _runs(docs):
         if meta.get("deck_source") != source or meta.get("deck_digest") != digest:
             continue
-        ended = _ended(read_events(run_paths(root)))
+        try:
+            ended = _ended(read_events(run_paths(root)))
+        except (OSError, ValueError) as e:
+            print(f"warning: skipping the earlier run {root}: its event log is unreadable ({e})", file=sys.stderr)
+            continue
         if ended is None or ended.get("outcome") == "blocked":
             found.append((str(meta.get("created_at", "")), str(root), root))
     return max(found)[2] if found else None
@@ -363,6 +369,8 @@ def _start(deck_path: Path, repo: Path, config: Config | None, new: bool) -> tup
     errors = [p.message for p in check_deck(deck, repo, config) if p.level == "error"]
     if errors:
         raise EngineError("the deck has errors: " + "; ".join(errors))
+    for msg in unsupported_warnings(config):
+        print(f"warning: {msg}", file=sys.stderr)
     docs = docs_dir_for(config, repo)
     if not new:
         existing = _find_unfinished(docs, str(deck_path), deck.digest)
@@ -1235,7 +1243,8 @@ def _request_integrate(ctx: _Run, c: CardState, events: list[dict], index: dict[
         route = None
         if "claude" in installed_vendors():
             try:
-                route = resolve(ctx.config, role=last.req["role"], card=card, attempt=1,
+                # A card pinned to Codex still integrates on Claude: the pin is set aside.
+                route = resolve(ctx.config, role=last.req["role"], card=replace(card, route_pin=None), attempt=1,
                                 installed=frozenset({"claude"}), profile=ctx.deck.profile).route
             except (LadderExhausted, PinnedVendorMissing, ConfigError):
                 route = None
@@ -2242,6 +2251,7 @@ def _write_handoff(ctx: _Run, ended: dict, events: list[dict]) -> None:
     index = _dispatches(events)
     last = max(index.values(), key=lambda d: d.req["seq"]) if index else None
     qualifier = ended.get("qualifier") or ""
+    cli, root = shlex.quote(str(dsp.CLI_PATH)), shlex.quote(str(ctx.root))
     lines = [f"# Handoff: {ctx.deck.title}", "",
              f"Outcome: blocked{f' ({qualifier})' if qualifier else ''}", "",
              "## Where it stopped", "",
@@ -2254,8 +2264,9 @@ def _write_handoff(ctx: _Run, ended: dict, events: list[dict]) -> None:
     lines += ["", "## What to do", "",
               f"1. Read the report: {ctx.paths.report}",
               "2. Settle what the reasons above name: a decision (record it in the decisions file or "
-              "`leadhand unpark` a card with a note), capacity coming back, or the environment fixed.",
-              f"3. Resume the run with `leadhand run \"{ctx.root}\"` (`leadhand launch-line \"{ctx.root}\"` "
+              f"`{cli} unpark {root} --card N --note '…'` with a note), capacity coming back, or the "
+              "environment fixed.",
+              f"3. Resume the run with `{cli} run {root}` (`{cli} launch-line {root}` "
               "prints the exact command). Gates that passed on the same commit are not run again."]
     _write_bytes_atomic(ctx.paths.handoff, ("\n".join(lines) + "\n").encode("utf-8"))
 
@@ -2668,12 +2679,16 @@ def _flag(run_dir: Path, what: str) -> RunPaths:
     return paths
 
 
+def _run_command(paths: RunPaths) -> str:
+    return f"{shlex.quote(str(dsp.CLI_PATH))} run {shlex.quote(str(paths.root))}"
+
+
 def request_pause(run_dir: Path) -> str:
     """`leadhand pause`: create the pause flag. Running workers finish, nothing new starts, the
     handoff is written and the run ends blocked (paused); `leadhand run` continues it."""
     paths = _flag(run_dir, "pause")
     return ("pause requested: running workers finish, nothing new starts, and the run ends blocked "
-            f"(paused) with a handoff. Continue it later with: {dsp.CLI_PATH} run '{paths.root}'")
+            f"(paused) with a handoff. Continue it later with: {_run_command(paths)}")
 
 
 def request_cancel(run_dir: Path) -> str:
@@ -2682,7 +2697,7 @@ def request_cancel(run_dir: Path) -> str:
     paths = _flag(run_dir, "cancel")
     return ("cancel requested: every running worker is stopped and the run ends incomplete (cancelled); "
             "partial work stays on the card branches. If no supervisor is running, "
-            f"{dsp.CLI_PATH} run '{paths.root}' finishes the cancel.")
+            f"{_run_command(paths)} finishes the cancel.")
 
 
 # --------------------------------------------------------------------------
@@ -2758,13 +2773,29 @@ def _record_started(ctx: _Run, dispatch_id: str, worker_id: str) -> dict:
                         card=d.req["card"], deadline=deadline, session=_current_session(ctx))
 
 
-def _copy_if_missing(src: Path | None, dest: Path, text: str | None = None) -> bool:
+def _copy_if_missing(src: Path | None, dest: Path, text: str | None = None,
+                     notes: list[str] | None = None) -> bool:
+    """Copy a worker's file into the run folder once. Only a regular file is copied, never
+    through a symlink (a worker could point one anywhere); anything else is noted."""
     if dest.exists():
         return True
     if text is None:
-        if src is None or not src.is_file():
+        if src is None:
             return False
-        data = src.read_bytes()
+        try:
+            fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            if notes is not None:
+                notes.append(f"{src} not copied: it is a symlink or cannot be opened ({e.strerror or e})")
+            return False
+        with os.fdopen(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                if notes is not None:
+                    notes.append(f"{src} not copied: not a regular file")
+                return False
+            data = f.read()
     else:
         data = text.encode("utf-8", "surrogateescape")
     _write_bytes_atomic(dest, data)
@@ -2857,9 +2888,9 @@ def _store_result(ctx: _Run, d: _Dispatch, worker_id: str, reply: str, *, stoppe
     req, n = d.req, d.req["card"]
     folder = ctx.card_dir(n, dispatch_id)
     folder.mkdir(parents=True, exist_ok=True)
-    files = {}
+    files, skipped = {}, []
     for name, src in (("brief", Path(req["brief"])), ("report", Path(req["report"]))):
-        if _copy_if_missing(src, folder / f"{name}.md"):
+        if _copy_if_missing(src, folder / f"{name}.md", notes=skipped):
             files[name] = str(folder / f"{name}.md")
     _copy_if_missing(None, folder / "reply.md", text=reply)
     files["reply"] = str(folder / "reply.md")
@@ -2874,13 +2905,13 @@ def _store_result(ctx: _Run, d: _Dispatch, worker_id: str, reply: str, *, stoppe
         head_info = {**head_info, "status": "BLOCKED", "blocked_by": "environment", "head": "Status",
                      "verdict": None, "result": None, "source": "runner commit"}
         head_info.pop("interrupted", None)
-    partial: dict[str, str] = {}
+    partial: dict[str, Any] = {"files_skipped": skipped} if skipped else {}
     if (req["vendor"] == "claude" and (d.kind in IMPLEMENTER_KINDS or d.kind == "final_fix")
             and (stopped or head_info.get("interrupted")) and _cancelling(ctx, read_events(ctx.paths))):
         # R42 (cancel): a Claude worker the cancel stopped, or found dead, leaves its partial
         # work committed on its branch (a Codex runner does this itself, R39). Not yet for a
         # stop at the deadline or an interruption found on a relaunch: see the fix report.
-        partial = _commit_partial(ctx, d)
+        partial = {**partial, **_commit_partial(ctx, d)}
     tip = None
     if d.kind in IMPLEMENTER_KINDS:
         card_branch = _card_state(ctx, read_events(ctx.paths), n).branch or card_branch_name(ctx.branch, n)
@@ -3062,7 +3093,8 @@ def unpark(run_dir: Path, card: Any, note: str) -> dict:
 # timer
 
 def timer(run_dir: Path, dispatch_id: str, *, interval: float = TIMER_INTERVAL) -> str:
-    """Return "result" once the dispatch has a result, or "deadline" once its deadline passes."""
+    """Return "result" once the dispatch has a result, "deadline" once its deadline passes,
+    or "flag" as soon as the operator asks to pause or cancel the run (`next` acts on it)."""
     paths = run_paths(Path(run_dir).absolute())
     if not paths.run_json.is_file():
         raise EngineError(f"not a run directory (no run.json): {paths.root}")
@@ -3071,6 +3103,8 @@ def timer(run_dir: Path, dispatch_id: str, *, interval: float = TIMER_INTERVAL) 
         d = _known_dispatch(events, dispatch_id)
         if d.result is not None:
             return "result"
+        if paths.cancel_flag.exists() or paths.pause_flag.exists():
+            return "flag"
         if (d.req["vendor"] == "codex" and d.started is not None
                 and dsp.load_result(paths.root / "workers" / dispatch_id) is not None):
             return "result"           # the runner finished: `next` records its result.json
@@ -3147,7 +3181,8 @@ def _cmd_cancel(args) -> int:
 
 def _cmd_timer(args) -> int:
     what = timer(Path(args.run_dir), args.dispatch)
-    print("result recorded" if what == "result" else "deadline passed", flush=True)
+    print({"result": "result recorded", "deadline": "deadline passed"}.get(what, "pause or cancel requested"),
+          flush=True)
     return 0
 
 

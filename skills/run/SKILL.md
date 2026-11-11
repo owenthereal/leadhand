@@ -179,7 +179,9 @@ tool, 10 lines). If `report` is null, print the action's `outcome`,
 - Never read worker transcripts. A worker's reply and the files the engine
   names are all you need.
 - Pass files by path. Never paste a report, brief or diff into a message.
-- Never edit code, or any file in the workspace. Workers do the work.
+- Never edit code, or any file in the workspace. Workers do the work. The one
+  file you write is a dispatch's `reply_file` (in the git-ignored scratch
+  folder), with the worker's reply verbatim.
 - Never run `git push`, `gh pr` or `gh merge`.
 - Record every ruling with `record ruling`. Never answer a worker any other
   way.

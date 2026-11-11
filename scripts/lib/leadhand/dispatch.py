@@ -703,8 +703,41 @@ def commit_failed(result: Mapping[str, Any]) -> str | None:
     return result.get("commit_error") or result.get("commit_skipped") or None
 
 
+@contextlib.contextmanager
+def _beating(beat: Path | None):
+    """Touch the heartbeat every HEARTBEAT_EVERY seconds while the block runs (the runner's
+    finalize: committing and charging can take a while, and a stale heartbeat reads as hung)."""
+    if beat is None:
+        yield
+        return
+    done = threading.Event()
+
+    def touch() -> None:
+        while not done.wait(HEARTBEAT_EVERY):
+            with contextlib.suppress(OSError):
+                _touch(beat)
+
+    with contextlib.suppress(OSError):
+        _touch(beat)
+    t = threading.Thread(target=touch, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        done.set()
+        t.join(timeout=5)
+
+
 def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_exit: int | None,
-              tracker: _Tracker, started_at: str | None, deadline: float | None = None) -> DispatchResult:
+              tracker: _Tracker, started_at: str | None, deadline: float | None = None,
+              beat: Path | None = None) -> DispatchResult:
+    with _beating(beat):
+        return _finalize_body(wd, req, stopped_for=stopped_for, codex_exit=codex_exit, tracker=tracker,
+                              started_at=started_at, deadline=deadline)
+
+
+def _finalize_body(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_exit: int | None,
+                   tracker: _Tracker, started_at: str | None, deadline: float | None = None) -> DispatchResult:
     with _finalize_lock(wd):
         existing = load_result(wd)
         if existing is not None:
@@ -954,7 +987,8 @@ def run_runner(worker_dir: Path) -> int:
     tracker.stop(beat=wd / HEARTBEAT)      # also clears leftovers after a normal exit
     proc.wait()
     _finalize(wd, req, stopped_for=stopped_for, codex_exit=proc.returncode, tracker=tracker,
-              started_at=started_at, deadline=_cancel_deadline(wd) if stopped_for == "cancelled" else None)
+              started_at=started_at, deadline=_cancel_deadline(wd) if stopped_for == "cancelled" else None,
+              beat=wd / HEARTBEAT)
     if raise_later:
         raise raise_later[1]
     return 0

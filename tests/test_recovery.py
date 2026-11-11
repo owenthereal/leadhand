@@ -875,8 +875,9 @@ class RunnerHelpers(unittest.TestCase):
                 p.stdout.close()
 
     def spawn(self, code):
+        # stderr discarded: a stop's SIGINT makes these sleepers print a KeyboardInterrupt traceback.
         p = subprocess.Popen([sys.executable, "-c", code], start_new_session=True, stdin=subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, text=True)
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.procs.append(p)
         return p
 

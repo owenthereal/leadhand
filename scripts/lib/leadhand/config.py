@@ -299,3 +299,16 @@ def unsupported_settings(config: Config) -> list[str]:
         c = config.run.cost_limit_usd
         out.append(f"not supported in this version: run.cost_limit_usd = {int(c) if c == int(c) else c}")
     return out
+
+
+DEFAULT_CODEX_PAUSE_PERCENT = 95       # the presets' value
+
+
+def unsupported_warnings(config: Config) -> list[str]:
+    """Settings this version reads but does not act on yet: a warning, not an error."""
+    out = []
+    if config.notify_command:
+        out.append(f"not supported in this version: notify.command = {config.notify_command}")
+    if config.codex_pause_percent != DEFAULT_CODEX_PAUSE_PERCENT:
+        out.append(f"not supported in this version: capacity.codex_pause_percent = {config.codex_pause_percent}")
+    return out

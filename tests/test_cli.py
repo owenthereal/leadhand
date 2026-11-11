@@ -10,7 +10,7 @@ CLI = str(ROOT / "scripts" / "leadhand")
 class CliTests(unittest.TestCase):
     def run_cli(self, *args):
         return subprocess.run(
-            [sys.executable, CLI, *args], capture_output=True, text=True, cwd=ROOT
+            [sys.executable, "-B", CLI, *args], capture_output=True, text=True, cwd=ROOT, timeout=60
         )
 
     def test_version_prints_package_version(self):

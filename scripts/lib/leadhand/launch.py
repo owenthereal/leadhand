@@ -251,6 +251,14 @@ def _read_meta(paths: RunPaths) -> dict:
     return meta
 
 
+def _start_command(meta: dict) -> str:
+    """The operator's command to start a new run of this run's deck (paths quoted)."""
+    cmd = [str(CLI_PATH), "start", str(meta.get("deck_source") or "<deck>")]
+    if meta.get("repo"):
+        cmd += ["--repo", str(meta["repo"])]
+    return " ".join(shlex.quote(c) for c in cmd)
+
+
 def _supervisor_route(meta: dict, root: Path | None = None) -> tuple[str | None, str | None]:
     repo = meta.get("repo")
     if not isinstance(repo, str) or not repo:
@@ -345,7 +353,7 @@ def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "cla
             print(f"error: this run has ended: {ended.get('outcome')}"
                   + (f" ({qualifier})" if qualifier else "")
                   + "; only a blocked or unfinished run continues. Start a new run from the deck "
-                    "with `leadhand start`.", file=sys.stderr)
+                    f"with: {_start_command(meta)}", file=sys.stderr)
             return 1
         try:
             workspace = _workspace(meta)
