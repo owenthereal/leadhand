@@ -151,7 +151,6 @@ class DispatchRequest:
     network: bool
     writable_dirs: tuple[Path, ...]
     resume: str | None = None
-    codex_bin: str = "codex"
     kind: str | None = None        # the dispatch kind; COMMIT_KINDS get their work committed
     branch: str | None = None      # the branch the work must be committed on
 
@@ -300,10 +299,21 @@ def _toml_string(value: str) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
+def codex_executable() -> str:
+    """The Codex program: always `codex` as found on PATH (ruling R49). request.json is
+    writable by anything that can write the run directory, so it never names an
+    executable. Tests point LEADHAND_TEST_CODEX_BIN at a fake, honoured only under
+    LEADHAND_TESTING=1."""
+    override = os.environ.get("LEADHAND_TEST_CODEX_BIN")
+    if os.environ.get("LEADHAND_TESTING") == "1" and override:
+        return override
+    return "codex"
+
+
 def codex_argv(req: DispatchRequest, last_message: Path, git_common: Path,
                env_overrides: Mapping[str, str]) -> list[str]:
     """The `codex exec` command; the prompt goes on stdin (`-`)."""
-    argv = [req.codex_bin, "exec", "-m", req.model,
+    argv = [codex_executable(), "exec", "-m", req.model,
             "-c", f"model_reasoning_effort={_toml_string(req.effort)}",
             "-c", 'approval_policy="never"',
             "-c", f"sandbox_workspace_write.network_access={'true' if req.network else 'false'}",
@@ -963,7 +973,7 @@ def run_runner(worker_dir: Path) -> int:
     try:
         proc = _launch(wd, record, argv, env, req.cwd, cancelled)
     except OSError as e:
-        (wd / STDERR).write_text(f"leadhand: cannot start {req.codex_bin}: {e}\n", encoding="utf-8")
+        (wd / STDERR).write_text(f"leadhand: cannot start {argv[0]}: {e}\n", encoding="utf-8")
         _finalize(wd, req, stopped_for=None, codex_exit=None, tracker=tracker, started_at=started_at)
         return 0
     if proc is None:

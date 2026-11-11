@@ -59,6 +59,7 @@ class Base(unittest.TestCase):
         env = mock.patch.dict(os.environ, {
             "FAKE_CODEX_LOG": str(self.log), "CODEX_HOME": str(self.codex_home),
             "LEADHAND_TESTING": "1", "LEADHAND_CONFIG": str(self.tmp / "no user config.toml"),
+            "LEADHAND_TEST_CODEX_BIN": str(FAKE),       # R49: the fake Codex comes from the test environment
             "GH_TOKEN": "parent-gh-token", "GITHUB_TOKEN": "parent-github-token",
             "SSH_AUTH_SOCK": "/nonexistent/agent.sock"})
         env.start()
@@ -100,7 +101,7 @@ class Base(unittest.TestCase):
         fields = dict(model="gpt-6-luna", effort="low", role="implementer", brief=brief,
                       report=folder / "report.md", cwd=self.repo, run_dir=self.run_dir, card=1,
                       attempt=1, dispatch_id=dispatch_id, steps=50, minutes=5, network=False,
-                      writable_dirs=(), resume=None, codex_bin=str(FAKE))
+                      writable_dirs=(), resume=None)
         fields.update(kw)
         return DispatchRequest(**fields)
 
@@ -289,7 +290,8 @@ class ResultTests(Base):
                          ("d2", None, False, None))
 
     def test_missing_codex_binary_is_blocked_environment(self):
-        result = dispatch(self.request(codex_bin=str(self.tmp / "no such codex")))
+        os.environ["LEADHAND_TEST_CODEX_BIN"] = str(self.tmp / "no such codex")
+        result = dispatch(self.request())
         self.assertEqual((result.status, result.blocked_by, result.exit_reason), ("BLOCKED", "environment", "error"))
         self.assertIn("cannot start", (self.worker_dir() / "codex.stderr").read_text())
 
