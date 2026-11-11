@@ -2892,7 +2892,8 @@ def _store_result(ctx: _Run, d: _Dispatch, worker_id: str, reply: str, *, stoppe
                                 attempt=req["attempt"], dispatch_kind=d.kind, worker_id=worker_id, tip=tip,
                                 session_id=codex.session_id if codex else None, files=files,
                                 stopped=bool(stopped), charge_ids=[], reconciled=True, **head_info, **partial,
-                                **({k: commit.get(k) for k in ("committed", "commit_error", "commit_skipped")}
+                                **({k: commit.get(k) for k in ("committed", "commit_error", "commit_skipped", "gitlinks_skipped")
+                                    if k != "gitlinks_skipped" or commit.get(k)}
                                    if req["vendor"] == "codex" else {}))
 
     ended_at = utc_now()
@@ -2921,7 +2922,8 @@ def _store_result(ctx: _Run, d: _Dispatch, worker_id: str, reply: str, *, stoppe
                             session_id=codex.session_id if codex else None, files=files, stopped=bool(stopped),
                             charge_ids=[charge_id], **({"reconciled": True} if interrupted else {}), **head_info,
                             **partial,
-                            **({k: commit.get(k) for k in ("committed", "commit_error", "commit_skipped")}
+                            **({k: commit.get(k) for k in ("committed", "commit_error", "commit_skipped", "gitlinks_skipped")
+                                    if k != "gitlinks_skipped" or commit.get(k)}
                                if req["vendor"] == "codex" else {}))
 
 
@@ -2958,11 +2960,13 @@ def _commit_partial(ctx: _Run, d: _Dispatch) -> dict[str, str]:
                          head_before=before)
         # Tracked changes and the files that appeared during the dispatch; never another
         # worker's untracked leftovers (I3).
-        if not stage_work(ctx.ws, new_paths=new):
-            return {}
+        staged, gitlinks = stage_work(ctx.ws, new_paths=new)
+        if not staged:
+            return {"partial_gitlinks_skipped": gitlinks} if gitlinks else {}
         git(ctx.ws, "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--quiet",
             "--no-verify", "-m", f"{d.id}: partial work (stopped)", "-m", f"{dsp.TRAILER}: {d.id}")
-        return {"partial_commit": head(ctx.ws, f"refs/heads/{branch}")}
+        return {"partial_commit": head(ctx.ws, f"refs/heads/{branch}"),
+                **({"partial_gitlinks_skipped": gitlinks} if gitlinks else {})}
     except GitError as e:
         return {"partial_commit_error": str(e)}
 

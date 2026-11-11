@@ -23,6 +23,10 @@ FETCH_TIMEOUT = 600.0
 # Commits the library itself creates (rebase, stash create) are never signed:
 # signing may prompt, and these commits are leadhand's own bookkeeping.
 NO_SIGN = ("-c", "commit.gpgsign=false")
+# Passed on every Git call leadhand makes (ruling R45): no repository hook, no fsmonitor
+# command (also a nested repository's: command-line config reaches Git's child processes),
+# and nested repositories are never looked into.
+SAFE_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "diff.ignoreSubmodules=all")
 # Variables that would point Git at another repository than the cwd.
 _REPO_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
 
@@ -44,7 +48,7 @@ def _run(cwd: Path, args: tuple[str, ...] | list[str], env: Mapping[str, str] | 
         full_env.update(env)
     try:
         return subprocess.run(
-            ["git", *args], cwd=cwd, env=full_env, capture_output=True, stdin=subprocess.DEVNULL,
+            ["git", *SAFE_CONFIG, *args], cwd=cwd, env=full_env, capture_output=True, stdin=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="surrogateescape", timeout=timeout,
         )
     except subprocess.TimeoutExpired as e:
@@ -54,7 +58,7 @@ def _run(cwd: Path, args: tuple[str, ...] | list[str], env: Mapping[str, str] | 
 
 
 def _fail(r: subprocess.CompletedProcess[str], cwd: Path) -> GitError:
-    cmd = " ".join(r.args[1:])
+    cmd = " ".join(r.args[1 + len(SAFE_CONFIG):])
     detail = (r.stderr or r.stdout).strip()
     return GitError(f"git {cmd} failed with exit {r.returncode} (in {cwd}): {detail}")
 
@@ -376,11 +380,12 @@ def _pathspec_file(ws: Path, paths: Sequence[str]) -> str:
     return tmp
 
 
-def stage_work(ws: Path, *, new_paths: Sequence[str], deadline: float | None = None) -> bool:
+def stage_work(ws: Path, *, new_paths: Sequence[str], deadline: float | None = None) -> tuple[bool, list[str]]:
     """Stage a worker's changes for leadhand's own commit: every tracked change (`add -u`)
     and the untracked files in `new_paths` (those that appeared during the dispatch), never
-    any other untracked file. `deadline` (time.monotonic) bounds every Git call. Returns
-    whether anything is staged."""
+    any other untracked file, and never a gitlink (a nested repository or submodule
+    pointer: one that got staged is unstaged again, R45). `deadline` (time.monotonic)
+    bounds every Git call. Returns (whether anything is staged, the gitlinks left out)."""
     def timeout() -> float:
         if deadline is None:
             return GIT_TIMEOUT
@@ -398,7 +403,19 @@ def stage_work(ws: Path, *, new_paths: Sequence[str], deadline: float | None = N
                 timeout=timeout())
         finally:
             Path(spec).unlink(missing_ok=True)
-    return not _test(ws, "diff", "--cached", "--quiet", "--no-ext-diff", "HEAD", "--")
+    raw = _nul_list(git(ws, "diff", "--cached", "--raw", "-z", "--no-renames", "--no-ext-diff",
+                        "--ignore-submodules=none", "HEAD", "--", timeout=timeout()))
+    gitlinks = sorted({path for meta, path in zip(raw[::2], raw[1::2])
+                       if "160000" in meta.lstrip(":").split()[:2]})
+    if gitlinks:
+        spec = _pathspec_file(ws, gitlinks)
+        try:
+            git(ws, "--literal-pathspecs", "reset", "--quiet", f"--pathspec-from-file={spec}",
+                "--pathspec-file-nul", "HEAD", timeout=timeout())
+        finally:
+            Path(spec).unlink(missing_ok=True)
+    staged = not _test(ws, "diff", "--cached", "--quiet", "--no-ext-diff", "--ignore-submodules=none", "HEAD", "--")
+    return staged, gitlinks
 
 
 def preserve_and_restore(ws: Path, *, ref: str, expected_head: str, expected_branch: str,

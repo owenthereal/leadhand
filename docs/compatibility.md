@@ -141,9 +141,13 @@ Codex workers and the runner:
     (implement, fix, continue, answer, final fix), whatever the final status, so partial work
     survives.
   - The runner commits only when the workspace is on the expected branch and no Git
-    operation is in progress. It runs `git add -A`, which respects `.gitignore` and
-    `info/exclude`, so the `.leadhand/` scratch folder is never committed, then an unsigned
-    commit with hooks off. The message is `<kind> card <n>: <summary>`, with a
+    operation is in progress. Before it launches Codex it records the untracked files Git
+    does not ignore; it then stages every tracked change and only the untracked files that
+    appeared during the dispatch, so another worker's leftovers are never swept in, and
+    `.gitignore` and `info/exclude` keep the `.leadhand/` scratch folder out. It never
+    commits a gitlink (a nested repository or submodule pointer): such an entry is unstaged
+    and named in `result.json` (`gitlinks_skipped`). Then an unsigned commit with hooks
+    off. The message is `<kind> card <n>: <summary>`, with a
     `Leadhand-Dispatch: <dispatch id>` trailer.
   - The runner records a commit intent first. After a restart, a HEAD that already carries
     the trailer is not committed again. The commit's SHA is in `result.json` (`committed`).
@@ -219,9 +223,17 @@ are not blocked:
 - `http.extraHeader` (or `http.<url>.extraHeader`) in the user's Git config, for example an
   `Authorization` header.
 - Remote URLs that embed a token (`https://<token>@host/...`) in the repository's config.
-- Hooks: the worker can write the repository's common Git directory (it is a writable
-  folder for commits), so it can plant hooks that later run in the operator's own Git
-  commands.
+- The Git directory: leadhand passes the repository's common Git directory to Codex with
+  `--add-dir`, but in the observed version Codex's sandbox keeps it read-only anyway (see
+  the runtime findings above), so a worker cannot commit there. Should a Codex version let
+  it write there, a worker could plant hooks or config. Leadhand's own Git calls (the
+  engine's, and the runner's commits) run with `core.hooksPath=/dev/null`,
+  `core.fsmonitor=false` and `diff.ignoreSubmodules=all`, so no hook, fsmonitor command or
+  nested repository's setting runs in them; the operator's own Git commands in the
+  repository are not protected.
+- Tokens for other hosts: only the GitHub token variables are removed. Others, such as
+  `GITLAB_TOKEN`, `BITBUCKET_TOKEN` or a cloud provider's credentials, pass through to
+  the Codex worker unchanged.
 - A push to a local path needs no credentials and still works.
 
 ## End to end

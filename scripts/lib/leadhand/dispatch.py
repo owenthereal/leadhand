@@ -65,7 +65,7 @@ from typing import Any, Iterable, Mapping
 
 from leadhand import procs
 from leadhand.briefs import parse_report_head, worker_prompt
-from leadhand.gitops import GitError, git_common_dir, stage_work, status_entries, untracked_files
+from leadhand.gitops import SAFE_CONFIG, GitError, git_common_dir, stage_work, status_entries, untracked_files
 from leadhand.state import (utc_now, append_attempt, crash_point, read_attempts, run_paths, state_lock,
                             write_json_atomic)
 from leadhand.usage import CODEX_STREAM_SOURCE, UNKNOWN, Usage, charge, codex_usage_from_stream, estimate_cost
@@ -220,7 +220,7 @@ def load_commit(wd: Path) -> dict:
     """The runner's commit outcome from result.json: committed, changes, commit_error,
     commit_skipped (each None when absent)."""
     d = _read_json(Path(wd) / RESULT) or {}
-    return {k: d.get(k) for k in ("committed", "changes", "commit_error", "commit_skipped")}
+    return {k: d.get(k) for k in ("committed", "changes", "commit_error", "commit_skipped", "gitlinks_skipped")}
 
 
 def load_result(wd: Path) -> DispatchResult | None:
@@ -598,8 +598,10 @@ def _commit_subject(req: DispatchRequest) -> str:
 def _git(ws: Path, *args: str, timeout: float = COMMIT_TIMEOUT) -> subprocess.CompletedProcess[str]:
     env = {k: v for k, v in os.environ.items() if k not in _REPO_VARS}
     env["GIT_TERMINAL_PROMPT"] = "0"
-    return subprocess.run(["git", *args], cwd=ws, env=env, capture_output=True, text=True,
-                          stdin=subprocess.DEVNULL, timeout=timeout)
+    # No hooks, no fsmonitor, no look into nested repositories (R45); output that is not
+    # UTF-8 is replaced, never fatal.
+    return subprocess.run(["git", *SAFE_CONFIG, *args], cwd=ws, env=env, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=timeout)
 
 
 class _CommitProblem(Exception):
@@ -675,12 +677,16 @@ def _commit_work(wd: Path, req: DispatchRequest, *, deadline: float | None = Non
             return {"committed": None, "changes": False, "commit_skipped": "no changes"}
         if intent is None:
             write_json_atomic(wd / COMMIT_INTENT, {"at": utc_now(), "branch": req.branch, "head_before": head_now})
-        if not stage_work(ws, new_paths=new, deadline=deadline):
-            return {"committed": None, "changes": False, "commit_skipped": "no changes"}
+        staged, gitlinks = stage_work(ws, new_paths=new, deadline=deadline)
+        skipped = {"gitlinks_skipped": gitlinks} if gitlinks else {}
+        if not staged:
+            why = (f"only nested repositories changed, and gitlinks are never committed: {', '.join(gitlinks)}"
+                   if gitlinks else "no changes")
+            return {"committed": None, "changes": False, "commit_skipped": why, **skipped}
         # Unsigned (signing may prompt) and without hooks: this is leadhand's own bookkeeping.
         run("-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "--no-verify",
             "-m", _commit_subject(req), "-m", f"{TRAILER}: {req.dispatch_id}")
-        return {"committed": run("rev-parse", "--verify", "HEAD").stdout.strip(), "changes": True}
+        return {"committed": run("rev-parse", "--verify", "HEAD").stdout.strip(), "changes": True, **skipped}
     except (_CommitProblem, GitError) as e:
         return {"committed": None, "changes": changes, "commit_error": str(e)}
     except OSError as e:
