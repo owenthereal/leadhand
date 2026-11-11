@@ -77,7 +77,8 @@ from leadhand import dispatch as dsp
 from leadhand import usage
 from leadhand.briefs import (CODEX_AGENT, agent_for, dispatch_message, parse_report_head, scratch_dir,
                              write_brief)
-from leadhand.config import VENDORS, Config, ConfigError, Route, docs_dir_for, load_config
+from leadhand.config import (SNAPSHOT, VENDORS, Config, ConfigError, Route, config_to_dict, docs_dir_for,
+                             load_config, load_run_config)
 from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, parse_deck
 from leadhand.gitops import (GitError, card_branch_name, changed_paths, cut_card_branch, default_base,
                              detect_violation, ensure_excluded, fast_forward, git, head, is_ancestor,
@@ -221,7 +222,7 @@ def _load(run_dir: Path | str, *, check_digest: bool) -> _Run:
             raise EngineError(f"deck changed since start (expected {meta['deck_digest']})")
     try:
         deck = parse_deck(paths.deck)
-        config = load_config(Path(meta["repo"]))
+        config = load_run_config(root, Path(meta["repo"]))      # the snapshot from start (I5)
     except (DeckError, ConfigError, OSError) as e:
         raise EngineError(str(e)) from None
     return _Run(root=root, paths=paths, meta=meta, deck=deck, config=config,
@@ -373,6 +374,8 @@ def _start(deck_path: Path, repo: Path, config: Config | None, new: bool) -> tup
     root = new_run_dir(docs, slug, date.today())
     paths = run_paths(root)
     _write_bytes_atomic(paths.deck, raw)
+    # The effective configuration, read by the run from now on instead of the live files (I5).
+    write_json_atomic(root / SNAPSHOT, config_to_dict(config))
     if deck.base_sha:
         base_ref, base_sha = deck.base_ref, head(repo, deck.base_sha)
     else:

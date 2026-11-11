@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import procs
-from .config import ConfigError, load_config
+from .config import ConfigError, load_config, load_run_config
 from .state import RunPaths, append_event, read_events, run_paths, write_json_atomic
 
 SUPERVISOR_AGENT = "leadhand:supervisor"
@@ -251,11 +251,13 @@ def _read_meta(paths: RunPaths) -> dict:
     return meta
 
 
-def _supervisor_route(meta: dict) -> tuple[str | None, str | None]:
+def _supervisor_route(meta: dict, root: Path | None = None) -> tuple[str | None, str | None]:
     repo = meta.get("repo")
     if not isinstance(repo, str) or not repo:
         raise LaunchError("run.json: no repo")
-    role = load_config(Path(repo)).roles.get("supervisor")
+    # The run's configuration snapshot (I5), when the run directory is known.
+    config = load_run_config(root, Path(repo)) if root is not None else load_config(Path(repo))
+    role = config.roles.get("supervisor")
     route = role.routes.get("claude") if role is not None else None
     return (route.model, route.effort) if route is not None else (None, None)
 
@@ -347,7 +349,7 @@ def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "cla
             return 1
         try:
             workspace = _workspace(meta)
-            model, effort = _supervisor_route(meta)
+            model, effort = _supervisor_route(meta, root)
             if shutil.which(claude_bin) is None:
                 raise LaunchError(f"{claude_bin} not found on PATH")
         except (LaunchError, ConfigError) as e:

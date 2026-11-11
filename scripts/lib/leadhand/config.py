@@ -1,6 +1,7 @@
 """Configuration loading: presets, user file and repo file, merged and validated."""
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from dataclasses import dataclass
@@ -237,6 +238,50 @@ def load_config(repo: Path, *, user_file: Path | None = None, presets_dir: Path 
         raise ConfigError(f"preset: unknown preset {name!r}")
     merged = _merge(_merge(_read(preset_path), user), repo_cfg)
     return _build(merged)
+
+
+SNAPSHOT = "config.json"
+
+
+def config_to_dict(config: Config) -> dict:
+    """The effective configuration as a plain table that `config_from_dict` (the same
+    validation as the TOML files) turns back into an equal Config."""
+    return {
+        "profile": config.profile,
+        "docs_dir": config.docs_dir,
+        "run": {"worktree": config.run.worktree, "test_first": config.run.test_first,
+                "evidence": config.run.evidence, "card_review": config.run.card_review,
+                "cost_limit_usd": config.run.cost_limit_usd, "branch_prefix": config.run.branch_prefix},
+        "after_run": {"step": config.after_run.step, "on_incomplete": config.after_run.on_incomplete,
+                      "repeat_safe": config.after_run.repeat_safe, "check": config.after_run.check},
+        "capacity": {"codex_pause_percent": config.codex_pause_percent},
+        "codex": {"network": config.codex.network, "writable_dirs": list(config.codex.writable_dirs)},
+        "limits": {role: {"steps": lim.steps, "minutes": lim.minutes} for role, lim in config.limits.items()},
+        "roles": {role: {**{v: f"{r.model} {r.effort}" for v, r in spec.routes.items()}, "prefer": spec.prefer}
+                  for role, spec in config.roles.items()},
+        "notify": {"command": config.notify_command},
+        "prices": {fam: dict(p) for fam, p in config.prices.items()},
+    }
+
+
+def config_from_dict(d: Mapping[str, Any]) -> Config:
+    if not isinstance(d, dict):
+        raise ConfigError("the configuration snapshot is not a table")
+    return _build(dict(d))
+
+
+def load_run_config(run_dir: Path, repo: Path) -> Config:
+    """A run's configuration: the snapshot `start` wrote into the run directory (I5), so a
+    worker that edits `.leadhand.toml` or the user file mid-run changes nothing for the run.
+    A run started before snapshots existed reads the live files."""
+    path = Path(run_dir) / SNAPSHOT
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return load_config(Path(repo))
+    except (OSError, ValueError) as e:
+        raise ConfigError(f"{path}: {e}") from None
+    return config_from_dict(data)
 
 
 def docs_dir_for(config: Config, repo: Path) -> Path:

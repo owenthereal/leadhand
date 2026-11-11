@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from leadhand import usage as usage_mod
-from leadhand.config import ConfigError, docs_dir_for, load_config
+from leadhand.config import ConfigError, docs_dir_for, load_config, load_run_config
 from leadhand.dispatch import CLI_PATH
 from leadhand.deck import DeckError, parse_deck
 from leadhand.state import (CardState, RunPaths, fold_cards, read_attempts, read_events, run_paths,
@@ -198,7 +198,7 @@ def vendor_of(source: str) -> str:
 
 def _prices(snap: Snapshot) -> dict:
     try:
-        return dict(load_config(Path(snap.meta["repo"])).prices)
+        return dict(load_run_config(snap.root, Path(snap.meta["repo"])).prices)
     except (ConfigError, KeyError, OSError, ValueError, TypeError):
         return {}
 

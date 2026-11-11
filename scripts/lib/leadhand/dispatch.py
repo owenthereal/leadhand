@@ -1276,13 +1276,14 @@ def request_for(run_dir: Path, dispatch_id: str, *, card: int | None, attempt: i
                 effort: str, brief: Path, report: Path, cwd: Path, resume: str | None = None,
                 kind: str | None = None, branch: str | None = None) -> DispatchRequest:
     """The DispatchRequest for a dispatch, with limits, network and writable folders from the
-    run repo's configuration. `leadhand dispatch` and the engine build requests only here, so
+    run's configuration snapshot. `leadhand dispatch` and the engine build requests only here, so
     the request.json both write is the same."""
-    from leadhand.config import load_config
+    from leadhand.config import load_run_config
     run_dir = Path(run_dir).absolute()
     cwd = Path(cwd).absolute()
     meta = _read_json(run_paths(run_dir).run_json) or {}
-    config = load_config(Path(meta.get("repo") or cwd))
+    # The run's snapshot (I5): a worker editing .leadhand.toml mid-run changes nothing.
+    config = load_run_config(run_dir, Path(meta.get("repo") or cwd))
     limits = limits_for(config, role)
     writable = tuple(p if p.is_absolute() else cwd / p
                      for p in (Path(d).expanduser() for d in config.codex.writable_dirs))
