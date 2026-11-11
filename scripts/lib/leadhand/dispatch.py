@@ -68,7 +68,8 @@ from leadhand.briefs import parse_report_head, worker_prompt
 from leadhand.gitops import SAFE_CONFIG, GitError, git_common_dir, stage_work, status_entries, untracked_files
 from leadhand.state import (utc_now, append_attempt, crash_point, read_attempts, run_paths, state_lock,
                             write_json_atomic)
-from leadhand.usage import CODEX_STREAM_SOURCE, UNKNOWN, Usage, charge, codex_usage_from_stream, estimate_cost
+from leadhand.usage import (CODEX_STREAM_SOURCE, UNKNOWN, Usage, charge, codex_usage_from_stream, estimate_cost,
+                            usage_to_dict)
 
 STEP_ITEM_TYPES: frozenset[str] = frozenset({"command_execution", "file_change"})
 CREDENTIAL_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
@@ -199,7 +200,7 @@ def _read_json(path: Path) -> dict | None:
 
 
 def usage_dict(u: Usage) -> dict | None:
-    return asdict(u) if u.known else None
+    return usage_to_dict(u) if u.known else None
 
 
 def _usage_from(d: Mapping[str, Any] | None) -> Usage:

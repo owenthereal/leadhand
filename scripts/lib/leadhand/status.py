@@ -213,7 +213,7 @@ def usage_summary(snap: Snapshot, sessions_dir: Path | None = None, meter: tuple
     incomplete: set[str] = set()
     for c in snap.charges:
         cost = (usage_mod.estimate_cost(c.usage, c.usage.model, prices)
-                if c.usage.known and c.usage.model else None)
+                if c.usage.known and (c.usage.model or c.usage.by_model) else None)
         for table, key in ((by_role, c.role), (by_vendor, vendor_of(c.source))):
             row = table.setdefault(key, {"input": 0, "output": 0, "cached": 0, "estimated_usd": None,
                                          "unknown_charges": 0})

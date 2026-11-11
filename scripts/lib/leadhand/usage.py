@@ -129,6 +129,9 @@ class Usage:
     reasoning: int = 0
     known: bool = True
     model: str | None = None
+    # When the usage mixes models: model -> its token fields (model None then). Priced per
+    # model by `estimate_cost` (final review I9). "" stands for records without a model.
+    by_model: Mapping[str, Mapping[str, int]] | None = None
 
 
 UNKNOWN = Usage(known=False)
@@ -136,17 +139,37 @@ UNKNOWN = Usage(known=False)
 _TOKEN_FIELDS = ("input", "cached", "cache_write_5m", "cache_write_1h", "output", "reasoning")
 
 
+def _parts(u: Usage) -> dict[str, dict[str, int]]:
+    """The usage's tokens per model; records with no tokens at all (a synthetic message)
+    are no part."""
+    if u.by_model:
+        return {m: {f: _int(t.get(f)) for f in _TOKEN_FIELDS} for m, t in u.by_model.items()}
+    tokens = _tokens_dict(u)
+    return {u.model or "": tokens} if any(tokens.values()) else {}
+
+
 def add(a: Usage, b: Usage) -> Usage:
     """Field-wise sum. The result is known only if both are: a total that includes
-    an unknown part must not pass for a complete one. Differing models give None."""
-    if a.model == b.model or b.model is None:
+    an unknown part must not pass for a complete one. Tokens of different models are
+    also kept per model (`by_model`, model None), so the total is priced per model."""
+    parts = _parts(a)
+    for m, t in _parts(b).items():
+        mine = parts.setdefault(m, dict.fromkeys(_TOKEN_FIELDS, 0))
+        for f in _TOKEN_FIELDS:
+            mine[f] += t[f]
+    by_model = None
+    if len(parts) > 1:
+        model, by_model = None, parts
+    elif len(parts) == 1:
+        model = next(iter(parts)) or None
+    elif a.model == b.model or b.model is None:
         model = a.model
     elif a.model is None:
         model = b.model
     else:
         model = None
     return Usage(**{f: getattr(a, f) + getattr(b, f) for f in _TOKEN_FIELDS},
-                 known=a.known and b.known, model=model)
+                 known=a.known and b.known, model=model, by_model=by_model)
 
 
 def subtract(a: Usage, b: Usage) -> Usage:
@@ -156,7 +179,13 @@ def subtract(a: Usage, b: Usage) -> Usage:
 
 
 def _usage_to_dict(u: Usage) -> dict:
-    return asdict(u)
+    d = asdict(u)
+    if d.get("by_model") is None:
+        d.pop("by_model", None)          # single-model usage keeps its old shape
+    return d
+
+
+usage_to_dict = _usage_to_dict
 
 
 def _usage_from_dict(d: Mapping[str, Any]) -> Usage:
@@ -562,16 +591,30 @@ def price_family(model: str | None) -> str | None:
     return next((f for f in PRICE_FAMILIES if f in low), None)
 
 
-def estimate_cost(usage: Usage, model: str, prices: Mapping[str, Mapping[str, float]]) -> float | None:
+def estimate_cost(usage: Usage, model: str | None, prices: Mapping[str, Mapping[str, float]]) -> float | None:
     """Estimated API-equivalent cost in dollars: sum of tokens x $/MTok. None for
     unknown usage or an unpriced model. Reasoning tokens are not priced separately."""
     if not usage.known:
         return None
+    if usage.by_model:
+        # Mixed models: each model's part at its own price; an unpriced part makes the
+        # whole estimate unknown rather than silently low. A part with no model takes `model`.
+        total = 0.0
+        for m, t in _parts(usage).items():
+            cost = _price(t, m or model, prices)
+            if cost is None:
+                return None
+            total += cost
+        return total
+    return _price(_tokens_dict(usage), model, prices)
+
+
+def _price(t: Mapping[str, int], model: str | None, prices: Mapping[str, Mapping[str, float]]) -> float | None:
     family = price_family(model)
     p = prices.get(family) if family else None
     if p is None:
         return None
-    return (usage.input * p["input"] + usage.output * p["output"]
-            + usage.cached * p["cache_read"]
-            + usage.cache_write_5m * p["cache_write_5m"]
-            + usage.cache_write_1h * p["cache_write_1h"]) / 1_000_000
+    return (t["input"] * p["input"] + t["output"] * p["output"]
+            + t["cached"] * p["cache_read"]
+            + t["cache_write_5m"] * p["cache_write_5m"]
+            + t["cache_write_1h"] * p["cache_write_1h"]) / 1_000_000
