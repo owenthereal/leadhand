@@ -82,7 +82,7 @@ from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, p
 from leadhand.gitops import (GitError, card_branch_name, changed_paths, cut_card_branch, default_base,
                              detect_violation, ensure_excluded, fast_forward, git, head, is_ancestor,
                              is_test_or_doc_path, needs_integration, prepare_workspace, preserve_and_restore,
-                             rebase_onto)
+                             rebase_onto, stage_work, status_entries, untracked_files)
 from leadhand.route import LadderExhausted, PinnedVendorMissing, Resolution, resolve
 from leadhand.state import (CardState, RunPaths, utc_now, allowed_next_step, append_attempt, append_event,
                             crash_point, decide_outcome, fold_cards, new_run_dir, read_attempts, read_events,
@@ -528,7 +528,8 @@ def _step(ctx: _Run, events: list[dict]) -> dict | None:
     if c.state == "pending":
         _no_open_dispatch(ctx, events, n)
         current = _current_branch(ctx)
-        if _ensure_clean(ctx, events, branch=current or ctx.branch, why=f"before cutting card {n}"):
+        if _ensure_clean(ctx, events, branch=current or ctx.branch, why=f"before cutting card {n}",
+                         untracked=True):
             return None
         branch, base = cut_card_branch(ctx.ws, ctx.branch, n)
         append_event(ctx.paths, "card_cut", card=n, branch=branch, base=base)
@@ -636,6 +637,8 @@ def _request(ctx: _Run, c: CardState, events: list[dict], *, kind: str, attempt:
             guard = {"refs": {run_ref: head(ctx.ws, run_ref)}, "ref_scope": [run_ref]}
         if kind in IMPLEMENTER_KINDS:
             guard["start_tip"] = head(ctx.ws, f"refs/heads/{c.branch}")
+            # What is untracked already is not this dispatch's: a partial-work commit leaves it (I3).
+            guard["untracked"] = untracked_files(ctx.ws)
     if continues is not None:
         guard["continues"] = continues
     brief, report = write_brief(kind, ws=ctx.ws, deck=ctx.deck, card=ctx.card(c.number), attempt=attempt,
@@ -690,7 +693,7 @@ def _check_out(ctx: _Run, events: list[dict], card: int, branch: str) -> None:
     if current == branch:
         return
     _no_open_dispatch(ctx, events, card)
-    _ensure_clean(ctx, events, branch=current or branch, why=f"before switching to {branch}")
+    _ensure_clean(ctx, events, branch=current or branch, why=f"before switching to {branch}", untracked=True)
     if _current_branch(ctx) != branch:
         git(ctx.ws, "checkout", "--quiet", branch, "--")
 
@@ -1116,7 +1119,7 @@ def _rebase(ctx: _Run, card: int, branch: str, integ: dict) -> None:
     if integ.get("keep"):
         git(ctx.ws, "update-ref", "-m", "leadhand: card tip before integration", integ["keep"], integ["tip"])
     crash_point("before_rebase")
-    _ensure_clean(ctx, read_events(ctx.paths), branch=branch, why=f"before rebasing card {card}")
+    _ensure_clean(ctx, read_events(ctx.paths), branch=branch, why=f"before rebasing card {card}", untracked=True)
     onto = integ["onto"]
     conflicts = [] if _contains(ctx, branch, onto) else rebase_onto(ctx.ws, branch, onto)
     crash_point("after_rebase")
@@ -1517,26 +1520,31 @@ def _operation(ctx: _Run) -> str | None:
 
 
 def _ensure_clean(ctx: _Run, events: list[dict], *, branch: str, why: str, after_dispatch: str | None = None,
-                  operations_only: bool = False) -> dict | None:
+                  operations_only: bool = False, untracked: bool = False) -> dict | None:
     """R30: before a check is dispatched and before the engine rebases or switches branches,
     anything an implementer left in the workspace (a dirty tree or index, HEAD off `branch`'s
     tip, an operation in progress) is preserved under refs/leadhand/<run_id>/leftovers/<n>
     (with preserve_and_restore's siblings) and cleared, putting the workspace on `branch` at
     its tip. Recorded as `violation{by: implementer}`; it voids nothing. With
-    `operations_only`, only an operation in progress counts. Returns the `found` event."""
+    `operations_only`, only an operation in progress counts. With `untracked` (before the
+    engine switches cards or rebases), untracked files Git does not ignore count too: they
+    are kept in the leftovers commit and removed, so no later card's commit sweeps them in
+    (I3); nested repositories are left alone. Returns the `found` event."""
     op = _operation(ctx)
     if operations_only and op is None:
         return None
     tip = head(ctx.ws, f"refs/heads/{branch}")
     v = detect_violation(ctx.ws, tip, branch)
-    if op is None and v is None:
+    loose = [p for p in untracked_files(ctx.ws) if not p.endswith("/")] if untracked else []
+    if op is None and v is None and not loose:
         return None
     n = 1 + sum(1 for e in read_events(ctx.paths) if e["kind"] == "violation" and _by(e) == "implementer"
                 and e.get("stage") == "found")
     found = append_event(ctx.paths, "violation", stage="found", by="implementer", n=n,
                          ref=f"refs/leadhand/{ctx.meta['run_id']}/leftovers/{n}", paths=_violation_paths(ctx, v),
                          operation=op, head_moved=bool(v and v.head_moved), index_dirty=bool(v and v.index_dirty),
-                         expected_head=tip, expected_branch=branch, after_dispatch=after_dispatch, why=why)
+                         expected_head=tip, expected_branch=branch, after_dispatch=after_dispatch, why=why,
+                         **({"untracked": loose} if loose else {}))
     _finish_leftovers(ctx, [found])
     return found
 
@@ -1550,9 +1558,11 @@ def _finish_leftovers(ctx: _Run, events: list[dict]) -> bool:
                and e.get("stage") == "found" and e.get("n") not in restored]
     for f in pending:
         saved = None
-        if _operation(ctx) or detect_violation(ctx.ws, f["expected_head"], f["expected_branch"]) is not None:
+        loose = [p for p in f.get("untracked") or () if os.path.lexists(ctx.ws / p)]
+        if (_operation(ctx) or detect_violation(ctx.ws, f["expected_head"], f["expected_branch"]) is not None
+                or loose):
             saved = preserve_and_restore(ctx.ws, ref=f["ref"], expected_head=f["expected_head"],
-                                         expected_branch=f["expected_branch"])
+                                         expected_branch=f["expected_branch"], untracked=loose)
         now = _ref_snapshot(ctx)
         append_event(ctx.paths, "violation", stage="restored", by="implementer", n=f["n"], ref=f["ref"],
                      saved=saved or now.get(f["ref"]), after_dispatch=f.get("after_dispatch"),
@@ -1865,7 +1875,7 @@ def _request_run(ctx: _Run, events: list[dict], *, kind: str, attempt: int, role
         # Like an integrate worker: it commits on the final branch but must leave the run branch alone.
         run_ref = f"refs/heads/{ctx.branch}"
         guard = {"refs": {run_ref: head(ctx.ws, run_ref)}, "ref_scope": [run_ref],
-                 "start_tip": head(ctx.ws, f"refs/heads/{branch}")}
+                 "start_tip": head(ctx.ws, f"refs/heads/{branch}"), "untracked": untracked_files(ctx.ws)}
     if kind == "evidence":
         # Every evidence dispatch (first run, voided or failed re-run) starts from a clean base.
         extra = {**extra, "base_worktree": str(_base_worktree(ctx))}
@@ -2861,8 +2871,9 @@ def _cancelling(ctx: _Run, events: list[dict]) -> bool:
 
 def _commit_partial(ctx: _Run, d: _Dispatch) -> dict[str, str]:
     """R42: commit what a stopped or interrupted Claude worker left uncommitted, when the
-    workspace is on its branch and no Git operation is in progress: everything Git does not
-    ignore, unsigned and without hooks, with the `Leadhand-Dispatch` trailer, after a
+    workspace is on its branch and no Git operation is in progress: its tracked changes and
+    the untracked files Git does not ignore that were not there when it was dispatched (I3),
+    unsigned and without hooks, with the `Leadhand-Dispatch` trailer, after a
     `reconciled{stage: partial_work}` intent. Repeat-safe: after a crash past the commit the
     workspace is clean and nothing more is committed. Returns `partial_commit` (the commit)
     or `partial_commit_error` for the result event, or {} when there was nothing to commit."""
@@ -2874,14 +2885,20 @@ def _commit_partial(ctx: _Run, d: _Dispatch) -> dict[str, str]:
     try:
         if _current_branch(ctx) != branch or _operation(ctx) is not None:
             return {}
-        if not git(ctx.ws, "status", "--porcelain=v1", "--untracked-files=all"):
+        tracked, loose = status_entries(ctx.ws)
+        earlier = set(d.req.get("untracked") or ())
+        new = [p for p in loose if p not in earlier and not p.endswith("/")]
+        if not tracked and not new:
             return {}
         before = head(ctx.ws, f"refs/heads/{branch}")
         if not any(e["kind"] == "reconciled" and e.get("stage") == "partial_work" and e.get("dispatch_id") == d.id
                    for e in read_events(ctx.paths)):
             append_event(ctx.paths, "reconciled", stage="partial_work", dispatch_id=d.id, branch=branch,
                          head_before=before)
-        git(ctx.ws, "add", "-A")
+        # Tracked changes and the files that appeared during the dispatch; never another
+        # worker's untracked leftovers (I3).
+        if not stage_work(ctx.ws, new_paths=new):
+            return {}
         git(ctx.ws, "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--quiet",
             "--no-verify", "-m", f"{d.id}: partial work (stopped)", "-m", f"{dsp.TRAILER}: {d.id}")
         return {"partial_commit": head(ctx.ws, f"refs/heads/{branch}")}

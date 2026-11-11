@@ -65,7 +65,7 @@ from typing import Any, Iterable, Mapping
 
 from leadhand import procs
 from leadhand.briefs import parse_report_head, worker_prompt
-from leadhand.gitops import GitError, git_common_dir
+from leadhand.gitops import GitError, git_common_dir, stage_work, status_entries, untracked_files
 from leadhand.state import (utc_now, append_attempt, crash_point, read_attempts, run_paths, state_lock,
                             write_json_atomic)
 from leadhand.usage import CODEX_STREAM_SOURCE, UNKNOWN, Usage, charge, codex_usage_from_stream, estimate_cost
@@ -107,6 +107,10 @@ CANCEL, STOPPING, RESULT, FINALIZE_LOCK = "cancel", "stopping.json", "result.jso
 OWNER_LOCK, RUNNER_LOCK = "owner.lock", "runner.lock"
 RUNNER_OUT, RUNNER_ERR, GH_DIR, SUPERSEDED = "runner.out", "runner.err", "gh-config", "superseded"
 COMMIT_INTENT = "commit.json"
+# The untracked files (not ignored) in the workspace when the first runner launched Codex:
+# they are not the worker's, so its commit leaves them out (final review I3). Written once,
+# kept across generations.
+UNTRACKED = "untracked.json"
 GENERATION_FILES = (SPAWN, RUNNER, HEARTBEAT, PROCS, STREAM, STDERR, LAST, RAW, CANCEL, STOPPING, RESULT,
                     COMMIT_INTENT,
                     RUNNER_OUT, RUNNER_ERR)
@@ -630,9 +634,25 @@ def _commit_work(wd: Path, req: DispatchRequest, *, deadline: float | None = Non
             raise _CommitProblem(f"git {' '.join(args)} failed: {(r.stderr or r.stdout).strip()}")
         return r
 
+    def bound() -> float:
+        if deadline is None:
+            return COMMIT_TIMEOUT
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise _CommitProblem("no time left before the cancel deadline")
+        return min(COMMIT_TIMEOUT, left)
+
     changes = False
     try:
-        changes = bool(run("status", "--porcelain=v1", "--untracked-files=all").stdout.strip())
+        # Tracked changes, and the untracked files that were not there when Codex launched.
+        # (No record: a direct call, before any launch. A record without paths: the listing
+        # failed at launch, so no untracked file is taken.)
+        snap = _read_json(wd / UNTRACKED)
+        earlier = set((snap or {}).get("paths") or ())
+        tracked, loose = status_entries(ws, timeout=bound())
+        new = ([p for p in loose if p not in earlier and not p.endswith("/")]
+               if snap is None or snap.get("paths") is not None else [])
+        changes = tracked or bool(new)
         r = run("symbolic-ref", "--quiet", "--short", "HEAD", ok=False)
         current = r.stdout.strip() if r.returncode == 0 else None
         if current != req.branch:
@@ -655,12 +675,13 @@ def _commit_work(wd: Path, req: DispatchRequest, *, deadline: float | None = Non
             return {"committed": None, "changes": False, "commit_skipped": "no changes"}
         if intent is None:
             write_json_atomic(wd / COMMIT_INTENT, {"at": utc_now(), "branch": req.branch, "head_before": head_now})
-        run("add", "-A")
+        if not stage_work(ws, new_paths=new, deadline=deadline):
+            return {"committed": None, "changes": False, "commit_skipped": "no changes"}
         # Unsigned (signing may prompt) and without hooks: this is leadhand's own bookkeeping.
         run("-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "--no-verify",
             "-m", _commit_subject(req), "-m", f"{TRAILER}: {req.dispatch_id}")
         return {"committed": run("rev-parse", "--verify", "HEAD").stdout.strip(), "changes": True}
-    except _CommitProblem as e:
+    except (_CommitProblem, GitError) as e:
         return {"committed": None, "changes": changes, "commit_error": str(e)}
     except OSError as e:
         return {"committed": None, "changes": changes, "commit_error": str(e)}
@@ -812,6 +833,19 @@ def _launch(wd: Path, record: dict, argv: list[str], env: Mapping[str, str], cwd
     return proc
 
 
+def _record_untracked(wd: Path, req: DispatchRequest) -> None:
+    """Before the first launch: the untracked files already in the workspace (I3). If they
+    cannot be listed, the commit later takes only tracked changes."""
+    if (wd / UNTRACKED).exists():
+        return
+    try:
+        paths: list[str] | None = untracked_files(Path(req.cwd))
+        error = None
+    except (GitError, OSError) as e:
+        paths, error = None, str(e)
+    write_json_atomic(wd / UNTRACKED, {"at": utc_now(), "paths": paths, **({"error": error} if error else {})})
+
+
 def _cancel_deadline(wd: Path) -> float | None:
     """The canceller's deadline (time.monotonic), from the cancel request, less a margin."""
     wall = (_read_json(wd / CANCEL) or {}).get("deadline_wall")
@@ -866,6 +900,7 @@ def run_runner(worker_dir: Path) -> int:
         _finalize(wd, req, stopped_for=None, codex_exit=None, tracker=tracker, started_at=started_at)
         return 0
 
+    _record_untracked(wd, req)
     try:
         proc = _launch(wd, record, argv, env, req.cwd, cancelled)
     except OSError as e:

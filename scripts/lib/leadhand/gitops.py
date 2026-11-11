@@ -12,10 +12,11 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
-from typing import Mapping
+from typing import Collection, Mapping, Sequence
 
 GIT_TIMEOUT = 120.0
 FETCH_TIMEOUT = 600.0
@@ -349,7 +350,59 @@ def detect_violation(ws: Path, expected_head: str, expected_branch: str) -> Viol
     return None
 
 
-def preserve_and_restore(ws: Path, *, ref: str, expected_head: str, expected_branch: str) -> str:
+def untracked_files(ws: Path) -> list[str]:
+    """Untracked paths Git does not ignore, relative to the worktree root. A nested
+    repository is listed as its folder with a trailing slash (Git never looks inside)."""
+    return _nul_list(git(ws, "ls-files", "--others", "--exclude-standard", "-z", "--full-name", "--", ":/"))
+
+
+def status_entries(ws: Path, timeout: float = GIT_TIMEOUT) -> tuple[bool, list[str]]:
+    """(whether any tracked file changed, the untracked paths Git does not ignore)."""
+    out = git(ws, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", timeout=timeout)
+    tracked, untracked = False, []
+    for entry in _nul_list(out):
+        if entry.startswith("?? "):
+            untracked.append(entry[3:])
+        else:
+            tracked = True
+    return tracked, untracked
+
+
+def _pathspec_file(ws: Path, paths: Sequence[str]) -> str:
+    """A NUL-separated pathspec file for --pathspec-from-file (argv stays short)."""
+    fd, tmp = tempfile.mkstemp(prefix="leadhand-paths.")
+    with os.fdopen(fd, "wb") as f:
+        f.write(b"".join(p.encode("utf-8", "surrogateescape") + b"\0" for p in paths))
+    return tmp
+
+
+def stage_work(ws: Path, *, new_paths: Sequence[str], deadline: float | None = None) -> bool:
+    """Stage a worker's changes for leadhand's own commit: every tracked change (`add -u`)
+    and the untracked files in `new_paths` (those that appeared during the dispatch), never
+    any other untracked file. `deadline` (time.monotonic) bounds every Git call. Returns
+    whether anything is staged."""
+    def timeout() -> float:
+        if deadline is None:
+            return GIT_TIMEOUT
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise GitError("no time left before the deadline")
+        return min(GIT_TIMEOUT, left)
+
+    git(ws, "add", "-u", "--", ":/", timeout=timeout())
+    files = [p for p in new_paths if not p.endswith("/")]
+    if files:
+        spec = _pathspec_file(ws, files)
+        try:
+            git(ws, "--literal-pathspecs", "add", f"--pathspec-from-file={spec}", "--pathspec-file-nul",
+                timeout=timeout())
+        finally:
+            Path(spec).unlink(missing_ok=True)
+    return not _test(ws, "diff", "--cached", "--quiet", "--no-ext-diff", "HEAD", "--")
+
+
+def preserve_and_restore(ws: Path, *, ref: str, expected_head: str, expected_branch: str,
+                         untracked: Collection[str] = ()) -> str:
     """Save the workspace state under `ref`, then put `ws` back on `expected_branch` at
     `expected_head` with a clean index and tracked files. Returns the saved commit.
 
@@ -367,7 +420,9 @@ def preserve_and_restore(ws: Path, *, ref: str, expected_head: str, expected_bra
     landing on the shared stash. A sibling ref this call does not need is deleted, so
     `ref` and its siblings always describe one violation. In-progress rebase, am,
     cherry-pick and merge states are cleared. `refs/stash` is never touched. Untracked
-    files are left alone."""
+    files are left alone, except the ones named in `untracked` (files Git does not ignore;
+    a nested repository's folder is skipped): those are kept in the saved commit, a child
+    of the saved state whose tree adds them, and removed from the worktree."""
     if not ref.startswith("refs/") or _run(ws, ("check-ref-format", ref)).returncode != 0:
         raise GitError(f"not a valid ref to preserve under: {ref!r}")
     _check_branch_name(ws, expected_branch)
@@ -378,6 +433,9 @@ def preserve_and_restore(ws: Path, *, ref: str, expected_head: str, expected_bra
         saved = _snapshot_conflicted(ws)
     else:
         raise _fail(r, ws)
+    files = [p for p in untracked if not p.endswith("/") and os.path.lexists(ws / p)]
+    if files:
+        saved = _snapshot_untracked(ws, saved, files)
     git(ws, "update-ref", "-m", "leadhand: preserve workspace", ref, saved)
     branch_ref = f"refs/heads/{expected_branch}"
     moved_tip = None
@@ -393,7 +451,45 @@ def preserve_and_restore(ws: Path, *, ref: str, expected_head: str, expected_bra
     _clear_operations(ws)
     git(ws, "checkout", "--quiet", "--force", "-B", expected_branch, expected_head, "--")
     git(ws, "reset", "--quiet", "--hard", expected_head)
+    for p in files:
+        _remove_untracked(ws, p)
     return saved
+
+
+def _snapshot_untracked(ws: Path, saved: str, paths: Sequence[str]) -> str:
+    """A commit whose parent is `saved` and whose tree is `saved`'s plus the untracked
+    `paths`, built in a scratch index so the real one is untouched."""
+    index = _git_path(ws, "index")
+    fd, tmp = tempfile.mkstemp(dir=index.parent, prefix="leadhand-index.")
+    os.close(fd)
+    spec = _pathspec_file(ws, paths)
+    try:
+        env = {"GIT_INDEX_FILE": tmp}
+        git(ws, "read-tree", f"{saved}^{{tree}}", env=env)
+        git(ws, "--literal-pathspecs", "add", "--force", f"--pathspec-from-file={spec}", "--pathspec-file-nul",
+            env=env)
+        tree = git(ws, "write-tree", env=env)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+        Path(spec).unlink(missing_ok=True)
+    return git(ws, *NO_SIGN, "commit-tree", tree, "-p", saved, "-m", "leadhand: preserved untracked files")
+
+
+def _remove_untracked(ws: Path, rel: str) -> None:
+    """Remove one untracked file (a symlink itself, never its target), then any folders it
+    leaves empty, up to the worktree root."""
+    path = ws / rel
+    if path.is_dir() and not path.is_symlink():
+        return
+    path.unlink(missing_ok=True)
+    parent = path.parent
+    root = Path(ws).resolve()
+    while parent.resolve() != root and root in parent.resolve().parents:
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
 
 
 def _set_sibling(ws: Path, name: str, sha: str | None, message: str) -> None:
