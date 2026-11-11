@@ -501,5 +501,81 @@ class FollowUpTests(LaunchTestCase):
         self.assertEqual(self.starts(), [])
 
 
+# --------------------------------------------------------------------------
+# R41(a): CLI children of the supervisor drop the inherited run.lock descriptor
+
+CLI_CHILD = """import json, os, sys, time
+before = os.environ.get("LEADHAND_LOCK_FD")
+from leadhand import cli
+cli.main(["version"])
+with open(sys.argv[1], "a", encoding="utf-8") as f:
+    f.write(json.dumps({"pid": os.getpid(), "cli_child": True, "lock_fd_env": before,
+                        "after": os.environ.get("LEADHAND_LOCK_FD")}) + "\\n")
+time.sleep(60)
+"""
+
+
+class InheritedLockTests(LaunchTestCase):
+    def test_relaunch_succeeds_while_a_cli_child_of_the_killed_supervisor_runs(self):
+        child_log = self.tmp / "cli child.log"
+        spawn = json.dumps([sys.executable, "-B", "-c", CLI_CHILD, str(child_log)])
+        launcher = self.spawn_launcher(sleep="60", FAKE_CLAUDE_SPAWN=spawn)
+        sup = self.wait_supervisor()
+        rec = wait_for(lambda: child_log.exists() and child_log.read_text(encoding="utf-8")
+                       and json.loads(child_log.read_text(encoding="utf-8").splitlines()[0]),
+                       "the CLI child to run")
+        self.addCleanup(lambda: procs.process_start_time(rec["pid"])
+                        and os.kill(rec["pid"], signal.SIGKILL))
+        self.assertTrue(rec["lock_fd_env"], "launcher did not export LEADHAND_LOCK_FD")
+        self.assertIsNone(rec["after"])
+        self.kill_launcher(launcher)
+        os.kill(sup["pid"], signal.SIGKILL)
+        self.wait_gone(sup["pid"])
+        self.assertIsNotNone(procs.process_start_time(rec["pid"]), "the CLI child exited early")
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 0, err)
+        self.assertIsNotNone(procs.process_start_time(rec["pid"]))
+
+    def _main_with(self, fd: int, run_dir: Path | None):
+        env = {"LEADHAND_LOCK_FD": str(fd)}
+        if run_dir is not None:
+            env["LEADHAND_RUN_DIR"] = str(run_dir)
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+            from leadhand import cli
+            self.assertEqual(cli.main(["version"]), 0)
+            return "LEADHAND_LOCK_FD" in os.environ
+
+    def test_cli_closes_inherited_run_lock_fd(self):
+        fd = os.open(self.paths.lock, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            still_set = self._main_with(fd, self.run_dir)
+            self.assertFalse(still_set)
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
+
+    def test_cli_leaves_an_unrelated_fd_open(self):
+        other = self.tmp / "unrelated.txt"
+        other.write_text("x", encoding="utf-8")
+        fd = os.open(other, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        self.assertFalse(self._main_with(fd, self.run_dir))
+        os.fstat(fd)                                   # still open
+        # A run.lock fd, but no LEADHAND_RUN_DIR to verify it against: left open too.
+        lock_fd = os.open(self.paths.lock, os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(os.close, lock_fd)
+        self._main_with(lock_fd, None)
+        os.fstat(lock_fd)
+        # Not a number, or not open: ignored.
+        self._main_with(-1, self.run_dir)
+        with mock.patch.dict(os.environ, {"LEADHAND_LOCK_FD": "nope"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            from leadhand import cli
+            self.assertEqual(cli.main(["version"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

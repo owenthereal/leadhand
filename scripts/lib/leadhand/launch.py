@@ -48,6 +48,7 @@ from .state import RunPaths, append_event, read_events, run_paths, write_json_at
 SUPERVISOR_AGENT = "leadhand:supervisor"
 CLI_PATH = Path(__file__).resolve().parents[2] / "leadhand"   # scripts/leadhand
 EXIT_REFUSED = 3
+LOCK_FD_ENV = "LEADHAND_LOCK_FD"
 PLATFORM = sys.platform        # read at launch time; tests inject another platform
 KEEP_AWAKE_TIMEOUT = 10.0
 FORWARDED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
@@ -362,7 +363,7 @@ def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "cla
             plugin_dir=plugin, settings=cli_settings(), model=model, effort=effort,
             print_mode=print_mode)
         env = {**os.environ, "LEADHAND_RUN_ID": run_id, "LEADHAND_RUN_DIR": str(root),
-               "LEADHAND_CLI": str(CLI_PATH)}
+               "LEADHAND_CLI": str(CLI_PATH), LOCK_FD_ENV: str(fd)}
         print(ATTENDED_WARNING.format(cli=CLI_PATH), file=sys.stderr, flush=True)
         if any(c.isspace() for c in str(CLI_PATH)):
             print(SPACES_WARNING.format(cli=CLI_PATH), file=sys.stderr, flush=True)
@@ -419,6 +420,40 @@ def _supervise(lock: RunLock, fd: int, argv: list[str], workspace: Path, env: di
         for s, h in previous.items():
             signal.signal(s, h)
         _stop_keep_awake(keep_awake)
+
+
+def close_inherited_lock(environ=os.environ) -> None:
+    """Drop the run.lock descriptor a supervisor's Bash command inherited.
+
+    Claude Code does not close the descriptor the launcher passes it, so every
+    command the supervisor runs inherits run.lock. A long-lived one (a background
+    `leadhand timer`) would keep the run locked after the supervisor dies and
+    refuse every relaunch. Every `leadhand` command calls this first: it closes
+    fd $LEADHAND_LOCK_FD only when it is open and is the same file (device and
+    inode) as $LEADHAND_RUN_DIR/run.lock, never any other descriptor, and never
+    unlocks (closing one reference leaves the supervisor's lock in place). The
+    variable is removed from `environ` either way, so children do not try again.
+    """
+    raw = environ.pop(LOCK_FD_ENV, None)
+    run_dir = environ.get("LEADHAND_RUN_DIR")
+    if not raw or not run_dir:
+        return
+    try:
+        fd = int(raw)
+    except ValueError:
+        return
+    if fd <= 2:
+        return
+    try:
+        held = os.fstat(fd)
+        lock = os.stat(run_paths(Path(run_dir)).lock)
+    except OSError:
+        return
+    if (held.st_dev, held.st_ino) == (lock.st_dev, lock.st_ino):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def launch_line(run_dir: Path, *, plugin_dir: Path | None = None) -> str:

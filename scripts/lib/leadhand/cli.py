@@ -42,5 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from leadhand.launch import close_inherited_lock
+    close_inherited_lock()
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     return args.func(args)
