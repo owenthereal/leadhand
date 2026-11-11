@@ -112,6 +112,9 @@ COMMIT_INTENT = "commit.json"
 # they are not the worker's, so its commit leaves them out (final review I3). Written once,
 # kept across generations.
 UNTRACKED = "untracked.json"
+# In the run directory: the workspace's untracked files when the run started (the operator's,
+# in an in-place run). Never swept or committed (ruling R48').
+UNTRACKED_AT_START = "untracked-at-start.json"
 GENERATION_FILES = (SPAWN, RUNNER, HEARTBEAT, PROCS, STREAM, STDERR, LAST, RAW, CANCEL, STOPPING, RESULT,
                     COMMIT_INTENT,
                     RUNNER_OUT, RUNNER_ERR)
@@ -653,7 +656,7 @@ def _commit_work(wd: Path, req: DispatchRequest, *, deadline: float | None = Non
         snap = _read_json(wd / UNTRACKED)
         earlier = set((snap or {}).get("paths") or ())
         tracked, loose = status_entries(ws, timeout=bound())
-        new = ([p for p in loose if p not in earlier and not p.endswith("/")]
+        new = ([p for p in untracked_to_take(req.run_dir, ws, loose) if p not in earlier]
                if snap is None or snap.get("paths") is not None else [])
         changes = tracked or bool(new)
         r = run("symbolic-ref", "--quiet", "--short", "HEAD", ok=False)
@@ -871,6 +874,22 @@ def _launch(wd: Path, record: dict, argv: list[str], env: Mapping[str, str], cwd
     write_json_atomic(wd / RUNNER, record)
     crash_point("after_worker_launch")
     return proc
+
+
+def untracked_to_take(run_dir: Path, ws: Path, paths: Iterable[str]) -> list[str]:
+    """Of the workspace's untracked `paths`, the ones leadhand may sweep or commit: never a
+    nested repository, a file the workspace had when the run started, or anything under the
+    run directory or its docs folder when they lie inside the workspace (R48')."""
+    run_dir = Path(run_dir)
+    start = set((_read_json(run_dir / UNTRACKED_AT_START) or {}).get("paths") or ())
+    real_ws = os.path.realpath(ws)
+    fenced = []
+    for d in (run_dir, run_dir.parent.parent):       # <docs_dir>/runs/<run>
+        rel = os.path.relpath(os.path.realpath(d), real_ws)
+        if rel != os.pardir and not rel.startswith(os.pardir + os.sep):
+            fenced.append("" if rel == os.curdir else rel.replace(os.sep, "/").rstrip("/") + "/")
+    return [p for p in paths if not p.endswith("/") and p not in start
+            and not any(p.startswith(f) for f in fenced)]
 
 
 def _record_untracked(wd: Path, req: DispatchRequest) -> None:

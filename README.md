@@ -12,5 +12,4 @@ Status: under construction. For attended runs on fixture and trial repos only un
 
 Not supported in this version (`leadhand check` reports an error and `leadhand start` refuses):
 
-- `run.worktree = false`: a run always works in its own worktree.
 - A `docs_dir` inside the repository (a relative one counts from the repository): run files must live outside it.

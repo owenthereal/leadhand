@@ -294,8 +294,6 @@ def unsupported_settings(config: Config, repo: Path | None = None) -> list[str]:
     also a docs_dir that resolves inside the repository (a relative one is resolved
     against the repository): the run's own files would sit in the workspace (ruling R48)."""
     out = []
-    if not config.run.worktree:
-        out.append("not supported in this version: run.worktree = false")
     if repo is not None:
         root = Path(os.path.realpath(repo))
         docs = docs_dir_for(config, root)

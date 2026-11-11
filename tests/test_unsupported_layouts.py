@@ -1,4 +1,4 @@
-"""In-place runs and in-repo docs dirs are not supported in this version (ruling R48):
+"""In-repo docs dirs are not supported in this version (rulings R48, R48'):
 `leadhand check` errors and `leadhand start` refuses before creating anything."""
 import unittest
 
@@ -27,10 +27,6 @@ class Unsupported(unittest.TestCase):
         self.assertFalse(docs.exists(), docs)
         self.assertEqual(branches(w), before)
         self.assertFalse((w.repo / ".worktrees").exists())
-
-    def test_worktree_false_is_refused(self):
-        w = FakeWorld(self, [card(1)], config="[run]\nworktree = false\n")
-        self.assert_refused(w, w.docs, "not supported in this version: run.worktree = false")
 
     def test_docs_dir_inside_the_repo_is_refused(self):
         w = FakeWorld(self, [card(1)])

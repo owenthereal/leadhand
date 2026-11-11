@@ -391,6 +391,9 @@ def _start(deck_path: Path, repo: Path, config: Config | None, new: bool) -> tup
     # The worktree is named after the run directory, which is unique, so no two runs share it.
     ws = prepare_workspace(repo, run_branch=branch, base_sha=base_sha, slug=root.name,
                            use_worktree=config.run.worktree)
+    # The operator's own untracked files (an in-place run works in their checkout): never swept,
+    # never committed (R48').
+    write_json_atomic(root / dsp.UNTRACKED_AT_START, {"paths": untracked_files(Path(ws))})
     meta = {
         "run_id": secrets.token_hex(6), "repo": str(repo), "deck_source": str(deck_path),
         "deck_digest": deck.digest, "base_ref": base_ref, "base_sha": base_sha, "branch": branch,
@@ -1616,7 +1619,7 @@ def _ensure_clean(ctx: _Run, events: list[dict], *, branch: str, why: str, after
         return None
     tip = head(ctx.ws, f"refs/heads/{branch}")
     v = detect_violation(ctx.ws, tip, branch)
-    loose = [p for p in untracked_files(ctx.ws) if not p.endswith("/")] if untracked else []
+    loose = _foreign_untracked(ctx, untracked_files(ctx.ws)) if untracked else []
     if op is None and v is None and not loose:
         return None
     n = 1 + sum(1 for e in read_events(ctx.paths) if e["kind"] == "violation" and _by(e) == "implementer"
@@ -1628,6 +1631,12 @@ def _ensure_clean(ctx: _Run, events: list[dict], *, branch: str, why: str, after
                          **({"untracked": loose} if loose else {}))
     _finish_leftovers(ctx, [found])
     return found
+
+
+def _foreign_untracked(ctx: _Run, paths: list[str]) -> list[str]:
+    """The untracked paths a worker may have left: not a nested repository, not one the
+    operator had at start, nothing under the run directory or docs_dir (R48')."""
+    return dsp.untracked_to_take(ctx.root, ctx.ws, paths)
 
 
 def _finish_leftovers(ctx: _Run, events: list[dict]) -> bool:
@@ -2995,7 +3004,7 @@ def _commit_partial(ctx: _Run, d: _Dispatch) -> dict[str, str]:
             return {}
         tracked, loose = status_entries(ctx.ws)
         earlier = set(d.req.get("untracked") or ())
-        new = [p for p in loose if p not in earlier and not p.endswith("/")]
+        new = [p for p in _foreign_untracked(ctx, loose) if p not in earlier]
         if not tracked and not new:
             return {}
         before = head(ctx.ws, f"refs/heads/{branch}")
