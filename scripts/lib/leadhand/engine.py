@@ -85,7 +85,7 @@ from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, p
 from leadhand.gitops import (GitError, card_branch_name, changed_paths, cut_card_branch, default_base,
                              detect_violation, ensure_excluded, fast_forward, git, head, is_ancestor,
                              is_test_or_doc_path, needs_integration, prepare_workspace, preserve_and_restore,
-                             rebase_onto, stage_work, status_entries, untracked_files)
+                             rebase_onto, resolves_in_place, stage_work, status_entries, untracked_files)
 from leadhand.route import LadderExhausted, PinnedVendorMissing, Resolution, resolve
 from leadhand.state import (CardState, RunPaths, utc_now, allowed_next_step, append_attempt, append_event,
                             crash_point, decide_outcome, fold_cards, new_run_dir, read_attempts, read_events,
@@ -1863,14 +1863,23 @@ def _base_worktree(ctx: _Run) -> Path:
     repo = Path(ctx.meta["repo"])
     path = _base_worktree_path(ctx)
     base = ctx.meta["base_sha"]
+
+    def in_place() -> None:
+        # In an in-place run <repo>/.worktrees/ is worker-writable: a symlink there would aim
+        # the reset below at another worktree (security review M3).
+        if not resolves_in_place(repo, path):
+            raise EngineError(f"{path} is a symlink or lies behind one; refusing to reset it. Move it aside")
+
+    in_place()
     git(repo, "worktree", "prune")
     listed = git(repo, "worktree", "list", "--porcelain").splitlines()
-    registered = {Path(ln[len("worktree "):]).resolve() for ln in listed if ln.startswith("worktree ")}
-    if path.exists() and path.resolve() not in registered:
+    registered = {os.path.realpath(ln[len("worktree "):]) for ln in listed if ln.startswith("worktree ")}
+    if os.path.lexists(path) and os.path.realpath(path) not in registered:
         raise EngineError(f"{path} exists but is not a worktree of {repo}; move it aside")
-    if not path.exists():
+    if not os.path.lexists(path):
         ensure_excluded(repo, ".worktrees/")
         git(repo, "worktree", "add", "--quiet", "--detach", str(path), base)
+    in_place()
     git(path, "checkout", "--quiet", "--force", "--detach", base, "--")
     git(path, "reset", "--quiet", "--hard", base)
     git(path, "clean", "-q", "-f", "-d", "-x")

@@ -11,9 +11,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from fakeworld import FakeWorld, card
 from gitfixture import make_repo, run_git, write
 from leadhand import dispatch as dsp
-from leadhand import gitops, procs
+from leadhand import engine, gitops, procs
 from test_dispatch import CARD_BRANCH, CLI, FAKES, Base, alive
 
 
@@ -322,6 +323,57 @@ class H3FilterDrivers(Base):
             self.assertEqual(run("config", "--get", "filter.lfs.required").stdout.strip(), "false")
             env = run("-c", "alias.showenv=!env", "showenv").stdout
             self.assertIn("GIT_LFS_SKIP_SMUDGE=1", env.splitlines())
+
+
+class M3SymlinkedBaseWorktree(unittest.TestCase):
+    """M3: in an in-place run <repo>/.worktrees/ is worker-writable; a symlink there must never
+    turn the evidence reset (checkout --force, reset --hard, clean -fdx) on another worktree."""
+
+    def setUp(self):
+        self.w = FakeWorld(self, [card(1)], config="[run]\nworktree = false\n")
+        self.w.start()
+        repo = self.w.repo
+        self.other = repo / ".worktrees" / "other"
+        run_git(repo, "worktree", "add", "--quiet", "-b", "other", str(self.other))
+        write(self.other, {"README.md": "uncommitted work\n", "untracked.env": "KEEP=1\n"})
+
+    def assert_other_untouched(self):
+        self.assertEqual((self.other / "README.md").read_text(), "uncommitted work\n")
+        self.assertTrue((self.other / "untracked.env").exists())
+        self.assertEqual(run_git(self.other, "symbolic-ref", "--short", "HEAD"), "other")
+
+    def test_evidence_reset_refuses_a_symlinked_base_worktree(self):
+        ctx = engine._load(self.w.run_dir, check_digest=False)
+        link = engine._base_worktree_path(ctx)
+        link.symlink_to(self.other)
+        with self.assertRaises(engine.EngineError) as cm:
+            engine._base_worktree(ctx)
+        self.assertIn("symlink", str(cm.exception))
+        self.assert_other_untouched()
+
+    def test_evidence_reset_refuses_a_symlinked_worktrees_folder(self):
+        ctx = engine._load(self.w.run_dir, check_digest=False)
+        name = engine._base_worktree_path(ctx).name
+        moved = self.w.repo / ".worktrees moved"
+        (self.w.repo / ".worktrees").rename(moved)
+        self.other = moved / "other"
+        run_git(self.w.repo, "worktree", "repair", str(self.other))
+        # .worktrees itself is the symlink; the base worktree's own name inside it is too.
+        decoy = self.w.repo / "decoy"
+        decoy.mkdir()
+        (decoy / name).symlink_to(self.other)
+        (self.w.repo / ".worktrees").symlink_to(decoy)
+        with self.assertRaises(engine.EngineError):
+            engine._base_worktree(ctx)
+        self.assert_other_untouched()
+
+    def test_prepare_workspace_refuses_a_symlinked_worktree(self):
+        repo = self.w.repo
+        base = run_git(repo, "rev-parse", "HEAD")
+        (repo / ".worktrees" / "slug").symlink_to(self.other)
+        with self.assertRaises(gitops.GitError):
+            gitops.prepare_workspace(repo, run_branch="leadhand/sym", base_sha=base, slug="slug", use_worktree=True)
+        self.assert_other_untouched()
 
 
 if __name__ == "__main__":

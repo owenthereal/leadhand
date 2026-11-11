@@ -207,6 +207,15 @@ def ensure_excluded(repo: Path, pattern: str) -> None:
         raise
 
 
+def resolves_in_place(root: Path, path: Path) -> bool:
+    """Whether `path` lies inside `root` and resolves to itself: neither it nor any folder
+    between `root` and it is a symlink (security review M3). `root`'s own location may."""
+    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(root))
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        return False
+    return os.path.realpath(path) == os.path.normpath(os.path.join(os.path.realpath(root), rel))
+
+
 def prepare_workspace(repo: Path, *, run_branch: str, base_sha: str, slug: str, use_worktree: bool) -> Path:
     """Idempotent: create `run_branch` at `base_sha` when missing (an existing one is
     left as is), then a worktree at <repo>/.worktrees/<slug> or a checkout in `repo`.
@@ -230,8 +239,10 @@ def prepare_workspace(repo: Path, *, run_branch: str, base_sha: str, slug: str, 
             git(repo, "checkout", "--quiet", run_branch, "--")
         return repo
     ws = repo / ".worktrees" / slug
-    registered = {Path(w["worktree"]).resolve() for w in _worktrees(repo) if "worktree" in w}
-    if ws.exists() and ws.resolve() in registered:
+    if not resolves_in_place(repo, ws):
+        raise GitError(f"{ws} is a symlink or lies behind one; move it aside")
+    registered = {os.path.realpath(w["worktree"]) for w in _worktrees(repo) if "worktree" in w}
+    if ws.exists() and os.path.realpath(ws) in registered:
         return ws
     git(repo, "worktree", "add", "--quiet", str(ws), run_branch)
     return ws
