@@ -13,8 +13,8 @@ from unittest import mock
 
 from gitfixture import make_repo, run_git, write
 from leadhand import dispatch as dsp
-from leadhand import procs
-from test_dispatch import CLI, FAKES, Base, alive
+from leadhand import gitops, procs
+from test_dispatch import CARD_BRANCH, CLI, FAKES, Base, alive
 
 
 def marker_script(path: Path, marker: Path) -> Path:
@@ -250,6 +250,78 @@ class M1ConfinedStop(Anchored):
         self.assert_refused(self.cli("dispatch-runner", wd))
         self.assertFalse((wd / "result.json").exists())
         self.assert_nothing_ran()
+
+
+class H3FilterDrivers(Base):
+    """H3: a worker's .gitattributes and .lfsconfig never make leadhand's own Git calls run the
+    operator's git-lfs filter (a smudge POSTs to the URL in .lfsconfig, outside every sandbox)."""
+
+    def setUp(self):
+        super().setUp()
+        self.marker = self.tmp / "FILTER RAN"
+        fake = self.tmp / "fake-lfs"
+        fake.write_text(f'#!/bin/sh\necho "$* GIT_LFS_SKIP_SMUDGE=$GIT_LFS_SKIP_SMUDGE" >> "{self.marker}"\n'
+                        'cat\n')
+        fake.chmod(0o755)
+        # The operator's global configuration, as `git lfs install` writes it, isolated to this test.
+        config = self.tmp / "global gitconfig"
+        config.write_text(f"[filter \"lfs\"]\n\tclean = '{fake}' clean -- %f\n\tsmudge = '{fake}' smudge -- %f\n"
+                          f"\tprocess = '{fake}' filter-process\n\trequired = true\n")
+        self.base_sha = run_git(self.repo, "rev-parse", "HEAD")
+        # The worker's commit (made here without any filter, as the runner's commit would be).
+        run_git(self.repo, "checkout", "--quiet", "-b", CARD_BRANCH)
+        write(self.repo, {".gitattributes": "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+                          ".lfsconfig": "[lfs]\n\turl = http://127.0.0.1:9/exfil/SECRET-DATA\n",
+                          "p.bin": "version https://git-lfs.github.com/spec/v1\n"
+                                   f"oid sha256:{'ab' * 32}\nsize 12\n"})
+        run_git(self.repo, "add", "-A")
+        run_git(self.repo, "commit", "--quiet", "-m", "worker")
+        self.card_sha = run_git(self.repo, "rev-parse", "HEAD")
+        run_git(self.repo, "checkout", "--quiet", "main")
+        os.environ["GIT_CONFIG_GLOBAL"] = str(config)
+        os.environ.pop("GIT_LFS_SKIP_SMUDGE", None)
+
+    def assert_no_filter(self):
+        self.assertFalse(self.marker.exists(), self.marker.read_text() if self.marker.exists() else "")
+
+    def test_the_global_filter_is_live_for_plain_git(self):
+        # Control: without leadhand's options, the same checkout runs the operator's filter.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LEADHAND")}
+        subprocess.run(["git", "checkout", "--quiet", CARD_BRANCH, "--"], cwd=self.repo, env=env,
+                       capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+        self.assertTrue(self.marker.exists())
+
+    def test_checkout_reset_and_stash_run_no_filter(self):
+        gitops.git(self.repo, "checkout", "--quiet", CARD_BRANCH, "--")       # engine _check_out
+        self.assertTrue((self.repo / "p.bin").read_text().startswith("version https://git-lfs"))
+        os.unlink(self.repo / "p.bin")                                      # a later worker deletes it
+        write(self.repo, {"README.md": "changed\n"})
+        gitops.preserve_and_restore(self.repo, ref="refs/leadhand/x/1", expected_head=self.card_sha,
+                                    expected_branch=CARD_BRANCH)              # checkout + reset --hard
+        self.assertTrue((self.repo / "p.bin").exists())
+        gitops.git(self.repo, "checkout", "--quiet", "--force", "--detach", self.base_sha, "--")
+        gitops.git(self.repo, "reset", "--quiet", "--hard", self.card_sha)
+        gitops.git(self.repo, "stash", "create")
+        gitops.status_entries(self.repo)
+        self.assert_no_filter()
+
+    def test_runner_git_calls_run_no_filter(self):
+        gitops.git(self.repo, "checkout", "--quiet", CARD_BRANCH, "--")
+        write(self.repo, {"q.bin": "new binary\n", "README.md": "changed\n"})
+        req = self.request(kind="implement", branch=CARD_BRANCH)
+        wd = self.worker_dir()
+        wd.mkdir(parents=True)
+        out = dsp._commit_work(wd, req)
+        self.assertTrue(out["committed"], out)
+        self.assert_no_filter()
+
+    def test_every_call_carries_the_options_and_the_environment(self):
+        for run in (lambda *a: gitops._run(self.repo, a), lambda *a: dsp._git(self.repo, *a)):
+            self.assertEqual(run("config", "--get", "filter.lfs.process").stdout.strip(), "")
+            self.assertEqual(run("config", "--get", "filter.lfs.smudge").stdout.strip(), "")
+            self.assertEqual(run("config", "--get", "filter.lfs.required").stdout.strip(), "false")
+            env = run("-c", "alias.showenv=!env", "showenv").stdout
+            self.assertIn("GIT_LFS_SKIP_SMUDGE=1", env.splitlines())
 
 
 if __name__ == "__main__":

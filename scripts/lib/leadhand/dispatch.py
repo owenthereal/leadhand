@@ -65,7 +65,7 @@ from typing import Any, Iterable, Mapping
 
 from leadhand import procs
 from leadhand.briefs import parse_report_head, worker_prompt
-from leadhand.gitops import SAFE_CONFIG, GitError, git_common_dir, stage_work, status_entries, untracked_files
+from leadhand.gitops import SAFE_CONFIG, SAFE_ENV, GitError, git_common_dir, stage_work, status_entries, untracked_files
 from leadhand.state import (utc_now, append_attempt, crash_point, read_attempts, run_paths, state_lock,
                             write_json_atomic)
 from leadhand.usage import (CODEX_STREAM_SOURCE, UNKNOWN, Usage, charge, codex_usage_from_stream, estimate_cost,
@@ -611,9 +611,9 @@ def _commit_subject(req: DispatchRequest) -> str:
 
 def _git(ws: Path, *args: str, timeout: float = COMMIT_TIMEOUT) -> subprocess.CompletedProcess[str]:
     env = {k: v for k, v in os.environ.items() if k not in _REPO_VARS}
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    # No hooks, no fsmonitor, no look into nested repositories (R45); output that is not
-    # UTF-8 is replaced, never fatal.
+    env.update(SAFE_ENV)
+    # No hooks, no fsmonitor, no look into nested repositories (R45), no git-lfs filter (H3);
+    # output that is not UTF-8 is replaced, never fatal.
     return subprocess.run(["git", *SAFE_CONFIG, *args], cwd=ws, env=env, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=timeout)
 

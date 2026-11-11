@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import json
 import shlex
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from leadhand import gitops
 from leadhand import usage as usage_mod
 from leadhand.config import ConfigError, docs_dir_for, load_config, load_run_config
 from leadhand.dispatch import CLI_PATH
@@ -453,11 +453,11 @@ def _latest_unfinished(docs: Path) -> Path | None:
 def _repo_root() -> Path:
     """The operator's main checkout, even from one of its worktrees."""
     try:
-        common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                                capture_output=True, text=True, timeout=30, check=True).stdout.strip()
+        r = gitops._run(Path.cwd(), ("rev-parse", "--path-format=absolute", "--git-common-dir"), timeout=30)
+        common = r.stdout.strip() if r.returncode == 0 else ""
         if common:
             return Path(common).parent
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, gitops.GitError):
         pass
     return Path.cwd()
 
