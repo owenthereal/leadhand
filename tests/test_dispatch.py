@@ -54,6 +54,10 @@ class Base(unittest.TestCase):
         self.repo = make_repo(self.tmp)                       # "<tmp>/my repo"
         self.run_dir = self.tmp / "docs dir" / "runs" / "2026-11-10-demo run"
         self.run_dir.mkdir(parents=True)
+        # The run the dispatch commands are anchored to (security review H2): run_id is the
+        # folder's name, as before run.json existed here.
+        (self.run_dir / "run.json").write_text(json.dumps(
+            {"run_id": self.run_dir.name, "repo": str(self.repo), "workspace": str(self.repo)}))
         self.log = self.tmp / "codex log.jsonl"
         self.codex_home = self.tmp / "codex home"
         env = mock.patch.dict(os.environ, {

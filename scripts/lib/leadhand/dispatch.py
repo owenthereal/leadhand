@@ -633,6 +633,13 @@ def _commit_work(wd: Path, req: DispatchRequest, *, deadline: float | None = Non
     if req.kind not in COMMIT_KINDS or not req.branch:
         return {"committed": None, "changes": False,
                 "commit_skipped": f"{req.kind or 'this'} dispatch does not commit"}
+    try:
+        # Never commit outside the run's own workspace, whatever request.json says (M1).
+        check_request(req, Path(os.path.realpath(req.run_dir)), _read_json(run_paths(req.run_dir).run_json)
+                      or {"workspace": "/nonexistent run.json"})
+    except DispatchError as e:
+        # Changes unknown: reported as uncommitted work, so the result cannot pass for finished.
+        return {"committed": None, "changes": True, "commit_error": str(e)}
     ws = Path(req.cwd)
 
     def run(*args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
@@ -1326,6 +1333,126 @@ def dispatch(req: DispatchRequest, *, wait: float | None = None) -> DispatchResu
 
 
 # --------------------------------------------------------------------------
+# The run a dispatch command may act on (security review H1, H2, M1)
+#
+# The supervisor runs the CLI outside Claude Code's sandbox (`<cli> *` in excludedCommands),
+# so any Claude worker of the session can run `dispatch`, `stop-dispatch` and
+# `dispatch-runner` too. Each acts only on the session's own run, its workspace and its own
+# worker folders:
+# - With $LEADHAND_RUN_DIR set (every command of a supervisor session, and every runner its
+#   `dispatch` starts): the run directory must be that one (and $LEADHAND_RUN_ID, when set,
+#   its run.json's run_id).
+# - Without it (an operator's terminal): the run directory must hold run.json with a run_id,
+#   and no live supervisor may own it (holder.json naming the same run_id and a supervisor
+#   whose pid and start time still match): that supervisor's own commands carry the variable.
+# - Either way the run directory must not lie inside its own workspace or repository, the
+#   worker's cwd must be the run's workspace or its evidence base worktree, the brief and
+#   report must resolve under <cwd>/.leadhand/, and a worker folder must be exactly
+#   <run>/workers/<dispatch id> (no symlink out of the run).
+# What this cannot stop (a worker in the session overriding the variable on a prefixed
+# command, forging state inside the real run) is the Plan 2 run guard's (docs/compatibility.md).
+
+def _refuse(msg: str) -> DispatchError:
+    return DispatchError(f"refused: {msg}")
+
+
+def _inside(path: str, root: str, *, strict: bool = False) -> bool:
+    root = root.rstrip(os.sep) or os.sep
+    return (not strict and path == root) or path.startswith(root if root == os.sep else root + os.sep)
+
+
+def _check_dispatch_id(dispatch_id: str) -> None:
+    if (not dispatch_id or "/" in dispatch_id or os.sep in dispatch_id or "\0" in dispatch_id
+            or dispatch_id in (".", "..")):
+        raise _refuse(f"bad dispatch id {dispatch_id!r}")
+
+
+def anchored_run(run_dir: Path, environ: Mapping[str, str] | None = None) -> tuple[Path, dict]:
+    """(real path, run.json) of the run a dispatch command may act on, or DispatchError
+    ("refused: ..."). See the comment above for the rules."""
+    environ = os.environ if environ is None else environ
+    real = os.path.realpath(run_dir)
+    session = environ.get("LEADHAND_RUN_DIR")
+    if session and os.path.realpath(session) != real:
+        raise _refuse(f"{run_dir} is not this session's run ($LEADHAND_RUN_DIR is {session})")
+    meta = _read_json(Path(real) / "run.json")
+    run_id = (meta or {}).get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise _refuse(f"{run_dir} is not a run directory (no run.json with a run_id)")
+    if session:
+        session_id = environ.get("LEADHAND_RUN_ID")
+        if session_id and session_id != run_id:
+            raise _refuse(f"{run_dir} holds run {run_id}, not this session's run {session_id}")
+    else:
+        holder = _read_json(Path(real) / "holder.json") or {}
+        if holder.get("run_id") not in (None, run_id):
+            raise _refuse(f"{run_dir}/holder.json names run {holder.get('run_id')}, not {run_id}")
+        pid, start = holder.get("supervisor_pid"), holder.get("supervisor_start")
+        if (isinstance(pid, int) and not isinstance(pid, bool) and isinstance(start, str)
+                and procs.same_process(pid, start)):
+            raise _refuse(f"supervisor pid {pid} owns run {run_id}; only commands from its session "
+                          "($LEADHAND_RUN_DIR set) act on it")
+    workspace = meta.get("workspace")
+    if not isinstance(workspace, str) or not os.path.isabs(workspace):
+        raise _refuse(f"{run_dir}/run.json names no absolute workspace")
+    for key in ("workspace", "repo"):
+        root = meta.get(key)
+        if isinstance(root, str) and os.path.isabs(root) and _inside(real, os.path.realpath(root)):
+            raise _refuse(f"the run directory {run_dir} lies inside the run's {key} {root}")
+    return Path(real), meta
+
+
+def _allowed_cwds(run_real: Path, run_dir: Path, meta: Mapping[str, Any]) -> list[str]:
+    """The run's workspace, and its evidence base worktree <repo>/.worktrees/<run>--base
+    reached through no symlink below the repository (real paths)."""
+    out = [os.path.realpath(meta["workspace"])]
+    repo = meta.get("repo")
+    if isinstance(repo, str) and os.path.isabs(repo):
+        for name in dict.fromkeys((Path(run_dir).name, run_real.name)):
+            out.append(os.path.join(os.path.realpath(repo), ".worktrees", f"{name}--base"))
+    return out
+
+
+def check_request(req: DispatchRequest, run_real: Path, meta: Mapping[str, Any]) -> None:
+    """Refuse a request that leaves the anchored run: another run directory, a cwd that is not
+    the run's workspace or evidence base worktree, a brief or report outside <cwd>/.leadhand/."""
+    _check_dispatch_id(req.dispatch_id)
+    if os.path.realpath(req.run_dir) != str(run_real):
+        raise _refuse(f"the request's run {req.run_dir} is not {run_real}")
+    cwd = os.path.realpath(req.cwd)
+    if cwd not in _allowed_cwds(run_real, req.run_dir, meta):
+        raise _refuse(f"--cwd {req.cwd} is not this run's workspace ({meta['workspace']}) "
+                      "or its evidence base worktree")
+    scratch = os.path.join(cwd, ".leadhand")
+    for name, path in (("brief", req.brief), ("report", req.report)):
+        if not _inside(os.path.realpath(path), scratch, strict=True):
+            raise _refuse(f"the {name} {path} is not under {Path(req.cwd) / '.leadhand'}")
+
+
+def _worker_dir(run_dir: Path, run_real: Path, dispatch_id: str) -> Path:
+    """<run>/workers/<dispatch id>, refused unless it resolves exactly there (a symlinked
+    folder or `workers` pointing out of the run is refused)."""
+    _check_dispatch_id(dispatch_id)
+    wd = Path(os.path.abspath(run_dir)) / "workers" / dispatch_id
+    if os.path.realpath(wd) != os.path.join(str(run_real), "workers", dispatch_id):
+        raise _refuse(f"the worker folder {wd} resolves outside the run")
+    return wd
+
+
+def _anchored_worker(run_dir: Path, dispatch_id: str) -> tuple[Path, DispatchRequest | None]:
+    """The worker folder of an anchored run and its checked request (None when it has none)."""
+    run_real, meta = anchored_run(run_dir)
+    wd = _worker_dir(run_dir, run_real, dispatch_id)
+    if not (wd / REQUEST).exists():
+        return wd, None
+    req = _load_request(wd)
+    if req.dispatch_id != dispatch_id:
+        raise _refuse(f"{wd / REQUEST} is for dispatch {req.dispatch_id}, not {dispatch_id}")
+    check_request(req, run_real, meta)
+    return wd, req
+
+
+# --------------------------------------------------------------------------
 # Commands
 
 def limits_for(config, role: str):
@@ -1359,9 +1486,15 @@ def request_for(run_dir: Path, dispatch_id: str, *, card: int | None, attempt: i
 
 
 def _request_from_args(args) -> DispatchRequest:
-    return request_for(Path(args.run), args.dispatch_id, card=args.card, attempt=args.attempt, role=args.role,
-                       model=args.model, effort=args.effort, brief=Path(args.brief), report=Path(args.report),
-                       cwd=Path(args.cwd), resume=args.resume, kind=args.kind, branch=args.branch)
+    """The checked request: only for the anchored run, in its workspace (H2)."""
+    _check_dispatch_id(args.dispatch_id)
+    run_real, meta = anchored_run(Path(args.run))
+    _worker_dir(Path(args.run), run_real, args.dispatch_id)
+    req = request_for(Path(args.run), args.dispatch_id, card=args.card, attempt=args.attempt, role=args.role,
+                      model=args.model, effort=args.effort, brief=Path(args.brief), report=Path(args.report),
+                      cwd=Path(args.cwd), resume=args.resume, kind=args.kind, branch=args.branch)
+    check_request(req, run_real, meta)
+    return req
 
 
 def reply_lines(result: DispatchResult) -> list[str]:
@@ -1396,7 +1529,14 @@ def _cmd_dispatch(args) -> int:
 
 def _cmd_stop(args) -> int:
     try:
-        result = cancel(Path(args.run_dir).absolute() / "workers" / args.dispatch)
+        # Only a worker folder of the anchored run, whose request stays in it (M1): its
+        # runner.json and procs.json are the only processes ever signalled.
+        wd, req = _anchored_worker(Path(args.run_dir), args.dispatch)
+        result = load_result(wd)
+        if result is None:
+            if req is None:
+                raise DispatchError(f"no request.json in {wd}")
+            result = cancel(wd)
     except (DispatchError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -1405,7 +1545,17 @@ def _cmd_stop(args) -> int:
 
 
 def _cmd_runner(args) -> int:
-    return run_runner(Path(args.worker_dir))
+    wd = Path(os.path.abspath(args.worker_dir))
+    try:
+        if wd.parent.name != "workers":
+            raise _refuse(f"{wd} is not a run's worker folder")
+        wd, req = _anchored_worker(wd.parent.parent, wd.name)
+        if req is None:
+            raise DispatchError(f"no request.json in {wd}")
+    except (DispatchError, OSError) as e:
+        print(f"leadhand: {e}", file=sys.stderr)
+        return 1
+    return run_runner(wd)
 
 
 def add_commands(sub) -> None:

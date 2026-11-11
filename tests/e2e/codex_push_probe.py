@@ -227,11 +227,15 @@ class Probe:
     def ssh_log(self) -> Path:
         return self.gitdir() / "probe-fake-ssh.log"
 
+    def scratch(self) -> Path:
+        # leadhand dispatch takes a brief and report only under <cwd>/.leadhand/ (security review H2).
+        return self.repo() / ".leadhand" / "probe"
+
     def dispatch_argv(self) -> list[str]:
         run = self.p("probe run")
         return [str(CLI), "dispatch", "--run", str(run), "--dispatch-id", DISPATCH_ID,
                 "--attempt", "1", "--role", "implementer", "--model", MODEL, "--effort", EFFORT,
-                "--brief", str(run / "brief.md"), "--report", str(run / "report.md"),
+                "--brief", str(self.scratch() / "brief.md"), "--report", str(self.scratch() / "report.md"),
                 "--cwd", str(self.repo())]
 
     def control_argvs(self) -> list[list[str]]:
@@ -298,7 +302,11 @@ class Probe:
                 git(repo, "config", "--local", f"remote.{remote}.pushurl", pushurl)
         (run / "run.json").write_text(json.dumps({"run_id": f"pushprobe{os.getpid()}", "repo": str(repo),
                                                   "workspace": str(repo)}), encoding="utf-8")
-        (run / "brief.md").write_text(brief_text(repo), encoding="utf-8")
+        self.scratch().mkdir(parents=True)
+        (self.gitdir() / "info").mkdir(exist_ok=True)
+        with open(self.gitdir() / "info" / "exclude", "a", encoding="utf-8") as f:
+            f.write(".leadhand/\n")
+        (self.scratch() / "brief.md").write_text(brief_text(repo), encoding="utf-8")
         return {"remotes": git(repo, "remote", "-v").stdout.strip().splitlines(),
                 "core.sshCommand": git(repo, "config", "--get", "core.sshCommand").stdout.strip()}
 
