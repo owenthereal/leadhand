@@ -65,7 +65,8 @@ from typing import Any, Iterable, Mapping
 
 from leadhand import procs
 from leadhand.briefs import parse_report_head, worker_prompt
-from leadhand.gitops import SAFE_CONFIG, SAFE_ENV, GitError, git_common_dir, stage_work, status_entries, untracked_files
+from leadhand.gitops import (SAFE_CONFIG, SAFE_ENV, GitError, git, git_common_dir, resolves_in_place, stage_work,
+                             status_entries, untracked_files)
 from leadhand.state import (utc_now, append_attempt, crash_point, read_attempts, run_paths, state_lock,
                             write_json_atomic)
 from leadhand.usage import (CODEX_STREAM_SOURCE, UNKNOWN, Usage, charge, codex_usage_from_stream, estimate_cost,
@@ -315,8 +316,9 @@ def codex_executable() -> str:
 
 
 def codex_argv(req: DispatchRequest, last_message: Path, git_common: Path,
-               env_overrides: Mapping[str, str]) -> list[str]:
-    """The `codex exec` command; the prompt goes on stdin (`-`)."""
+               env_overrides: Mapping[str, str], extra_dirs: Iterable[Path] = ()) -> list[str]:
+    """The `codex exec` command; the prompt goes on stdin (`-`). `extra_dirs` are writable
+    folders the dispatch itself needs (an evidence worker's base worktree)."""
     argv = [codex_executable(), "exec", "-m", req.model,
             "-c", f"model_reasoning_effort={_toml_string(req.effort)}",
             "-c", 'approval_policy="never"',
@@ -324,7 +326,7 @@ def codex_argv(req: DispatchRequest, last_message: Path, git_common: Path,
             "-C", str(req.cwd),
             "-s", "read-only" if req.role == "scout" else "workspace-write",
             "--add-dir", str(git_common)]
-    for d in req.writable_dirs:
+    for d in (*req.writable_dirs, *extra_dirs):
         argv += ["--add-dir", str(d)]
     for name, value in env_overrides.items():
         if not _ENV_NAME.match(name):
@@ -999,9 +1001,9 @@ def run_runner(worker_dir: Path) -> int:
         gh_dir.mkdir(exist_ok=True)
         env = {**worker_env(os.environ, run_id=run_id, gh_config_dir=gh_dir), TAG_VAR: tag}
         overrides = {**blocking_env(os.environ, gh_config_dir=gh_dir), "LEADHAND_RUN_ID": run_id, TAG_VAR: tag}
-        argv = codex_argv(req, wd / LAST, git_common_dir(req.cwd), overrides)
+        argv = codex_argv(req, wd / LAST, git_common_dir(req.cwd), overrides, evidence_dirs(req))
         prompt = worker_prompt(req.role, req.brief, req.report).encode("utf-8")
-    except (GitError, OSError, ValueError) as e:
+    except (DispatchError, GitError, OSError, ValueError) as e:
         (wd / STDERR).write_text(f"leadhand: cannot prepare the Codex worker: {e}\n", encoding="utf-8")
         _finalize(wd, req, stopped_for=None, codex_exit=None, tracker=tracker, started_at=started_at)
         return 0
@@ -1458,6 +1460,27 @@ def _allowed_cwds(run_real: Path, run_dir: Path, meta: Mapping[str, Any]) -> lis
             out.append(os.path.join(os.path.realpath(repo), ".worktrees",
                                     os.path.basename(base_worktree_path(meta, name))))
     return out
+
+
+def evidence_dirs(req: DispatchRequest) -> list[Path]:
+    """For an evidence dispatch, the run's evidence base worktree, where the worker runs the
+    evidence checks; Codex's sandbox lets it write only its cwd and --add-dir folders. Refused
+    unless it is a registered worktree of the repository reached through no symlink below it
+    (as the engine checks before resetting it, security review M3)."""
+    if req.kind != "evidence":
+        return []
+    meta = _read_json(run_paths(req.run_dir).run_json) or {}
+    repo = meta.get("repo")
+    if not isinstance(repo, str) or not os.path.isabs(repo):
+        raise _refuse(f"the run {req.run_dir} names no repository for its evidence base worktree")
+    path = Path(base_worktree_path(meta, Path(req.run_dir).name))
+    if not resolves_in_place(Path(repo), path):
+        raise _refuse(f"the evidence base worktree {path} is a symlink or lies behind one")
+    listed = git(Path(repo), "worktree", "list", "--porcelain").splitlines()
+    if os.path.realpath(path) not in {os.path.realpath(ln[len("worktree "):])
+                                      for ln in listed if ln.startswith("worktree ")}:
+        raise _refuse(f"the evidence base worktree {path} is not a worktree of {repo}")
+    return [Path(os.path.realpath(path))]
 
 
 def check_request(req: DispatchRequest, run_real: Path, meta: Mapping[str, Any]) -> None:

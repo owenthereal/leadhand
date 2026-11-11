@@ -194,6 +194,33 @@ class ArgvTests(Base):
             self.assertNotIn(name, start["env"])
         self.assertEqual(os.listdir(start["env"]["GH_CONFIG_DIR"]), [])
 
+    def test_evidence_worker_may_write_the_evidence_base_worktree_only(self):
+        # The run is in place (workspace == repo), so its base worktree is named after the run dir.
+        base = self.repo / ".worktrees" / f"{self.run_dir.name}--base"
+        run_git(self.repo, "worktree", "add", "--quiet", "--detach", str(base), "HEAD")
+        self.scenario("ready")
+        dispatch(self.request("e1", role="verifier", card=None, kind="evidence"))
+        dispatch(self.request("v1", role="verifier", card=None, kind="verify"))
+        evidence, verify = (r["argv"] for r in self.records("start"))
+        dirs = lambda argv: [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"]
+        self.assertIn(os.path.realpath(base), dirs(evidence))
+        self.assertEqual(dirs(verify), [d for d in dirs(evidence) if d != os.path.realpath(base)])
+        self.assertNotIn(os.path.realpath(base), [os.path.realpath(d) for d in dirs(verify)])
+
+    def test_evidence_base_worktree_must_be_registered_and_reached_through_no_symlink(self):
+        base = self.repo / ".worktrees" / f"{self.run_dir.name}--base"
+        other = self.tmp / "other worktree"
+        run_git(self.repo, "worktree", "add", "--quiet", "--detach", str(other), "HEAD")
+        base.parent.mkdir()
+        self.scenario("ready")
+        for n, make in enumerate((lambda: base.symlink_to(other, target_is_directory=True),
+                                  lambda: (base.unlink(), base.mkdir()))):
+            make()
+            dispatch(self.request(f"e{n}", role="verifier", card=None, kind="evidence"))
+            stderr = (self.worker_dir(f"e{n}") / dsp.STDERR).read_text()
+            self.assertIn("cannot prepare the Codex worker: refused", stderr)
+        self.assertEqual(self.records("start"), [])         # Codex never started
+
     def test_resume_argv_matches_findings(self):
         fresh = codex_argv(self.request(), Path("/l"), Path("/g"), {})
         resumed = codex_argv(self.request(resume="thread-123"), Path("/l"), Path("/g"), {})
