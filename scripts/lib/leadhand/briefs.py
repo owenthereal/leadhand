@@ -8,10 +8,10 @@ through `worker_prompt`.
 """
 from __future__ import annotations
 
+import errno
 import os
 import re
 import shlex
-import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from string import Template
@@ -82,6 +82,106 @@ def scratch_dir(ws: Path, card: int | None, dispatch_id: str) -> Path:
     if not dispatch_id or "/" in dispatch_id or dispatch_id in (".", ".."):
         raise ValueError(f"bad dispatch id {dispatch_id!r}")
     return Path(ws) / SCRATCH / ("run" if card is None else str(card)) / dispatch_id
+
+
+# -- scratch files ---------------------------------------------------------
+#
+# The CLI runs outside Claude Code's sandbox, and a worker can plant a symlink (or a file)
+# at a later dispatch's scratch folder. Every write or removal under <ws>/.leadhand/ walks
+# the folders from the workspace down with O_NOFOLLOW | O_DIRECTORY and acts relative to
+# the last folder's descriptor, so it never follows a symlink out of <ws>/.leadhand/ (a
+# folder swapped after the check is not followed either). A symlink or a non-folder on the
+# way is refused (ScratchError); nothing is written or removed.
+
+
+class ScratchError(ValueError):
+    """A folder under <ws>/.leadhand/ is a symlink or not a folder."""
+
+
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_scratch(ws: Path, card: int | None, dispatch_id: str, *, create: bool) -> int | None:
+    """A descriptor for the dispatch's scratch folder (None when it is missing and not
+    `create`), or ScratchError naming the offending path."""
+    folder = scratch_dir(ws, card, dispatch_id)
+    parts = folder.relative_to(Path(ws)).parts
+    fd = os.open(ws, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        for i, name in enumerate(parts):
+            shown = Path(ws).joinpath(*parts[:i + 1])
+            try:
+                nxt = os.open(name, _DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    return None
+                try:
+                    os.mkdir(name, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                nxt = _reopen(name, fd, shown)
+            except OSError as e:
+                raise _refusal(shown, e) from None
+            os.close(fd)
+            fd = nxt
+        out, fd = fd, -1
+        return out
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _reopen(name: str, dir_fd: int, shown: Path) -> int:
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=dir_fd)
+    except OSError as e:
+        raise _refusal(shown, e) from None
+
+
+def _refusal(shown: Path, e: OSError) -> OSError:
+    if e.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT):
+        what = "a symlink" if os.path.islink(shown) else "not a folder"
+        return ScratchError(f"refused: the scratch path {shown} is {what}; remove it and run the "
+                            "command again (a worker may have planted it)")
+    return e
+
+
+def write_scratch_file(ws: Path, card: int | None, dispatch_id: str, name: str, text: str) -> Path:
+    """Atomically write `name` in the dispatch's scratch folder (created as needed), never
+    through a symlink. Returns the file's path."""
+    fd = _open_scratch(ws, card, dispatch_id, create=True)
+    tmp = f".{name}.{os.getpid()}.{os.urandom(4).hex()}"
+    try:
+        f = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+        try:
+            with os.fdopen(f, "w", encoding="utf-8") as out:
+                out.write(text)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=fd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(fd)
+    return scratch_dir(ws, card, dispatch_id) / name
+
+
+def remove_scratch_file(ws: Path, card: int | None, dispatch_id: str, name: str) -> None:
+    """Remove `name` from the dispatch's scratch folder if it is there (a symlink named `name`
+    is removed itself, never its target); a symlinked folder on the way is refused."""
+    fd = _open_scratch(ws, card, dispatch_id, create=False)
+    if fd is None:
+        return
+    try:
+        os.unlink(name, dir_fd=fd)
+    except FileNotFoundError:
+        pass
+    finally:
+        os.close(fd)
 
 
 # -- rendering -------------------------------------------------------------
@@ -179,22 +279,10 @@ def _context(deck: Deck, card: Card | None, *, attempt: int, base: str, branch: 
     return "\n".join(parts)
 
 
-def _atomic_write(path: Path, text: str) -> None:
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
-
-
 def write_brief(kind: str, *, ws: Path, deck: Deck, card: Card | None, attempt: int, dispatch_id: str,
-                extra: Mapping[str, str]) -> tuple[Path, Path]:
-    """Write the brief for `kind` and return (brief, report) paths.
+                extra: Mapping[str, str], notes: str = "") -> tuple[Path, Path]:
+    """Write the brief for `kind` (with `notes` appended) and return (brief, report) paths.
+    A symlink or non-folder on the scratch folder's way raises ScratchError.
 
     `extra` supplies the keys in REQUIRED[kind]; card kinds also need `base` and
     `branch` (the card's base commit and card branch), and review/rereview need
@@ -242,8 +330,10 @@ def write_brief(kind: str, *, ws: Path, deck: Deck, card: Card | None, attempt: 
     except (KeyError, ValueError) as e:
         raise ValueError(f"brief-{kind}.md: cannot fill {e}") from None
     ensure_excluded(ws, f"{SCRATCH}/")
-    folder.mkdir(parents=True, exist_ok=True)
-    _atomic_write(brief, text.rstrip("\n") + "\n")
+    text = text.rstrip("\n") + "\n"
+    if notes:
+        text += "\n" + notes.rstrip("\n") + "\n"
+    write_scratch_file(ws, None if card is None else card.number, dispatch_id, brief.name, text)
     return brief, report
 
 

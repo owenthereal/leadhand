@@ -256,6 +256,12 @@ exclusion), so any Claude worker of the session can run it too. What the CLI che
   executable.
 - `record result --reply-file` reads only the dispatch's own reply file, never through a
   symlink.
+- Scratch folders (L2): the engine writes a brief, and removes a stale report or reply file,
+  only by walking `<workspace>/.leadhand/<card or run>/<dispatch id>/` from the workspace
+  down without following a symlink, and acts relative to that folder. If a worker left a
+  symlink or a file at any of those folders, `next` refuses with an error naming the path and
+  writes or removes nothing; the run waits until the operator removes it and runs `next`
+  again. A symlink named like the file itself is replaced or removed, never followed.
 - `run` refuses a CLI or `--plugin-dir` inside the run's workspace, and `start` an in-place
   run of the repository that holds the CLI.
 - The evidence base worktree is reset only when neither it nor a folder between the
@@ -289,9 +295,6 @@ Known limits, until Plan 2's run guard (a caller check on the CLI):
 - Run forgery (M6): a worker can run any other CLI step for its own run (`record`, `next`,
   `unpark`, `pause`, `cancel`) and so pass its own gates, and `start --repo` reaches any
   repository the operator owns.
-- Symlinked scratch folders (L2): the engine writes briefs and removes stale reports in
-  `<workspace>/.leadhand/` without checking every folder for symlinks; the file names are
-  fixed.
 - The run lock (L3): every command of the session inherits the `run.lock` descriptor, and
   unlocking it drops the lock; a relaunch is still refused while the supervisor lives.
 - Test hooks (L4): `LEADHAND_TESTING=1` turns on test-only behaviour (crash points, a fake

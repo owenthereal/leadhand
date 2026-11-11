@@ -77,8 +77,8 @@ from typing import Any
 
 from leadhand import dispatch as dsp
 from leadhand import usage
-from leadhand.briefs import (CODEX_AGENT, agent_for, dispatch_message, parse_report_head, scratch_dir,
-                             write_brief)
+from leadhand.briefs import (CODEX_AGENT, ScratchError, agent_for, dispatch_message, parse_report_head,
+                             remove_scratch_file, scratch_dir, write_brief)
 from leadhand.config import (SNAPSHOT, VENDORS, Config, ConfigError, Route, config_to_dict, docs_dir_for,
                              load_config, load_run_config, unsupported_warnings)
 from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, parse_deck
@@ -719,13 +719,19 @@ def _request(ctx: _Run, c: CardState, events: list[dict], *, kind: str, attempt:
             guard["untracked"] = untracked_files(ctx.ws)
     if continues is not None:
         guard["continues"] = continues
-    brief, report = write_brief(kind, ws=ctx.ws, deck=ctx.deck, card=ctx.card(c.number), attempt=attempt,
-                                dispatch_id=did, extra=full)
-    if notes:
-        with open(brief, "a", encoding="utf-8") as f:
-            f.write("\n" + notes.rstrip("\n") + "\n")
+    brief, report = _write_brief(kind, ws=ctx.ws, deck=ctx.deck, card=ctx.card(c.number), attempt=attempt,
+                                 dispatch_id=did, extra=full, notes=notes)
     return _append_request(ctx, did, card=c.number, attempt=attempt, kind=kind, role=role, route=route,
                            brief=brief, report=report, extra=extra, notes=notes, resume=resume, **guard)
+
+
+def _write_brief(kind: str, **kw: Any) -> tuple[Path, Path]:
+    """write_brief, refusing a scratch folder a worker replaced with a symlink or a file (L2):
+    the run stops with an error naming the path until the operator removes it."""
+    try:
+        return write_brief(kind, **kw)
+    except ScratchError as e:
+        raise EngineError(str(e)) from None
 
 
 def _append_request(ctx: _Run, did: str, *, card: int | None, attempt: int, kind: str, role: str, route: Route,
@@ -733,9 +739,13 @@ def _append_request(ctx: _Run, did: str, *, card: int | None, attempt: int, kind
                     **more: Any) -> dict:
     """Append `dispatch_requested` for a brief already written (with the notes appended)."""
     # No worker can have written this dispatch's report yet, nor the supervisor its reply file:
-    # one already there is left over from an earlier run that used the same workspace.
-    Path(report).unlink(missing_ok=True)
-    _reply_file(ctx, card, did).unlink(missing_ok=True)
+    # one already there is left over from an earlier run that used the same workspace. Never
+    # removed through a symlinked scratch folder (L2).
+    try:
+        for name in (Path(report).name, REPLY_FILE):
+            remove_scratch_file(ctx.ws, card, did, name)
+    except ScratchError as e:
+        raise EngineError(str(e)) from None
     resume_worker = resume_session = None
     if resume is not None:
         if route.vendor == "claude":
@@ -2003,11 +2013,8 @@ def _request_run(ctx: _Run, events: list[dict], *, kind: str, attempt: int, role
             "cards": ",".join(str(c.number) for c in accepted), **extra}
     if gate is not None and not any(e["kind"] == "gate_started" and e.get("dispatch_id") == did for e in events):
         append_event(ctx.paths, "gate_started", gate=gate, examined_sha=guard["expected_head"], dispatch_id=did)
-    brief, report = write_brief(kind, ws=ctx.ws, deck=ctx.deck, card=None, attempt=attempt, dispatch_id=did,
-                                extra=full)
-    if notes:
-        with open(brief, "a", encoding="utf-8") as f:
-            f.write("\n" + notes.rstrip("\n") + "\n")
+    brief, report = _write_brief(kind, ws=ctx.ws, deck=ctx.deck, card=None, attempt=attempt, dispatch_id=did,
+                                 extra=full, notes=notes)
     return _append_request(ctx, did, card=None, attempt=attempt, kind=kind, role=role, route=route, brief=brief,
                            report=report, extra=extra, notes=notes, resume=None, gate=gate, wave=wave, **guard)
 

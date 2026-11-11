@@ -509,6 +509,59 @@ class L1ReplyFile(unittest.TestCase):
         self.assert_nothing_copied(self.record(reply))
 
 
+class L2SymlinkedScratch(unittest.TestCase):
+    """L2 (Codex review round 1): an implementer plants a symlink at the next dispatch's scratch
+    path; the engine must not write the review brief, nor remove a report, through it."""
+
+    def plant(self, which):
+        w = FakeWorld(self, [card(1)])
+        outside = w.tmp / "outside"
+        outside.mkdir()
+        (outside / "report.md").write_text("keep me\n")
+        (outside / "reply.txt").write_text("keep me too\n")
+
+        def tamper(world, ws, a):
+            scratch = ws / ".leadhand" / "1"
+            if which == "dispatch folder":
+                (scratch / "c1-a1-review-1").symlink_to(outside, target_is_directory=True)
+            elif which == "card folder":
+                os.rename(scratch, ws / ".leadhand" / "1-moved")
+                scratch.symlink_to(outside, target_is_directory=True)
+            else:                               # a file where the dispatch folder should be
+                (scratch / "c1-a1-review-1").write_text("not a folder\n")
+
+        w.script(1, "implement", {"tamper": tamper})
+        w.start()
+        a = w.next()
+        self.assertEqual(a["dispatch_id"], "c1-a1-implement-1")
+        w.act(a)
+        return w, outside
+
+    def assert_refused(self, w, outside, path_part):
+        with self.assertRaises(engine.EngineError) as cm:
+            w.next()
+        self.assertIn(path_part, str(cm.exception))
+        self.assertEqual([p for p in outside.rglob("brief.md")], [])
+        self.assertEqual((outside / "report.md").read_text(), "keep me\n")
+        self.assertEqual((outside / "reply.txt").read_text(), "keep me too\n")
+        self.assertEqual([e for e in w.events("dispatch_requested") if e["dispatch_kind"] == "review"], [])
+        r = w.cli("next", w.run_dir)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn(path_part, r.stderr)
+
+    def test_a_symlinked_dispatch_folder_is_refused(self):
+        w, outside = self.plant("dispatch folder")
+        self.assert_refused(w, outside, str(Path(".leadhand") / "1" / "c1-a1-review-1"))
+
+    def test_a_symlinked_card_folder_is_refused(self):
+        w, outside = self.plant("card folder")
+        self.assert_refused(w, outside, str(Path(".leadhand") / "1"))
+
+    def test_a_file_in_place_of_the_dispatch_folder_is_refused(self):
+        w, outside = self.plant("file")
+        self.assert_refused(w, outside, str(Path(".leadhand") / "1" / "c1-a1-review-1"))
+
+
 class L6ToolsInsideTheWorkspace(LaunchTestCase):
     """L6: workers can edit their workspace, so neither the CLI (which runs outside the sandbox)
     nor the plugin the supervisor loads may live in it."""
