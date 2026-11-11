@@ -1,4 +1,5 @@
 """Engine: integration before acceptance, unparking, and reviewer/verifier violations."""
+import shlex
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -673,6 +674,38 @@ class FixRound2(unittest.TestCase):
         self.assertEqual([e["dispatch_id"] for e in w.events("verdict_recorded")],
                          ["c1-a1-review-1", "c1-a1-rereview-2"])
         self.assertEqual([e["card"] for e in w.events("accepted")], [1])
+
+
+class CodexIntegrate(unittest.TestCase):
+    """Ruling R39: integrating rewrites the card branch, and Codex's sandbox refuses Git writes."""
+
+    def test_integrate_after_codex_implementer_routes_to_claude(self):
+        w = parked_world(self, card1_files={"src/shared.txt": "card one\n"},
+                         card2_files={"src/shared.txt": "card two\n"}, installed=("claude", "codex"))
+        implement = requested(w, "c1-a1-implement-1")
+        self.assertEqual(implement["vendor"], "codex")
+        argv = shlex.split(w.started[0]["message"])
+        self.assertEqual(argv[argv.index("--kind") + 1], "implement")
+        self.assertEqual(argv[argv.index("--branch") + 1], CARD1)
+        engine.unpark(w.run_dir, card=1, note=NOTE)
+        integrate = drive_to(w, "integrate", 1)
+        self.assertEqual(integrate["route"]["vendor"], "claude")
+        self.assertEqual(integrate["agent"], "leadhand:implementer")
+        self.assertEqual(integrate["role"], implement["role"])
+        w.act(integrate)
+        w.run()
+        (rebased,) = w.events("rebased")
+        self.assertEqual(rebased["dispatch_id"], "c1-a2-integrate-1")
+        self.assertEqual([e["card"] for e in w.events("accepted")], [2, 1])
+
+    def test_integrate_without_claude_parks_the_card(self):
+        w = parked_world(self, card1_files={"src/shared.txt": "card one\n"},
+                         card2_files={"src/shared.txt": "card two\n"}, installed=("codex",))
+        engine.unpark(w.run_dir, card=1, note=NOTE)
+        w.run()
+        parked = [e for e in w.events("parked") if e["card"] == 1][-1]
+        self.assertEqual(parked["reason"], "integration needs a Claude worker")
+        self.assertNotIn("c1-a2-integrate-1", w.dispatch_ids())
 
 
 if __name__ == "__main__":

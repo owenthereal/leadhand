@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from gitfixture import hermetic, make_repo
+from gitfixture import hermetic, make_repo, run_git
 from leadhand import cli, dispatch as dsp, procs
 from leadhand.briefs import worker_prompt
 from leadhand.dispatch import (DispatchError, DispatchRequest, DispatchStillRunning, blocking_env,
@@ -631,6 +631,155 @@ class FixRoundTests(Base):
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual((self.worker_dir() / "runner.json").read_text(), before)
         self.assertEqual(len(self.records("start")), 1)
+
+
+CARD_BRANCH = "leadhand/demo--card-1"
+
+
+class RunnerCommitTests(Base):
+    """Ruling R39: Codex cannot write the Git directory, so the runner commits its work."""
+
+    def setUp(self):
+        super().setUp()
+        run_git(self.repo, "checkout", "--quiet", "-b", CARD_BRANCH)
+        self.base_sha = run_git(self.repo, "rev-parse", "HEAD")
+        exclude = Path(run_git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text(".leadhand/\n")
+        # The runner's commit must be unsigned and skip hooks, whatever the repo says.
+        run_git(self.repo, "config", "commit.gpgsign", "true")
+        run_git(self.repo, "config", "gpg.program", "false")
+        hook = Path(run_git(self.repo, "rev-parse", "--path-format=absolute", "--git-path", "hooks")) / "pre-commit"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+
+    def commit_request(self, dispatch_id="d1", **kw):
+        req = self.request(dispatch_id, kind="implement", branch=CARD_BRANCH, **kw)
+        req.brief.write_text("# Brief\n## Card 1: Widget card\n- Card branch: leadhand/demo--card-1\n")
+        return req
+
+    def write_scenario(self, lines):
+        path = self.tmp / "scenario.jsonl"
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+        os.environ["FAKE_CODEX_SCENARIO"] = str(path)
+
+    def edits(self, req, *, report=True, steps=0, status="READY"):
+        lines = [{"type": "thread.started", "thread_id": "{thread}"}, {"type": "turn.started"},
+                 {"action": "write_file", "path": "src/widget.py", "text": "WIDGET = 1\n"},
+                 {"action": "write_file", "path": "notes/new file.txt", "text": "untracked\n"}]
+        if report:
+            lines.append({"action": "write_file", "path": str(req.report),
+                          "text": f"Status: {status}\n## Summary\nAdded the widget constant.\nMore.\n"})
+        for i in range(steps):
+            lines += [{"type": "item.completed", "item": {"id": f"c{i}", "type": "command_execution",
+                                                          "status": "completed"}},
+                      {"action": "sleep", "seconds": 0.3}]
+        if steps:
+            lines.append({"action": "sleep", "seconds": 30})
+        lines += [{"action": "last_message", "text": f"Status: {status}\n"},
+                  {"type": "turn.completed", "usage": {"input_tokens": 10, "cached_input_tokens": 0,
+                                                        "output_tokens": 1}}]
+        self.write_scenario(lines)
+
+    def head_files(self):
+        return run_git(self.repo, "show", "--name-only", "--format=", "HEAD").splitlines()
+
+    def test_runner_commits_codex_work_on_card_branch(self):
+        req = self.commit_request()
+        self.edits(req)
+        result = dispatch(req)
+        self.assertEqual(result.status, "READY")
+        saved = json.loads((self.worker_dir() / "result.json").read_text())
+        head = run_git(self.repo, "rev-parse", "HEAD")
+        self.assertEqual(saved["committed"], head)
+        self.assertEqual(run_git(self.repo, "rev-parse", f"refs/heads/{CARD_BRANCH}"), head)
+        self.assertEqual(run_git(self.repo, "rev-parse", "HEAD^"), self.base_sha)
+        self.assertEqual(run_git(self.repo, "log", "-1", "--format=%s"), "implement card 1: Added the widget constant.")
+        self.assertIn("Leadhand-Dispatch: d1", run_git(self.repo, "log", "-1", "--format=%B"))
+        self.assertNotIn("gpgsig", run_git(self.repo, "cat-file", "commit", "HEAD"))
+        self.assertEqual(sorted(self.head_files()), ["notes/new file.txt", "src/widget.py"])
+        self.assertEqual(run_git(self.repo, "status", "--porcelain"), "")
+        self.assertTrue(req.report.exists())         # the scratch folder stays, untracked and ignored
+
+    def test_runner_commits_partial_work_when_spent(self):
+        req = self.commit_request(steps=2)
+        self.edits(req, report=False, steps=5)
+        result = dispatch(req)
+        self.assertEqual((result.status, result.exit_reason), ("SPENT", "step_limit"))
+        saved = json.loads((self.worker_dir() / "result.json").read_text())
+        self.assertEqual(saved["committed"], run_git(self.repo, "rev-parse", "HEAD"))
+        self.assertEqual(run_git(self.repo, "log", "-1", "--format=%s"), "implement card 1: Widget card")
+        self.assertIn("src/widget.py", self.head_files())
+
+    def test_commit_intent_restart_does_not_double_commit(self):
+        req = self.commit_request()
+        wd = self.worker_dir()
+        wd.mkdir(parents=True)
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "widget.py").write_text("WIDGET = 1\n")
+        first = dsp._commit_work(wd, req)
+        sha = run_git(self.repo, "rev-parse", "HEAD")
+        self.assertEqual(first["committed"], sha)
+        self.assertTrue((wd / "commit.json").exists())
+        # A restart after the commit (intent there, HEAD carries the trailer): nothing new.
+        again = dsp._commit_work(wd, req)
+        self.assertEqual(again["committed"], sha)
+        self.assertEqual(run_git(self.repo, "rev-parse", "HEAD"), sha)
+        self.assertEqual(run_git(self.repo, "rev-list", "--count", f"{self.base_sha}..HEAD"), "1")
+        # A restart after the intent but before the commit: it commits.
+        run_git(self.repo, "reset", "--quiet", "--soft", self.base_sha)
+        late = dsp._commit_work(wd, req)
+        self.assertNotEqual(late["committed"], self.base_sha)
+        self.assertEqual(run_git(self.repo, "rev-list", "--count", f"{self.base_sha}..HEAD"), "1")
+
+    def test_wrong_branch_is_not_committed(self):
+        req = self.commit_request()
+        run_git(self.repo, "checkout", "--quiet", "-b", "somewhere-else")
+        self.edits(req)
+        result = dispatch(req)
+        self.assertEqual(result.status, "READY")
+        saved = json.loads((self.worker_dir() / "result.json").read_text())
+        self.assertIsNone(saved["committed"])
+        self.assertIn("somewhere-else", saved["commit_skipped"])
+        self.assertEqual(run_git(self.repo, "rev-parse", "HEAD"), self.base_sha)
+        self.assertIn("src/", run_git(self.repo, "status", "--porcelain"))
+
+    def test_operation_in_progress_is_not_committed(self):
+        req = self.commit_request()
+        wd = self.worker_dir()
+        wd.mkdir(parents=True)
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "widget.py").write_text("WIDGET = 1\n")
+        merge_head = Path(run_git(self.repo, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"))
+        merge_head.write_text(self.base_sha + "\n")
+        out = dsp._commit_work(wd, req)
+        self.assertIsNone(out["committed"])
+        self.assertIn("in progress", out["commit_skipped"])
+        self.assertEqual(run_git(self.repo, "rev-parse", "HEAD"), self.base_sha)
+
+    def test_check_dispatch_is_not_committed(self):
+        req = self.request("r1", kind="review", branch=CARD_BRANCH)
+        self.edits(req)
+        dispatch(req)
+        saved = json.loads((self.worker_dir("r1") / "result.json").read_text())
+        self.assertIsNone(saved["committed"])
+        self.assertEqual(run_git(self.repo, "rev-parse", "HEAD"), self.base_sha)
+
+    def test_cli_passes_kind_and_branch(self):
+        req = self.commit_request()
+        args = ["dispatch", "--run", str(self.run_dir), "--dispatch-id", "d1", "--card", "1", "--attempt", "1",
+                "--role", "implementer", "--model", "gpt-6-luna", "--effort", "low", "--brief", str(req.brief),
+                "--report", str(req.report), "--cwd", str(self.repo), "--kind", "implement",
+                "--branch", CARD_BRANCH]
+        self.edits(req)
+        with mock.patch.dict(os.environ, {"PATH": f"{FAKES}{os.pathsep}{os.environ['PATH']}"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(args), 0)
+        request = json.loads((self.worker_dir() / "request.json").read_text())
+        self.assertEqual((request["kind"], request["branch"]), ("implement", CARD_BRANCH))
+        self.assertEqual(json.loads((self.worker_dir() / "result.json").read_text())["committed"],
+                         run_git(self.repo, "rev-parse", "HEAD"))
 
 
 if __name__ == "__main__":

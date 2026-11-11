@@ -123,6 +123,26 @@ Codex workers and the runner:
   different `-m`/`-c` is untested. Decision:
   `codex_argv` for a resume is
   `codex exec <the same options as the first run> resume <thread id> -`, prompt on stdin.
+- Codex's `workspace-write` sandbox keeps the repository's Git directory read-only, even when
+  that directory is passed with `--add-dir`. In an end-to-end run a Codex implementer wrote
+  and tested its change, but `git commit` failed with "Operation not permitted" creating the
+  worktree's `index.lock`, so it reported `Status: BLOCKED` (environment). Decision:
+  - Codex workers never commit. Their prompt overrides the contract's commit rule: leave the
+    changes in the working tree and list the changed files in the report.
+  - The runner, which runs outside Codex's sandbox, commits the work once Codex is confirmed
+    stopped and before it writes the result. This applies to implementer-side dispatches
+    (implement, fix, continue, answer, final fix), whatever the final status, so partial work
+    survives.
+  - The runner commits only when the workspace is on the expected branch and no Git
+    operation is in progress. It runs `git add -A`, which respects `.gitignore` and
+    `info/exclude`, so the `.leadhand/` scratch folder is never committed, then an unsigned
+    commit with hooks off. The message is `<kind> card <n>: <summary>`, with a
+    `Leadhand-Dispatch: <dispatch id>` trailer.
+  - The runner records a commit intent first. After a restart, a HEAD that already carries
+    the trailer is not committed again. The commit's SHA is in `result.json` (`committed`).
+  - Integrating a card (a rebase) needs Git writes too. An integrate attempt always runs on
+    the role's Claude route; without Claude installed the card is parked with "integration
+    needs a Claude worker".
 
 ## Limits
 

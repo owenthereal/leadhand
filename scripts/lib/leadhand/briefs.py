@@ -259,10 +259,23 @@ def _agent_body(agent: str) -> str:
     return text.strip()
 
 
+# Codex's workspace-write sandbox keeps the Git directory read-only (ruling R39), so a
+# Codex implementer never commits; the dispatcher's runner commits its work afterwards.
+CODEX_NO_COMMIT = (
+    "## Commits (Codex workers)\n\n"
+    "This overrides the contract's rule to commit on the card branch. Do not run git commit,\n"
+    "git add, or any command that writes under .git; leave your changes in the working tree\n"
+    "and list the changed files in your report. leadhand commits them on the card branch\n"
+    "after you finish.")
+
+
 def worker_prompt(role: str, brief: Path, report: Path) -> str:
     """The instructions a Codex worker gets: the Claude agent's body (contract and
-    role rules) followed by the brief and report paths."""
-    body = _agent_body(agent_for(role, "claude"))
+    role rules), for implementers the no-commit rule, then the brief and report paths."""
+    agent = agent_for(role, "claude")
+    body = _agent_body(agent)
+    if agent == "leadhand:implementer":
+        body += "\n\n" + CODEX_NO_COMMIT
     return (f"{body}\n\n## Your files\n\n- Brief: {brief}\n- Report file: {report}\n\n"
             "Read the brief now, do the work, write the report, then reply.\n")
 

@@ -674,12 +674,22 @@ def _budget_seconds(req: dict) -> float:
     return minutes * dsp.minute_seconds()
 
 
+def _work_branch(ctx: _Run, req: dict) -> str:
+    """The branch a dispatch works on: the card branch, the final fix branch, or the run branch.
+    The Codex runner commits implementer work there (ruling R39)."""
+    if req["card"] is not None:
+        return (_card_state(ctx, read_events(ctx.paths), req["card"]).branch
+                or card_branch_name(ctx.branch, req["card"]))
+    return _final_branch(ctx) if req["dispatch_kind"] == "final_fix" else ctx.branch
+
+
 def _codex_command(ctx: _Run, req: dict) -> list[str]:
     cmd = [str(dsp.CLI_PATH), "dispatch", "--run", str(ctx.root), "--dispatch-id", req["dispatch_id"],
            *(["--card", str(req["card"])] if req["card"] is not None else []),
            "--attempt", str(req["attempt"]), "--role", req["role"],
            "--model", req["model"], "--effort", req["effort"], "--brief", req["brief"],
-           "--report", req["report"], "--cwd", str(ctx.ws)]
+           "--report", req["report"], "--cwd", str(ctx.ws),
+           "--kind", req["dispatch_kind"], "--branch", _work_branch(ctx, req)]
     if req.get("resume_session"):
         cmd += ["--resume", req["resume_session"]]
     return cmd
@@ -756,7 +766,7 @@ def _cancel_codex(ctx: _Run, d: _Dispatch) -> dsp.DispatchResult:
         wd = dsp.write_request(dsp.request_for(
             ctx.root, d.id, card=req["card"], attempt=req["attempt"], role=req["role"], model=req["model"],
             effort=req["effort"], brief=Path(req["brief"]), report=Path(req["report"]), cwd=ctx.ws,
-            resume=req.get("resume_session")))
+            resume=req.get("resume_session"), kind=req["dispatch_kind"], branch=_work_branch(ctx, req)))
         return dsp.cancel(wd, timeout=dsp.CANCEL_TIMEOUT)
     except (dsp.DispatchError, ConfigError, OSError) as e:
         raise EngineError(f"could not stop Codex dispatch {d.id}: {e}") from None
@@ -1070,7 +1080,21 @@ def _request_integrate(ctx: _Run, c: CardState, events: list[dict], index: dict[
     landed = [ctx.card(e["card"]) for e in events if e["kind"] == "accepted" and e["seq"] > cut
               and e.get("card") != c.number and e.get("card") in ctx.numbers]
     run_intent = "; ".join(f"card {x.number} ({x.title}): {x.done_when}" for x in landed)
-    _request(ctx, c, events, kind="integrate", attempt=attempt, role=last.req["role"], route=last.route,
+    route = last.route
+    if route.vendor != "claude":
+        # Rebasing writes the Git directory, which Codex's sandbox refuses (ruling R39): the
+        # integrate attempt runs on the role's Claude route, not escalated.
+        route = None
+        if "claude" in installed_vendors():
+            try:
+                route = resolve(ctx.config, role=last.req["role"], card=card, attempt=1,
+                                installed=frozenset({"claude"}), profile=ctx.deck.profile).route
+            except (LadderExhausted, PinnedVendorMissing, ConfigError):
+                route = None
+        if route is None or route.vendor != "claude":
+            append_event(ctx.paths, "parked", card=c.number, reason="integration needs a Claude worker")
+            return
+    _request(ctx, c, events, kind="integrate", attempt=attempt, role=last.req["role"], route=route,
              extra={"run_tip": conflict["onto"], "conflicts": ", ".join(conflict["paths"]),
                     "card_intent": f"card {card.number} ({card.title}): {card.done_when}",
                     "run_intent": run_intent or "(no card was accepted since this card was cut)"})

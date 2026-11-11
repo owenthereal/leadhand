@@ -242,6 +242,18 @@ class BriefTests(unittest.TestCase):
         self.assertIn("Verdict: clean", review)
         self.assertNotIn(CONTRACT, review)
 
+    def test_codex_implementer_prompt_forbids_commits_and_claude_agents_do_not(self):
+        no_commit = ("Do not run git commit, git add, or any command that writes under .git; leave your "
+                     "changes in the working tree and list the changed files in your report. leadhand "
+                     "commits them on the card branch after you finish.")
+        brief, report = self.brief("implement")
+        for role in ("implementer", "implementer_hard"):
+            self.assertIn(no_commit, " ".join(worker_prompt(role, brief, report).split()), role)
+        self.assertNotIn("leadhand commits them", worker_prompt("reviewer", brief, report))
+        root = Path(__file__).resolve().parents[1]
+        for agent in sorted((root / "agents").glob("*.md")):
+            self.assertNotIn("leadhand commits them", agent.read_text(encoding="utf-8"), agent.name)
+
     def test_parse_report_head_variants(self):
         cases = {
             "Status: READY\n## Summary\n": ("Status", "READY", ""),

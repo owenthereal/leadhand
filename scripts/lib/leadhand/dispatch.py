@@ -105,12 +105,22 @@ STREAM, STDERR, LAST, RAW = "stream.jsonl", "codex.stderr", "last-message.md", "
 CANCEL, STOPPING, RESULT, FINALIZE_LOCK = "cancel", "stopping.json", "result.json", "finalize.lock"
 OWNER_LOCK, RUNNER_LOCK = "owner.lock", "runner.lock"
 RUNNER_OUT, RUNNER_ERR, GH_DIR, SUPERSEDED = "runner.out", "runner.err", "gh-config", "superseded"
+COMMIT_INTENT = "commit.json"
 GENERATION_FILES = (SPAWN, RUNNER, HEARTBEAT, PROCS, STREAM, STDERR, LAST, RAW, CANCEL, STOPPING, RESULT,
+                    COMMIT_INTENT,
                     RUNNER_OUT, RUNNER_ERR)
 
+# Codex's workspace-write sandbox keeps the Git directory read-only even when it is an
+# --add-dir (end-to-end finding, ruling R39), so Codex workers never commit: the runner
+# commits their work for these kinds once Codex is confirmed stopped.
+COMMIT_KINDS = frozenset({"implement", "fix", "continue", "answer", "final_fix"})
+TRAILER = "Leadhand-Dispatch"
+COMMIT_TIMEOUT = 120.0
+_GIT_OPERATIONS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-merge", "rebase-apply")
 _USAGE_LIMIT = re.compile(r"usage[\s_-]*limit", re.IGNORECASE)
 _STATUS_BLOCKED = re.compile(r"^[\s*_`#>]*status[\s*_`]*:[\s*_`]*blocked\b", re.IGNORECASE)
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_REPO_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
 _SPAWNED: list[subprocess.Popen] = []
 _RUNNER_LOCK_FD: int | None = None
 
@@ -133,6 +143,8 @@ class DispatchRequest:
     writable_dirs: tuple[Path, ...]
     resume: str | None = None
     codex_bin: str = "codex"
+    kind: str | None = None        # the dispatch kind; COMMIT_KINDS get their work committed
+    branch: str | None = None      # the branch the work must be committed on
 
 
 @dataclass(frozen=True)
@@ -541,6 +553,85 @@ def _charge_usage(req: DispatchRequest, wd: Path, *, thread: str | None, launche
     return c.usage, [cid], ("stream" if c.source == CODEX_STREAM_SOURCE else "session")
 
 
+def _commit_subject(req: DispatchRequest) -> str:
+    """The first line of the report's `## Summary`, else the card title from the brief."""
+    subject = ""
+    try:
+        lines = req.report.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    for i, line in enumerate(lines):
+        if line.strip().lower() == "## summary":
+            subject = next((ln.strip() for ln in lines[i + 1:] if ln.strip()), "")
+            if subject.startswith("#"):
+                subject = ""
+            break
+    if not subject:
+        try:
+            brief = req.brief.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            brief = ""
+        m = re.search(r"^## Card \d+: (.+)$", brief, re.MULTILINE)
+        subject = m.group(1).strip() if m else f"leadhand dispatch {req.dispatch_id}"
+    prefix = f"{req.kind} card {req.card}" if req.card is not None else f"{req.kind}"
+    text = f"{prefix}: {subject}"
+    return text if len(text) <= 100 else text[:99].rstrip() + "…"
+
+
+def _git(ws: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = {k: v for k, v in os.environ.items() if k not in _REPO_VARS}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return subprocess.run(["git", *args], cwd=ws, env=env, capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, timeout=COMMIT_TIMEOUT)
+
+
+def _commit_work(wd: Path, req: DispatchRequest) -> dict:
+    """Commit what the Codex worker left in the workspace, on `req.branch` (ruling R39).
+
+    Returns {"committed": sha or None} plus "commit_skipped" (why nothing was committed)
+    or "commit_error". Two-phase: commit.json records the intent and HEAD before; a
+    restart that finds HEAD moved to a commit carrying this dispatch's trailer does not
+    commit again. Never commits off the expected branch or during a Git operation."""
+    if req.kind not in COMMIT_KINDS or not req.branch:
+        return {"committed": None, "commit_skipped": f"{req.kind or 'this'} dispatch does not commit"}
+    ws = Path(req.cwd)
+    try:
+        r = _git(ws, "symbolic-ref", "--quiet", "--short", "HEAD")
+        current = r.stdout.strip() if r.returncode == 0 else None
+        if current != req.branch:
+            return {"committed": None,
+                    "commit_skipped": f"workspace is on {current or 'a detached HEAD'}, not {req.branch}"}
+        for name in _GIT_OPERATIONS:
+            path = Path(_git(ws, "rev-parse", "--path-format=absolute", "--git-path", name).stdout.strip())
+            if path.exists():
+                return {"committed": None, "commit_skipped": f"a Git operation is in progress ({name})"}
+        head_now = _git(ws, "rev-parse", "--verify", "HEAD").stdout.strip()
+        intent = _read_json(wd / COMMIT_INTENT)
+        if intent is not None and head_now and head_now != intent.get("head_before"):
+            body = _git(ws, "log", "-1", "--format=%B", "HEAD").stdout
+            if f"{TRAILER}: {req.dispatch_id}" in body.splitlines():
+                return {"committed": head_now}          # committed before a restart
+        status = _git(ws, "status", "--porcelain=v1", "--untracked-files=all")
+        if status.returncode != 0:
+            return {"committed": None, "commit_error": status.stderr.strip()}
+        if not status.stdout.strip():
+            return {"committed": None, "commit_skipped": "no changes"}
+        if intent is None:
+            write_json_atomic(wd / COMMIT_INTENT, {"at": utc_now(), "branch": req.branch, "head_before": head_now})
+        add = _git(ws, "add", "-A")
+        if add.returncode != 0:
+            return {"committed": None, "commit_error": add.stderr.strip()}
+        # Unsigned (signing may prompt) and without hooks: this is leadhand's own bookkeeping.
+        done = _git(ws, "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--quiet",
+                    "--no-verify",
+                    "-m", _commit_subject(req), "-m", f"{TRAILER}: {req.dispatch_id}")
+        if done.returncode != 0:
+            return {"committed": None, "commit_error": (done.stderr or done.stdout).strip()}
+        return {"committed": _git(ws, "rev-parse", "--verify", "HEAD").stdout.strip()}
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"committed": None, "commit_error": str(e)}
+
+
 def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_exit: int | None,
               tracker: _Tracker, started_at: str | None) -> DispatchResult:
     with _finalize_lock(wd):
@@ -570,6 +661,7 @@ def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_
             blocked_by = "environment"     # Codex could not be started at all
         if keep_raw:
             (wd / RAW).write_text(reply, encoding="utf-8")
+        commit = _commit_work(wd, req) if launched else {"committed": None, "commit_skipped": "Codex never ran"}
         usage, charge_ids, source = _charge_usage(req, wd, thread=stream.thread_id, launched=launched,
                                                   generation=generation, stopped=stopped_for is not None,
                                                   stream=stream)
@@ -602,7 +694,7 @@ def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_
             "generation": generation, "stopped": stopped, "confirmed_at": time.time(),
             "cancel_token": ((_read_json(wd / CANCEL) or {}).get("token")
                              if exit_reason == "cancelled" else None),
-            "started_at": started_at, "ended_at": ended_at,
+            "started_at": started_at, "ended_at": ended_at, **commit,
         }
         write_json_atomic(wd / RESULT, result)
         return _result_from(result)
@@ -1031,7 +1123,8 @@ def limits_for(config, role: str):
 
 
 def request_for(run_dir: Path, dispatch_id: str, *, card: int | None, attempt: int, role: str, model: str,
-                effort: str, brief: Path, report: Path, cwd: Path, resume: str | None = None) -> DispatchRequest:
+                effort: str, brief: Path, report: Path, cwd: Path, resume: str | None = None,
+                kind: str | None = None, branch: str | None = None) -> DispatchRequest:
     """The DispatchRequest for a dispatch, with limits, network and writable folders from the
     run repo's configuration. `leadhand dispatch` and the engine build requests only here, so
     the request.json both write is the same."""
@@ -1046,13 +1139,14 @@ def request_for(run_dir: Path, dispatch_id: str, *, card: int | None, attempt: i
     return DispatchRequest(model=model, effort=effort, role=role, brief=Path(brief).absolute(),
                            report=Path(report).absolute(), cwd=cwd, run_dir=run_dir, card=card, attempt=attempt,
                            dispatch_id=dispatch_id, steps=limits.steps, minutes=limits.minutes,
-                           network=config.codex.network, writable_dirs=writable, resume=resume)
+                           network=config.codex.network, writable_dirs=writable, resume=resume,
+                           kind=kind, branch=branch)
 
 
 def _request_from_args(args) -> DispatchRequest:
     return request_for(Path(args.run), args.dispatch_id, card=args.card, attempt=args.attempt, role=args.role,
                        model=args.model, effort=args.effort, brief=Path(args.brief), report=Path(args.report),
-                       cwd=Path(args.cwd), resume=args.resume)
+                       cwd=Path(args.cwd), resume=args.resume, kind=args.kind, branch=args.branch)
 
 
 def reply_lines(result: DispatchResult) -> list[str]:
@@ -1113,6 +1207,8 @@ def add_commands(sub) -> None:
     p.add_argument("--report", required=True)
     p.add_argument("--cwd", required=True, help="the workspace the worker runs in")
     p.add_argument("--resume", default=None, help="Codex session (thread) ID to resume")
+    p.add_argument("--kind", default=None, help="the dispatch kind (implement, fix, review, ...)")
+    p.add_argument("--branch", default=None, help="the branch the worker's changes are committed on")
     p.set_defaults(func=_cmd_dispatch)
 
     p = sub.add_parser("stop-dispatch", help="stop a Codex dispatch and record its result")
