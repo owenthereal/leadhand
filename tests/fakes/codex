@@ -15,7 +15,7 @@ an event printed to stdout; "{thread}" inside it is replaced by the thread ID
   {"action": "stderr", "text": "..."}
   {"action": "last_message", "text": "..."}       writes the -o file
   {"action": "write_file", "path": "rel", "text": "..."}
-  {"action": "commit", "message": "..."}          git add -A && git commit
+  {"action": "commit", "message": "..."}          git add -A && git commit (if anything changed)
   {"action": "append_loop", "path": "rel", "interval": 0.2}   background writer
   {"action": "tool_child", "seconds": N}          a `sleep` child in its own group
   {"action": "rollout", "fixture": "name.jsonl"}  copies a fixture into
@@ -140,7 +140,8 @@ def main() -> int:
             git = ["git", "-c", "commit.gpgsign=false", "-c", "user.name=Fake Codex",
                    "-c", "user.email=fake@example.invalid"]
             subprocess.run([*git, "add", "-A"], check=True, timeout=30)
-            subprocess.run([*git, "commit", "--quiet", "-m", step["message"]], check=True, timeout=30)
+            if subprocess.run([*git, "diff", "--cached", "--quiet"], timeout=30).returncode:
+                subprocess.run([*git, "commit", "--quiet", "-m", step["message"]], check=True, timeout=30)
         elif action == "append_loop":
             threading.Thread(target=append_loop, args=(Path(step["path"]), float(step["interval"])),
                              daemon=True).start()

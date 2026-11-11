@@ -368,9 +368,45 @@ def write_json_atomic(path: Path, data: dict) -> None:
 
 def crash_point(name: str) -> None:
     """Fault injection: exit at once with code 97, skipping all cleanup, when
-    LEADHAND_TESTING=1 and LEADHAND_CRASH_AT names this point."""
-    if os.environ.get("LEADHAND_TESTING") == "1" and os.environ.get("LEADHAND_CRASH_AT") == name:
-        os._exit(97)
+    LEADHAND_TESTING=1 and LEADHAND_CRASH_AT names this point.
+
+    Test-only refinements, all under LEADHAND_TESTING=1 (recovery tests crash at every
+    occurrence of a point, across the processes of a run):
+    - LEADHAND_CRASH_LOG=<file>: every point passed appends its name there (crash or not).
+    - LEADHAND_CRASH_COUNTER=<file> with LEADHAND_CRASH_SKIP=<n>: the named point counts its
+      passes in the file (under a lock, so runners count too) and crashes only after n of them.
+    - LEADHAND_CRASH_KILL_PGID=<pgid>: the crash first SIGKILLs that process group, as a
+      crash of the whole supervisor session would.
+    """
+    if os.environ.get("LEADHAND_TESTING") != "1":
+        return
+    log = os.environ.get("LEADHAND_CRASH_LOG")
+    if log:
+        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, f"{name}\n".encode())
+        finally:
+            os.close(fd)
+    if os.environ.get("LEADHAND_CRASH_AT") != name:
+        return
+    counter = os.environ.get("LEADHAND_CRASH_COUNTER")
+    if counter:
+        fd = os.open(counter, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            seen = int(os.pread(fd, 64, 0).decode().strip() or 0) + 1
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, f"{seen}\n".encode(), 0)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if seen <= int(os.environ.get("LEADHAND_CRASH_SKIP") or 0):
+            return
+    group = os.environ.get("LEADHAND_CRASH_KILL_PGID")
+    if group:
+        with contextlib.suppress(OSError, ValueError):
+            os.killpg(int(group), 9)
+    os._exit(97)
 
 
 # --------------------------------------------------------------------------

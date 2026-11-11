@@ -281,6 +281,26 @@ def _activity(c: CardState, req: dict | None) -> str:
     return f"{STATE_VERBS.get(c.state, 'Working on')} card {c.number}"
 
 
+def _steering_headline(events: list[dict], progress_text: str) -> str | None:
+    """While the run has no outcome: a cancel or pause in progress, or, after a relaunch,
+    what reconciliation found (`Resumed at card 2; card 2's commits were found and recorded`)
+    until the next worker starts."""
+    if any(e.get("kind") == "cancelled" for e in events):
+        return f"Cancelling · stopping every worker · {progress_text}"
+    since = max((e.get("seq", 0) for e in events if e.get("kind") == "resumed"), default=0)
+    if any(e.get("kind") == "paused" and e.get("seq", 0) > since for e in events):
+        return f"Pausing · running workers finish, nothing new starts · {progress_text}"
+    summaries = [e for e in events if e.get("kind") == "reconciled" and "found" in e
+                 and e.get("resumed_seq") == since and since]
+    if not summaries:
+        return None
+    rec = summaries[-1]
+    if any(e.get("kind") == "worker_started" and e.get("seq", 0) > rec.get("seq", 0) and not e.get("reconciled")
+           for e in events):
+        return None
+    return str(rec.get("headline") or "") or None
+
+
 def _number_list(numbers: list[int]) -> str:
     if len(numbers) == 1:
         return f"card {numbers[0]}"
@@ -326,6 +346,10 @@ def build_status(run_dir: Path, sessions_dir: Path | None = None, meter: tuple |
     else:
         activity = "Waiting for the supervisor"
         headline = f"Running · {activity} · {progress_text}"
+    if outcome is None:
+        steering = _steering_headline(snap.events, progress_text)
+        if steering:
+            headline = steering
     attention.extend(snap.problems)
 
     card_rows = []

@@ -194,3 +194,17 @@ When the operator tells you to skip a card:
 2. Record the card parked:
    `<cli> record <run_dir> park --card <card> --reason 'operator: skip'`
 3. Run `next` and carry on.
+
+When the operator tells you to pause or cancel the run: to pause, run `<cli> pause <run_dir>`; to cancel, `<cli> cancel <run_dir>`.
+Then run `next` and act on what it returns. A pause lets running workers
+finish (`wait`) and starts nothing new; a cancel returns `stop_worker` for
+each worker you started. Either ends with `done`.
+
+When the operator tells you to let a parked card continue, with their answer
+or instruction, run `<cli> unpark <run_dir> --card N --note '…'` with `N` the
+card and their words as the note (the same quoting rules as `--text`), then
+run `next`. The card resumes once no other work is in flight.
+
+After a relaunch, `next` first settles what the earlier session left running.
+A `wait` can then name a Codex worker started by that session: no completion
+notice comes for it, so start the timer and end your turn as usual.

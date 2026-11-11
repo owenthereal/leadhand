@@ -34,6 +34,15 @@ tests/fakes/codex on PATH. Every worker the world starts is kept in `started`.
 
 A step's `crash` of "before_commit" or "after_commit" makes the worker die at
 that point: nothing after it happens (no commit and/or no report, no result).
+The same two points are also crash points (`leadhand.state.crash_point`), so
+LEADHAND_CRASH_AT can kill the whole supervisor process there, as a crash of the
+session a Claude worker runs in would.
+
+`work_label(action)` names a worker's work: its file, the file's text and the
+commit message (the dispatch ID by default; recovery tests key it to the card's
+attempt, so a worker re-run under a new dispatch ID makes the same commit). A
+worker whose files are already committed as they are makes no commit.
+`launch_log`, when set, is a file each launch appends its dispatch ID to.
 
 Everything runs hermetically: Git through tests/gitfixture.py, configuration
 from a temp file (LEADHAND_CONFIG), Claude transcripts under a temp
@@ -59,7 +68,7 @@ from unittest import mock
 
 from gitfixture import hermetic, make_repo, run_git, write
 from leadhand import engine, procs
-from leadhand.state import read_attempts, read_events, run_paths
+from leadhand.state import crash_point, read_attempts, read_events, run_paths
 from leadhand.usage import read_charges
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -126,6 +135,7 @@ class FakeWorld:
         self.started: list[dict] = []
         self.run_started: list[dict] = []
         self.proxies: list[subprocess.Popen] = []
+        self.launch_log: Path | None = None
         self._ids = itertools.count(1)
         self._messages = itertools.count(1)
         test.addCleanup(self.kill_leftovers)
@@ -228,6 +238,9 @@ class FakeWorld:
             worker = f"agent{next(self._ids):04d}"
         engine.record(self.run_dir, "started", dispatch_id=a["dispatch_id"], worker_id=worker)
         (self.started if a["card"] is not None else self.run_started).append(a)
+        if self.launch_log is not None:
+            with open(self.launch_log, "a", encoding="utf-8") as f:
+                f.write(a["dispatch_id"] + "\n")
         return worker
 
     def perform(self, a: dict, worker: str) -> str | None:
@@ -274,12 +287,15 @@ class FakeWorld:
             run_tip = run_git(ws, "rev-parse", f"refs/heads/{self.meta()['branch']}")
             run_git(ws, "-c", "core.editor=true", "rebase", "--quiet", "-X", "theirs", run_tip)
         if a["kind"] in IMPLEMENTER_KINDS:
-            files = step.get("files") or {self.default_file(a): f"{a['dispatch_id']}\n"}
+            files = step.get("files") or {self.default_file(a): f"{self.work_label(a)}\n"}
             write(ws, files)
+            crash_point("before_commit")
             if step.get("crash") == "before_commit":
                 return None
             run_git(ws, "add", "--", *files)
-            run_git(ws, "commit", "--quiet", "-m", f"work for {a['dispatch_id']}")
+            if run_git(ws, "diff", "--cached", "--name-only"):
+                run_git(ws, "commit", "--quiet", "-m", f"work for {self.work_label(a)}")
+            crash_point("after_commit")
             if step.get("crash") == "after_commit":
                 return None
         if step.get("tamper"):
@@ -292,10 +308,12 @@ class FakeWorld:
         self._append_message(self.subagent_transcript(worker), "claude-sonnet-4")
         return step.get("reply") or f"{text.splitlines()[0]}\nReport: {report}"
 
-    @staticmethod
-    def default_file(a: dict) -> str:
+    def work_label(self, a: dict) -> str:
+        return a["dispatch_id"]
+
+    def default_file(self, a: dict) -> str:
         folder = "final" if a["card"] is None else f"card{a['card']}"
-        return f"src/{folder}/{a['dispatch_id']}.txt"
+        return f"src/{folder}/{self.work_label(a)}.txt"
 
     def subagent_transcript(self, worker: str) -> Path:
         return (self.claude_home / "projects" / PROJECT / MAIN_SESSION / "subagents"
@@ -315,10 +333,10 @@ class FakeWorld:
         if step.get("sleep"):
             lines.append({"action": "sleep", "seconds": step["sleep"]})
         if a["kind"] in IMPLEMENTER_KINDS:
-            files = step.get("files") or {self.default_file(a): f"{a['dispatch_id']}\n"}
+            files = step.get("files") or {self.default_file(a): f"{self.work_label(a)}\n"}
             lines += [{"action": "write_file", "path": p, "text": t} for p, t in files.items()]
             if step.get("commit", True):         # False: leave it to the runner, like real Codex
-                lines.append({"action": "commit", "message": f"work for {a['dispatch_id']}"})
+                lines.append({"action": "commit", "message": f"work for {self.work_label(a)}"})
         text = self.report_text(a, step)
         reply = step.get("reply") or f"{text.splitlines()[0]}\nReport: {a['report']}"
         if step.get("report", True):

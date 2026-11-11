@@ -48,6 +48,13 @@ dispatched again on the same route.
 End of run: once every card is accepted, parked, or waits on a parked card, the
 commit-bound gates run on the run head (see `_end_of_run`), then the outcome, the
 report, a handoff when blocked, and one line in `<docs_dir>/runs.md`.
+
+Recovery: after a relaunch (`resumed`), the first `next` reconciles every step the dead
+session left in flight from Git and the run directory before anything new happens, and
+records `reconciled` with what it found (see `_reconcile`). The operator's `leadhand
+pause` and `leadhand cancel` create flags the engine turns into `paused` and `cancelled`:
+a pause lets running workers finish and ends blocked (paused); a cancel stops every
+worker, confirmed, then ends incomplete (cancelled), and no relaunch undoes it.
 """
 from __future__ import annotations
 
@@ -418,7 +425,17 @@ def _next_action(run_dir: Path) -> dict:
         if ended is not None:
             _wrap_up(ctx, ended, events)
             return _done_action(ctx, ended, read_events(ctx.paths))
-        action = _step(ctx, events)
+        if _cancel_requested(ctx, events):
+            # A cancel comes first, and a relaunch never undoes it.
+            action = _cancel_step(ctx, read_events(ctx.paths))
+        elif _needs_reconcile(events):
+            # After a relaunch, nothing new happens before every in-flight step is reconciled.
+            _reconcile(ctx, events)
+            action = None
+        elif _pause_requested(ctx, events):
+            action = _pause_step(ctx, read_events(ctx.paths))
+        else:
+            action = _step(ctx, events)
         if action is not None:
             return action
     raise EngineError(f"no action after {MAX_STEPS} steps; the run state does not settle")
@@ -434,17 +451,36 @@ def _charge_supervisor(ctx: _Run) -> None:
         if sid not in meta.setdefault("supervisor_sessions", []):
             meta["supervisor_sessions"].append(sid)
             write_json_atomic(ctx.paths.run_json, meta)
-        path = usage.claude_session_transcript(sid, _projects_dir())
-        if path is None:
-            return
-        charges = usage.read_charges(ctx.paths)
-        _, reached = usage.new_claude_usage(path, usage.charged_checkpoint(charges, "claude", sid))
-        if not reached["messages"]:
-            return
-        prefix = f"supervisor:{sid}:"
-        n = 1 + sum(1 for c in charges if c.charge_id.startswith(prefix))
-        usage.charge(ctx.paths, charge_id=f"{prefix}{n}", source="claude", key=sid,
-                     dispatch_id="supervisor", role="supervisor", path_or_thread=path)
+        _charge_session(ctx, sid)
+
+
+def _charge_earlier_sessions(ctx: _Run) -> None:
+    """After a relaunch: charge what earlier supervisor sessions used after their last charge
+    (they ended with the crash, so their transcripts are final)."""
+    current = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    with state_lock(ctx.paths):
+        try:
+            sessions = json.loads(ctx.paths.run_json.read_text(encoding="utf-8")).get("supervisor_sessions") or []
+        except (OSError, ValueError):
+            sessions = []
+        for sid in sessions:
+            if sid != current:
+                _charge_session(ctx, sid)
+
+
+def _charge_session(ctx: _Run, sid: str) -> None:
+    """Charge a supervisor session's transcript from its checkpoint (caller holds the state lock)."""
+    path = usage.claude_session_transcript(sid, _projects_dir())
+    if path is None:
+        return
+    charges = usage.read_charges(ctx.paths)
+    _, reached = usage.new_claude_usage(path, usage.charged_checkpoint(charges, "claude", sid))
+    if not reached["messages"]:
+        return
+    prefix = f"supervisor:{sid}:"
+    n = 1 + sum(1 for c in charges if c.charge_id.startswith(prefix))
+    usage.charge(ctx.paths, charge_id=f"{prefix}{n}", source="claude", key=sid,
+                 dispatch_id="supervisor", role="supervisor", path_or_thread=path)
 
 
 def _pick(ctx: _Run, cards: dict[int, CardState], events: list[dict]) -> int | None:
@@ -568,9 +604,12 @@ def _resolve_or_park(ctx: _Run, card: Card, *, role: str, attempt: int, last_ven
 
 
 def _request(ctx: _Run, c: CardState, events: list[dict], *, kind: str, attempt: int, role: str, route: Route,
-             extra: dict[str, str], resume: _Dispatch | None = None, notes: str = "") -> dict:
+             extra: dict[str, str], resume: _Dispatch | None = None, notes: str = "",
+             continues: str | None = None) -> dict:
     """Write the brief and append `dispatch_requested`. Deterministic: after a crash before the
-    event, the next call computes the same dispatch ID and rewrites the same brief."""
+    event, the next call computes the same dispatch ID and rewrites the same brief. An
+    implementer-side dispatch records the card branch's tip as `start_tip`, so a restart can
+    tell the commits its worker made; a `continue` names the dispatch it `continues`."""
     n = 1 + sum(1 for e in events if e["kind"] == "dispatch_requested" and e.get("card") == c.number
                 and e.get("attempt") == attempt and e.get("dispatch_kind") == kind)
     did = f"c{c.number}-a{attempt}-{kind}-{n}"
@@ -590,10 +629,14 @@ def _request(ctx: _Run, c: CardState, events: list[dict], *, kind: str, attempt:
             if kind == "verify" and extra.get("tip") != guard["expected_head"]:
                 raise EngineError(f"card {c.number}: verify of {extra.get('tip')} requested, but the card "
                                   f"branch is at {guard['expected_head']}")
-        elif kind == "integrate" or (kind == "answer" and _integrate_origin(_dispatches(events), resume)):
+        elif kind == "integrate" or (kind in ("answer", "continue") and _integrate_origin(_dispatches(events), resume)):
             # An integrate worker rewrites the card branch, but must leave the run branch alone.
             run_ref = f"refs/heads/{ctx.branch}"
             guard = {"refs": {run_ref: head(ctx.ws, run_ref)}, "ref_scope": [run_ref]}
+        if kind in IMPLEMENTER_KINDS:
+            guard["start_tip"] = head(ctx.ws, f"refs/heads/{c.branch}")
+    if continues is not None:
+        guard["continues"] = continues
     brief, report = write_brief(kind, ws=ctx.ws, deck=ctx.deck, card=ctx.card(c.number), attempt=attempt,
                                 dispatch_id=did, extra=full)
     if notes:
@@ -614,7 +657,10 @@ def _append_request(ctx: _Run, did: str, *, card: int | None, attempt: int, kind
     resume_worker = resume_session = None
     if resume is not None:
         if route.vendor == "claude":
-            resume_worker = resume.started["worker_id"] if resume.started else None
+            # A Claude worker dies with its supervisor session (P9): one started before the
+            # latest relaunch cannot be resumed, so a fresh worker gets the brief instead.
+            resume_worker = (resume.started["worker_id"]
+                             if resume.started and not _gone(read_events(ctx.paths), resume) else None)
         else:
             resume_session = (resume.result or {}).get("session_id")
     try:
@@ -733,15 +779,26 @@ def _dispatch_action(ctx: _Run, req: dict) -> dict:
     return action
 
 
-def _in_flight(ctx: _Run, d: _Dispatch) -> dict:
+def _in_flight(ctx: _Run, d: _Dispatch) -> dict | None:
     if d.started is None:
         return _dispatch_action(ctx, d.req)       # no worker is known to exist
     worker = d.started["worker_id"]
     deadline = d.started["deadline"]
+    orphan = d.req["vendor"] == "codex" and _gone(read_events(ctx.paths), d)
+    if orphan:
+        # A Codex runner that outlived its supervisor session: no proxy is left to report its
+        # result, so the engine records it once result.json is there.
+        result = dsp.load_result(ctx.root / "workers" / d.id)
+        if result is not None:
+            _store_result(ctx, d, worker, "\n".join(dsp.reply_lines(result)),
+                          stopped=result.exit_reason == "cancelled", charge=not d.started.get("reconciled"))
+            return None
     if _now() < _parse_time(deadline):
+        reason = (f"{d.kind} worker for {_whose(d.req)} is running" if not orphan else
+                  f"the Codex worker for {_whose(d.req)} outlived an earlier supervisor session; "
+                  "no completion notice comes for it, and the timer reports its result")
         return {"action": "wait", "dispatch_id": d.id, "worker_id": worker, "deadline": deadline,
-                "reply_file": str(_reply_file(ctx, d.req["card"], d.id)),
-                "reason": f"{d.kind} worker for {_whose(d.req)} is running"}
+                "reply_file": str(_reply_file(ctx, d.req["card"], d.id)), "reason": reason}
     if d.req["vendor"] == "codex":
         result = _cancel_codex(ctx, d)
         # A runner that finished before the cancel keeps its own status (the proxy only hung).
@@ -839,6 +896,9 @@ def _after_result(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
         # is preserved and cleared, and the dispatch counts as BLOCKED (environment).
         events = read_events(ctx.paths)
         return _worker_failed(ctx, c, d, events, _dispatches(events))
+    if r.get("interrupted"):
+        _after_interrupted(ctx, c, d, events, index)
+        return None
     if d.kind == "verify":
         if r.get("result") == "pass":
             _accept(ctx, c.number, d.req["extra"]["tip"])
@@ -910,7 +970,8 @@ def _worker_failed(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
         since = _reopened_since(events)
         voided = _voided(events)
         same = [x for x in _card_dispatches(index, c.number, attempt=d.req["attempt"], kinds=(d.kind,))
-                if x.result is not None and x.result["seq"] > since and x.id not in voided]
+                if x.result is not None and x.result["seq"] > since and x.id not in voided
+                and not x.result.get("interrupted")]
         if status == "BLOCKED":
             failures = [x for x in same if head_of(x) != ("BLOCKED", "usage limit")
                         and head_of(x)[0] == "BLOCKED"]
@@ -1123,15 +1184,15 @@ def _after_integrate(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
 
 
 def _integrate_origin(index: dict[str, _Dispatch], d: _Dispatch | None) -> _Dispatch | None:
-    """The integrate dispatch `d` is, or that `d` answers (through any chain of answers)."""
+    """The integrate dispatch `d` is, or that `d` answers or continues (through any chain)."""
     seen = set()
     while d is not None and d.id not in seen:
         if d.kind == "integrate":
             return d
-        if d.kind != "answer":
+        if d.kind not in ("answer", "continue"):
             return None
         seen.add(d.id)
-        d = index.get(d.req.get("resumes") or "")
+        d = index.get(d.req.get("continues") or d.req.get("resumes") or "")
     return None
 
 
@@ -1791,7 +1852,8 @@ def _request_run(ctx: _Run, events: list[dict], *, kind: str, attempt: int, role
     elif kind == "final_fix":
         # Like an integrate worker: it commits on the final branch but must leave the run branch alone.
         run_ref = f"refs/heads/{ctx.branch}"
-        guard = {"refs": {run_ref: head(ctx.ws, run_ref)}, "ref_scope": [run_ref]}
+        guard = {"refs": {run_ref: head(ctx.ws, run_ref)}, "ref_scope": [run_ref],
+                 "start_tip": head(ctx.ws, f"refs/heads/{branch}")}
     if kind == "evidence":
         # Every evidence dispatch (first run, voided or failed re-run) starts from a clean base.
         extra = {**extra, "base_worktree": str(_base_worktree(ctx))}
@@ -1828,6 +1890,9 @@ def _after_run_result(ctx: _Run, d: _Dispatch, events: list[dict], index: dict[s
             return False, None
         if "refs" in req and _run_check_voided(ctx, d, events, accepted):
             return True, None
+        if r.get("interrupted"):
+            _rerun(ctx, events, accepted, notes=req.get("notes") or "", d=d)     # the gate runs again
+            return True, None
         if not _usable(d):
             _run_worker_failed(ctx, d, events, index, accepted)
             return True, None
@@ -1841,6 +1906,11 @@ def _after_run_result(ctx: _Run, d: _Dispatch, events: list[dict], index: dict[s
         if any(e["kind"] == "verdict_recorded" and e.get("dispatch_id") == d.id for e in events):
             return False, None                      # settled as spent: never checked again
         if "refs" in req and _run_check_voided(ctx, d, events, accepted):
+            return True, None
+        if r.get("interrupted"):
+            # Its worker died with an earlier session: the wave's implementer runs again on the
+            # final branch as it stands (the fix review covers every commit since the wave's base).
+            _rerun(ctx, events, accepted, d=d, notes=_continue_notes(req.get("notes") or "", d))
             return True, None
         if r["status"] == "READY":
             base, tip = req["extra"]["base"], r.get("tip")
@@ -1869,6 +1939,9 @@ def _after_run_result(ctx: _Run, d: _Dispatch, events: list[dict], index: dict[s
     verdict = next((e for e in events if e["kind"] == "verdict_recorded" and e.get("dispatch_id") == d.id), None)
     if verdict is None:
         if "refs" in req and _run_check_voided(ctx, d, events, accepted):
+            return True, None
+        if r.get("interrupted"):
+            _rerun(ctx, events, accepted, notes=req.get("notes") or "", d=d)
             return True, None
         if not _usable(d):
             _run_worker_failed(ctx, d, events, index, accepted)
@@ -1970,7 +2043,8 @@ def _run_worker_failed(ctx: _Run, d: _Dispatch, events: list[dict], index: dict[
         same = [x for x in _run_dispatches(index)
                 if x.kind == d.kind and x.req.get("wave") == req.get("wave") and x.req.get("gate") == req.get("gate")
                 and x.req.get("expected_head") == req.get("expected_head") and x.result is not None
-                and x.result["seq"] > since and x.id not in voided and not _usable(x)]
+                and x.result["seq"] > since and x.id not in voided and not _usable(x)
+                and not x.result.get("interrupted")]
         if len(same) >= 2:
             _end_blocked(ctx, events, "environment",
                          why=(f"{d.kind} ended {r['status']} twice without a usable report",))
@@ -1980,22 +2054,24 @@ def _run_worker_failed(ctx: _Run, d: _Dispatch, events: list[dict], index: dict[
 
 def _end(ctx: _Run, events: list[dict], *, blocked_reason: str | None = None, open_findings: bool = False,
          holds: tuple[str, ...] = (), gates_current: bool = False, verification_failed: bool = False,
-         why: tuple[str, ...] = ()) -> dict:
+         why: tuple[str, ...] = (), cancelled: bool = False, unreconciled: str | None = None) -> dict:
     """Decide the outcome and append it, with the allowed next step and the run head. The
     wrap-up (handoff, report, runs.md) follows in `_wrap_up`.
 
     `gates_current` means every required gate passed on the run head; a gate that failed
     there for good is also reported through `open_findings`, `holds` or
     `verification_failed`. Every accepted card and fix must still be on the run branch;
-    otherwise the state cannot be reconciled and the run fails."""
+    otherwise the state cannot be reconciled and the run fails (`unreconciled` names another
+    mismatch a restart found). `cancelled`: the operator's cancel, after every worker stopped."""
     cards = fold_cards(events, ctx.numbers)
     run_ref = f"refs/heads/{ctx.branch}"
     missing = [f"card {e.get('card')} at {str(e.get('sha'))[:12]}" for e in events
                if e["kind"] == "accepted" and e.get("sha") and not is_ancestor(ctx.ws, e["sha"], run_ref)]
-    unreconciled = f"accepted work missing from the run branch: {', '.join(missing)}" if missing else None
+    if missing and not unreconciled:
+        unreconciled = f"accepted work missing from the run branch: {', '.join(missing)}"
     decision = decide_outcome(cards, removed=frozenset(), open_findings=open_findings, holds=holds,
                               gates_current=gates_current, verification_failed=verification_failed,
-                              cancelled=False, blocked_reason=blocked_reason, unreconciled=unreconciled)
+                              cancelled=cancelled, blocked_reason=blocked_reason, unreconciled=unreconciled)
     return append_event(ctx.paths, "outcome", outcome=decision.outcome.value, qualifier=decision.qualifier,
                         reasons=[*decision.reasons, *why],
                         next_step=allowed_next_step(decision, ctx.config.after_run), head=_run_head(ctx))
@@ -2077,6 +2153,357 @@ def _record_run_line(ctx: _Run, ended: dict, events: list[dict]) -> None:
         new.append(line)
     docs.mkdir(parents=True, exist_ok=True)
     _write_bytes_atomic(path, ("\n".join(new) + "\n").encode("utf-8"))
+
+
+# --------------------------------------------------------------------------
+# Recovery: reconciling after a relaunch, pause and cancel
+
+def _latest_resumed(events: list[dict]) -> int:
+    """The seq of the latest `resumed` (0 when the run was never relaunched)."""
+    return max((e["seq"] for e in events if e["kind"] == "resumed"), default=0)
+
+
+def _gone(events: list[dict], d: _Dispatch) -> bool:
+    """Whether the dispatch's Claude worker (or, for a Codex route, its proxy) died with an
+    earlier supervisor session: it was requested or started before the latest relaunch, or its
+    start was recorded by reconciliation (no worker of this session runs it). P9."""
+    since = _latest_resumed(events)
+    if d.started is None:
+        return d.req["seq"] < since
+    return bool(d.started.get("reconciled")) or d.started["seq"] < since
+
+
+def _needs_reconcile(events: list[dict]) -> bool:
+    since = _latest_resumed(events)
+    return bool(since) and not any(e["kind"] == "reconciled" and "found" in e and e.get("resumed_seq") == since
+                                   for e in events)
+
+
+def _open_dispatches(ctx: _Run, events: list[dict], index: dict[str, _Dispatch]) -> list[_Dispatch]:
+    """The dispatches the run waits on: each unsettled card's current dispatch, and the latest
+    run-level one, while they have no result."""
+    cards = fold_cards(events, ctx.numbers)
+    out = [index[c.dispatch_id] for c in cards.values()
+           if c.state in ACTIVE_STATES and c.dispatch_id in index and index[c.dispatch_id].result is None]
+    runs = _run_dispatches(index)
+    if runs and runs[-1].result is None:
+        out.append(runs[-1])
+    return sorted(out, key=lambda d: d.req["seq"])
+
+
+def _ref_sha(ctx: _Run, ref: str) -> str | None:
+    try:
+        return git(ctx.ws, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}") or None
+    except GitError:
+        return None
+
+
+def _unmatched(ctx: _Run, events: list[dict]) -> str | None:
+    """What a restart finds that matches no recovery rule (the run then fails), or None."""
+    if not ctx.ws.is_dir():
+        return f"the workspace {ctx.ws} is missing"
+    run_ref = f"refs/heads/{ctx.branch}"
+    run_tip = _ref_sha(ctx, run_ref)
+    if run_tip is None:
+        return f"the run branch {ctx.branch} is missing"
+    missing = [f"card {e.get('card')} at {str(e['sha'])[:12]}" for e in events
+               if e["kind"] == "accepted" and e.get("sha") and not is_ancestor(ctx.ws, e["sha"], run_ref)]
+    if missing:
+        return f"accepted work missing from the run branch: {', '.join(missing)}"
+    cards = fold_cards(events, ctx.numbers)
+    for n in sorted(cards):
+        c = cards[n]
+        if c.state in ("cut", *ACTIVE_STATES) and c.branch and _ref_sha(ctx, f"refs/heads/{c.branch}") is None:
+            return f"card {n}'s branch {c.branch} is missing"
+        target = c.accept_target
+        if c.state == "accepting" and target and not (is_ancestor(ctx.ws, target, run_ref)
+                                                      or is_ancestor(ctx.ws, run_ref, target)):
+            return (f"card {n}'s acceptance of {target[:12]} cannot complete: the run branch is at "
+                    f"{run_tip[:12]}, which neither contains it nor is behind it")
+    return None
+
+
+def _tip_before(ctx: _Run, events: list[dict], d: _Dispatch) -> str | None:
+    """The branch tip a dispatch started from: recorded as `start_tip`, else (an older log) the
+    card's last known tip or base before the dispatch, or a fix wave's base."""
+    if d.req.get("start_tip"):
+        return d.req["start_tip"]
+    if d.req["card"] is None:
+        return (d.req.get("extra") or {}).get("base")
+    before = fold_cards([e for e in events if e["seq"] < d.req["seq"]], ctx.numbers).get(d.req["card"])
+    return (before.tip or before.base) if before else None
+
+
+def _branch_progress(ctx: _Run, events: list[dict], d: _Dispatch) -> str:
+    """For an interrupted implementer-side dispatch: "commits" when its branch moved on from
+    where the dispatch started (an integrate step may also have rewritten it), "nothing"
+    when it did not move, else why the branch cannot be matched."""
+    n = d.req["card"]
+    if n is None:
+        branch = _final_branch(ctx)
+    else:
+        branch = fold_cards(events, ctx.numbers)[n].branch or card_branch_name(ctx.branch, n)
+    tip = _ref_sha(ctx, f"refs/heads/{branch}")
+    who = "the final fix" if n is None else f"card {n}"
+    if tip is None:
+        return f"{who}'s branch {branch} is missing"
+    start = _tip_before(ctx, events, d)
+    if not start or tip == start:
+        return "nothing"
+    if is_ancestor(ctx.ws, start, tip) or _integrate_origin(_dispatches(events), d) is not None:
+        return "commits"
+    return (f"{who}'s branch {branch} was rewritten while {d.id} was interrupted "
+            f"(from {start[:12]} to {tip[:12]})")
+
+
+CONTINUE_NOTE = "## The interrupted step"
+
+
+def _continue_notes(notes: str, d: _Dispatch) -> str:
+    """Brief notes for the step that carries on from an interrupted dispatch (added once)."""
+    if CONTINUE_NOTE in notes:
+        return notes
+    copy = ((d.result or {}).get("files") or {}).get("brief") or d.req["brief"]
+    text = (f"{CONTINUE_NOTE}\n\nThis carries on from {d.kind} dispatch {d.id}, whose worker stopped "
+            f"before it reported (its supervisor session ended). Its brief: {copy}. Keep its commits; "
+            "continue from the branch as it stands and write your report.")
+    return (notes.rstrip("\n") + "\n\n" if notes else "") + text
+
+
+def _after_interrupted(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
+                       index: dict[str, _Dispatch]) -> None:
+    """A card dispatch whose worker died with an earlier session and left no report: a check
+    runs again with a fresh worker; implementer-side work continues from its commits (resuming
+    the Codex session when its ID is known) or, when the branch did not move, is requested
+    again as the same attempt under a new dispatch ID. A branch that matches neither fails
+    the run: nothing is guessed."""
+    req = d.req
+    if d.kind not in IMPLEMENTER_KINDS:
+        _request(ctx, c, events, kind=d.kind, attempt=req["attempt"], role=req["role"], route=d.route,
+                 extra=req.get("extra") or {}, notes=req.get("notes") or "")
+        return
+    progress = _branch_progress(ctx, events, d)
+    if progress == "commits":
+        _request(ctx, c, events, kind="continue", attempt=req["attempt"], role=req["role"], route=d.route,
+                 extra={}, resume=d, notes=_continue_notes("", d), continues=d.id)
+    elif progress == "nothing":
+        _request(ctx, c, events, kind=d.kind, attempt=req["attempt"], role=req["role"], route=d.route,
+                 extra=req.get("extra") or {}, resume=index.get(req.get("resumes") or ""),
+                 notes=req.get("notes") or "", continues=req.get("continues"))
+    else:
+        _end(ctx, events, unreconciled=progress)
+
+
+def _synth_started(ctx: _Run, d: _Dispatch) -> dict:
+    """Record a start for a dispatch whose start was never recorded, so its result (or its
+    still-running Codex runner) can be recorded against it."""
+    return append_event(ctx.paths, "worker_started", dispatch_id=d.id, worker_id=f"{d.id}:unrecorded",
+                        card=d.req["card"], deadline=_format_time(_now() + _budget_seconds(d.req)),
+                        session=_current_session(ctx), reconciled=True)
+
+
+def _reconcile_dispatch(ctx: _Run, events: list[dict], d: _Dispatch) -> str:
+    """Settle one dispatch the run waits on whose worker (or proxy) died with an earlier
+    session; returns what was found."""
+    who = "the run" if d.req["card"] is None else f"card {d.req['card']}"
+    started = d.started
+    if d.req["vendor"] == "codex":
+        wd = ctx.root / "workers" / d.id
+        ours = any(e["kind"] == "reconciled" and e.get("stage") == "cancel" and e.get("dispatch_id") == d.id
+                   for e in events)
+        state = dsp.runner_state(wd)
+        if state == "running":
+            if started is None:
+                _synth_started(ctx, d)
+            return f"{who}'s Codex worker is still running; waiting for it"
+        if state == "finished" and not ours:
+            left = dsp.stop_strays(wd)
+            if left:
+                raise EngineError(f"could not stop what Codex dispatch {d.id} left running: "
+                                  + ", ".join(f"pid {r['pid']}" for r in left))
+            started = started or _synth_started(ctx, d)
+            result = dsp.load_result(wd)
+            _store_result(ctx, d, started["worker_id"], "\n".join(dsp.reply_lines(result)),
+                          stopped=result.exit_reason == "cancelled", charge=not started.get("reconciled"))
+            return f"{who}'s Codex worker had finished; its result was recorded"
+        if state != "finished":
+            # Hung, orphaned (its processes outlived the runner, P14), dead or never started:
+            # stop it (confirmed) before anything else; the intent makes a repeat treat the
+            # cancelled result as an interruption.
+            append_event(ctx.paths, "reconciled", stage="cancel", dispatch_id=d.id, runner=state)
+            _cancel_codex(ctx, d)
+    started = started or _synth_started(ctx, d)
+    ev = _store_result(ctx, d, started["worker_id"], "", interrupted=True, charge=not started.get("reconciled"))
+    if not ev.get("interrupted"):
+        return f"{who}'s report was found and recorded"
+    if d.kind in IMPLEMENTER_KINDS or d.kind == "final_fix":
+        progress = _branch_progress(ctx, read_events(ctx.paths), d)
+        if progress == "commits":
+            return f"{who}'s commits were found and recorded"
+        if progress == "nothing":
+            return f"{who}'s {d.kind} worker was interrupted before it changed anything; it runs again"
+        return progress
+    if d.req.get("gate"):
+        return f"the {d.req['gate']} gate was interrupted; it runs again"
+    return f"{who}'s {d.kind} worker was interrupted; it runs again"
+
+
+def _reconcile(ctx: _Run, events: list[dict]) -> None:
+    """After a `resumed`, before anything new: settle every step a dead session left in flight,
+    then append `reconciled{resumed_seq, found, headline}`. Repeat-safe: a crash part-way
+    leaves what was settled recorded, and the next call settles the rest.
+
+    - A dispatch with no result: a live Codex runner with a fresh heartbeat is waited for (its
+      result is recorded when it lands); a finished runner's result is recorded; a hung,
+      orphaned or dead runner is cancelled first (confirmed). Otherwise the worker counts as
+      interrupted: a report in the scratch folder is recorded as its result, else the result
+      is marked interrupted and the next step continues from the branch's commits or requests
+      the same attempt again (`_after_interrupted`).
+    - A Codex dispatch the run no longer waits on (a parked card's) is cancelled; a finished
+      one's leftover processes are stopped (P14).
+    - An acceptance whose fast-forward may not have happened is completed.
+    - Integration, a fix round and the gates resume from the recorded events and Git.
+    - Anything that matches none of these ends the run failed with the mismatch."""
+    since = _latest_resumed(events)
+    _charge_earlier_sessions(ctx)
+    problem = _unmatched(ctx, events)
+    if problem:
+        append_event(ctx.paths, "reconciled", resumed_seq=since, found=[f"state could not be reconciled: {problem}"],
+                     headline=f"Resumed; state could not be reconciled: {problem}")
+        _end(ctx, read_events(ctx.paths), unreconciled=problem)
+        return
+    index = _dispatches(events)
+    current = {d.id for d in _open_dispatches(ctx, events, index)}
+    found: list[tuple[int | None, str]] = []
+    for d in sorted(index.values(), key=lambda x: x.req["seq"]):
+        if d.req["vendor"] == "codex" and d.req["seq"] < since and d.result is not None:
+            left = dsp.stop_strays(ctx.root / "workers" / d.id)
+            if left:
+                raise EngineError(f"could not stop what Codex dispatch {d.id} left running: "
+                                  + ", ".join(f"pid {r['pid']}" for r in left))
+        if d.result is not None or not _gone(events, d):
+            continue
+        if d.id in current:
+            found.append((d.req["card"], _reconcile_dispatch(ctx, read_events(ctx.paths), d)))
+        elif d.req["vendor"] == "codex" and d.started is not None:
+            _cancel_codex(ctx, d)               # nothing waits on it: it must not write any more
+    events = read_events(ctx.paths)
+    cards = fold_cards(events, ctx.numbers)
+    for n in dependency_order(ctx.deck):
+        c = cards[n]
+        if c.state == "accepting":
+            _finish_accept(ctx, n, c.accept_target)
+            found.append((n, f"card {n}'s acceptance was completed"))
+        elif c.state == "integrating" and not any(n == m for m, _ in found):
+            found.append((n, f"card {n}'s integration resumes from Git's state"))
+        elif c.state == "fixing" and c.dispatch_kind != "fix":
+            found.append((n, f"card {n}'s fix round resumes from its findings"))
+    lines = [text for _, text in found]
+    if found:
+        n, text = found[0]
+        headline = f"Resumed at card {n}; {text}" if n is not None else f"Resumed at the end of the run; {text}"
+    else:
+        headline = "Resumed; nothing was in flight"
+    append_event(ctx.paths, "reconciled", resumed_seq=since, found=lines, headline=headline)
+
+
+def _cancel_requested(ctx: _Run, events: list[dict]) -> bool:
+    """The operator's cancel, from the flag (recorded as `cancelled` once). It is never undone:
+    a relaunch finishes it."""
+    if any(e["kind"] == "cancelled" for e in events):
+        ctx.paths.cancel_flag.unlink(missing_ok=True)
+        return True
+    if ctx.paths.cancel_flag.exists():
+        append_event(ctx.paths, "cancelled", by="operator")
+        ctx.paths.cancel_flag.unlink(missing_ok=True)
+        return True
+    return False
+
+
+def _cancel_step(ctx: _Run, events: list[dict]) -> dict | None:
+    """Stop every running worker, then end incomplete (cancelled). Codex runners are cancelled
+    through the dispatcher (termination confirmed) and their results recorded; a Claude worker
+    of this session gets `stop_worker`; one that died with an earlier session needs no stop
+    and is recorded as interrupted. The outcome comes only after every worker is stopped.
+    Partial work stays on the card branches."""
+    for d in sorted(_dispatches(events).values(), key=lambda x: x.req["seq"]):
+        if d.result is not None:
+            continue
+        if d.req["vendor"] == "codex":
+            result = _cancel_codex(ctx, d)     # also when never started: a late proxy then starts nothing
+            if d.started is None:
+                continue
+            _store_result(ctx, d, d.started["worker_id"], "\n".join(dsp.reply_lines(result)),
+                          stopped=result.exit_reason == "cancelled", charge=not d.started.get("reconciled"))
+            return None
+        if d.started is None:
+            continue
+        if _gone(events, d):
+            _store_result(ctx, d, d.started["worker_id"], "", interrupted=True,
+                          charge=not d.started.get("reconciled"))
+            return None
+        return {"action": "stop_worker", "dispatch_id": d.id, "worker_id": d.started["worker_id"],
+                "vendor": "claude", "record_result": True, "reason": "the run is cancelled"}
+    _charge_earlier_sessions(ctx)
+    _end(ctx, events, cancelled=True)
+    return None
+
+
+def _pause_requested(ctx: _Run, events: list[dict]) -> bool:
+    """The operator's pause, from the flag (recorded as `paused`); a relaunch ends it."""
+    since = _latest_resumed(events)
+    if any(e["kind"] == "paused" and e["seq"] > since for e in events):
+        ctx.paths.pause_flag.unlink(missing_ok=True)
+        return True
+    if ctx.paths.pause_flag.exists():
+        append_event(ctx.paths, "paused", by="operator")
+        ctx.paths.pause_flag.unlink(missing_ok=True)
+        return True
+    return False
+
+
+def _pause_step(ctx: _Run, events: list[dict]) -> dict | None:
+    """Running workers finish (`wait`, or `stop_worker` at their deadline); nothing new starts.
+    Then the run ends blocked (paused), with the handoff."""
+    for d in _open_dispatches(ctx, events, _dispatches(events)):
+        if d.started is not None:
+            return _in_flight(ctx, d)
+    _end_blocked(ctx, events, "paused")
+    return None
+
+
+def _outcome_text(ended: dict) -> str:
+    q = ended.get("qualifier") or ""
+    return f"{ended.get('outcome')}" + (f" ({q})" if q else "")
+
+
+def _flag(run_dir: Path, what: str) -> RunPaths:
+    paths = run_paths(Path(run_dir).absolute())
+    if not paths.run_json.is_file():
+        raise EngineError(f"not a run directory (no run.json): {paths.root}")
+    ended = _ended(read_events(paths))
+    if ended is not None and (what == "pause" or ended.get("outcome") != "blocked"):
+        raise EngineError(f"this run has ended: {_outcome_text(ended)}; there is nothing to {what}")
+    flag = paths.pause_flag if what == "pause" else paths.cancel_flag
+    write_json_atomic(flag, {"requested_at": utc_now(), "by_pid": os.getpid()})
+    return paths
+
+
+def request_pause(run_dir: Path) -> str:
+    """`leadhand pause`: create the pause flag. Running workers finish, nothing new starts, the
+    handoff is written and the run ends blocked (paused); `leadhand run` continues it."""
+    paths = _flag(run_dir, "pause")
+    return ("pause requested: running workers finish, nothing new starts, and the run ends blocked "
+            f"(paused) with a handoff. Continue it later with: {dsp.CLI_PATH} run '{paths.root}'")
+
+
+def request_cancel(run_dir: Path) -> str:
+    """`leadhand cancel`: create the cancel flag. Every running worker is stopped (confirmed),
+    then the run ends incomplete (cancelled); partial work stays on the card branches."""
+    paths = _flag(run_dir, "cancel")
+    return ("cancel requested: every running worker is stopped and the run ends incomplete (cancelled); "
+            "partial work stays on the card branches. If no supervisor is running, "
+            f"{dsp.CLI_PATH} run '{paths.root}' finishes the cancel.")
 
 
 # --------------------------------------------------------------------------
@@ -2165,8 +2592,10 @@ def _copy_if_missing(src: Path | None, dest: Path, text: str | None = None) -> b
     return True
 
 
-def _head(report: str | None, reply: str, codex: dsp.DispatchResult | None, stopped: bool) -> dict:
-    """Status from the report's head line, else (stopped -> SPENT), the reply's head, the
+def _head(report: str | None, reply: str, codex: dsp.DispatchResult | None, stopped: bool,
+          interrupted: bool = False) -> dict:
+    """Status from the report's head line, else (interrupted -> SPENT, marked interrupted: the
+    restart decides from the branch what follows), (stopped -> SPENT), the reply's head, the
     Codex runner's result, a Claude turn-limit note (SPENT), else BLOCKED with the raw reply kept."""
     def from_text(text: str, source: str) -> dict:
         key, value, blocked_by = parse_report_head(text)
@@ -2179,6 +2608,9 @@ def _head(report: str | None, reply: str, codex: dsp.DispatchResult | None, stop
 
     if _has_status(report):
         return from_text(report, "report")
+    if interrupted:
+        return {"status": "SPENT", "blocked_by": "", "head": "Status", "verdict": None, "result": None,
+                "source": "interrupted", "raw_kept": False, "interrupted": True}
     if stopped:
         return {"status": "SPENT", "blocked_by": "", "head": "Status", "verdict": None, "result": None,
                 "source": "stopped", "raw_kept": False}
@@ -2207,6 +2639,17 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str = "",
     if d.started["worker_id"] != worker_id:
         raise EngineError(f"dispatch {dispatch_id} started worker {d.started['worker_id']}, not {worker_id}")
     reply = _read_reply_file(reply_file) if reply_file is not None else (reply or "")
+    return _store_result(ctx, d, worker_id, reply, stopped=stopped)
+
+
+def _store_result(ctx: _Run, d: _Dispatch, worker_id: str, reply: str, *, stopped: bool = False,
+                  interrupted: bool = False, charge: bool = True) -> dict:
+    """Copy the dispatch's files, work out its head, charge the worker and append the attempt
+    and `result_recorded` (repeat-safe). `interrupted`: the worker died with an earlier
+    supervisor session (reconciliation); without a report the result is marked interrupted.
+    `charge` False: no worker is known (its start was never recorded), so nothing is charged
+    and no attempt is written."""
+    dispatch_id = d.id
     crash_point("before_result_record")
     req, n = d.req, d.req["card"]
     folder = ctx.card_dir(n, dispatch_id)
@@ -2221,15 +2664,16 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str = "",
     if req["vendor"] == "codex":
         codex = dsp.load_result(ctx.root / "workers" / dispatch_id)
         commit = dsp.load_commit(ctx.root / "workers" / dispatch_id)
-    head_info = _head(_read_text(folder / "report.md"), reply, codex, stopped)
+    head_info = _head(_read_text(folder / "report.md"), reply, codex, stopped, interrupted)
     if dsp.commit_failed(commit):
         # The runner could not commit the worker's changes (ruling R39): whatever the report
         # says, the work is not on the branch, so the card must not go on as if it were.
         head_info = {**head_info, "status": "BLOCKED", "blocked_by": "environment", "head": "Status",
                      "verdict": None, "result": None, "source": "runner commit"}
+        head_info.pop("interrupted", None)
     tip = None
     if d.kind in IMPLEMENTER_KINDS:
-        card_branch = _card_state(ctx, events, n).branch or card_branch_name(ctx.branch, n)
+        card_branch = _card_state(ctx, read_events(ctx.paths), n).branch or card_branch_name(ctx.branch, n)
         tip = head(ctx.ws, f"refs/heads/{card_branch}")
     elif d.kind == "final_fix":
         tip = head(ctx.ws, f"refs/heads/{_final_branch(ctx)}")
@@ -2237,11 +2681,23 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str = "",
 
     role = req["role"] if req["vendor"] == "claude" else "proxy"
     charge_id = f"{dispatch_id}:claude:{worker_id}"
-    charged = usage.charge(ctx.paths, charge_id=charge_id, source="claude", key=worker_id,
-                           dispatch_id=dispatch_id, role=role,
-                           path_or_thread=usage.claude_subagent_transcript(worker_id, _projects_dir()),
-                           possibly_incomplete=stopped)
+    if charge:
+        charged = usage.charge(ctx.paths, charge_id=charge_id, source="claude", key=worker_id,
+                               dispatch_id=dispatch_id, role=role,
+                               path_or_thread=usage.claude_subagent_transcript(worker_id, _projects_dir()),
+                               possibly_incomplete=stopped or bool(head_info.get("interrupted")))
     crash_point("after_charge_before_attempt")
+    if not charge:
+        with state_lock(ctx.paths):
+            again = _known_dispatch(read_events(ctx.paths), dispatch_id)
+            if again.result is not None:
+                return again.result
+            return append_event(ctx.paths, "result_recorded", dispatch_id=dispatch_id, card=n,
+                                attempt=req["attempt"], dispatch_kind=d.kind, worker_id=worker_id, tip=tip,
+                                session_id=codex.session_id if codex else None, files=files,
+                                stopped=bool(stopped), charge_ids=[], reconciled=True, **head_info,
+                                **({k: commit.get(k) for k in ("committed", "commit_error", "commit_skipped")}
+                                   if req["vendor"] == "codex" else {}))
 
     ended_at = utc_now()
     model = req["model"] if req["vendor"] == "claude" else None
@@ -2253,7 +2709,8 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str = "",
         "agent": CODEX_AGENT if req["vendor"] == "codex" else agent_for(req["role"], "claude"),
         "worker_id": worker_id, "started_at": d.started["ts"], "ended_at": ended_at, "steps": None,
         "charge_ids": [charge_id], "usage": dsp.usage_dict(charged.usage), "usage_known": charged.usage.known,
-        "cost_estimate": cost, "exit_reason": "stopped" if stopped else "completed",
+        "cost_estimate": cost,
+        "exit_reason": "stopped" if stopped else "interrupted" if head_info.get("interrupted") else "completed",
         "status": head_info["status"], "blocked_by": head_info["blocked_by"], "recorded_by": "engine",
     }
     with state_lock(ctx.paths):
@@ -2266,7 +2723,7 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str = "",
         return append_event(ctx.paths, "result_recorded", dispatch_id=dispatch_id, card=n,
                             attempt=req["attempt"], dispatch_kind=d.kind, worker_id=worker_id, tip=tip,
                             session_id=codex.session_id if codex else None, files=files, stopped=bool(stopped),
-                            charge_ids=[charge_id], **head_info,
+                            charge_ids=[charge_id], **({"reconciled": True} if interrupted else {}), **head_info,
                             **({k: commit.get(k) for k in ("committed", "commit_error", "commit_skipped")}
                                if req["vendor"] == "codex" else {}))
 
@@ -2341,9 +2798,13 @@ def timer(run_dir: Path, dispatch_id: str, *, interval: float = TIMER_INTERVAL) 
     if not paths.run_json.is_file():
         raise EngineError(f"not a run directory (no run.json): {paths.root}")
     while True:
-        d = _known_dispatch(read_events(paths), dispatch_id)
+        events = read_events(paths)
+        d = _known_dispatch(events, dispatch_id)
         if d.result is not None:
             return "result"
+        if (d.req["vendor"] == "codex" and d.started is not None and _gone(events, d)
+                and dsp.load_result(paths.root / "workers" / dispatch_id) is not None):
+            return "result"           # no proxy is left to report it: `next` records it
         wait = interval
         if d.started is not None:
             left = _parse_time(d.started["deadline"]) - _now()
@@ -2405,6 +2866,16 @@ def _cmd_record(args) -> int:
     return 0
 
 
+def _cmd_pause(args) -> int:
+    print(request_pause(Path(args.run_dir)), flush=True)
+    return 0
+
+
+def _cmd_cancel(args) -> int:
+    print(request_cancel(Path(args.run_dir)), flush=True)
+    return 0
+
+
 def _cmd_timer(args) -> int:
     what = timer(Path(args.run_dir), args.dispatch)
     print("result recorded" if what == "result" else "deadline passed", flush=True)
@@ -2437,6 +2908,14 @@ def add_commands(sub) -> None:
     p.add_argument("--ok", choices=("yes", "no"), help="whether the diff is acceptable (diff-check)")
     p.add_argument("--note", default="", help="what the diff check found (diff-check)")
     p.set_defaults(func=_guard(_cmd_record))
+
+    p = sub.add_parser("pause", help="pause a run: running workers finish, nothing new starts, it ends blocked")
+    p.add_argument("run_dir")
+    p.set_defaults(func=_guard(_cmd_pause))
+
+    p = sub.add_parser("cancel", help="cancel a run: stop every worker, end it incomplete (cancelled)")
+    p.add_argument("run_dir")
+    p.set_defaults(func=_guard(_cmd_cancel))
 
     p = sub.add_parser("timer", help="wait until a dispatch has a result or its deadline passes")
     p.add_argument("run_dir")

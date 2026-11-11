@@ -993,6 +993,44 @@ def _owner_state(wd: Path) -> str:
     return "dead"
 
 
+def runner_state(worker_dir: Path, *, recheck: float | None = None) -> str:
+    """For recovery after a relaunch: finished (result.json) | running | hung | orphaned |
+    dead | none (no runner was ever recorded). A live runner whose heartbeat is stale is
+    looked at again for `recheck` seconds (default HUNG_RECHECK) before it counts as hung:
+    after a laptop sleep the runner refreshes it as soon as it runs again."""
+    wd = Path(worker_dir)
+    if load_result(wd) is not None:
+        return "finished"
+    if not wd.is_dir():
+        return "none"
+    state = _owner_state(wd)
+    if state == "stale":
+        beat, until = _beat(wd), time.monotonic() + (HUNG_RECHECK if recheck is None else recheck)
+        while time.monotonic() < until:
+            if load_result(wd) is not None:
+                return "finished"
+            if _beat(wd) != beat:
+                return "running"
+            time.sleep(POLL)
+        state = "hung" if _owner_state(wd) == "stale" else _owner_state(wd)
+    if load_result(wd) is not None:
+        return "finished"
+    return state
+
+
+def stop_strays(worker_dir: Path, *, timeout: float = CANCEL_TIMEOUT) -> list[dict]:
+    """Stop the recorded Codex processes of a dispatch whose runner is gone (a SIGKILLed
+    runner leaves Codex's tool and helper processes under init, P14). Returns what is still
+    alive after `timeout` (empty when everything is stopped). A live runner is left alone."""
+    wd = Path(worker_dir)
+    if not (wd / RUNNER).exists() or _runner_alive(wd):
+        return []
+    tracker = _Tracker.load(wd)
+    if not tracker.alive():
+        return []
+    return tracker.stop(deadline=time.monotonic() + timeout)
+
+
 def _supersede(wd: Path) -> None:
     runner = _read_json(wd / RUNNER) or {}
     superseded = wd / SUPERSEDED

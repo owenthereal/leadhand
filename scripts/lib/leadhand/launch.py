@@ -12,7 +12,9 @@ Claude child (`pass_fds`), so the lock stays held for the session's life even if
 the launcher dies. When the child exits, the launcher releases the lock. Only
 once it owns the run does it append `resumed`, and only when the run has events
 beyond `run_started` (an earlier supervisor worked it); a fresh run's first
-launch appends nothing.
+launch appends nothing. A run whose latest outcome is complete, incomplete
+(including cancelled) or failed is refused: only a blocked or unfinished run
+continues.
 
 The child runs in the run's workspace (from `run.json`), whatever directory the
 launch came from, with `LEADHAND_RUN_ID`, `LEADHAND_RUN_DIR` and `LEADHAND_CLI`
@@ -257,6 +259,17 @@ def _supervisor_route(meta: dict) -> tuple[str | None, str | None]:
     return (route.model, route.effort) if route is not None else (None, None)
 
 
+def _ended(events: list[dict]) -> dict | None:
+    """The outcome event that ended the run, unless a later `resumed` reopened it."""
+    last = None
+    for e in events:
+        if e.get("kind") == "outcome":
+            last = e
+        elif e.get("kind") == "resumed":
+            last = None
+    return last
+
+
 def _workspace(meta: dict) -> Path:
     ws = meta.get("workspace")
     if not isinstance(ws, str) or not ws or not os.path.isabs(ws) or not os.path.isdir(ws):
@@ -321,6 +334,16 @@ def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "cla
         return EXIT_REFUSED
 
     try:
+        ended = _ended(read_events(paths))
+        if ended is not None and ended.get("outcome") != "blocked":
+            # Only a blocked or unfinished run continues: a relaunch must never reopen a run
+            # that completed, failed or was cancelled.
+            qualifier = ended.get("qualifier") or ""
+            print(f"error: this run has ended: {ended.get('outcome')}"
+                  + (f" ({qualifier})" if qualifier else "")
+                  + "; only a blocked or unfinished run continues. Start a new run from the deck "
+                    "with `leadhand start`.", file=sys.stderr)
+            return 1
         try:
             workspace = _workspace(meta)
             model, effort = _supervisor_route(meta)
