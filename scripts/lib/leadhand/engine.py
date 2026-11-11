@@ -425,13 +425,14 @@ def _next_action(run_dir: Path) -> dict:
         if ended is not None:
             _wrap_up(ctx, ended, events)
             return _done_action(ctx, ended, read_events(ctx.paths))
-        if _cancel_requested(ctx, events):
-            # A cancel comes first, and a relaunch never undoes it.
-            action = _cancel_step(ctx, read_events(ctx.paths))
-        elif _needs_reconcile(events):
-            # After a relaunch, nothing new happens before every in-flight step is reconciled.
+        if _needs_reconcile(events):
+            # After a relaunch, nothing else happens before every in-flight step is reconciled
+            # (it only records what really happened, so a pending cancel ends on true state).
             _reconcile(ctx, events)
             action = None
+        elif _cancel_requested(ctx, events):
+            # A cancel comes before anything new, and a relaunch never undoes it.
+            action = _cancel_step(ctx, read_events(ctx.paths))
         elif _pause_requested(ctx, events):
             action = _pause_step(ctx, read_events(ctx.paths))
         else:
@@ -799,13 +800,19 @@ def _in_flight(ctx: _Run, d: _Dispatch) -> dict | None:
                   "no completion notice comes for it, and the timer reports its result")
         return {"action": "wait", "dispatch_id": d.id, "worker_id": worker, "deadline": deadline,
                 "reply_file": str(_reply_file(ctx, d.req["card"], d.id)), "reason": reason}
+    synthesized = bool(d.started.get("reconciled"))
     if d.req["vendor"] == "codex":
         result = _cancel_codex(ctx, d)
         # A runner that finished before the cancel keeps its own status (the proxy only hung).
-        _record_result(ctx, d.id, worker, "\n".join(dsp.reply_lines(result)),
-                       stopped=result.exit_reason == "cancelled")
+        _store_result(ctx, d, worker, "\n".join(dsp.reply_lines(result)),
+                      stopped=result.exit_reason == "cancelled", charge=not synthesized)
+        if synthesized:
+            return None           # no agent of this session runs it: nothing for the supervisor to stop
         return {"action": "stop_worker", "dispatch_id": d.id, "worker_id": worker, "vendor": "codex",
                 "record_result": False}
+    if synthesized:
+        _store_result(ctx, d, worker, "", interrupted=True, charge=False)
+        return None
     return {"action": "stop_worker", "dispatch_id": d.id, "worker_id": worker, "vendor": "claude",
             "record_result": True}
 
@@ -2065,8 +2072,9 @@ def _end(ctx: _Run, events: list[dict], *, blocked_reason: str | None = None, op
     mismatch a restart found). `cancelled`: the operator's cancel, after every worker stopped."""
     cards = fold_cards(events, ctx.numbers)
     run_ref = f"refs/heads/{ctx.branch}"
+    run_tip = _ref_sha(ctx, run_ref) if ctx.ws.is_dir() else None
     missing = [f"card {e.get('card')} at {str(e.get('sha'))[:12]}" for e in events
-               if e["kind"] == "accepted" and e.get("sha") and not is_ancestor(ctx.ws, e["sha"], run_ref)]
+               if run_tip and e["kind"] == "accepted" and e.get("sha") and not is_ancestor(ctx.ws, e["sha"], run_ref)]
     if missing and not unreconciled:
         unreconciled = f"accepted work missing from the run branch: {', '.join(missing)}"
     decision = decide_outcome(cards, removed=frozenset(), open_findings=open_findings, holds=holds,
@@ -2074,7 +2082,7 @@ def _end(ctx: _Run, events: list[dict], *, blocked_reason: str | None = None, op
                               cancelled=cancelled, blocked_reason=blocked_reason, unreconciled=unreconciled)
     return append_event(ctx.paths, "outcome", outcome=decision.outcome.value, qualifier=decision.qualifier,
                         reasons=[*decision.reasons, *why],
-                        next_step=allowed_next_step(decision, ctx.config.after_run), head=_run_head(ctx))
+                        next_step=allowed_next_step(decision, ctx.config.after_run), head=run_tip)
 
 
 def _wrap_up(ctx: _Run, ended: dict, events: list[dict]) -> None:
@@ -2291,7 +2299,18 @@ def _after_interrupted(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict]
                  extra=req.get("extra") or {}, resume=index.get(req.get("resumes") or ""),
                  notes=req.get("notes") or "", continues=req.get("continues"))
     else:
-        _end(ctx, events, unreconciled=progress)
+        _stop_codex_runners(ctx, events)
+        _end(ctx, read_events(ctx.paths), unreconciled=progress)
+
+
+def _stop_codex_runners(ctx: _Run, events: list[dict]) -> None:
+    """Before reconciliation ends the run: stop every Codex dispatch that has no result
+    (`dispatch.cancel`, termination confirmed), so no detached runner writes, or commits,
+    after the outcome. Their results are left unrecorded: the state they would be recorded
+    against could not be matched."""
+    for d in _dispatches(events).values():
+        if d.result is None and d.req["vendor"] == "codex":
+            _cancel_codex(ctx, d)
 
 
 def _synth_started(ctx: _Run, d: _Dispatch) -> dict:
@@ -2363,11 +2382,16 @@ def _reconcile(ctx: _Run, events: list[dict]) -> None:
       one's leftover processes are stopped (P14).
     - An acceptance whose fast-forward may not have happened is completed.
     - Integration, a fix round and the gates resume from the recorded events and Git.
-    - Anything that matches none of these ends the run failed with the mismatch."""
+    - Anything that matches none of these ends the run failed with the mismatch, after every
+      Codex dispatch without a result is stopped (confirmed), so nothing writes after the outcome.
+
+    It runs before a pending cancel is acted on: it only records what really happened, and
+    the cancel then ends the run on that state."""
     since = _latest_resumed(events)
     _charge_earlier_sessions(ctx)
     problem = _unmatched(ctx, events)
     if problem:
+        _stop_codex_runners(ctx, events)
         append_event(ctx.paths, "reconciled", resumed_seq=since, found=[f"state could not be reconciled: {problem}"],
                      headline=f"Resumed; state could not be reconciled: {problem}")
         _end(ctx, read_events(ctx.paths), unreconciled=problem)
@@ -2425,7 +2449,8 @@ def _cancel_step(ctx: _Run, events: list[dict]) -> dict | None:
     through the dispatcher (termination confirmed) and their results recorded; a Claude worker
     of this session gets `stop_worker`; one that died with an earlier session needs no stop
     and is recorded as interrupted. The outcome comes only after every worker is stopped.
-    Partial work stays on the card branches."""
+    Partial work stays on the card branches: a Codex runner commits it (R39), and a stopped
+    or dead Claude worker's uncommitted changes are committed by `_store_result` (R42)."""
     for d in sorted(_dispatches(events).values(), key=lambda x: x.req["seq"]):
         if d.result is not None:
             continue
@@ -2671,6 +2696,13 @@ def _store_result(ctx: _Run, d: _Dispatch, worker_id: str, reply: str, *, stoppe
         head_info = {**head_info, "status": "BLOCKED", "blocked_by": "environment", "head": "Status",
                      "verdict": None, "result": None, "source": "runner commit"}
         head_info.pop("interrupted", None)
+    partial: dict[str, str] = {}
+    if (req["vendor"] == "claude" and (d.kind in IMPLEMENTER_KINDS or d.kind == "final_fix")
+            and (stopped or head_info.get("interrupted")) and _cancelling(ctx, read_events(ctx.paths))):
+        # R42 (cancel): a Claude worker the cancel stopped, or found dead, leaves its partial
+        # work committed on its branch (a Codex runner does this itself, R39). Not yet for a
+        # stop at the deadline or an interruption found on a relaunch: see the fix report.
+        partial = _commit_partial(ctx, d)
     tip = None
     if d.kind in IMPLEMENTER_KINDS:
         card_branch = _card_state(ctx, read_events(ctx.paths), n).branch or card_branch_name(ctx.branch, n)
@@ -2695,7 +2727,7 @@ def _store_result(ctx: _Run, d: _Dispatch, worker_id: str, reply: str, *, stoppe
             return append_event(ctx.paths, "result_recorded", dispatch_id=dispatch_id, card=n,
                                 attempt=req["attempt"], dispatch_kind=d.kind, worker_id=worker_id, tip=tip,
                                 session_id=codex.session_id if codex else None, files=files,
-                                stopped=bool(stopped), charge_ids=[], reconciled=True, **head_info,
+                                stopped=bool(stopped), charge_ids=[], reconciled=True, **head_info, **partial,
                                 **({k: commit.get(k) for k in ("committed", "commit_error", "commit_skipped")}
                                    if req["vendor"] == "codex" else {}))
 
@@ -2724,8 +2756,44 @@ def _store_result(ctx: _Run, d: _Dispatch, worker_id: str, reply: str, *, stoppe
                             attempt=req["attempt"], dispatch_kind=d.kind, worker_id=worker_id, tip=tip,
                             session_id=codex.session_id if codex else None, files=files, stopped=bool(stopped),
                             charge_ids=[charge_id], **({"reconciled": True} if interrupted else {}), **head_info,
+                            **partial,
                             **({k: commit.get(k) for k in ("committed", "commit_error", "commit_skipped")}
                                if req["vendor"] == "codex" else {}))
+
+
+def _cancelling(ctx: _Run, events: list[dict]) -> bool:
+    """A cancel is recorded, or requested and not yet seen by `next` (reconciliation comes first)."""
+    return any(e["kind"] == "cancelled" for e in events) or ctx.paths.cancel_flag.exists()
+
+
+def _commit_partial(ctx: _Run, d: _Dispatch) -> dict[str, str]:
+    """R42: commit what a stopped or interrupted Claude worker left uncommitted, when the
+    workspace is on its branch and no Git operation is in progress: everything Git does not
+    ignore, unsigned and without hooks, with the `Leadhand-Dispatch` trailer, after a
+    `reconciled{stage: partial_work}` intent. Repeat-safe: after a crash past the commit the
+    workspace is clean and nothing more is committed. Returns `partial_commit` (the commit)
+    or `partial_commit_error` for the result event, or {} when there was nothing to commit."""
+    n = d.req["card"]
+    if n is None:
+        branch = _final_branch(ctx)
+    else:
+        branch = fold_cards(read_events(ctx.paths), ctx.numbers)[n].branch or card_branch_name(ctx.branch, n)
+    try:
+        if _current_branch(ctx) != branch or _operation(ctx) is not None:
+            return {}
+        if not git(ctx.ws, "status", "--porcelain=v1", "--untracked-files=all"):
+            return {}
+        before = head(ctx.ws, f"refs/heads/{branch}")
+        if not any(e["kind"] == "reconciled" and e.get("stage") == "partial_work" and e.get("dispatch_id") == d.id
+                   for e in read_events(ctx.paths)):
+            append_event(ctx.paths, "reconciled", stage="partial_work", dispatch_id=d.id, branch=branch,
+                         head_before=before)
+        git(ctx.ws, "add", "-A")
+        git(ctx.ws, "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--quiet",
+            "--no-verify", "-m", f"{d.id}: partial work (stopped)", "-m", f"{dsp.TRAILER}: {d.id}")
+        return {"partial_commit": head(ctx.ws, f"refs/heads/{branch}")}
+    except GitError as e:
+        return {"partial_commit_error": str(e)}
 
 
 def _record_ruling(ctx: _Run, card: Any, text: str) -> dict:

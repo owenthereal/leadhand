@@ -7,6 +7,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -516,6 +517,347 @@ class PauseCancel(unittest.TestCase):
         self.assertIn("`<cli> unpark <run_dir> --card N --note '…'`", steering)
 
 
+def git_log_body(repo, ref):
+    return run_git(repo, "log", "-1", "--format=%B", ref)
+
+
+def orphaned_codex(test, lines, *, start=True):
+    """A Codex card dispatch whose runner was SIGKILLed while Codex (and a tool child) live on;
+    the proxy died with the session."""
+    w = FakeWorld(test, [card(1, route=CODEX_CARD)], installed=("claude", "codex"))
+    w.session("supervisor-1")
+    w.start()
+    a = w.next()
+    if start:
+        w.launch(a)
+    p = start_codex(w, a, lines)
+    log = w.tmp / "codex log.jsonl"
+    wait_for(lambda: log.exists() and '"child"' in log.read_text(), what="the tool child")
+    rec = wait_for(lambda: runner_record(w, a["dispatch_id"]).get("codex") and runner_record(w, a["dispatch_id"]),
+                   what="codex to start")
+    os.kill(rec["runner"]["pid"], signal.SIGKILL)
+    kill_proxy(p)
+    wait_for(lambda: not alive(rec["runner"]), what="the runner to die")
+    children = [json.loads(x)["child_pid"] for x in log.read_text().splitlines()
+                if json.loads(x).get("event") == "child"]
+    return w, a, rec, children
+
+
+ORPHAN_LINES = [{"type": "thread.started", "thread_id": "{thread}"}, {"type": "turn.started"},
+                {"action": "write_file", "path": "src/card1/p.txt", "text": "p\n"},
+                {"action": "tool_child", "seconds": 120}, {"action": "sleep", "seconds": 120}]
+
+
+def pid_gone(pid) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+class FixRound1(unittest.TestCase):
+    """Review fix round 1 of Task 21."""
+
+    def test_cancel_after_an_interrupted_acceptance_reconciles_first(self):
+        w = FakeWorld(self, [card(1), card(2)])
+        w.session("supervisor-1")
+        w.start()
+        for _ in range(2):
+            w.act(w.next())                      # card 1 implemented and reviewed (clean)
+        r = w.cli("next", w.run_dir, crash="after_fast_forward")
+        self.assertEqual(r.returncode, 97, r.stderr)
+        self.assertNotEqual(w.branch_tip(RUN), w.base)
+        w.cli("cancel", w.run_dir)
+        resume(w)
+        done = w.next()
+        self.assertEqual((done["outcome"], done["qualifier"]), ("incomplete", "cancelled"))
+        (acc,) = w.events("accepted")
+        self.assertEqual((acc["card"], acc["sha"]), (1, w.branch_tip(RUN)))
+        self.assertFalse(any("card 1" in r for r in done["reasons"]), done["reasons"])
+        (rec,) = [e for e in w.events("reconciled") if "found" in e]
+        self.assertIn("card 1's acceptance was completed", rec["found"])
+        self.assertLess(rec["seq"], w.events("cancelled")[0]["seq"])
+
+    def test_cancel_commits_a_stopped_claude_workers_partial_work(self):
+        w = FakeWorld(self, [card(1)])
+        w.session("supervisor-1")
+        w.start()
+        a = w.next()
+        worker = w.launch(a)
+        ws = w.workspace()
+        write(ws, {"src/card1/partial.txt": "partial\n"})       # uncommitted when it is stopped
+        w.cli("cancel", w.run_dir)
+        self.assertEqual(w.next()["action"], "stop_worker")
+        event = engine.record(w.run_dir, "result", dispatch_id=a["dispatch_id"], worker_id=worker,
+                              reply="Status: SPENT (time limit)", stopped=True)
+        done = w.next()
+        self.assertEqual((done["outcome"], done["qualifier"]), ("incomplete", "cancelled"))
+        tip = w.branch_tip(CARD1)
+        self.assertEqual(event["tip"], tip)
+        run_git(w.repo, "cat-file", "-e", f"{CARD1}:src/card1/partial.txt")
+        body = git_log_body(w.repo, CARD1)
+        self.assertIn(f"Leadhand-Dispatch: {a['dispatch_id']}", body.splitlines())
+        self.assertIn("partial work (stopped)", body)
+        self.assertEqual(run_git(ws, "status", "--porcelain"), "")
+        intent = [e for e in w.events("reconciled") if e.get("stage") == "partial_work"]
+        self.assertEqual([e["dispatch_id"] for e in intent], [a["dispatch_id"]])
+        self.assertLess(intent[0]["seq"], event["seq"])
+
+    def test_cancel_commits_partial_work_of_a_worker_that_died_with_its_session(self):
+        w = FakeWorld(self, [card(1)])
+        w.session("supervisor-1")
+        w.start()
+        w.script(1, "implement", {"crash": "before_commit"})
+        a = w.next()
+        worker = w.launch(a)
+        self.assertIsNone(w.perform(a, worker))  # its files are written, not committed
+        w.cli("cancel", w.run_dir)
+        resume(w)
+        done = w.next()                          # no stop needed: it died with the session
+        self.assertEqual((done["outcome"], done["qualifier"]), ("incomplete", "cancelled"))
+        run_git(w.repo, "cat-file", "-e", f"{CARD1}:src/card1/{a['dispatch_id']}.txt")
+        self.assertIn(f"Leadhand-Dispatch: {a['dispatch_id']}", git_log_body(w.repo, CARD1).splitlines())
+        (res,) = w.events("result_recorded")
+        self.assertEqual((res["tip"], res["partial_commit"]), (w.branch_tip(CARD1), w.branch_tip(CARD1)))
+
+    def test_stopped_check_worker_changes_are_not_committed(self):
+        w = FakeWorld(self, [card(1)])
+        w.session("supervisor-1")
+        w.start()
+        w.act(w.next())                          # implement
+        a = w.next()
+        self.assertEqual(a["kind"], "review")
+        worker = w.launch(a)
+        tip = w.branch_tip(CARD1)
+        write(w.workspace(), {"src/card1/reviewer.txt": "not mine to write\n"})
+        w.cli("cancel", w.run_dir)
+        self.assertEqual(w.next()["action"], "stop_worker")
+        engine.record(w.run_dir, "result", dispatch_id=a["dispatch_id"], worker_id=worker,
+                      reply="Status: SPENT (time limit)", stopped=True)
+        w.next()
+        self.assertEqual(w.branch_tip(CARD1), tip)
+
+    def test_failed_reconciliation_stops_live_codex_before_the_outcome(self):
+        w = FakeWorld(self, [card(1, route=CODEX_CARD)], installed=("claude", "codex"))
+        w.session("supervisor-1")
+        w.start()
+        a = w.next()
+        w.launch(a)
+        lines = [{"type": "thread.started", "thread_id": "{thread}"}, {"type": "turn.started"},
+                 {"action": "write_file", "path": "src/card1/started.txt", "text": "started\n"},
+                 {"action": "append_loop", "path": "src/card1/loop.txt", "interval": 0.05},
+                 {"action": "sleep", "seconds": 120}]
+        p = start_codex(w, a, lines)
+        loop = w.workspace() / "src/card1/loop.txt"
+        wait_for(lambda: loop.exists() and loop.stat().st_size > 0, what="the worker writing")
+        rec = wait_for(lambda: runner_record(w, a["dispatch_id"]).get("codex") and runner_record(w, a["dispatch_id"]),
+                       what="codex to start")
+        kill_proxy(p)
+        run_git(w.repo, "update-ref", "-d", f"refs/heads/{RUN}")     # unmatched: the run branch is gone
+        resume(w)
+        done = w.next()
+        self.assertEqual(done["outcome"], "failed")
+        self.assertIn(f"state could not be reconciled: the run branch {RUN} is missing", done["reasons"])
+        for who in (rec["runner"], rec["codex"]):
+            self.assertFalse(alive(who), who)
+        self.assertTrue((w.run_dir / "workers" / a["dispatch_id"] / "result.json").exists())
+        size = loop.stat().st_size
+        time.sleep(0.5)
+        self.assertEqual(loop.stat().st_size, size)
+
+    def test_orphaned_codex_is_cancelled_before_anything_else(self):
+        w, a, rec, children = orphaned_codex(self, ORPHAN_LINES)
+        self.assertTrue(alive(rec["codex"]))
+        self.assertTrue(children and not pid_gone(children[0]))
+        resume(w)
+        nxt = w.next()
+        self.assertFalse(alive(rec["codex"]))
+        self.assertTrue(all(pid_gone(c) for c in children))
+        (intent,) = [e for e in w.events("reconciled") if e.get("stage") == "cancel"]
+        self.assertEqual((intent["dispatch_id"], intent["runner"]), (a["dispatch_id"], "orphaned"))
+        self.assertEqual((nxt["kind"], nxt["dispatch_id"]), ("continue", "c1-a1-continue-1"))
+        run_git(w.repo, "cat-file", "-e", f"{CARD1}:src/card1/p.txt")      # the runner's cancel commit
+        self.assertEqual(codex_starts(w), {a["dispatch_id"]: 1})
+
+    def test_crash_in_reconciliations_cancel_window_is_repeat_safe(self):
+        w, a, rec, children = orphaned_codex(self, ORPHAN_LINES)
+        resume(w)
+        r = w.cli("next", w.run_dir, crash="after_cancel_request")
+        self.assertEqual(r.returncode, 97, r.stderr)
+        intents = [e for e in w.events("reconciled") if e.get("stage") == "cancel"]
+        self.assertEqual(len(intents), 1)
+        self.assertEqual([e for e in w.events("reconciled") if "found" in e], [])
+        self.assertEqual(w.events("result_recorded"), [])
+        resume(w, "supervisor-3")
+        nxt = w.next()
+        self.assertEqual((nxt["kind"], nxt["dispatch_id"]), ("continue", "c1-a1-continue-1"))
+        self.assertFalse(alive(rec["codex"]))
+        self.assertTrue(all(pid_gone(c) for c in children))
+        (res,) = w.events("result_recorded")
+        self.assertTrue(res["interrupted"])          # our own cancel, not a stop at the deadline
+
+    def test_unrecorded_codex_start_past_its_deadline_is_not_charged_or_stopped(self):
+        lines = [{"type": "thread.started", "thread_id": "{thread}"}, {"type": "turn.started"},
+                 {"action": "tool_child", "seconds": 120}, {"action": "sleep", "seconds": 120}]
+        w = FakeWorld(self, [card(1, route=CODEX_CARD)], installed=("claude", "codex"))
+        w.session("supervisor-1")
+        w.start()
+        a = w.next()                             # the proxy ran, but `record started` never happened
+        p = start_codex(w, a, lines)
+        wait_for(lambda: runner_record(w, a["dispatch_id"]).get("codex"), what="codex to start")
+        kill_proxy(p)
+        resume(w)
+        wait = w.next()
+        self.assertEqual((wait["action"], wait["worker_id"]), ("wait", f"{a['dispatch_id']}:unrecorded"))
+        w.advance(70 * 60)
+        nxt = w.next()
+        self.assertEqual(nxt["action"], "dispatch")          # no stop_worker for the made-up worker ID
+        self.assertEqual(nxt["dispatch_id"], "c1-a2-implement-1")   # stopped at its limit: SPENT, escalated
+        (res,) = w.events("result_recorded")
+        self.assertEqual((res["status"], res["stopped"], res["charge_ids"]), ("SPENT", True, []))
+        self.assertFalse(any(":unrecorded" in c.charge_id for c in w.charges()))
+
+    def interrupted_check(self, kind):
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.session("supervisor-1")
+        w.start()
+        for _ in range(50):
+            a = w.next()
+            if a["action"] == "dispatch" and (a.get("gate") == kind or a["kind"] == kind):
+                break
+            w.act(a)
+        w.launch(a)                              # the worker dies without a report
+        resume(w)
+        nxt = w.next()
+        done = w.run()[-1]
+        self.assertEqual(done["outcome"], "complete")
+        return a, nxt, w
+
+    def test_interrupted_review_without_report_runs_again(self):
+        a, nxt, w = self.interrupted_check("review")
+        self.assertEqual((nxt["kind"], nxt["dispatch_id"], nxt["resume"]), ("review", "c1-a1-review-2", None))
+        res = next(e for e in w.events("result_recorded") if e["dispatch_id"] == a["dispatch_id"])
+        self.assertTrue(res["interrupted"])
+
+    def test_interrupted_gate_without_report_runs_again(self):
+        a, nxt, w = self.interrupted_check("final_review")
+        self.assertEqual((nxt["kind"], nxt["dispatch_id"], nxt["gate"]), ("final_review", "run-final_review-2", "final_review"))
+        self.assertEqual([e["dispatch_id"] for e in w.events("gate_started") if e["gate"] == "final_review"],
+                         ["run-final_review-1", "run-final_review-2"])
+        self.assertEqual([e["dispatch_id"] for e in w.events("gate_result") if e["gate"] == "final_review"],
+                         ["run-final_review-2"])
+
+    def interrupted_final_fix(self, crash):
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.script(None, "final_review", {"verdict": "defects"})
+        w.script(None, "final_fix", {"crash": crash} if crash else {})
+        w.session("supervisor-1")
+        w.start()
+        for _ in range(50):
+            a = w.next()
+            if a["action"] == "dispatch" and a["kind"] == "final_fix":
+                break
+            w.act(a)
+        worker = w.launch(a)
+        if crash:
+            self.assertIsNone(w.perform(a, worker))
+        resume(w)
+        nxt = w.next()
+        self.assertEqual((nxt["kind"], nxt["dispatch_id"], nxt["wave"]), ("final_fix", "run-w1-final_fix-2", 1))
+        self.assertIn("## The interrupted step", Path(nxt["brief"]).read_text())
+        done = w.run()[-1]
+        self.assertEqual(done["outcome"], "complete")
+        return w, a
+
+    def test_interrupted_final_fix_before_its_commit_runs_again(self):
+        w, a = self.interrupted_final_fix(None)
+        self.assertEqual(len([e for e in w.events("accepted") if e["card"] == "final"]), 1)
+
+    def test_interrupted_final_fix_after_its_commit_keeps_it(self):
+        w, a = self.interrupted_final_fix("after_commit")
+        found = [e["found"] for e in w.events("reconciled") if "found" in e]
+        self.assertIn("the run's commits were found and recorded", found[0])
+        run_git(w.repo, "cat-file", "-e", f"{RUN}:src/final/{a['dispatch_id']}.txt")   # on the run branch
+
+
+class RunnerHelpers(unittest.TestCase):
+    """`dispatch.runner_state` and `dispatch.stop_strays`, against real processes."""
+
+    def setUp(self):
+        self.wd = Path(tempfile.mkdtemp(prefix="lh runner ")) / "worker dir"
+        self.wd.mkdir()
+        self.addCleanup(shutil.rmtree, self.wd.parent, True)
+        self.procs = []
+        self.addCleanup(self.kill_all)
+
+    def kill_all(self):
+        for p in self.procs:
+            if p.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(p.pid, signal.SIGKILL)
+            p.wait(timeout=10)
+            if p.stdout:
+                p.stdout.close()
+
+    def spawn(self, code):
+        p = subprocess.Popen([sys.executable, "-c", code], start_new_session=True, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, text=True)
+        self.procs.append(p)
+        return p
+
+    def record(self, p):
+        info = wait_for(lambda: procs.process_info(p.pid), what="process info")
+        return {"pid": p.pid, "pgid": info.pgid, "start": info.start}
+
+    def holding_runner_lock(self):
+        lock = self.wd / "runner.lock"
+        p = self.spawn("import fcntl,os,sys,time\n"
+                       f"fd=os.open({str(lock)!r},os.O_RDWR|os.O_CREAT)\nfcntl.flock(fd,fcntl.LOCK_EX)\n"
+                       "print('locked',flush=True)\ntime.sleep(120)")
+        self.assertEqual(p.stdout.readline().strip(), "locked")
+        return p
+
+    def write_json(self, name, data):
+        (self.wd / name).write_text(json.dumps(data), encoding="utf-8")
+
+    def test_runner_state(self):
+        self.assertEqual(dsp.runner_state(self.wd.parent / "missing"), "none")
+        self.assertEqual(dsp.runner_state(self.wd), "none")
+        runner = self.holding_runner_lock()
+        self.write_json("runner.json", {"runner": self.record(runner), "codex": None})
+        (self.wd / "heartbeat").touch()
+        self.assertEqual(dsp.runner_state(self.wd, recheck=0.2), "running")
+        old = time.time() - 600
+        os.utime(self.wd / "heartbeat", (old, old))
+        self.assertEqual(dsp.runner_state(self.wd, recheck=0.2), "hung")
+        os.killpg(runner.pid, signal.SIGKILL)
+        runner.wait(timeout=10)
+        codex = self.spawn("import time; time.sleep(120)")
+        self.write_json("runner.json", {"runner": self.record(codex), "codex": self.record(codex)})
+        self.assertEqual(dsp.runner_state(self.wd), "orphaned")
+        os.killpg(codex.pid, signal.SIGKILL)
+        codex.wait(timeout=10)
+        self.assertEqual(dsp.runner_state(self.wd), "dead")
+        self.write_json("result.json", {"status": "READY", "exit_reason": "completed"})
+        self.assertEqual(dsp.runner_state(self.wd), "finished")
+
+    def test_stop_strays_stops_what_a_dead_runner_left_and_leaves_a_live_runner_alone(self):
+        tool = self.spawn("import time; time.sleep(120)")
+        codex = self.spawn("import time; time.sleep(120)")
+        self.write_json("runner.json", {"runner": {"pid": 1, "pgid": 1, "start": "gone"}, "codex": self.record(codex)})
+        self.write_json("procs.json", {"descendants": [self.record(tool)]})
+        runner = self.holding_runner_lock()
+        self.assertEqual(dsp.stop_strays(self.wd), [])             # a live runner stops its own
+        self.assertIsNone(codex.poll())
+        os.killpg(runner.pid, signal.SIGKILL)
+        runner.wait(timeout=10)
+        self.assertEqual(dsp.stop_strays(self.wd, timeout=15), [])
+        self.assertIsNotNone(codex.wait(timeout=10))
+        self.assertIsNotNone(tool.wait(timeout=10))
+        self.assertEqual(dsp.stop_strays(self.wd), [])             # nothing left: a no-op
+
+
 # --------------------------------------------------------------------------
 # Every crash window
 
@@ -561,6 +903,8 @@ class StableWorld(FakeWorld):
             return {"status": "SPENT"}
         if label == "c2-a1-review":
             return {"verdict": "defects"}
+        if label == "c2-a1-fix":
+            return {"files": {"src/card2/fix.py": "FIXED = 'c2-a1-fix'\n"}}   # production: a re-review follows
         return {}
 
     def operator(self):
@@ -693,6 +1037,7 @@ class EveryCrashPoint(unittest.TestCase):
         self.assertEqual(set(expected["cards"].values()), {"accepted"})
         self.assertEqual(sorted(expected["accepted"]), [1, 2, 3])
         self.assertTrue(ref.events("integration_started") and ref.events("fix_round"))
+        self.assertIn("c2-a1-rereview-1", ref.dispatch_ids())
         self.assertTrue(any(d["attempt"] == 2 for d in ref.started if d["card"] == 3))
         ref.check_invariants(self)
         seen = collections.Counter(log.read_text().split())
