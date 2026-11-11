@@ -289,8 +289,19 @@ def docs_dir_for(config: Config, repo: Path) -> Path:
     return Path(text).expanduser()
 
 
-def unsupported_settings(config: Config) -> list[str]:
+def unsupported_settings(config: Config, repo: Path | None = None) -> list[str]:
+    """Settings this version refuses (an error in check, and start refuses). With `repo`,
+    also a docs_dir that resolves inside the repository (a relative one is resolved
+    against the repository): the run's own files would sit in the workspace (ruling R48)."""
     out = []
+    if not config.run.worktree:
+        out.append("not supported in this version: run.worktree = false")
+    if repo is not None:
+        root = Path(os.path.realpath(repo))
+        docs = docs_dir_for(config, root)
+        docs = Path(os.path.realpath(docs if docs.is_absolute() else root / docs))
+        if docs == root or root in docs.parents:
+            out.append(f"not supported in this version: docs_dir inside the repository ({docs})")
     if config.after_run.step != "none":
         out.append(f"not supported in this version: after_run.step = {config.after_run.step}")
     if config.after_run.on_incomplete != "none":

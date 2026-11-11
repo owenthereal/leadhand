@@ -280,7 +280,7 @@ def check_deck(deck: Deck, repo: Path, config: Config) -> list[Problem]:
     def warn(msg, card=None):
         out.append(Problem("warning", card, msg))
 
-    for msg in unsupported_settings(config):
+    for msg in unsupported_settings(config, repo=repo):
         err(msg)
     for msg in unsupported_warnings(config):
         warn(msg)
