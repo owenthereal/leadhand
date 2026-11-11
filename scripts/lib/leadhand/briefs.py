@@ -340,6 +340,20 @@ def write_brief(kind: str, *, ws: Path, deck: Deck, card: Card | None, attempt: 
 # -- dispatch --------------------------------------------------------------
 
 
+def agent_max_turns(agent: str) -> int | None:
+    """The `maxTurns` in a Claude worker agent's frontmatter (None when it sets none): a
+    Claude worker's turn cap, which no dispatch can change (ruling R52)."""
+    text = (AGENTS_DIR / f"{agent.split(':', 1)[-1]}.md").read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        return None
+    head, sep, _ = text[4:].partition("\n---\n")
+    for line in head.splitlines() if sep else ():
+        key, _, value = line.partition(":")
+        if key.strip() == "maxTurns" and value.strip().isdigit():
+            return int(value.strip())
+    return None
+
+
 def _agent_body(agent: str) -> str:
     text = (AGENTS_DIR / f"{agent.split(':', 1)[-1]}.md").read_text(encoding="utf-8")
     if text.startswith("---\n"):

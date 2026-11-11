@@ -1,8 +1,12 @@
 import os
+import shutil
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
+from leadhand import briefs
 from leadhand import config as cfg
 from leadhand.config import ConfigError, Limits, Route, load_config
 
@@ -88,6 +92,39 @@ class ConfigTests(unittest.TestCase):
             "not supported in this version: after_run.on_incomplete = draft-pr",
             "not supported in this version: run.cost_limit_usd = 5",
         ])
+
+    def test_step_limits_claude_workers_cannot_honour_are_rejected(self):
+        # Ruling R52: a Claude worker's turn cap is its agent file's maxTurns.
+        for preset in ("claude-codex", "claude-only"):
+            (self.repo / ".leadhand.toml").write_text(f'preset = "{preset}"\n')
+            self.assertEqual(cfg.unsupported_settings(self.load()), [], preset)
+        (self.repo / ".leadhand.toml").write_text(
+            '[limits]\nreviewer = { steps = 80, minutes = 20 }\nscout = { steps = 30, minutes = 5 }\n')
+        self.assertEqual(cfg.unsupported_settings(self.load()), [
+            "not supported in this version: limits.reviewer.steps = 80 "
+            "(Claude workers use the agent file's maxTurns = 60)"])
+
+    def test_step_limits_follow_the_roles_routes_and_agent_files(self):
+        (self.repo / ".leadhand.toml").write_text(
+            '[limits]\nimplementer = { steps = 200, minutes = 60 }\nreviewer = { steps = 80, minutes = 20 }\n')
+        c = self.load()
+        codex_only = lambda role: cfg.RoleSpec({"codex": c.roles[role].routes["codex"]}, "codex")
+        # Codex-only implementer roles honour any step limit; final_reviewer still has a Claude
+        # route, and it uses limits.reviewer and the reviewer agent.
+        c = replace(c, roles={**c.roles, **{r: codex_only(r) for r in
+                                            ("implementer", "implementer_hard", "reviewer", "reviewer_hard")}})
+        self.assertEqual(cfg.unsupported_settings(c), [
+            "not supported in this version: limits.reviewer.steps = 80 "
+            "(Claude workers use the agent file's maxTurns = 60)"])
+        # M comes from the agent file.
+        agents = self.tmp / "agents"
+        shutil.copytree(briefs.AGENTS_DIR, agents)
+        path = agents / "verifier.md"
+        path.write_text(path.read_text().replace("maxTurns: 40\n", "maxTurns: 45\n"))
+        with mock.patch.object(briefs, "AGENTS_DIR", agents):
+            self.assertEqual(cfg.unsupported_settings(self.load())[-1],
+                             "not supported in this version: limits.verifier.steps = 40 "
+                             "(Claude workers use the agent file's maxTurns = 45)")
 
     def test_parse_route_and_leadhand_config_env(self):
         self.assertEqual(cfg.parse_route("codex", "gpt-6.1-terra high"), Route("codex", "gpt-6.1-terra", "high"))

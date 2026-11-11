@@ -420,6 +420,18 @@ class Start(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("scout cards", r.stderr)
 
+    def test_check_and_start_refuse_step_limits_claude_workers_cannot_honour(self):
+        w = FakeWorld(self, [card(1)], config='[limits]\nimplementer = { steps = 90, minutes = 60 }\n')
+        msg = ("not supported in this version: limits.implementer.steps = 90 "
+               "(Claude workers use the agent file's maxTurns = 150)")
+        r = w.cli("check", w.deck_path, "--repo", w.repo)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn(msg, r.stdout + r.stderr)
+        with self.assertRaises(EngineError) as cm:
+            w.start()
+        self.assertIn(msg, str(cm.exception))
+        self.assertFalse((w.docs / "runs").exists())
+
     def test_deck_changed_since_start_refuses(self):
         w = FakeWorld(self, [card(1)])
         w.start()

@@ -310,6 +310,24 @@ def unsupported_settings(config: Config, repo: Path | None = None) -> list[str]:
     if config.run.cost_limit_usd != 0:
         c = config.run.cost_limit_usd
         out.append(f"not supported in this version: run.cost_limit_usd = {int(c) if c == int(c) else c}")
+    out += _unhonoured_step_limits(config)
+    return out
+
+
+def _unhonoured_step_limits(config: Config) -> list[str]:
+    """`limits.<role>.steps` that a Claude worker cannot honour (ruling R52): the Agent tool
+    has no per-dispatch turn limit, so a Claude worker stops at its agent file's maxTurns. A
+    limit is refused when it differs from that for any role using it that has a Claude route."""
+    from leadhand.briefs import ROLE_AGENT, agent_max_turns
+    from leadhand.dispatch import LIMITS_ROLE
+    out = []
+    for key, lim in config.limits.items():
+        turns = sorted({agent_max_turns(ROLE_AGENT[role]) for role, spec in config.roles.items()
+                        if role in ROLE_AGENT and "claude" in spec.routes and LIMITS_ROLE.get(role, role) == key}
+                       - {None, lim.steps})
+        for m in turns:
+            out.append(f"not supported in this version: limits.{key}.steps = {lim.steps} "
+                       f"(Claude workers use the agent file's maxTurns = {m})")
     return out
 
 

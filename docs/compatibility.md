@@ -180,6 +180,14 @@ Claude workers:
   Decision: the worker status is `SPENT` when the dispatcher recognises the
   `stopped at its <N>-turn limit` text, otherwise `BLOCKED` (the no-status-line rule, raw
   reply kept).
+- The Agent tool has no per-dispatch turn limit, so a Claude worker always stops at its agent
+  file's `maxTurns` (implementer 150, reviewer 60, verifier 40, scout 30; `implementer_hard`
+  uses the implementer agent, `reviewer_hard` and `final_reviewer` the reviewer agent, and
+  each shares its base role's `[limits]` entry). Decision: `limits.<role>.steps` is enforced
+  for Codex workers only, and `leadhand check` and `leadhand start` refuse a value that
+  differs from the agent file's `maxTurns` when any role using that entry has a Claude
+  route: "not supported in this version: limits.<role>.steps = N (Claude workers use the
+  agent file's maxTurns = M)". The presets' values match. `minutes` applies to both vendors.
 - Per-dispatch Agent `model` and `effort` override the subagent's frontmatter (a haiku/low
   worker dispatched with `model: "sonnet"`, `effort: "medium"` ran as sonnet at medium).
   Decision: the dispatcher sets model and effort on every Agent call.
