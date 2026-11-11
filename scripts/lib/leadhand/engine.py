@@ -507,6 +507,12 @@ def _pick(ctx: _Run, cards: dict[int, CardState], events: list[dict]) -> int | N
 
 def _step(ctx: _Run, events: list[dict]) -> dict | None:
     """One mechanical step (returns None after appending an event) or an action."""
+    problem = _run_head_problem(ctx, events)
+    if problem and not _run_ref_guarded(ctx, events):
+        # The run branch moved with no acceptance and no worker guard to explain it (I4).
+        _stop_codex_runners(ctx, events)
+        _end(ctx, read_events(ctx.paths), unreconciled=problem)
+        return None
     if _finish_leftovers(ctx, events):
         return None
     cards = fold_cards(events, ctx.numbers)
@@ -558,6 +564,57 @@ def _step(ctx: _Run, events: list[dict]) -> dict | None:
     if d.result is None:
         return _in_flight(ctx, d)
     return _after_result(ctx, c, d, events, index)
+
+
+def _run_head_problem(ctx: _Run, events: list[dict]) -> str | None:
+    """Why the run head is not the last accepted commit (else the base), or None. An
+    acceptance whose fast-forward happened but is not recorded yet is not a problem."""
+    run_ref = f"refs/heads/{ctx.branch}"
+    now = _ref_sha(ctx, run_ref) if ctx.ws.is_dir() else None
+    if now is None:
+        return f"the run branch {ctx.branch} is missing"
+    accepted = [e for e in events if e["kind"] == "accepted" and e.get("sha")]
+    expected = accepted[-1]["sha"] if accepted else ctx.meta["base_sha"]
+    if now == expected:
+        return None
+    after = accepted[-1]["seq"] if accepted else 0
+    if any(e["kind"] == "accept_started" and e["seq"] > after and e.get("target") == now for e in events):
+        return None
+    return (f"the run branch {ctx.branch} is at {now[:12]}, not at the last accepted commit "
+            f"{expected[:12]}{'' if accepted else ' (the base)'}")
+
+
+def _run_ref_guarded(ctx: _Run, events: list[dict]) -> bool:
+    """Whether a dispatch that guards the run branch will still check it: one with no result
+    yet, a card's current dispatch whose result is not acted on yet (`reported`), the latest
+    run-level dispatch whose result is not settled, or a violation not restored yet. Its guard
+    then deals with a moved run branch (a violation), not this check."""
+    run_ref = f"refs/heads/{ctx.branch}"
+    found = {(e.get("dispatch_id"), e.get("n")) for e in events
+             if e["kind"] == "violation" and e.get("stage") == "found" and _by(e) != "implementer"}
+    restored = {(e.get("dispatch_id"), e.get("n")) for e in events
+                if e["kind"] == "violation" and e.get("stage") == "restored" and _by(e) != "implementer"}
+    if found - restored:
+        return True
+    index = _dispatches(events)
+    cards = fold_cards(events, ctx.numbers)
+    # Card states whose current dispatch `_step` hands to `_after_result` (which checks its guard).
+    current = {c.dispatch_id for c in cards.values()
+               if c.state in ACTIVE_STATES and c.state not in ("reviewed", "integrating", "accepting")
+               and not (c.state == "fixing" and c.dispatch_kind != "fix")}
+    runs = _run_dispatches(index)
+    for d in index.values():
+        if run_ref not in (d.req.get("refs") or {}):
+            continue
+        if d.req.get("card") is not None:
+            if d.id in current:
+                return True
+        elif runs and d.id == runs[-1].id:
+            settled = any(e.get("dispatch_id") == d.id and e["kind"] in ("gate_result", "verdict_recorded")
+                          for e in events)
+            if d.result is None or not settled:
+                return True
+    return False
 
 
 def _card_summary(ctx: _Run, cards: dict[int, CardState]) -> list[dict]:
@@ -631,8 +688,9 @@ def _request(ctx: _Run, c: CardState, events: list[dict], *, kind: str, attempt:
             if kind == "verify" and extra.get("tip") != guard["expected_head"]:
                 raise EngineError(f"card {c.number}: verify of {extra.get('tip')} requested, but the card "
                                   f"branch is at {guard['expected_head']}")
-        elif kind == "integrate" or (kind in ("answer", "continue") and _integrate_origin(_dispatches(events), resume)):
-            # An integrate worker rewrites the card branch, but must leave the run branch alone.
+        elif kind in IMPLEMENTER_KINDS:
+            # An implementer-side worker commits on (an integrate worker rewrites) the card branch,
+            # but must leave the run branch alone: moving it is a violation (I4).
             run_ref = f"refs/heads/{ctx.branch}"
             guard = {"refs": {run_ref: head(ctx.ws, run_ref)}, "ref_scope": [run_ref]}
         if kind in IMPLEMENTER_KINDS:
@@ -2094,6 +2152,9 @@ def _end(ctx: _Run, events: list[dict], *, blocked_reason: str | None = None, op
                and (run_tip is None or not is_ancestor(ctx.ws, e["sha"], run_ref))]
     if missing and not unreconciled:
         unreconciled = f"accepted work missing from the run branch: {', '.join(missing)}"
+    if run_tip is not None and not unreconciled:
+        # Only acceptance moves the run branch: anything else on it is unaccepted work (I4).
+        unreconciled = _run_head_problem(ctx, events)
     if not (blocked_reason or cancelled or unreconciled or verification_failed):
         waiting = _waiting_on_decisions(ctx, cards, events)
         if waiting:
