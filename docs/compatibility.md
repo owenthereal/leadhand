@@ -228,13 +228,78 @@ are not blocked:
   the runtime findings above), so a worker cannot commit there. Should a Codex version let
   it write there, a worker could plant hooks or config. Leadhand's own Git calls (the
   engine's, and the runner's commits) run with `core.hooksPath=/dev/null`,
-  `core.fsmonitor=false` and `diff.ignoreSubmodules=all`, so no hook, fsmonitor command or
-  nested repository's setting runs in them; the operator's own Git commands in the
-  repository are not protected.
+  `core.fsmonitor=false`, `diff.ignoreSubmodules=all` and an empty `filter.lfs.smudge` and
+  `filter.lfs.process` (`filter.lfs.required=false`, `GIT_LFS_SKIP_SMUDGE=1`), so no hook,
+  fsmonitor command, git-lfs filter or nested repository's setting runs in them; the
+  operator's own Git commands in the repository are not protected.
 - Tokens for other hosts: only the GitHub token variables are removed. Others, such as
   `GITLAB_TOKEN`, `BITBUCKET_TOKEN` or a cloud provider's credentials, pass through to
   the Codex worker unchanged.
 - A push to a local path needs no credentials and still works.
+
+## Security
+
+The supervisor runs the leadhand CLI outside Claude Code's sandbox (the `"<cli> *"`
+exclusion), so any Claude worker of the session can run it too. What the CLI checks:
+
+- `dispatch`, `stop-dispatch` and `dispatch-runner` act only on one run. With
+  `$LEADHAND_RUN_DIR` set (every command of a supervisor session, and every runner its
+  `dispatch` starts), the run directory must be that one, and `$LEADHAND_RUN_ID`, when set, its
+  run ID. Without it (direct use from an operator's terminal), the run directory must hold a
+  `run.json` with a run ID, and no live supervisor may own it: `holder.json`, when present,
+  must name the same run ID and a supervisor that is no longer running (pid and start time),
+  because that supervisor's own commands carry the variable. Either way the run directory may
+  not lie inside its own workspace or repository; the worker's `--cwd` must be the run's
+  workspace or its evidence base worktree; the brief and report must resolve under
+  `<cwd>/.leadhand/`; a worker folder must resolve to `<run>/workers/<dispatch id>` (no
+  symlink out of the run); and the runner and its commit re-check the request.
+- The runner always starts the `codex` found on `PATH`; `request.json` never names an
+  executable.
+- `record result --reply-file` reads only the dispatch's own reply file, never through a
+  symlink.
+- `run` refuses a CLI or `--plugin-dir` inside the run's workspace, and `start` an in-place
+  run of the repository that holds the CLI.
+- The evidence base worktree is reset only when neither it nor a folder between the
+  repository and it is a symlink.
+- Leadhand's Git calls never run the git-lfs filter. Files under LFS are pointer files in
+  leadhand's own checkouts, and a runner commit stores an LFS-tracked file as it is, without
+  the clean filter. Checking out a run branch in your own checkout runs your filters: review
+  changes to `.gitattributes` and `.lfsconfig` first.
+
+Known limits, until Plan 2's run guard (a caller check on the CLI):
+
+- Config-defined commands (M2): filter, merge and diff drivers other than git-lfs,
+  `core.sshCommand`, `core.editor`, `gpg.program` and `include.path` in the repository's Git
+  config still run in leadhand's Git calls, and any filter driver in the operator's config
+  runs on files a worker routes to it through `.gitattributes`. Today the Claude Code
+  sandbox denies writes to the repository config and Codex keeps the Git directory
+  read-only; a Codex release that honours `--add-dir <git common dir>` would open it.
+- Escaped Codex processes (M4): a double-forked child of a Codex worker escapes the
+  process tracker, outlives "stopped", and can still rewrite reports and briefs in the
+  workspace's `.leadhand/`, for example a later reviewer's verdict.
+- Credentials (M5): Claude workers get no stripping at all; they share the supervisor's
+  environment (tokens, `SSH_AUTH_SOCK`, the keychain helper through Git) and only the
+  operator's sandbox network policy stands in the way. A Codex worker can read credential
+  files such as `~/.netrc` or the gh hosts file and run credential helpers directly;
+  network-off is the barrier. The runner commits whatever a Codex worker writes, without
+  hooks or secret scanning. The parent's `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` entries (for
+  example an `http.<url>.extraHeader` with a token) are copied into Codex's environment and
+  onto Codex's command line, where `ps` shows them.
+- Run forgery (M6): a worker can run any other CLI step for its own run (`record`, `next`,
+  `unpark`, `pause`, `cancel`) and so pass its own gates, and `start --repo` reaches any
+  repository the operator owns.
+- Symlinked scratch folders (L2): the engine writes briefs and removes stale reports in
+  `<workspace>/.leadhand/` without checking every folder for symlinks; the file names are
+  fixed.
+- The run lock (L3): every command of the session inherits the `run.lock` descriptor, and
+  unlocking it drops the lock; a relaunch is still refused while the supervisor lives.
+- Test hooks (L4): `LEADHAND_TESTING=1` turns on test-only behaviour (crash points, a fake
+  Codex binary) that an environment-prefixed command could reach if the exclusion matched it.
+- The exclusion matcher (L5): whether `"<cli> *"` also matches prefixed or compound commands
+  (`VAR=x <cli> …`, `env -u LEADHAND_RUN_DIR <cli> …`, `<cli> …; x`) is not established; a
+  match would let a worker change the variables the checks above rely on.
+- Terminal escapes (L7): worker text reaches `status`, `next` output and handoff lines with
+  no control-character filtering.
 
 ## End to end
 
