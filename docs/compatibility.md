@@ -244,6 +244,27 @@ directory unrelated to the repository.
   write the run directory (the reply-file route above); a Codex implementer could not commit
   (the runner-commits rule under Worker lifecycle).
 
+## Interrupted end to end
+
+Same tools and fixture as above, with two interruptions: card 2's Codex worker was SIGKILLed
+about 1 s after it started, and the supervisor session was SIGKILLed while card 2's second
+attempt (a detached runner) was running. The run reached outcome `complete` after a relaunch
+with the `launch-line` command; each card was accepted once and the run branch had no
+duplicate commits.
+
+- A Codex killed before its first response leaves a rollout with no `token_usage_record`. The
+  attempt is charged as unknown and possibly incomplete (not zero), the report's
+  `Attempts with unknown usage` counts it, and the other threads' charges equal their rollout
+  totals.
+- A relaunch while the supervisor lives is refused (exit 3, "Run already in progress",
+  nothing written to the event log). Once the supervisor is gone the relaunch succeeds within
+  seconds, so the run lock is released with the supervisor.
+- A detached runner outlives its killed supervisor, keeps its process and generation, and
+  writes its result; the resumed supervisor folds that result in instead of restarting the
+  worker, and shows `Resumed at card 2; card 2's Codex worker is still running; waiting for it`.
+- The resumed headless `-p` session waited through the running Codex worker (about 99 s
+  without a model turn) and exited only after the outcome was recorded.
+
 ## Interrupted usage
 
 Tested with Claude Code 2.1.322 and codex-cli 0.167.0 on macOS.
