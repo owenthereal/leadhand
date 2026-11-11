@@ -999,8 +999,10 @@ def _after_result(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
         if fix is not None:
             return _after_fix(ctx, c, d, fix, events, index)
         card = ctx.card(c.number)
-        if ctx.config.run.card_review == "by-risk" and card.risk == "low" and not card.hard:
-            _accept(ctx, c.number, r.get("tip") or c.tip)
+        tip = r.get("tip") or c.tip
+        if (ctx.config.run.card_review == "by-risk" and card.risk == "low" and not card.hard
+                and tip != _attempt_start_tip(index, c, d.req["attempt"])):
+            _accept(ctx, c.number, tip)
         else:
             _request_review(ctx, c, events, d)
         return None
@@ -1019,6 +1021,15 @@ def _after_result(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
         _escalate(ctx, c, events, index, "ended SPENT")
         return None
     return _worker_failed(ctx, c, d, events, index)
+
+
+def _attempt_start_tip(index: dict[str, _Dispatch], c: CardState, attempt: int) -> str | None:
+    """Where the card branch stood when the attempt's first implementer-side dispatch was
+    requested (else the card's base). A READY at that tip changed nothing: with
+    `card_review = "by-risk"` it still goes to review, never straight to acceptance (I8)."""
+    first = sorted(_card_dispatches(index, c.number, attempt=attempt, kinds=IMPLEMENTER_KINDS),
+                   key=lambda x: x.req["seq"])
+    return (first[0].req.get("start_tip") if first else None) or c.base
 
 
 def _worker_failed(ctx: _Run, c: CardState, d: _Dispatch, events: list[dict],
