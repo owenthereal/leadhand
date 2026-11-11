@@ -782,6 +782,48 @@ class RunnerCommitTests(Base):
         self.assertIn("deadline", out["commit_error"])
         self.assertEqual(run_git(self.repo, "rev-parse", "HEAD"), self.base_sha)
 
+    def test_externally_killed_codex_is_possibly_incomplete_and_partial_work_committed(self):
+        req = self.commit_request()
+        self.write_scenario([{"type": "thread.started", "thread_id": "{thread}"}, {"type": "turn.started"},
+                             {"action": "write_file", "path": "src/widget.py", "text": "WIDGET = 1\n"},
+                             {"type": "item.completed", "item": {"id": "c1", "type": "command_execution",
+                                                                 "status": "completed"}},
+                             {"action": "sleep", "seconds": 60}])
+        codex = self.start_detached(req)
+        wait_for(lambda: (self.repo / "src" / "widget.py").exists())
+        os.kill(codex["pid"], signal.SIGKILL)          # from outside, like Task 22
+        result = dispatch(req, wait=30)
+        self.assertEqual((result.status, result.exit_reason), ("SPENT", "interrupted"))
+        [c] = [json.loads(l) for l in (self.run_dir / "charges.jsonl").read_text().splitlines()]
+        self.assertTrue(c.get("possibly_incomplete"))
+        [attempt] = read_attempts(run_paths(self.run_dir))
+        self.assertTrue(attempt["possibly_incomplete"])
+        saved = json.loads((self.worker_dir() / "result.json").read_text())
+        self.assertTrue(saved["possibly_incomplete"])
+        self.assertEqual(saved["committed"], run_git(self.repo, "rev-parse", "HEAD"))
+        self.assertIn("src/widget.py", self.head_files())
+
+    def test_exit_without_final_turn_completed_is_possibly_incomplete(self):
+        req = self.commit_request()
+        self.write_scenario([{"type": "thread.started", "thread_id": "{thread}"}, {"type": "turn.started"},
+                             {"type": "turn.completed", "usage": {"input_tokens": 5, "cached_input_tokens": 0,
+                                                                  "output_tokens": 1}},
+                             {"type": "turn.started"},
+                             {"action": "last_message", "text": "Status: READY\n"}])
+        result = dispatch(req)
+        self.assertEqual(result.status, "READY")
+        [c] = [json.loads(l) for l in (self.run_dir / "charges.jsonl").read_text().splitlines()]
+        self.assertTrue(c.get("possibly_incomplete"))
+        self.assertTrue(read_attempts(run_paths(self.run_dir))[0]["possibly_incomplete"])
+
+    def test_complete_run_is_not_possibly_incomplete(self):
+        req = self.commit_request()
+        self.edits(req)
+        dispatch(req)
+        [c] = [json.loads(l) for l in (self.run_dir / "charges.jsonl").read_text().splitlines()]
+        self.assertFalse(c.get("possibly_incomplete"))
+        self.assertFalse(read_attempts(run_paths(self.run_dir))[0]["possibly_incomplete"])
+
     def test_wrong_branch_is_not_committed(self):
         req = self.commit_request()
         run_git(self.repo, "checkout", "--quiet", "-b", "somewhere-else")

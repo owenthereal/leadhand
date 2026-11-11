@@ -328,6 +328,7 @@ class _Stream:
         self.events: list[dict] = []
         self.steps = 0
         self.thread_id: str | None = None
+        self.turn_open = False      # a turn.started not (yet) followed by its turn.completed
 
     def poll(self) -> None:
         try:
@@ -350,6 +351,10 @@ class _Stream:
     def _add(self, ev: dict) -> None:
         self.events.append(ev)
         kind = ev.get("type")
+        if kind == "turn.started":
+            self.turn_open = True
+        elif kind == "turn.completed":
+            self.turn_open = False
         if kind == "thread.started" and isinstance(ev.get("thread_id"), str) and self.thread_id is None:
             self.thread_id = ev["thread_id"]
         elif kind == "item.completed":
@@ -699,6 +704,10 @@ def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_
             blocked_by = "environment"     # Codex could not be started at all
         if keep_raw:
             (wd / RAW).write_text(reply, encoding="utf-8")
+        # Usage may be missing a response when Codex was stopped (by leadhand or by a signal
+        # from anyone else) or ended without the turn.completed of its last turn (R41b).
+        incomplete = launched and (stopped_for is not None or (codex_exit is not None and codex_exit < 0)
+                                   or stream.turn_open)
         commit = (_commit_work(wd, req, deadline=deadline) if launched
                   else {"committed": None, "changes": False, "commit_skipped": "Codex never ran"})
         failed = commit_failed(commit)
@@ -710,7 +719,7 @@ def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_
             commit["worker_status"], commit["worker_exit_reason"] = status, exit_reason
             status, blocked_by, exit_reason = "BLOCKED", "environment", "error"
         usage, charge_ids, source = _charge_usage(req, wd, thread=stream.thread_id, launched=launched,
-                                                  generation=generation, stopped=stopped_for is not None,
+                                                  generation=generation, stopped=incomplete,
                                                   stream=stream)
         crash_point("after_charge_before_attempt")
         ended_at = utc_now()
@@ -723,7 +732,7 @@ def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_
             "ended_at": ended_at, "steps": stream.steps, "charge_ids": charge_ids,
             "usage": usage_dict(usage), "usage_known": usage.known, "usage_source": source,
             "cost_estimate": cost, "exit_reason": exit_reason, "status": status, "blocked_by": blocked_by,
-            "generation": generation,
+            "generation": generation, "possibly_incomplete": incomplete,
         }
         paths = run_paths(req.run_dir)
         with state_lock(paths):
@@ -737,7 +746,7 @@ def _finalize(wd: Path, req: DispatchRequest, *, stopped_for: str | None, codex_
             "dispatch_id": req.dispatch_id, "status": status, "blocked_by": blocked_by,
             "session_id": stream.thread_id, "reply": reply, "steps": stream.steps,
             "usage": usage_dict(usage), "usage_known": usage.known, "usage_source": source,
-            "exit_reason": exit_reason, "codex_exit": codex_exit, "charge_ids": charge_ids,
+            "possibly_incomplete": incomplete, "exit_reason": exit_reason, "codex_exit": codex_exit, "charge_ids": charge_ids,
             "generation": generation, "stopped": stopped, "confirmed_at": time.time(),
             "cancel_token": ((_read_json(wd / CANCEL) or {}).get("token")
                              if exit_reason == "cancelled" else None),
