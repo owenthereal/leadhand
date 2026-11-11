@@ -25,8 +25,13 @@ Tested with Claude Code 2.1.322 and tmux 3.8 on macOS.
   before the process exits. Decision: end-to-end tests drive the supervisor headless, read
   the stream until the process exits, and use the result with the highest `result_index`.
   Only one background worker was observed at a time, and it finished about 1.2 s after the
-  main turn ended. Open check for Tasks 20 and 22: `-p` with a worker that outlives the main
-  turn by tens of seconds or more.
+  main turn ended. Confirmed end to end (Claude Code 2.1.322, a complete two-card run, 7
+  dispatches, one process of about 275 s): the headless `-p` supervisor stayed alive while
+  background workers ran and exited only after the run's outcome was recorded. In that run
+  every wait after a `result` record was under a second, because the supervisor polled with
+  the CLI's `timer` command; a failed earlier run showed a session sitting 570 s after a
+  `result` record before the next stream line, so `-p` does not exit merely because the
+  workers are slow. Not established: a worker silent for much longer than that.
 - Interactive launch in tmux works. The workspace trust dialog's default choice is
   "No, exit"; a driver must select "Yes, I trust this folder" (Down, then Enter) after
   checking the highlighted line.
@@ -37,13 +42,15 @@ Tested with Claude Code 2.1.322 and tmux 3.8 on macOS.
   arguments, no redirection, pipes or command chains). Not established: whether the overlay
   merges with or replaces the user's own `excludedCommands` (the user-exclusion control used
   a command with a redirection, which ran sandboxed even without the overlay).
-- In the first end-to-end run, the `"<cli path> *"` exclusion matched every plain
-  `<cli> …` invocation, including ones whose run-directory argument was single-quoted because
-  it contained spaces, but not a command with a heredoc (`<cli> record … --reply - <<'EOF'`):
+- In end-to-end runs (31 CLI calls in the complete run, none sandboxed, while control
+  commands such as `printenv` did run sandboxed), the `"<cli path> *"` exclusion matched every
+  plain `<cli> …` invocation, including ones whose run-directory argument was single-quoted
+  because it contained spaces, but not a command with a heredoc (`<cli> record … --reply - <<'EOF'`):
   that one ran sandboxed and could not write the run directory. Decision: the supervisor
   never uses heredocs, pipes or redirects. It writes a worker's reply to the dispatch's
   `reply_file` (a git-ignored file in the workspace) with its Write tool and records it with
-  the plain command `<cli> record <run dir> result … --reply-file '<path>'`.
+  the plain command `<cli> record <run dir> result … --reply-file '<path>'`. The complete run
+  used no heredoc `record` call, so the reply-file route is the one confirmed working.
 - Not established: whether the `"<cli path> *"` exclusion matches when the CLI's path contains
   spaces (the supervisor then has to quote it). Until an end-to-end run shows it does,
   `leadhand run` warns when the CLI path contains whitespace: install leadhand under a path
@@ -193,6 +200,13 @@ Codex workers (`codex exec --json`):
   variables through `shell_environment_policy.set`. Under the default policy, other
   variables from the launching environment (for example `SSH_AUTH_SOCK`) also reach the
   worker shell.
+- Push and `gh` blocking confirmed inside a real Codex shell (a worker started by the real
+  dispatcher, with a host control showing the same pushes succeed outside Codex): `git push`
+  to an `ssh://` remote, an SCP-style remote and a remote with an explicit `pushurl` all
+  failed with exit 128 ("Could not read from remote repository") before any SSH process ran
+  (`GIT_SSH_COMMAND=false`), and `gh auth status` exited 1 ("not logged into any GitHub
+  hosts") with `GH_CONFIG_DIR` set to the per-dispatch empty folder. Nothing reached any
+  target remote.
 - `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=credential.helper`, `GIT_CONFIG_VALUE_0=` adds an
   empty `credential.helper` entry after the user's helpers, which resets Git's helper list.
 
@@ -209,6 +223,26 @@ are not blocked:
   folder for commits), so it can plant hooks that later run in the operator's own Git
   commands.
 - A push to a local path needs no credentials and still works.
+
+## End to end
+
+Tested with Claude Code 2.1.322, codex-cli 0.167.0 and tmux 3.8 on macOS, headless, from a
+directory unrelated to the repository.
+
+- A two-card run (card 1 pinned to `claude sonnet low`, card 2 to `codex gpt-6-luna medium`,
+  depending on card 1) reached outcome `complete` in about 266 s with the supervisor driven by
+  `claude -p`. Both cards' commits were on the run branch, every gate (final review, evidence,
+  verify) passed on the run head, and `report.md` was written by the run itself.
+- The Agent tool accepted the route model names (`sonnet`, `haiku`) and efforts; workers ran
+  on the requested models. `leadhand:run` loaded through the Skill tool.
+- Every worker, Claude and Codex, ran in the run's workspace (or the evidence base worktree).
+  No `git push` or `gh pr` command ran, and the fixture's origin was unchanged.
+- Usage was recorded for every attempt, including the supervisor and the Claude proxy that
+  relays each Codex dispatch; the report prices Claude only and reports the Codex meter before
+  and after.
+- Runs that failed before it, and what changed: a heredoc `record` ran sandboxed and could not
+  write the run directory (the reply-file route above); a Codex implementer could not commit
+  (the runner-commits rule under Worker lifecycle).
 
 ## Interrupted usage
 
