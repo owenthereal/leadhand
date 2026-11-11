@@ -323,12 +323,16 @@ def _runs(docs: Path) -> list[tuple[Path, dict]]:
     return out
 
 
-def _find_unfinished(docs: Path, source: str, digest: str) -> Path | None:
-    """The newest run of this deck that has no outcome, or whose latest outcome is blocked
-    (a blocked run continues, R25)."""
+def _find_unfinished(docs: Path, source: str, digest: str, repo: Path) -> Path | None:
+    """The newest run of this deck in this repository that has no outcome, or whose latest
+    outcome is blocked (a blocked run continues, R25). A run of another repository (a second
+    clone sharing the docs_dir) is never returned."""
     found = []
+    real_repo = os.path.realpath(repo)
     for root, meta in _runs(docs):
         if meta.get("deck_source") != source or meta.get("deck_digest") != digest:
+            continue
+        if not isinstance(meta.get("repo"), str) or os.path.realpath(meta["repo"]) != real_repo:
             continue
         try:
             ended = _ended(read_events(run_paths(root)))
@@ -379,7 +383,7 @@ def _start(deck_path: Path, repo: Path, config: Config | None, new: bool) -> tup
             raise EngineError(problem)
     docs = docs_dir_for(config, repo)
     if not new:
-        existing = _find_unfinished(docs, str(deck_path), deck.digest)
+        existing = _find_unfinished(docs, str(deck_path), deck.digest, repo)
         if existing is not None:
             return existing, True, f"existing run: {existing}"
 

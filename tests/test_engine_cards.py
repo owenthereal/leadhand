@@ -352,6 +352,25 @@ class Start(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn(f"existing run: {third}", r.stdout)
 
+    def test_start_never_reuses_an_unfinished_run_of_another_clone(self):
+        # Two clones share the docs_dir and the deck file: start against the second clone
+        # must create its own run, not return the first clone's.
+        w = FakeWorld(self, [card(1)])
+        first = w.start()
+        clone = w.tmp / "second clone"
+        run_git(w.tmp, "clone", "--quiet", str(w.repo), str(clone))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            second = engine.start(w.deck_path, repo=clone)
+        self.assertNotEqual(second, first, out.getvalue())
+        self.assertNotIn("existing run", out.getvalue())
+        meta = json.loads((second / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["repo"], str(clone.resolve()))
+        self.assertTrue(Path(meta["workspace"]).resolve().is_relative_to(clone.resolve()))
+        # each clone still finds its own unfinished run
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(engine.start(w.deck_path, repo=w.repo), first)
+            self.assertEqual(engine.start(w.deck_path, repo=clone), second)
+
     def test_start_refuses_unsupported_settings_and_scout_cards(self):
         w = FakeWorld(self, [card(1)], config='[after_run]\nstep = "pr"\n')
         with self.assertRaises(EngineError) as cm:
