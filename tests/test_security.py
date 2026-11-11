@@ -81,10 +81,12 @@ class Anchored(Base):
         """Run the CLI as a worker in the supervisor's session would (LEADHAND_RUN_DIR set), or
         with it unset (`session=False`)."""
         e = cli_env(**env)
-        if session:
+        if session is True:
             e["LEADHAND_RUN_DIR"] = str(self.run_dir)
-        else:
+        elif session is False:
             e.pop("LEADHAND_RUN_DIR", None)
+        else:
+            e["LEADHAND_RUN_DIR"] = session
         return subprocess.run([sys.executable, "-B", str(CLI), *map(str, args)], env=e, capture_output=True,
                               text=True, timeout=60, stdin=subprocess.DEVNULL)
 
@@ -159,6 +161,23 @@ class H2ConfinedDispatch(Anchored):
             {"run_id": self.run_dir.name, "supervisor_pid": rec["pid"], "supervisor_start": rec["start"]}))
         r = self.cli(*self.dispatch_args(), session=False)
         self.assert_refused(r)
+        self.assert_nothing_ran()
+
+    def test_an_empty_session_variable_is_refused_not_read_as_unset(self):
+        # An emptied anchor is a worker clearing it, never an operator's terminal.
+        for blank in ("", " "):
+            self.assert_refused(self.cli(*self.dispatch_args(), session=blank))
+        self.assert_nothing_ran()
+        wd = self.worker_dir("y")
+        wd.mkdir(parents=True)
+        rec = self.decoy()
+        (wd / "request.json").write_text(json.dumps(dsp.request_to_json(self.request("y"))))
+        (wd / "runner.json").write_text(json.dumps({"runner": rec, "codex": rec, "generation": 1}))
+        self.assert_refused(self.cli("stop-dispatch", self.run_dir, "--dispatch", "y", session=""))
+        time.sleep(0.3)
+        self.assertTrue(alive(rec["pid"]))
+        (wd / "runner.json").unlink()
+        self.assert_refused(self.cli("dispatch-runner", wd, session=""))
         self.assert_nothing_ran()
 
     def test_run_dir_inside_its_own_workspace_is_refused(self):
@@ -254,21 +273,57 @@ class M1ConfinedStop(Anchored):
         self.assert_nothing_ran()
 
 
+FAKE_LFS = """\
+import hashlib, os, re, sys
+from pathlib import Path
+# A git-lfs stand-in for single-file clean/smudge: clean stores content and prints a pointer;
+# smudge prints stored content, prints the pointer as is under GIT_LFS_SKIP_SMUDGE=1 (as
+# git-lfs does), and otherwise "fetches" the object from .lfsconfig's URL: logged, then failed.
+STORE, LOG = Path(sys.argv[1]), Path(sys.argv[2])
+POINTER = b"version https://git-lfs.github.com/spec/v1\\n"
+data = sys.stdin.buffer.read()
+if sys.argv[3] == "clean":
+    if data.startswith(POINTER):
+        out = data
+    else:
+        oid = hashlib.sha256(data).hexdigest()
+        STORE.mkdir(exist_ok=True)
+        (STORE / oid).write_bytes(data)
+        out = POINTER + f"oid sha256:{oid}\\nsize {len(data)}\\n".encode()
+else:
+    oid = re.search(rb"oid sha256:([0-9a-f]{64})", data)
+    if not data.startswith(POINTER) or os.environ.get("GIT_LFS_SKIP_SMUDGE") == "1":
+        out = data
+    elif oid and (STORE / oid.group(1).decode()).exists():
+        out = (STORE / oid.group(1).decode()).read_bytes()
+    else:
+        url = Path(".lfsconfig").read_text() if Path(".lfsconfig").exists() else ""
+        with open(LOG, "a") as f:
+            f.write("FETCH " + " ".join(url.split()) + "\\n")
+        sys.exit(1)
+sys.stdout.buffer.write(out)
+"""
+
+
 class H3FilterDrivers(Base):
-    """H3: a worker's .gitattributes and .lfsconfig never make leadhand's own Git calls run the
-    operator's git-lfs filter (a smudge POSTs to the URL in .lfsconfig, outside every sandbox)."""
+    """H3: a worker's .gitattributes and .lfsconfig never make leadhand's own Git calls fetch
+    LFS objects (a smudge POSTs to the URL in .lfsconfig, outside every sandbox), while the
+    operator's LFS clean filter keeps working (follow-up: no LFS file reads as modified)."""
 
     def setUp(self):
         super().setUp()
-        self.marker = self.tmp / "FILTER RAN"
-        fake = self.tmp / "fake-lfs"
-        fake.write_text(f'#!/bin/sh\necho "$* GIT_LFS_SKIP_SMUDGE=$GIT_LFS_SKIP_SMUDGE" >> "{self.marker}"\n'
-                        'cat\n')
-        fake.chmod(0o755)
-        # The operator's global configuration, as `git lfs install` writes it, isolated to this test.
+        self.fetch_log = self.tmp / "LFS FETCHES"
+        fake = self.tmp / "fake-lfs.py"
+        fake.write_text(FAKE_LFS)
+        store = self.tmp / "lfs store"
+        cmd = f"'{sys.executable}' '{fake}' '{store}' '{self.fetch_log}'"
+        self.filters = (f"filter.lfs.clean={cmd} clean", f"filter.lfs.smudge={cmd} smudge",
+                        "filter.lfs.required=true")
+        # The operator's global configuration, as `git lfs install` writes it (single-file form),
+        # isolated to this test.
         config = self.tmp / "global gitconfig"
-        config.write_text(f"[filter \"lfs\"]\n\tclean = '{fake}' clean -- %f\n\tsmudge = '{fake}' smudge -- %f\n"
-                          f"\tprocess = '{fake}' filter-process\n\trequired = true\n")
+        config.write_text("[filter \"lfs\"]\n" + "".join(
+            f"\t{f.split('=', 1)[0].removeprefix('filter.lfs.')} = {f.split('=', 1)[1]}\n" for f in self.filters))
         self.base_sha = run_git(self.repo, "rev-parse", "HEAD")
         # The worker's commit (made here without any filter, as the runner's commit would be).
         run_git(self.repo, "checkout", "--quiet", "-b", CARD_BRANCH)
@@ -283,17 +338,21 @@ class H3FilterDrivers(Base):
         os.environ["GIT_CONFIG_GLOBAL"] = str(config)
         os.environ.pop("GIT_LFS_SKIP_SMUDGE", None)
 
-    def assert_no_filter(self):
-        self.assertFalse(self.marker.exists(), self.marker.read_text() if self.marker.exists() else "")
+    def with_filter(self, *args):
+        """Plain git with the operator's filter (run_git shuts the global config out)."""
+        return run_git(self.repo, *[x for f in self.filters for x in ("-c", f)], *args)
 
-    def test_the_global_filter_is_live_for_plain_git(self):
-        # Control: without leadhand's options, the same checkout runs the operator's filter.
+    def assert_no_fetch(self):
+        self.assertFalse(self.fetch_log.exists(), self.fetch_log.read_text() if self.fetch_log.exists() else "")
+
+    def test_the_global_filter_fetches_for_plain_git(self):
+        # Control: without leadhand's environment, the same checkout fetches from the worker's URL.
         env = {k: v for k, v in os.environ.items() if not k.startswith("LEADHAND")}
         subprocess.run(["git", "checkout", "--quiet", CARD_BRANCH, "--"], cwd=self.repo, env=env,
                        capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
-        self.assertTrue(self.marker.exists())
+        self.assertIn("127.0.0.1:9/exfil/SECRET-DATA", self.fetch_log.read_text())
 
-    def test_checkout_reset_and_stash_run_no_filter(self):
+    def test_checkout_reset_and_stash_fetch_nothing(self):
         gitops.git(self.repo, "checkout", "--quiet", CARD_BRANCH, "--")       # engine _check_out
         self.assertTrue((self.repo / "p.bin").read_text().startswith("version https://git-lfs"))
         os.unlink(self.repo / "p.bin")                                      # a later worker deletes it
@@ -305,9 +364,9 @@ class H3FilterDrivers(Base):
         gitops.git(self.repo, "reset", "--quiet", "--hard", self.card_sha)
         gitops.git(self.repo, "stash", "create")
         gitops.status_entries(self.repo)
-        self.assert_no_filter()
+        self.assert_no_fetch()
 
-    def test_runner_git_calls_run_no_filter(self):
+    def test_runner_git_calls_fetch_nothing(self):
         gitops.git(self.repo, "checkout", "--quiet", CARD_BRANCH, "--")
         write(self.repo, {"q.bin": "new binary\n", "README.md": "changed\n"})
         req = self.request(kind="implement", branch=CARD_BRANCH)
@@ -315,15 +374,41 @@ class H3FilterDrivers(Base):
         wd.mkdir(parents=True)
         out = dsp._commit_work(wd, req)
         self.assertTrue(out["committed"], out)
-        self.assert_no_filter()
+        self.assert_no_fetch()
 
-    def test_every_call_carries_the_options_and_the_environment(self):
+    def test_every_call_carries_the_environment(self):
         for run in (lambda *a: gitops._run(self.repo, a), lambda *a: dsp._git(self.repo, *a)):
-            self.assertEqual(run("config", "--get", "filter.lfs.process").stdout.strip(), "")
-            self.assertEqual(run("config", "--get", "filter.lfs.smudge").stdout.strip(), "")
-            self.assertEqual(run("config", "--get", "filter.lfs.required").stdout.strip(), "false")
             env = run("-c", "alias.showenv=!env", "showenv").stdout
             self.assertIn("GIT_LFS_SKIP_SMUDGE=1", env.splitlines())
+
+    def lfs_checkout(self):
+        """An operator's checkout with real LFS content: big.bin committed through the clean
+        filter (a pointer in the index), its content in the work tree, its stat data stale."""
+        run_git(self.repo, "checkout", "--quiet", CARD_BRANCH)
+        write(self.repo, {"big.bin": "large binary content\n"})
+        self.with_filter("add", "big.bin")
+        self.with_filter("commit", "--quiet", "-m", "big")
+        self.assertTrue(run_git(self.repo, "cat-file", "-p", ":big.bin").startswith("version https://git-lfs"))
+        old = time.time() - 3600
+        os.utime(self.repo / "big.bin", (old, old))       # Git must re-run the clean filter to compare
+
+    def test_checked_out_lfs_content_does_not_read_as_modified(self):
+        self.lfs_checkout()
+        self.assertEqual(gitops.status_entries(self.repo), (False, []))
+        self.assertFalse(gitops._has_changes(self.repo))
+        self.assert_no_fetch()
+
+    def test_runner_commits_lfs_files_as_pointers(self):
+        self.lfs_checkout()
+        write(self.repo, {"big.bin": "changed large content\n"})
+        req = self.request(kind="implement", branch=CARD_BRANCH)
+        wd = self.worker_dir()
+        wd.mkdir(parents=True)
+        out = dsp._commit_work(wd, req)
+        self.assertTrue(out["committed"], out)
+        self.assertTrue(run_git(self.repo, "cat-file", "-p", f"{out['committed']}:big.bin")
+                        .startswith("version https://git-lfs"))
+        self.assert_no_fetch()
 
 
 class M3SymlinkedBaseWorktree(unittest.TestCase):

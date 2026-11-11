@@ -612,7 +612,7 @@ def _commit_subject(req: DispatchRequest) -> str:
 def _git(ws: Path, *args: str, timeout: float = COMMIT_TIMEOUT) -> subprocess.CompletedProcess[str]:
     env = {k: v for k, v in os.environ.items() if k not in _REPO_VARS}
     env.update(SAFE_ENV)
-    # No hooks, no fsmonitor, no look into nested repositories (R45), no git-lfs filter (H3);
+    # No hooks, no fsmonitor, no look into nested repositories (R45), no git-lfs fetch (H3);
     # output that is not UTF-8 is replaced, never fatal.
     return subprocess.run(["git", *SAFE_CONFIG, *args], cwd=ws, env=env, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=timeout)
@@ -1342,6 +1342,7 @@ def dispatch(req: DispatchRequest, *, wait: float | None = None) -> DispatchResu
 # - With $LEADHAND_RUN_DIR set (every command of a supervisor session, and every runner its
 #   `dispatch` starts): the run directory must be that one (and $LEADHAND_RUN_ID, when set,
 #   its run.json's run_id).
+# - Set but empty: refused (a cleared anchor).
 # - Without it (an operator's terminal): the run directory must hold run.json with a run_id,
 #   and no live supervisor may own it (holder.json naming the same run_id and a supervisor
 #   whose pid and start time still match): that supervisor's own commands carry the variable.
@@ -1373,6 +1374,9 @@ def anchored_run(run_dir: Path, environ: Mapping[str, str] | None = None) -> tup
     environ = os.environ if environ is None else environ
     real = os.path.realpath(run_dir)
     session = environ.get("LEADHAND_RUN_DIR")
+    if session is not None and not session.strip():
+        # Set but empty: a cleared anchor, never an operator's terminal (which has none at all).
+        raise _refuse("$LEADHAND_RUN_DIR is set but empty")
     if session and os.path.realpath(session) != real:
         raise _refuse(f"{run_dir} is not this session's run ($LEADHAND_RUN_DIR is {session})")
     meta = _read_json(Path(real) / "run.json")

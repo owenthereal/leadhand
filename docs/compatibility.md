@@ -228,9 +228,8 @@ are not blocked:
   the runtime findings above), so a worker cannot commit there. Should a Codex version let
   it write there, a worker could plant hooks or config. Leadhand's own Git calls (the
   engine's, and the runner's commits) run with `core.hooksPath=/dev/null`,
-  `core.fsmonitor=false`, `diff.ignoreSubmodules=all` and an empty `filter.lfs.smudge` and
-  `filter.lfs.process` (`filter.lfs.required=false`, `GIT_LFS_SKIP_SMUDGE=1`), so no hook,
-  fsmonitor command, git-lfs filter or nested repository's setting runs in them; the
+  `core.fsmonitor=false`, `diff.ignoreSubmodules=all` and `GIT_LFS_SKIP_SMUDGE=1`, so no
+  hook, fsmonitor command, git-lfs fetch or nested repository's setting runs in them; the
   operator's own Git commands in the repository are not protected.
 - Tokens for other hosts: only the GitHub token variables are removed. Others, such as
   `GITLAB_TOKEN`, `BITBUCKET_TOKEN` or a cloud provider's credentials, pass through to
@@ -245,7 +244,7 @@ exclusion), so any Claude worker of the session can run it too. What the CLI che
 - `dispatch`, `stop-dispatch` and `dispatch-runner` act only on one run. With
   `$LEADHAND_RUN_DIR` set (every command of a supervisor session, and every runner its
   `dispatch` starts), the run directory must be that one, and `$LEADHAND_RUN_ID`, when set, its
-  run ID. Without it (direct use from an operator's terminal), the run directory must hold a
+  run ID. Set but empty, it is refused. Without it (direct use from an operator's terminal), the run directory must hold a
   `run.json` with a run ID, and no live supervisor may own it: `holder.json`, when present,
   must name the same run ID and a supervisor that is no longer running (pid and start time),
   because that supervisor's own commands carry the variable. Either way the run directory may
@@ -261,10 +260,12 @@ exclusion), so any Claude worker of the session can run it too. What the CLI che
   run of the repository that holds the CLI.
 - The evidence base worktree is reset only when neither it nor a folder between the
   repository and it is a symlink.
-- Leadhand's Git calls never run the git-lfs filter. Files under LFS are pointer files in
-  leadhand's own checkouts, and a runner commit stores an LFS-tracked file as it is, without
-  the clean filter. Checking out a run branch in your own checkout runs your filters: review
-  changes to `.gitattributes` and `.lfsconfig` first.
+- Leadhand's Git calls run with `GIT_LFS_SKIP_SMUDGE=1`, so git-lfs never fetches an object
+  (from a URL a worker's `.lfsconfig` could choose). Files under LFS are pointer files in
+  leadhand's own checkouts; the clean filter stays on, so checked-out LFS content does not
+  read as modified and runner commits store LFS files as pointers. Checking out a run branch
+  in your own checkout fetches with your settings: review changes to `.gitattributes` and
+  `.lfsconfig` first.
 
 Known limits, until Plan 2's run guard (a caller check on the CLI):
 
@@ -294,10 +295,15 @@ Known limits, until Plan 2's run guard (a caller check on the CLI):
 - The run lock (L3): every command of the session inherits the `run.lock` descriptor, and
   unlocking it drops the lock; a relaunch is still refused while the supervisor lives.
 - Test hooks (L4): `LEADHAND_TESTING=1` turns on test-only behaviour (crash points, a fake
-  Codex binary) that an environment-prefixed command could reach if the exclusion matched it.
+  Codex binary through `LEADHAND_TEST_CODEX_BIN`) that an environment-prefixed command could
+  reach if the exclusion matched it.
 - The exclusion matcher (L5): whether `"<cli> *"` also matches prefixed or compound commands
-  (`VAR=x <cli> …`, `env -u LEADHAND_RUN_DIR <cli> …`, `<cli> …; x`) is not established; a
-  match would let a worker change the variables the checks above rely on.
+  (`VAR=x <cli> …`, `env -u LEADHAND_RUN_DIR <cli> …`, `<cli> …; x`) is not established. If
+  it ever matched an environment-prefixed command, a worker could unset or replace
+  `LEADHAND_RUN_DIR` (or set the L4 test variables) on a command that still runs outside the
+  sandbox, which clears the run anchor and re-opens the escapes fixed above: a Codex binary
+  of its choosing, a writable root in another repository, signals to any process, commits in
+  any repository. This must be checked end to end before Plan 2 relies on the exclusion.
 - Terminal escapes (L7): worker text reaches `status`, `next` output and handoff lines with
   no control-character filtering.
 

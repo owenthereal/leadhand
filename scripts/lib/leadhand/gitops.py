@@ -26,15 +26,12 @@ NO_SIGN = ("-c", "commit.gpgsign=false")
 # Passed on every Git call leadhand makes (ruling R45): no repository hook, no fsmonitor
 # command (also a nested repository's: command-line config reaches Git's child processes),
 # and nested repositories are never looked into.
-#
-# Also no git-lfs filter (security review H3): a worker's .gitattributes can route any file
-# through the operator's global `filter.lfs`, and its .lfsconfig picks the URL a smudge
-# contacts, outside every sandbox. An empty `process` and `smudge` (and `required` off) make
-# Git skip the driver for checkout, reset, stash, status and add; GIT_LFS_SKIP_SMUDGE (SAFE_ENV)
-# covers a git-lfs that still runs. Files under LFS stay pointer files in leadhand's checkouts.
-SAFE_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "diff.ignoreSubmodules=all",
-               "-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false")
-# Set in the environment of every Git call leadhand makes.
+SAFE_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "diff.ignoreSubmodules=all")
+# Set in the environment of every Git call leadhand makes. GIT_LFS_SKIP_SMUDGE (security review
+# H3): a worker's .gitattributes can route any file through the operator's git-lfs filter, and
+# its .lfsconfig picks the URL a smudge would fetch from, outside every sandbox; with it git-lfs
+# leaves pointer files in leadhand's checkouts and fetches nothing. The filter itself stays on,
+# so its clean side keeps LFS files from reading as modified and commits them as pointers.
 SAFE_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"}
 # Variables that would point Git at another repository than the cwd.
 _REPO_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
