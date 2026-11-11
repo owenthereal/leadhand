@@ -1,10 +1,13 @@
 """Engine: commit-bound end-of-run gates, bounded fix waves, the outcome and the report."""
+import os
 import re
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from fakeworld import FakeWorld, card
+from fakeworld import CLI, FakeWorld, card
 from gitfixture import commit, run_git, write
 from leadhand import engine
 from leadhand.state import append_event, read_events
@@ -93,6 +96,29 @@ class Complete(unittest.TestCase):
         self.assertEqual(cells[3], "2/2 cards")
         self.assertRegex(cells[4], r"^(\$\d+\.\d\d|unknown)$")
         self.assertEqual(cells[5], str(w.run_dir))
+
+
+class RelativeDocsDir(unittest.TestCase):
+    def test_relative_docs_dir_resolves_against_the_repository_from_any_cwd(self):
+        # `start --repo` from another directory and the wrap-up run from the workspace must
+        # use one docs dir: the repository-relative one.
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.config_file.write_text('docs_dir = "../notes/{repo}"\n', encoding="utf-8")
+        w.docs = (w.repo.parent / "notes" / w.repo.name).resolve()
+        elsewhere = w.tmp / "a" / "b"
+        elsewhere.mkdir(parents=True)
+        r = subprocess.run([sys.executable, "-B", str(CLI), "start", str(w.deck_path), "--repo", str(w.repo)],
+                           cwd=elsewhere, capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        run_line = [ln for ln in r.stdout.splitlines() if ln.startswith("run: ")]
+        self.assertEqual(len(run_line), 1, r.stdout)
+        w.run_dir = Path(run_line[0][len("run: "):])
+        self.assertEqual(w.run_dir.parent.parent, w.docs)
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(w.workspace())
+        w.run()
+        self.assertEqual(len(runs_lines(w)), 1, sorted(str(p) for p in w.tmp.rglob("runs.md")))
 
 
 class FixWaves(unittest.TestCase):

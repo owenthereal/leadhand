@@ -285,8 +285,12 @@ def load_run_config(run_dir: Path, repo: Path) -> Config:
 
 
 def docs_dir_for(config: Config, repo: Path) -> Path:
-    text = config.docs_dir.replace("{repo}", Path(repo).resolve().name)
-    return Path(text).expanduser()
+    """The run docs directory, always absolute: a relative docs_dir is resolved against the
+    repository, so start (from any cwd), run discovery and the wrap-up (from the workspace)
+    all use the same directory."""
+    root = Path(repo).resolve()
+    docs = Path(config.docs_dir.replace("{repo}", root.name)).expanduser()
+    return docs if docs.is_absolute() else (root / docs).resolve()
 
 
 def unsupported_settings(config: Config, repo: Path | None = None) -> list[str]:
@@ -296,8 +300,7 @@ def unsupported_settings(config: Config, repo: Path | None = None) -> list[str]:
     out = []
     if repo is not None:
         root = Path(os.path.realpath(repo))
-        docs = docs_dir_for(config, root)
-        docs = Path(os.path.realpath(docs if docs.is_absolute() else root / docs))
+        docs = Path(os.path.realpath(docs_dir_for(config, root)))
         if docs == root or root in docs.parents:
             out.append(f"not supported in this version: docs_dir inside the repository ({docs})")
     if config.after_run.step != "none":
