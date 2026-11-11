@@ -317,9 +317,11 @@ def build_status(run_dir: Path, sessions_dir: Path | None = None, meter: tuple |
     active = [n for n in sorted(cards) if cards[n].state not in IDLE_STATES]
     outcome = snap.outcome
 
+    # `unpark` is a next step only while the run can continue: unfinished, or ended blocked.
+    actionable = outcome is None or outcome.get("outcome") == "blocked"
     attention = [f"Card {n} parked: {cards[n].park_reason or 'no reason recorded'}"
-                 f" — next: {shlex.quote(str(CLI_PATH))} unpark {shlex.quote(str(snap.root.absolute()))}"
-                 f" --card {n} --note '…'" for n in parked]
+                 + (f" — next: {shlex.quote(str(CLI_PATH))} unpark {shlex.quote(str(snap.root.absolute()))}"
+                    f" --card {n} --note '…'" if actionable else "") for n in parked]
     attention.extend(violation_lines(snap.events))
     state_name = "running"
     activity = ""

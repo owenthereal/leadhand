@@ -974,6 +974,11 @@ def _runner_alive(wd: Path) -> bool:
     return _runner_locked(wd) or _starting_runner(wd) is not None
 
 
+def runner_alive(worker_dir: Path) -> bool:
+    """Whether a runner owns the dispatch now (it holds runner.lock, or was just spawned)."""
+    return Path(worker_dir).is_dir() and _runner_alive(Path(worker_dir))
+
+
 def _runner_target(wd: Path) -> dict | None:
     """The runner as a signal target: only when its pid and start time match."""
     runner = _read_json(wd / RUNNER)

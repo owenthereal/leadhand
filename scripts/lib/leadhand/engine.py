@@ -786,14 +786,19 @@ def _in_flight(ctx: _Run, d: _Dispatch) -> dict | None:
     worker = d.started["worker_id"]
     deadline = d.started["deadline"]
     orphan = d.req["vendor"] == "codex" and _gone(read_events(ctx.paths), d)
-    if orphan:
-        # A Codex runner that outlived its supervisor session: no proxy is left to report its
-        # result, so the engine records it once result.json is there.
+    if d.req["vendor"] == "codex":
+        # A Codex dispatch's result is the runner's result.json, recorded as soon as it is
+        # there: by the proxy's `record result`, by this step, or (for a runner that
+        # outlived its supervisor session, which has no proxy left) only by this step.
         result = dsp.load_result(ctx.root / "workers" / d.id)
         if result is not None:
             _store_result(ctx, d, worker, "\n".join(dsp.reply_lines(result)),
                           stopped=result.exit_reason == "cancelled", charge=not d.started.get("reconciled"))
-            return None
+            if orphan or d.started.get("reconciled") or _now() < _parse_time(deadline):
+                return None
+            # The runner finished, but this session's proxy is still out past the deadline: stop it.
+            return {"action": "stop_worker", "dispatch_id": d.id, "worker_id": worker, "vendor": "codex",
+                    "record_result": False}
     if _now() < _parse_time(deadline):
         reason = (f"{d.kind} worker for {_whose(d.req)} is running" if not orphan else
                   f"the Codex worker for {_whose(d.req)} outlived an earlier supervisor session; "
@@ -2079,12 +2084,54 @@ def _end(ctx: _Run, events: list[dict], *, blocked_reason: str | None = None, op
                and (run_tip is None or not is_ancestor(ctx.ws, e["sha"], run_ref))]
     if missing and not unreconciled:
         unreconciled = f"accepted work missing from the run branch: {', '.join(missing)}"
+    if not (blocked_reason or cancelled or unreconciled or verification_failed):
+        waiting = _waiting_on_decisions(ctx, cards, events)
+        if waiting:
+            # R44: everything left needs the operator's decision: the run can continue once
+            # they unpark the cards, so it ends blocked (decision needed), with the handoff.
+            blocked_reason = "decision needed"
+            why = (*waiting, *why, *(("unresolved review findings",) if open_findings else ()),
+                   *(f"hold: {h}" for h in holds))
     decision = decide_outcome(cards, removed=frozenset(), open_findings=open_findings, holds=holds,
                               gates_current=gates_current, verification_failed=verification_failed,
                               cancelled=cancelled, blocked_reason=blocked_reason, unreconciled=unreconciled)
     return append_event(ctx.paths, "outcome", outcome=decision.outcome.value, qualifier=decision.qualifier,
                         reasons=[*decision.reasons, *why],
                         next_step=allowed_next_step(decision, ctx.config.after_run), head=run_tip)
+
+
+def _decision_park(events: list[dict], card: int) -> bool:
+    """Whether the card's latest park waits on the operator's decision: the supervisor parked
+    it on a worker's question (`decision`), or the violation cap parked it (R32)."""
+    parks = [e for e in events if e["kind"] == "parked" and e.get("card") == card]
+    return bool(parks) and bool(parks[-1].get("decision") or parks[-1].get("cap_dispatch"))
+
+
+def _waiting_on_decisions(ctx: _Run, cards: dict[int, CardState], events: list[dict]) -> list[str]:
+    """When every card not accepted is parked on a decision, or waits only on such cards,
+    one reason per parked card; else [] (also when every card is accepted)."""
+    left = [n for n in sorted(cards) if cards[n].state != "accepted"]
+    if not left:
+        return []
+    parked = {n for n in left if cards[n].state == "parked"}
+
+    def blockers(n: int, seen: frozenset = frozenset()) -> set[int]:
+        out: set[int] = set()
+        for d in ctx.card(n).depends_on:
+            if d not in cards or d in seen or cards[d].state == "accepted":
+                continue
+            out |= {d} if cards[d].state == "parked" else blockers(d, seen | {n})
+        return out
+
+    for n in left:
+        if n in parked:
+            if not _decision_park(events, n):
+                return []
+        else:
+            waits = blockers(n)
+            if not waits or not all(_decision_park(events, b) for b in waits):
+                return []
+    return [f"card {n} parked: {cards[n].park_reason or 'no reason recorded'}" for n in sorted(parked)]
 
 
 def _wrap_up(ctx: _Run, ended: dict, events: list[dict]) -> None:
@@ -2685,8 +2732,32 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str = "",
         raise EngineError(f"dispatch {dispatch_id} has no started worker; record started first")
     if d.started["worker_id"] != worker_id:
         raise EngineError(f"dispatch {dispatch_id} started worker {d.started['worker_id']}, not {worker_id}")
+    if d.req["vendor"] == "codex":
+        return _record_codex_result(ctx, d, worker_id, stopped=stopped)
     reply = _read_reply_file(reply_file) if reply_file is not None else (reply or "")
     return _store_result(ctx, d, worker_id, reply, stopped=stopped)
+
+
+def _record_codex_result(ctx: _Run, d: _Dispatch, worker_id: str, *, stopped: bool) -> dict:
+    """A Codex-route dispatch's result comes only from the runner's result.json, never from
+    the proxy's reply (the proxy may give up early, or invent one). While the runner runs,
+    nothing is recorded: the `wait` it returns lets `next` and the timer pick up result.json
+    when it lands. With no live runner and no result (the proxy never ran the command, or
+    the runner died), and for `--stopped` (the supervisor stopped the proxy: a skipped card),
+    the runner is stopped and the dispatch finalized first (`dispatch.cancel`), so no Codex
+    process writes after the result is recorded."""
+    wd = ctx.root / "workers" / d.id
+    result = dsp.load_result(wd)
+    if result is None and not stopped and dsp.runner_alive(wd):
+        return {"action": "wait", "dispatch_id": d.id, "worker_id": worker_id, "deadline": d.started["deadline"],
+                "reply_file": str(_reply_file(ctx, d.req["card"], d.id)),
+                "reason": f"the Codex worker for {_whose(d.req)} is still running; its result is recorded "
+                          "from the runner when it finishes (the timer reports it)"}
+    if result is None:
+        result = _cancel_codex(ctx, d)
+    # A runner that finished before the cancel keeps its own status.
+    return _store_result(ctx, d, worker_id, "\n".join(dsp.reply_lines(result)),
+                         stopped=result.exit_reason == "cancelled")
 
 
 def _store_result(ctx: _Run, d: _Dispatch, worker_id: str, reply: str, *, stopped: bool = False,
@@ -2842,7 +2913,13 @@ def _record_park(ctx: _Run, card: Any, reason: str) -> dict:
         raise EngineError(f"card {c.number} is already {c.state}")
     if not reason or not reason.strip():
         raise EngineError("parking a card needs a reason")
-    return append_event(ctx.paths, "parked", card=c.number, reason=reason.strip())
+    # A card parked on its worker's question waits on the operator's decision (R44).
+    d = _dispatches(events).get(c.dispatch_id or "")
+    asked = (c.state == "reported" and d is not None and d.result is not None
+             and d.kind in IMPLEMENTER_KINDS and d.result["status"] == "QUESTION"
+             and not any(e["kind"] == "ruling" and e.get("dispatch_id") == d.id for e in events))
+    return append_event(ctx.paths, "parked", card=c.number, reason=reason.strip(),
+                        **({"decision": True} if asked else {}))
 
 
 def _record_diff_check(ctx: _Run, card: Any, ok: Any, note: str = "") -> dict:
@@ -2873,7 +2950,13 @@ def unpark(run_dir: Path, card: Any, note: str) -> dict:
     if not note or not note.strip():
         raise EngineError("unparking a card needs a note")
     with state_lock(ctx.paths):
-        c = _card_state(ctx, read_events(ctx.paths), card)
+        events = read_events(ctx.paths)
+        ended = _ended(events)
+        if ended is not None and ended.get("outcome") != "blocked":
+            # Only a blocked run continues (a relaunch never reopens any other ending).
+            raise EngineError(f"this run has ended: {_outcome_text(ended)}; a parked card can only "
+                              "continue in a blocked or unfinished run. Start a new run from the deck.")
+        c = _card_state(ctx, events, card)
         if c.state != "parked":
             raise EngineError(f"card {c.number} is not parked (it is {c.state})")
         return append_event(ctx.paths, "unparked", card=c.number, note=note.strip())
@@ -2892,9 +2975,9 @@ def timer(run_dir: Path, dispatch_id: str, *, interval: float = TIMER_INTERVAL) 
         d = _known_dispatch(events, dispatch_id)
         if d.result is not None:
             return "result"
-        if (d.req["vendor"] == "codex" and d.started is not None and _gone(events, d)
+        if (d.req["vendor"] == "codex" and d.started is not None
                 and dsp.load_result(paths.root / "workers" / dispatch_id) is not None):
-            return "result"           # no proxy is left to report it: `next` records it
+            return "result"           # the runner finished: `next` records its result.json
         wait = interval
         if d.started is not None:
             left = _parse_time(d.started["deadline"]) - _now()

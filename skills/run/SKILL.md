@@ -112,6 +112,10 @@ that worker. Only if you have lost them, run `next`: a `wait` names
    `<cli> record <run_dir> result --dispatch <dispatch_id> --worker <agent id> --reply-file '<reply_file>'`
 3. Run `next`.
 
+For a Codex route the engine takes the result from the Codex runner, not from
+the proxy's reply. If the runner is still running, `record result` prints a
+`wait` and records nothing; the timer reports the result when it lands.
+
 A notice with status `killed` is a worker you stopped. Its result is already
 recorded; do nothing.
 
@@ -191,6 +195,8 @@ When the operator tells you to skip a card:
 1. Run `next`. If it returns a `wait` for that card (its `dispatch_id`
    starts with `c<card>-`), stop its worker first: TaskStop `worker_id`, then
    `<cli> record <run_dir> result --dispatch <dispatch_id> --worker <worker_id> --stopped --reply 'Status: SPENT (time limit)'`
+   For a Codex dispatch, `worker_id` is the proxy; this record also stops the
+   Codex worker itself (the engine's stop path handles the runner).
 2. Record the card parked:
    `<cli> record <run_dir> park --card <card> --reason 'operator: skip'`
 3. Run `next` and carry on.
