@@ -781,6 +781,80 @@ class FixRound1(unittest.TestCase):
         run_git(w.repo, "cat-file", "-e", f"{RUN}:src/final/{a['dispatch_id']}.txt")   # on the run branch
 
 
+class FixRound2(unittest.TestCase):
+    """Review fix round 2 of Task 21: a reconciliation mismatch outranks a pending cancel."""
+
+    def rewritten(self, cancel):
+        w = FakeWorld(self, [card(1)])
+        w.session("supervisor-1")
+        w.start()
+        w.script(1, "implement", {"crash": "after_commit"})
+        a = w.next()
+        worker = w.launch(a)
+        self.assertIsNone(w.perform(a, worker))
+        ws = w.workspace()
+        orphan = run_git(ws, "commit-tree", "-m", "rewritten", w.base + "^{tree}")
+        run_git(ws, "reset", "--hard", orphan)            # the card branch no longer holds where it started
+        if cancel:
+            w.cli("cancel", w.run_dir)
+        resume(w)
+        done = w.next()
+        self.assertEqual((done["action"], done["outcome"], done["qualifier"]), ("done", "failed", ""))
+        self.assertTrue(any(r.startswith("state could not be reconciled: card 1's branch") and "was rewritten" in r
+                            for r in done["reasons"]), done["reasons"])
+        (rec,) = [e for e in w.events("reconciled") if "found" in e]
+        self.assertTrue(any("was rewritten" in f for f in rec["found"]), rec["found"])
+        self.assertEqual(len(w.events("outcome")), 1)
+        self.assertEqual(len(w.events("dispatch_requested")), 1)       # nothing new was started
+        return w
+
+    def test_rewritten_branch_fails_the_run(self):
+        self.rewritten(cancel=False)
+
+    def test_rewritten_branch_fails_the_run_even_with_a_cancel_pending(self):
+        self.rewritten(cancel=True)
+
+    def test_cancel_with_the_run_branch_gone_fails_with_every_accepted_card_missing(self):
+        w = FakeWorld(self, [card(1), card(2)])
+        w.session("supervisor-1")
+        w.start()
+        for _ in range(2):
+            w.act(w.next())
+        a = w.next()                             # card 1 accepted; card 2 dispatched
+        (acc,) = w.events("accepted")
+        worker = w.launch(a)
+        run_git(w.repo, "update-ref", "-d", f"refs/heads/{RUN}")
+        w.cli("cancel", w.run_dir)
+        self.assertEqual(w.next()["action"], "stop_worker")
+        engine.record(w.run_dir, "result", dispatch_id=a["dispatch_id"], worker_id=worker,
+                      reply="Status: SPENT (time limit)", stopped=True)
+        done = w.next()
+        self.assertEqual((done["outcome"], done["qualifier"]), ("failed", ""))
+        self.assertIn("state could not be reconciled: accepted work missing from the run branch: "
+                      f"card 1 at {acc['sha'][:12]}", done["reasons"])
+        self.assertIsNone(w.events("outcome")[0]["head"])
+
+    def test_run_branch_deleted_after_acceptance_ends_failed_on_relaunch(self):
+        # With the real end of run (gates on), `done` always carries an outcome. The
+        # `outcome: None` the reviewer saw is FakeWorld's card-loop-only test mode (R34).
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.session("supervisor-1")
+        w.start()
+        for _ in range(20):
+            if w.events("accepted"):
+                break
+            w.act(w.next())
+        run_git(w.repo, "update-ref", "-d", f"refs/heads/{RUN}")
+        r = w.cli("next", w.run_dir)            # the live session cannot go on: an error, not a guess
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("error:", r.stderr)
+        resume(w)
+        done = w.next()
+        self.assertEqual((done["action"], done["outcome"]), ("done", "failed"))
+        self.assertIn(f"state could not be reconciled: the run branch {RUN} is missing", done["reasons"])
+        self.assertEqual(w.next()["outcome"], "failed")
+
+
 class RunnerHelpers(unittest.TestCase):
     """`dispatch.runner_state` and `dispatch.stop_strays`, against real processes."""
 

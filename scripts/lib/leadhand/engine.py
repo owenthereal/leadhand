@@ -2073,8 +2073,10 @@ def _end(ctx: _Run, events: list[dict], *, blocked_reason: str | None = None, op
     cards = fold_cards(events, ctx.numbers)
     run_ref = f"refs/heads/{ctx.branch}"
     run_tip = _ref_sha(ctx, run_ref) if ctx.ws.is_dir() else None
+    # With no run branch at all, every accepted card's work is missing from it.
     missing = [f"card {e.get('card')} at {str(e.get('sha'))[:12]}" for e in events
-               if run_tip and e["kind"] == "accepted" and e.get("sha") and not is_ancestor(ctx.ws, e["sha"], run_ref)]
+               if e["kind"] == "accepted" and e.get("sha")
+               and (run_tip is None or not is_ancestor(ctx.ws, e["sha"], run_ref))]
     if missing and not unreconciled:
         unreconciled = f"accepted work missing from the run branch: {', '.join(missing)}"
     decision = decide_outcome(cards, removed=frozenset(), open_findings=open_findings, holds=holds,
@@ -2321,6 +2323,10 @@ def _synth_started(ctx: _Run, d: _Dispatch) -> dict:
                         session=_current_session(ctx), reconciled=True)
 
 
+class _Mismatch(Exception):
+    """Reconciliation found a state no rule matches; the message says what."""
+
+
 def _reconcile_dispatch(ctx: _Run, events: list[dict], d: _Dispatch) -> str:
     """Settle one dispatch the run waits on whose worker (or proxy) died with an earlier
     session; returns what was found."""
@@ -2361,7 +2367,7 @@ def _reconcile_dispatch(ctx: _Run, events: list[dict], d: _Dispatch) -> str:
             return f"{who}'s commits were found and recorded"
         if progress == "nothing":
             return f"{who}'s {d.kind} worker was interrupted before it changed anything; it runs again"
-        return progress
+        raise _Mismatch(progress)
     if d.req.get("gate"):
         return f"the {d.req['gate']} gate was interrupted; it runs again"
     return f"{who}'s {d.kind} worker was interrupted; it runs again"
@@ -2391,11 +2397,27 @@ def _reconcile(ctx: _Run, events: list[dict]) -> None:
     _charge_earlier_sessions(ctx)
     problem = _unmatched(ctx, events)
     if problem:
-        _stop_codex_runners(ctx, events)
-        append_event(ctx.paths, "reconciled", resumed_seq=since, found=[f"state could not be reconciled: {problem}"],
-                     headline=f"Resumed; state could not be reconciled: {problem}")
-        _end(ctx, read_events(ctx.paths), unreconciled=problem)
+        _fail_reconciliation(ctx, since, [], problem)
         return
+    try:
+        _settle(ctx, events, since)
+    except _Mismatch as e:
+        # Decided here, not left to the next step: a pending cancel must not mask it.
+        _fail_reconciliation(ctx, since, [], str(e))
+
+
+def _fail_reconciliation(ctx: _Run, since: int, found: list[str], problem: str) -> None:
+    """End the run failed with the mismatch, after every Codex dispatch without a result is
+    stopped (confirmed). `failed` outranks any cancel (decide_outcome's order)."""
+    _stop_codex_runners(ctx, read_events(ctx.paths))
+    append_event(ctx.paths, "reconciled", resumed_seq=since, found=[*found, f"state could not be reconciled: {problem}"],
+                 headline=f"Resumed; state could not be reconciled: {problem}")
+    _end(ctx, read_events(ctx.paths), unreconciled=problem)
+
+
+def _settle(ctx: _Run, events: list[dict], since: int) -> None:
+    """`_reconcile`'s body once the run as a whole matches: settle each step in flight, then
+    record the summary. Raises _Mismatch for a step no rule matches."""
     index = _dispatches(events)
     current = {d.id for d in _open_dispatches(ctx, events, index)}
     found: list[tuple[int | None, str]] = []
