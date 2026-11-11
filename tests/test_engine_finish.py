@@ -98,6 +98,58 @@ class Complete(unittest.TestCase):
         self.assertEqual(cells[5], str(w.run_dir))
 
 
+# Records one run's runs.md line, pausing after its read of runs.md until the other process
+# has read it too (or 3 s): without a lock both read the same file and one row is lost.
+_RECORD_RUN_LINE = r"""
+import sys, time
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from leadhand import engine, status
+from leadhand.config import load_config
+docs, repo, sync, me, other = map(Path, sys.argv[1:6])
+status.load = lambda root: None
+status.usage_summary = lambda summary: {"estimated_usd": None}
+read_text = Path.read_text
+def synced_read(self, *args, **kwargs):
+    text = read_text(self, *args, **kwargs)
+    if self.name == "runs.md":
+        (sync / me.name).touch()
+        end = time.monotonic() + 3
+        while not (sync / other.name).exists() and time.monotonic() < end:
+            time.sleep(0.01)
+    return text
+Path.read_text = synced_read
+config = replace(load_config(repo, user_file=docs / "no user config.toml"), docs_dir=str(docs))
+ctx = SimpleNamespace(root=docs / "runs" / me.name, numbers=[1], deck=SimpleNamespace(title=me.name),
+                      config=config, meta={"repo": str(repo)})
+engine._record_run_line(ctx, {"outcome": "complete"}, [])
+"""
+
+
+class SharedRunIndex(unittest.TestCase):
+    def test_concurrent_runs_never_lose_a_runs_md_line(self):
+        tmp = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        docs, repo, sync = tmp / "docs dir", tmp / "repo", tmp / "sync"
+        for d in (docs, repo, sync):
+            d.mkdir()
+        (docs / "runs.md").write_text("# Runs\n\n| Date | Deck | Outcome | Cards | Estimated cost | Run |\n"
+                                      "| --- | --- | --- | --- | --- | --- |\n", encoding="utf-8")
+        env = {**os.environ, "PYTHONPATH": str(Path(engine.__file__).resolve().parents[1])}
+        names = ("run-a", "run-b")
+        children = [subprocess.Popen([sys.executable, "-B", "-c", _RECORD_RUN_LINE, str(docs), str(repo),
+                                      str(sync), me, other], env=env, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True)
+                    for me, other in (names, names[::-1])]
+        for child in children:
+            out, err = child.communicate(timeout=60)
+            self.assertEqual(child.returncode, 0, out + err)
+        text = (docs / "runs.md").read_text(encoding="utf-8")
+        for name in names:
+            self.assertEqual(sum(1 for ln in text.splitlines() if ln.endswith(f"| {docs / 'runs' / name} |")),
+                             1, text)
+
+
 class RelativeDocsDir(unittest.TestCase):
     def test_relative_docs_dir_resolves_against_the_repository_from_any_cwd(self):
         # `start --repo` from another directory and the wrap-up run from the workspace must

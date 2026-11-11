@@ -58,6 +58,7 @@ worker, confirmed, then ends incomplete (cancelled), and no relaunch undoes it.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import inspect
 import json
@@ -2355,23 +2356,30 @@ def _record_run_line(ctx: _Run, ended: dict, events: list[dict]) -> None:
             f"{accepted}/{len(cards)} cards | {'unknown' if usd is None else f'${usd:.2f}'} {run_cell}")
     docs = docs_dir_for(ctx.config, Path(ctx.meta["repo"]))
     path = docs / "runs.md"
-    try:
-        old = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        old = ["# Runs", "", "| Date | Deck | Outcome | Cards | Estimated cost | Run |",
-               "| --- | --- | --- | --- | --- | --- |"]
-    new, placed = [], False
-    for ln in old:
-        if ln.rstrip().endswith(run_cell):
-            if not placed:
-                new.append(line)
-                placed = True
-            continue
-        new.append(ln)
-    if not placed:
-        new.append(line)
     docs.mkdir(parents=True, exist_ok=True)
-    _write_bytes_atomic(path, ("\n".join(new) + "\n").encode("utf-8"))
+    # Runs sharing docs_dir (other repositories' too) update runs.md concurrently: the whole
+    # read-modify-replace holds an exclusive lock, so no run's line is lost.
+    fd = os.open(docs / "runs.md.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            old = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            old = ["# Runs", "", "| Date | Deck | Outcome | Cards | Estimated cost | Run |",
+                   "| --- | --- | --- | --- | --- | --- |"]
+        new, placed = [], False
+        for ln in old:
+            if ln.rstrip().endswith(run_cell):
+                if not placed:
+                    new.append(line)
+                    placed = True
+                continue
+            new.append(ln)
+        if not placed:
+            new.append(line)
+        _write_bytes_atomic(path, ("\n".join(new) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
 
 
 # --------------------------------------------------------------------------
