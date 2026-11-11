@@ -66,6 +66,22 @@ class ProcsTests(unittest.TestCase):
         with mock.patch.object(procs, "_ps", return_value=None):
             self.assertIsNone(procs._ps_one(101))
 
+    def test_tagged_processes_finds_a_process_by_an_environment_entry(self):
+        tag = f"LEADHAND_TEST_TAG=t-{os.getpid()}-{time.time_ns()}"
+        name, _, value = tag.partition("=")
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", f"{name}={value}-argv"],
+                             env={**os.environ, name: value}, start_new_session=True, stdin=subprocess.DEVNULL)
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        other = self.spawn(new_session=True)
+        time.sleep(0.2)
+        got = procs.tagged_processes(tag)
+        self.assertIsNotNone(got, "environments are readable on Linux and macOS")
+        found, _ = got
+        self.assertEqual([i.pid for i in found], [p.pid])
+        self.assertEqual(found[0].start, procs.process_start_time(p.pid))
+        self.assertEqual(procs.tagged_processes(f"{tag}-argv")[0], [])     # an argument is not the environment
+        self.assertNotIn(other.pid, [i.pid for i in procs.tagged_processes(tag)[0]])
+
     def test_missing_pid(self):
         self.assertIsNone(procs.process_info(0))
         self.assertIsNone(procs.process_info(2 ** 22 + 12345))

@@ -1,0 +1,11 @@
+{"type": "thread.started", "thread_id": "{thread}"}
+{"type": "turn.started"}
+{"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": "Reading the brief."}}
+{"type": "item.started", "item": {"id": "item_1", "type": "command_execution", "command": "cat brief.md", "aggregated_output": "", "exit_code": null, "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_1", "type": "command_execution", "command": "cat brief.md", "aggregated_output": "brief", "exit_code": 0, "status": "completed"}}
+{"action": "write_file", "path": "done.txt", "text": "done\n"}
+{"type": "item.completed", "item": {"id": "item_2", "type": "file_change", "changes": [{"path": "done.txt", "kind": "add"}], "status": "completed"}}
+{"type": "item.completed", "item": {"id": "item_3", "type": "agent_message", "text": "Status: READY\nCommits: none\nTests: pass\nReport: report.md"}}
+{"action": "escaped_writer", "path": "escaped.log", "interval": 0.05}
+{"action": "last_message", "text": "Status: READY\nCommits: none\nTests: pass\nReport: report.md\n"}
+{"type": "turn.completed", "usage": {"input_tokens": 1200, "cached_input_tokens": 200, "cache_write_input_tokens": 0, "output_tokens": 50, "reasoning_output_tokens": 10}}

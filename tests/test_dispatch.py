@@ -473,6 +473,33 @@ class CancelTests(Base):
         self.assertEqual(len(read_attempts(run_paths(self.run_dir))), 1)
 
 
+class EscapedDescendantTests(Base):
+    """Codex review round 1 (M4): a process that leaves Codex's tree (double fork, new session)
+    just before Codex exits is found by the dispatch tag in its environment and stopped
+    before the result is written."""
+
+    def test_double_forked_child_is_stopped_before_finalizing(self):
+        self.scenario("ready-escaped-writer")
+        req = self.request()
+        result = dispatch(req)
+        (rec,) = self.records("escaped")
+        pid = rec["escaped_pid"]
+        self.addCleanup(self.signal_quietly, pid, signal.SIGKILL)
+        self.assertEqual(result.status, "READY")
+        self.assertFalse(alive(pid), "the escaped writer outlived the dispatch")
+        log = self.repo / "escaped.log"
+        size = log.stat().st_size
+        time.sleep(0.5)
+        self.assertEqual(log.stat().st_size, size, "the escaped writer wrote after finalize")
+        tag = self.runner_json()["tag"]
+        self.assertEqual(tag, f"{self.run_dir.name}:{req.dispatch_id}:1")
+        start = self.records("start")[0]
+        self.assertEqual(start["env"]["LEADHAND_DISPATCH_TAG"], tag)
+        self.assertEqual(start["policy_set"]["LEADHAND_DISPATCH_TAG"], tag)
+        saved = json.loads((self.worker_dir() / "result.json").read_text())
+        self.assertIn(pid, [p["pid"] for p in saved["stopped"]])
+
+
 class FixRoundTests(Base):
     """Review fix round 1."""
 

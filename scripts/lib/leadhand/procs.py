@@ -10,6 +10,9 @@ Sources, in order:
   as seconds.microseconds). Claude Code's sandbox refuses `ps` but allows this.
 - Anything else, or if those fail: `ps` (`lstart`, second resolution).
 
+`tagged_processes` finds this user's processes by an entry in their environment:
+`/proc/<pid>/environ` on Linux, `sysctl` `KERN_PROCARGS2` on macOS (no `ps`).
+
 A start time is an opaque string, only ever compared for equality with a value
 the same function produced on the same machine. Zombies (exited, not yet
 reaped) count as gone: they cannot run or write anything.
@@ -75,7 +78,9 @@ _OFF_STAT = 36      # kp_proc.p_stat (char)
 _OFF_PID = 40       # kp_proc.p_pid
 _OFF_PPID = 560     # kp_eproc.e_ppid
 _OFF_PGID = 564     # kp_eproc.e_pgid
+_OFF_RUID = 392     # kp_eproc.e_pcred.p_ruid
 _SZOMB = 5
+_KERN_ARGMAX, _KERN_PROCARGS2 = 8, 49
 
 _libc = None
 
@@ -127,6 +132,79 @@ def _darwin_all() -> list[ProcInfo] | None:
     if raw is None:
         return None
     return [_kinfo(raw, off) for off in range(0, len(raw) - _KINFO_SIZE + 1, _KINFO_SIZE)]
+
+
+def _darwin_argmax() -> int:
+    raw = _sysctl([_CTL_KERN, _KERN_ARGMAX], 4)
+    n = struct.unpack("i", raw)[0] if raw and len(raw) == 4 else 0
+    return n if n > 0 else 1 << 20
+
+
+def _darwin_environ(pid: int, argmax: int) -> list[bytes] | None:
+    """The process's initial environment from KERN_PROCARGS2 (argc, exec path, NUL padding,
+    argv, then the environment), or None when it cannot be read."""
+    raw = _sysctl([_CTL_KERN, _KERN_PROCARGS2, pid], argmax)
+    if raw is None or len(raw) < 4:
+        return None
+    (argc,) = struct.unpack_from("i", raw, 0)
+    end = raw.find(b"\0", 4)
+    if end < 0 or argc < 0:
+        return None
+    while end < len(raw) and raw[end] == 0:
+        end += 1
+    strings = raw[end:].split(b"\0")
+    env = []
+    for item in strings[argc:]:
+        if not item:
+            break
+        env.append(item)
+    return env
+
+
+def _darwin_tagged(entry: bytes) -> tuple[list[ProcInfo], list[int]] | None:
+    raw = _sysctl([_CTL_KERN, _KERN_PROC, _KERN_PROC_ALL], None)
+    if raw is None:
+        return None
+    uid, me, argmax = os.getuid(), os.getpid(), _darwin_argmax()
+    found, unreadable = [], []
+    for off in range(0, len(raw) - _KINFO_SIZE + 1, _KINFO_SIZE):
+        info = _kinfo(raw, off)
+        (ruid,) = struct.unpack_from("I", raw, off + _OFF_RUID)
+        if info.zombie or info.pid in (0, me) or ruid != uid:
+            continue
+        env = _darwin_environ(info.pid, argmax)
+        if env is None:
+            if process_start_time(info.pid) == info.start:     # still there, unreadable
+                unreadable.append(info.pid)
+        elif entry in env:
+            found.append(info)
+    return found, unreadable
+
+
+def _linux_tagged(entry: bytes) -> tuple[list[ProcInfo], list[int]]:
+    uid, me = os.getuid(), os.getpid()
+    found, unreadable = [], []
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or int(name) == me:
+            continue
+        try:
+            if os.stat(f"/proc/{name}").st_uid != uid:
+                continue
+        except OSError:
+            continue
+        info = _proc_stat(int(name))
+        if info is None or info.zombie:
+            continue
+        try:
+            env = Path(f"/proc/{name}/environ").read_bytes().split(b"\0")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unreadable.append(info.pid)
+            continue
+        if entry in env:
+            found.append(info)
+    return found, unreadable
 
 
 # --------------------------------------------------------------------------
@@ -193,6 +271,19 @@ def list_processes() -> list[ProcInfo]:
         if got is not None:
             return got
     return _ps_all()
+
+
+def tagged_processes(entry: str) -> tuple[list[ProcInfo], list[int]] | None:
+    """(this user's live processes whose initial environment holds `entry`, "NAME=value";
+    the pids of this user's live processes whose environment could not be read). Never the
+    calling process. None where environments cannot be read without `ps` (the caller then
+    relies on its process-tree snapshot alone)."""
+    data = entry.encode("utf-8", "surrogateescape")
+    if sys.platform.startswith("linux") and os.path.isdir("/proc/self"):
+        return _linux_tagged(data)
+    if sys.platform == "darwin":
+        return _darwin_tagged(data)
+    return None
 
 
 def descendants(pid: int) -> list[ProcInfo]:

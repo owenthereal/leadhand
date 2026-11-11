@@ -120,7 +120,18 @@ Codex workers and the runner:
   by the walk. The ladder is SIGINT to Codex's group, up to 5 s, SIGTERM to Codex's group
   and to each recorded descendant's group (never the runner's own), 5 s, then SIGKILL to
   whatever remains. Stopped means Codex has been reaped and no recorded (pid, start time) is
-  still alive. Recovery re-checks the recorded set before re-dispatching. Only the SIGINT
+  still alive.
+- Decision (containment after Codex exits, M4): a descendant that leaves Codex's tree (a
+  double fork into a new session) between two snapshots is not found by the walk. The runner
+  therefore sets `LEADHAND_DISPATCH_TAG=<run id>:<dispatch id>:<generation>` in Codex's
+  environment and, through `shell_environment_policy.set`, in its tool shells'; children
+  inherit it. Every stop (after Codex exits on its own, at a limit, on cancel, and for strays
+  after a relaunch) scans all of the user's processes for that exact environment entry
+  (`/proc/<pid>/environ` on Linux; `sysctl` `KERN_PROCARGS2` on macOS, no `ps`), adds them to
+  the recorded set and stops them with the same ladder, identified by (pid, start time), and
+  scans again before "stopped" is confirmed. The tree snapshot is kept. A process whose
+  environment cannot be read is listed in `procs.json` (`tag_unreadable`) and is covered by
+  the snapshot only; on a platform with neither source the scan is skipped. Recovery re-checks the recorded set before re-dispatching. Only the SIGINT
   step was exercised (nothing was left after it); the SIGTERM/SIGKILL escalation to
   descendant groups is design, not observation.
 - The thread ID is in `thread.started.thread_id`. `codex exec` accepts options before or
@@ -281,9 +292,10 @@ Known limits, until Plan 2's run guard (a caller check on the CLI):
   runs on files a worker routes to it through `.gitattributes`. Today the Claude Code
   sandbox denies writes to the repository config and Codex keeps the Git directory
   read-only; a Codex release that honours `--add-dir <git common dir>` would open it.
-- Escaped Codex processes (M4): a double-forked child of a Codex worker escapes the
-  process tracker, outlives "stopped", and can still rewrite reports and briefs in the
-  workspace's `.leadhand/`, for example a later reviewer's verdict.
+- Escaped Codex processes (M4, narrowed): a process that clears its own environment
+  (`env -i`, or a daemon that drops `LEADHAND_DISPATCH_TAG`) after leaving Codex's process
+  tree, or one whose environment cannot be read (recorded in `procs.json` as
+  `tag_unreadable`), is found only by the process-tree snapshot, and can outlive "stopped".
 - Credentials (M5): Claude workers get no stripping at all; they share the supervisor's
   environment (tokens, `SSH_AUTH_SOCK`, the keychain helper through Git) and only the
   operator's sandbox network policy stands in the way. A Codex worker can read credential

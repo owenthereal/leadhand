@@ -18,6 +18,9 @@ an event printed to stdout; "{thread}" inside it is replaced by the thread ID
   {"action": "commit", "message": "..."}          git add -A && git commit (if anything changed)
   {"action": "append_loop", "path": "rel", "interval": 0.2}   background writer
   {"action": "tool_child", "seconds": N}          a `sleep` child in its own group
+  {"action": "escaped_writer", "path": "rel", "interval": 0.05}
+        a double-forked writer in a new session (not a descendant of Codex once
+        started), appending to `path` for up to 60 s; its pid is logged ("escaped")
   {"action": "rollout", "fixture": "name.jsonl"}  copies a fixture into
         $CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-<thread>.jsonl
         (skipped when $FAKE_CODEX_NO_ROLLOUT=1)
@@ -42,6 +45,25 @@ from pathlib import Path
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 DEFAULT_THREAD = "0f0f0f0f-0000-4000-8000-00000000c0de"
 children: list[subprocess.Popen] = []
+
+
+ESCAPED_WRITER = """
+import os, sys, time
+if os.fork():
+    os._exit(0)
+os.setsid()
+path, interval = sys.argv[1], float(sys.argv[2])
+with open(path, "a") as f:
+    f.write("started\\n")
+with open(path + ".tmp", "w") as f:
+    f.write(str(os.getpid()))
+os.replace(path + ".tmp", path + ".pid")
+end = time.time() + 60
+while time.time() < end:
+    with open(path, "a") as f:
+        f.write("x\\n")
+    time.sleep(interval)
+"""
 
 
 def log(record: dict) -> None:
@@ -150,6 +172,15 @@ def main() -> int:
                                      stdin=subprocess.DEVNULL)
             children.append(child)
             log({"event": "child", "child_pid": child.pid})
+        elif action == "escaped_writer":
+            target = Path(step["path"]).resolve()
+            pidfile = target.with_name(target.name + ".pid")
+            subprocess.run([sys.executable, "-c", ESCAPED_WRITER, str(target), str(step["interval"])],
+                           stdin=subprocess.DEVNULL, timeout=30)
+            deadline = time.monotonic() + 10
+            while not pidfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            log({"event": "escaped", "escaped_pid": int(pidfile.read_text())})
         elif action == "rollout":
             home = os.environ.get("CODEX_HOME")
             if home and os.environ.get("FAKE_CODEX_NO_ROLLOUT") != "1":

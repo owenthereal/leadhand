@@ -97,6 +97,10 @@ CANCEL_ACK = 5.0            # a runner that does not acknowledge a cancel this f
 SPAWN_GRACE = 60.0          # a spawned runner that has not written runner.json yet counts as starting
 POLL = 0.1
 SNAPSHOT_EVERY = 1.0
+# Set in Codex's environment (and its tool shells', through shell_environment_policy.set):
+# <run id>:<dispatch id>:<generation>. A process that left Codex's tree (double fork, new
+# session) still carries it, so the runner finds and stops it after Codex exits (M4).
+TAG_VAR = "LEADHAND_DISPATCH_TAG"
 # Roles that share another role's [limits] entry.
 LIMITS_ROLE: Mapping[str, str] = MappingProxyType({
     "implementer_hard": "implementer", "reviewer_hard": "reviewer", "final_reviewer": "reviewer"})
@@ -403,23 +407,43 @@ class _Stream:
 # Processes: recording, signalling, confirming
 
 class _Tracker:
-    """Codex and its recorded descendants, each as {pid, pgid, start}."""
+    """Codex and its recorded descendants, each as {pid, pgid, start}. With a dispatch tag,
+    stopping also finds every process of this user whose environment carries the tag, so a
+    process that left Codex's tree before a snapshot saw it is stopped too (M4)."""
 
     def __init__(self, wd: Path, codex: dict | None, descendants: Iterable[dict] = (),
-                 proc: subprocess.Popen | None = None) -> None:
-        self.wd, self.codex, self.proc = wd, codex, proc
+                 proc: subprocess.Popen | None = None, tag: str | None = None) -> None:
+        self.wd, self.codex, self.proc, self.tag = wd, codex, proc, tag
         self.live: dict[tuple[int, str], dict] = {}
         self.seen: dict[tuple[int, str], dict] = {}
         for d in descendants:
             if d.get("pid") and d.get("start"):
                 self._add(d)
-        self._saved: list | None = None
+        self._saved: dict | None = None
+        self.unreadable: list[int] | str = []     # pids whose environment could not be read
 
     @classmethod
     def load(cls, wd: Path) -> "_Tracker":
         runner = _read_json(wd / RUNNER) or {}
         saved = _read_json(wd / PROCS) or {}
-        return cls(wd, runner.get("codex"), saved.get("descendants") or ())
+        tag = runner.get("tag")
+        return cls(wd, runner.get("codex"), saved.get("descendants") or (),
+                   tag=tag if isinstance(tag, str) and tag else None)
+
+    def find_tagged(self) -> None:
+        """Add every live process carrying the dispatch tag. Processes whose environment
+        cannot be read (or a platform where none can) are noted in procs.json; for them the
+        process-tree snapshot is all there is."""
+        if not self.tag:
+            return
+        got = procs.tagged_processes(f"{TAG_VAR}={self.tag}")
+        if got is None:
+            self.unreadable = "unsupported"
+            return
+        found, self.unreadable = got
+        for p in found:
+            if p.pid != os.getpid():
+                self._add(p.record())
 
     def _add(self, rec: dict) -> None:
         key = (int(rec["pid"]), str(rec["start"]))
@@ -439,15 +463,19 @@ class _Tracker:
             return self.proc.poll() is None
         return procs.same_process(t.get("pid"), t.get("start"))
 
-    def snapshot(self) -> None:
+    def snapshot(self, *, tagged: bool = False) -> None:
         if self.codex_alive():
             for p in procs.descendants(int(self.codex["pid"])):
                 self._add(p.record())
+        if tagged:
+            self.find_tagged()
         self.live = {k: v for k, v in self.live.items() if procs.same_process(*k)}
-        current = sorted(self.live.values(), key=lambda r: r["pid"])
+        current = {"descendants": sorted(self.live.values(), key=lambda r: r["pid"])}
+        if self.unreadable:
+            current["tag_unreadable"] = self.unreadable
         if current != self._saved:
             with contextlib.suppress(OSError):
-                write_json_atomic(self.wd / PROCS, {"descendants": current})
+                write_json_atomic(self.wd / PROCS, current)
             self._saved = current
 
     def alive(self) -> list[dict]:
@@ -478,7 +506,7 @@ class _Tracker:
         while True:
             now = time.monotonic()
             if now - last_snap >= 0.25:
-                self.snapshot()
+                self.snapshot(tagged=True)
                 last_snap = now
             if not self.alive():
                 return True
@@ -496,20 +524,20 @@ class _Tracker:
         def left() -> float:
             return SIGNAL_STEP if deadline is None else max(0.0, min(SIGNAL_STEP, deadline - time.monotonic()))
 
-        self.snapshot()
+        self.snapshot(tagged=True)
         if not self.alive():
             return []
         if self.codex_alive():
             self.signal(signal.SIGINT, codex_only=True)
             if self.wait_gone(left(), beat):
                 return []
-        self.snapshot()
+        self.snapshot(tagged=True)
         if self.alive():
             self.signal(signal.SIGTERM, codex_only=False)
             if self.wait_gone(left(), beat):
                 return []
         while True:
-            self.snapshot()
+            self.snapshot(tagged=True)
             self.signal(signal.SIGKILL, codex_only=False)
             if self.wait_gone(KILL_RETRY if deadline is None else left(), beat):
                 return []
@@ -951,8 +979,11 @@ def run_runner(worker_dir: Path) -> int:
     started_at = utc_now()
     superseded = wd / SUPERSEDED
     generation = 1 + (sum(1 for _ in superseded.iterdir()) if superseded.is_dir() else 0)
+    run_id = _run_id(req.run_dir)
+    tag = f"{run_id}:{req.dispatch_id}:{generation}"
     record = {"runner": me.record() if me else {"pid": os.getpid(), "pgid": os.getpgid(0), "start": None},
-              "codex": None, "generation": generation, "started_wall": time.time(), "started_at": started_at}
+              "codex": None, "generation": generation, "tag": tag, "started_wall": time.time(),
+              "started_at": started_at}
     write_json_atomic(wd / RUNNER, record)
     _touch(wd / HEARTBEAT)
 
@@ -966,9 +997,8 @@ def run_runner(worker_dir: Path) -> int:
     try:
         gh_dir = wd / GH_DIR
         gh_dir.mkdir(exist_ok=True)
-        run_id = _run_id(req.run_dir)
-        env = worker_env(os.environ, run_id=run_id, gh_config_dir=gh_dir)
-        overrides = {**blocking_env(os.environ, gh_config_dir=gh_dir), "LEADHAND_RUN_ID": run_id}
+        env = {**worker_env(os.environ, run_id=run_id, gh_config_dir=gh_dir), TAG_VAR: tag}
+        overrides = {**blocking_env(os.environ, gh_config_dir=gh_dir), "LEADHAND_RUN_ID": run_id, TAG_VAR: tag}
         argv = codex_argv(req, wd / LAST, git_common_dir(req.cwd), overrides)
         prompt = worker_prompt(req.role, req.brief, req.report).encode("utf-8")
     except (GitError, OSError, ValueError) as e:
@@ -987,7 +1017,7 @@ def run_runner(worker_dir: Path) -> int:
         _finalize(wd, req, stopped_for="cancelled", codex_exit=None, tracker=tracker, started_at=started_at)
         return 0
     threading.Thread(target=_feed, args=(proc.stdin, prompt), daemon=True).start()
-    tracker = _Tracker(wd, record["codex"], proc=proc)
+    tracker = _Tracker(wd, record["codex"], proc=proc, tag=tag)
 
     stream = _Stream(wd / STREAM)
     t0 = time.monotonic()               # the time limit counts time awake
@@ -1114,7 +1144,9 @@ def _owner_state(wd: Path) -> str:
         return "running" if now - float(spawn.get("at") or 0) < SPAWN_GRACE else "stale"
     if not (wd / RUNNER).exists():
         return "none"
-    if _Tracker.load(wd).alive():
+    tracker = _Tracker.load(wd)
+    tracker.find_tagged()
+    if tracker.alive():
         return "orphaned"
     return "dead"
 
@@ -1152,6 +1184,7 @@ def stop_strays(worker_dir: Path, *, timeout: float = CANCEL_TIMEOUT) -> list[di
     if not (wd / RUNNER).exists() or _runner_alive(wd):
         return []
     tracker = _Tracker.load(wd)
+    tracker.find_tagged()
     if not tracker.alive():
         return []
     return tracker.stop(deadline=time.monotonic() + timeout)
