@@ -1886,11 +1886,12 @@ def _request_gate(ctx: _Run, events: list[dict], gate: str, head_sha: str, accep
 
 
 def _base_worktree_path(ctx: _Run) -> Path:
-    return Path(ctx.meta["repo"]) / ".worktrees" / f"{ctx.root.name}--base"
+    return Path(dsp.base_worktree_path(ctx.meta, ctx.root.name))
 
 
 def _base_worktree(ctx: _Run) -> Path:
-    """`<repo>/.worktrees/<run dir name>--base`, detached at the run's base commit, for the
+    """`<repo>/.worktrees/<workspace name>--base` (`<run dir name>--base` for an in-place
+    run), detached at the run's base commit, for the
     evidence gate. Before every evidence request it is put back exactly: stale worktree
     records pruned, created when missing, then detached at the base, hard-reset and cleaned
     of every untracked and ignored file. Idempotent. It is kept after the run (beside the

@@ -216,6 +216,10 @@ def resolves_in_place(root: Path, path: Path) -> bool:
 def prepare_workspace(repo: Path, *, run_branch: str, base_sha: str, slug: str, use_worktree: bool) -> Path:
     """Idempotent: create `run_branch` at `base_sha` when missing (an existing one is
     left as is), then a worktree at <repo>/.worktrees/<slug> or a checkout in `repo`.
+    A registered worktree there is reused only when it is this run's (checked out on
+    `run_branch`, or detached at `base_sha`); otherwise the first free `<slug>-2`,
+    `<slug>-3`, ... is used, so a run never takes over another run's worktree. A name is
+    free when neither the worktree nor its evidence base worktree (`<name>--base`) exists.
     Without a worktree, a repo with uncommitted tracked changes is refused (unless it is
     already on the run branch, i.e. a resumed run)."""
     _check_branch_name(repo, run_branch)
@@ -235,12 +239,21 @@ def prepare_workspace(repo: Path, *, run_branch: str, base_sha: str, slug: str, 
         if _current_branch(repo) != run_branch:
             git(repo, "checkout", "--quiet", run_branch, "--")
         return repo
-    ws = repo / ".worktrees" / slug
-    if not resolves_in_place(repo, ws):
-        raise GitError(f"{ws} is a symlink or lies behind one; move it aside")
-    registered = {os.path.realpath(w["worktree"]) for w in _worktrees(repo) if "worktree" in w}
-    if ws.exists() and os.path.realpath(ws) in registered:
-        return ws
+    registered = {os.path.realpath(w["worktree"]): w for w in _worktrees(repo) if "worktree" in w}
+    base = head(repo, base_sha)
+    name, n = slug, 1
+    while True:
+        ws = repo / ".worktrees" / name
+        if not resolves_in_place(repo, ws):
+            raise GitError(f"{ws} is a symlink or lies behind one; move it aside")
+        entry = registered.get(os.path.realpath(ws)) if ws.exists() else None
+        if entry is not None and (entry.get("branch") == ref
+                                  or ("detached" in entry and entry.get("HEAD") == base)):
+            return ws
+        if not os.path.lexists(ws) and not os.path.lexists(ws.parent / f"{name}--base"):
+            break
+        n += 1
+        name = f"{slug}-{n}"
     git(repo, "worktree", "add", "--quiet", str(ws), run_branch)
     return ws
 

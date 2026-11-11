@@ -371,6 +371,40 @@ class Start(unittest.TestCase):
             self.assertEqual(engine.start(w.deck_path, repo=w.repo), first)
             self.assertEqual(engine.start(w.deck_path, repo=clone), second)
 
+    def test_start_never_reuses_another_runs_worktree(self):
+        # docs_dir changed between two same-day runs of the same deck: the second run's
+        # directory has the same name, so its default worktree path is the first run's.
+        w = FakeWorld(self, [card(1)], gates=True)
+        first = w.start()
+        a = w.next()
+        self.assertEqual(a["action"], "dispatch")
+        w.launch(a)                                     # the first run's worker is active
+        ws1 = w.workspace()
+        branch1 = run_git(ws1, "symbolic-ref", "--short", "HEAD")
+        head1 = run_git(ws1, "rev-parse", "HEAD")
+        self.assertEqual(branch1, "leadhand/demo--card-1")
+
+        w.config_file.write_text(f'docs_dir = "{w.tmp / "other docs"}"\n', encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            second = engine.start(w.deck_path, repo=w.repo)
+        self.assertEqual(second.name, first.name)
+        meta = json.loads((second / "run.json").read_text(encoding="utf-8"))
+        ws2 = Path(meta["workspace"])
+        self.assertNotEqual(ws2.resolve(), ws1.resolve())
+        self.assertEqual(ws2.name, f"{first.name}-2")
+        self.assertEqual(run_git(ws2, "symbolic-ref", "--short", "HEAD"), meta["branch"])
+        engine.next_action(second)
+        # the first run's worktree is untouched
+        self.assertEqual(run_git(ws1, "symbolic-ref", "--short", "HEAD"), branch1)
+        self.assertEqual(run_git(ws1, "rev-parse", "HEAD"), head1)
+        self.assertEqual(run_git(ws2, "symbolic-ref", "--short", "HEAD"), f"{meta['branch']}--card-1")
+        # the second run's evidence base worktree is its own too
+        w.run_dir = second
+        self.assertEqual(w.run()[-1]["outcome"], "complete")
+        self.assertTrue((ws2.parent / f"{ws2.name}--base").is_dir())
+        self.assertFalse((ws1.parent / f"{first.name}--base").exists())
+        self.assertEqual(run_git(ws1, "symbolic-ref", "--short", "HEAD"), branch1)
+
     def test_start_refuses_unsupported_settings_and_scout_cards(self):
         w = FakeWorld(self, [card(1)], config='[after_run]\nstep = "pr"\n')
         with self.assertRaises(EngineError) as cm:

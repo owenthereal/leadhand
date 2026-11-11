@@ -1439,14 +1439,24 @@ def anchored_run(run_dir: Path, environ: Mapping[str, str] | None = None) -> tup
     return Path(real), meta
 
 
+def base_worktree_path(meta: Mapping[str, Any], run_name: str) -> str:
+    """The run's evidence base worktree: <repo>/.worktrees/<workspace name>--base when the
+    workspace is a worktree there (its name is collision-free, see prepare_workspace), else
+    <repo>/.worktrees/<run dir name>--base (an in-place run)."""
+    repo, ws = Path(meta["repo"]), Path(meta.get("workspace") or "")
+    name = ws.name if ws.parent == repo / ".worktrees" else run_name
+    return str(repo / ".worktrees" / f"{name}--base")
+
+
 def _allowed_cwds(run_real: Path, run_dir: Path, meta: Mapping[str, Any]) -> list[str]:
-    """The run's workspace, and its evidence base worktree <repo>/.worktrees/<run>--base
+    """The run's workspace, and its evidence base worktree <repo>/.worktrees/<name>--base
     reached through no symlink below the repository (real paths)."""
     out = [os.path.realpath(meta["workspace"])]
     repo = meta.get("repo")
     if isinstance(repo, str) and os.path.isabs(repo):
         for name in dict.fromkeys((Path(run_dir).name, run_real.name)):
-            out.append(os.path.join(os.path.realpath(repo), ".worktrees", f"{name}--base"))
+            out.append(os.path.join(os.path.realpath(repo), ".worktrees",
+                                    os.path.basename(base_worktree_path(meta, name))))
     return out
 
 
