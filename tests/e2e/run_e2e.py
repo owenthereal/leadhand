@@ -1467,6 +1467,15 @@ class Driver:
             charged = {k: sum(int((c.get("usage") or {}).get(k) or 0) for c in cs) for k in ("input", "cached", "output")}
             path = lh_usage.codex_session_file(thread)
             rollout = rollout_total(path) if path else None
+            if rollout is None and path and Path(path).exists():
+                # No token_usage_record at all (killed before its first response): P12 says unknown, so every
+                # charge must be known=false and possibly_incomplete (R43).
+                match = all((c.get("usage") or {}).get("known") is False and c.get("possibly_incomplete") for c in cs)
+                facts[thread] = {"charges": len(cs), "charged": charged, "rollout (distinct response_id)": None,
+                                 "no token_usage_record: charges unknown and possibly_incomplete": match,
+                                 "equal": match}
+                ok = ok and match
+                continue
             match = rollout is not None and all(charged[k] == rollout[k] for k in charged)
             facts[thread] = {"charges": len(cs), "charged": charged, "rollout (distinct response_id)": rollout,
                              "responses": rollout and rollout.get("responses"), "equal": match}
@@ -1628,7 +1637,8 @@ INTERRUPT_CHECK_DOCS = [
      "false; its Codex charges carry possibly_incomplete"),
     ("interrupt: charged Codex usage per thread equals the rollout total", "per Codex thread: the sum of "
      "charges.jsonl usage (input, cached, output) equals the rollout's token_usage_record sum over distinct "
-     "response_id (input excludes cached)"),
+     "response_id (input excludes cached); a thread whose rollout has no token_usage_record passes when all its "
+     "charges are known=false and possibly_incomplete"),
     ("interrupt: the report's Usage counts unknown attempts", "report.md's `Attempts with unknown usage: N` equals "
      "the attempts with usage_known false"),
     ("interrupt: a reconciliation headline appeared", "a status sample headline contains `Resumed at`"),
