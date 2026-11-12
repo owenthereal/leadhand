@@ -22,6 +22,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from gitfixture import hermetic, run_git
 from leadhand import launch, procs
 from leadhand.state import append_event, read_events, run_paths, write_json_atomic
 
@@ -632,6 +633,137 @@ class InPlaceCheckoutTests(LaunchTestCase):
         self.other_run("2026-11-10-other run", in_place=True, live=True)
         code, _, err = self.run_inprocess()
         self.assertEqual(code, 0, err)
+
+
+CLAIM_CLI_CHILD = """import json, os, sys, time
+before = os.environ.get("LEADHAND_CHECKOUT_FD")
+from leadhand import cli
+cli.main(["version"])
+with open(sys.argv[1], "a", encoding="utf-8") as f:
+    f.write(json.dumps({"pid": os.getpid(), "claim_fd_env": before,
+                        "after": os.environ.get("LEADHAND_CHECKOUT_FD")}) + "\\n")
+time.sleep(60)
+"""
+
+
+class CheckoutClaimTests(LaunchTestCase):
+    """R53 across runs folders and racing launches: an in-place launch claims the checkout
+    itself, so a second in-place launch of the repository is refused wherever either run's
+    folder lives, even before the first launch has written holder.json, and even after a
+    worker deletes what it can of the claim (its record in .git)."""
+
+    def setUp(self):
+        super().setUp()
+        hermetic(self, self.tmp)
+        run_git(self.repo, "init", "--quiet")
+        meta = json.loads(self.paths.run_json.read_text(encoding="utf-8"))
+        write_json_atomic(self.paths.run_json, {**meta, "workspace": str(self.repo)})
+
+    def in_place_run(self, docs: str, name: str = "2026-11-10-other run") -> Path:
+        other = self.tmp / docs / "runs" / name
+        other.mkdir(parents=True)
+        paths = run_paths(other)
+        paths.deck.write_text("# Other deck\n", encoding="utf-8")
+        write_json_atomic(paths.run_json, {
+            "run_id": "f" * 12, "repo": str(self.repo), "workspace": str(self.repo),
+            "deck_source": str(self.tmp / "other deck.md"), "supervisor_sessions": []})
+        append_event(paths, "run_started", run_id="f" * 12, base_sha="0" * 40, branch="lh/other")
+        return other
+
+    def supervise(self, run_dir: Path, **env) -> subprocess.Popen:
+        n = len(self.starts()) + 1
+        launcher = self.spawn_launcher(run_dir, sleep="60", **env)
+        holder = run_paths(run_dir).holder
+        wait_for(lambda: len(self.starts()) >= n and holder.exists()
+                 and json.loads(holder.read_text(encoding="utf-8")).get("supervisor_pid"),
+                 f"the supervisor of {run_dir.name}")
+        return launcher
+
+    def stop(self, launcher: subprocess.Popen):
+        os.kill(launcher.pid, signal.SIGTERM)
+        launcher.communicate(timeout=WAIT)
+
+    def test_in_place_launch_is_refused_while_a_run_in_another_runs_folder_is_supervised(self):
+        other = self.in_place_run("other docs")
+        launcher = self.supervise(other)
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 1, err)
+        self.assertIn(f"another in-place run of {self.repo} is being supervised: {other}", err)
+        self.assertEqual(len(self.starts()), 1)
+        self.stop(launcher)
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.starts()), 2)
+
+    def test_in_place_launch_is_refused_before_the_other_launch_records_its_supervisor(self):
+        # Two launches started together: the other passed its checks and holds the checkout,
+        # but has not written holder.json yet.
+        other = self.in_place_run("docs dir")
+        launcher = self.supervise(other)
+        run_paths(other).holder.unlink()
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 1, err)
+        self.assertIn(f"is being supervised: {other}", err)
+        self.assertEqual(len(self.starts()), 1)
+        self.stop(launcher)
+
+    def test_a_worker_deleting_the_claim_record_does_not_free_the_checkout(self):
+        other = self.in_place_run("other docs")
+        launcher = self.supervise(other)
+        record = self.repo / ".git" / "leadhand-checkout.json"
+        self.assertTrue(record.is_file())
+        record.unlink()
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 1, err)
+        self.assertIn(f"another in-place run of {self.repo} is being supervised: unknown", err)
+        self.assertEqual(len(self.starts()), 1)
+        self.stop(launcher)
+        self.assertFalse(record.exists())
+
+    def test_the_claim_is_released_and_its_record_removed_when_the_supervisor_exits(self):
+        other = self.in_place_run("other docs")
+        launcher = self.supervise(other)
+        self.stop(launcher)
+        self.assertFalse((self.repo / ".git" / "leadhand-checkout.json").exists())
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 0, err)
+
+    def test_worktree_launch_is_not_held_back_by_a_claimed_checkout(self):
+        launcher = self.supervise(self.in_place_run("other docs"))
+        meta = json.loads(self.paths.run_json.read_text(encoding="utf-8"))
+        write_json_atomic(self.paths.run_json, {**meta, "workspace": str(self.workspace)})
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 0, err)
+        self.stop(launcher)
+
+    def test_a_cli_child_of_a_killed_supervisor_does_not_keep_the_checkout_claimed(self):
+        child_log = self.tmp / "cli child.log"
+        spawn = json.dumps([sys.executable, "-B", "-c", CLAIM_CLI_CHILD, str(child_log)])
+        launcher = self.spawn_launcher(sleep="60", FAKE_CLAUDE_SPAWN=spawn)
+        sup = self.wait_supervisor()
+        rec = wait_for(lambda: child_log.exists() and child_log.read_text(encoding="utf-8")
+                       and json.loads(child_log.read_text(encoding="utf-8").splitlines()[0]),
+                       "the CLI child to run")
+        self.addCleanup(lambda: procs.process_start_time(rec["pid"])
+                        and os.kill(rec["pid"], signal.SIGKILL))
+        self.assertTrue(rec["claim_fd_env"], "launcher did not export LEADHAND_CHECKOUT_FD")
+        self.assertIsNone(rec["after"])
+        self.kill_launcher(launcher)
+        os.kill(sup["pid"], signal.SIGKILL)
+        self.wait_gone(sup["pid"])
+        self.assertIsNotNone(procs.process_start_time(rec["pid"]), "the CLI child exited early")
+        code, _, err = self.run_inprocess(self.in_place_run("other docs"))
+        self.assertEqual(code, 0, err)
+
+    def test_cli_leaves_an_unrelated_fd_named_as_the_checkout_claim_open(self):
+        fd = os.open(self.paths.lock, os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(os.close, fd)
+        env = {"LEADHAND_CHECKOUT_FD": str(fd), "LEADHAND_RUN_DIR": str(self.run_dir)}
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+            from leadhand import cli
+            self.assertEqual(cli.main(["version"]), 0)
+            self.assertFalse("LEADHAND_CHECKOUT_FD" in os.environ)
+        os.fstat(fd)                                   # still open
 
 
 if __name__ == "__main__":

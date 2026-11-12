@@ -2,16 +2,48 @@
 untracked files (ruling R48'): the files untracked at start are recorded and left alone."""
 import contextlib
 import json
+import os
+import subprocess
+import sys
+import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from fakeworld import FakeWorld, card
 from gitfixture import run_git, write
 from leadhand import engine
-from leadhand.state import append_event
+from leadhand.state import append_event, run_paths
 
 CODEX_CARD = "codex gpt-6-luna low"
 IN_PLACE = "[run]\nworktree = false\n"
+FAKE_CLAUDE = Path(__file__).resolve().parent / "fakes" / "claude"
+LIB = Path(__file__).resolve().parents[1] / "scripts" / "lib"
+
+
+def supervise(test, run_dir: Path) -> subprocess.Popen:
+    """Launch the run (`leadhand run`) with tests/fakes/claude as a supervisor that sleeps
+    60 s; it is stopped at cleanup. Returns once holder.json names the supervisor."""
+    code = ("import sys; from pathlib import Path; from leadhand import launch; "
+            "sys.exit(launch.run(Path(sys.argv[1]), claude_bin=sys.argv[2]))")
+    err = run_dir.parent / f"{run_dir.name} launcher.err"
+    with open(err, "wb") as f:
+        p = subprocess.Popen([sys.executable, "-B", "-c", code, str(run_dir), str(FAKE_CLAUDE)],
+                             env={**os.environ, "PYTHONPATH": str(LIB), "FAKE_CLAUDE_SLEEP": "60"},
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=f)
+
+    def stop():
+        if p.poll() is None:
+            p.terminate()
+        p.wait(timeout=15)
+    test.addCleanup(stop)
+    holder = run_paths(run_dir).holder
+    deadline = time.monotonic() + 15
+    while not (holder.exists() and json.loads(holder.read_text(encoding="utf-8")).get("supervisor_pid")):
+        if p.poll() is not None or time.monotonic() > deadline:
+            raise AssertionError(f"the supervisor of {run_dir} did not start: {err.read_text()}")
+        time.sleep(0.02)
+    return p
 
 
 class InPlace(unittest.TestCase):
@@ -83,6 +115,34 @@ class Exclusive(unittest.TestCase):
         second = w.start()
         self.assertNotEqual(second, first)
         self.assertEqual(w.meta()["branch"], "leadhand/other")
+
+    def test_in_place_start_is_refused_while_a_run_in_another_runs_folder_is_supervised(self):
+        w = FakeWorld(self, [card(1)], config=IN_PLACE)
+        first = w.start()
+        launcher = supervise(self, first)
+        other_docs = w.tmp / "other docs"
+        w.config_file.write_text(f'docs_dir = "{other_docs}"\n{IN_PLACE}', encoding="utf-8")
+        w.write_deck([card(1)], branch="leadhand/other")
+        with self.assertRaises(engine.EngineError) as cm:
+            w.start()
+        self.assertIn(f"another in-place run of {w.repo.resolve()} is being supervised: {first}",
+                      str(cm.exception))
+        self.assertEqual(run_git(w.repo, "symbolic-ref", "--short", "HEAD"), "leadhand/demo")
+        self.assertFalse(run_git(w.repo, "branch", "--list", "leadhand/other"))
+        self.assertFalse(other_docs.exists())
+
+        # Once its supervisor stops, the checkout is free again.
+        launcher.terminate()
+        launcher.wait(timeout=15)
+        second = w.start()
+        self.assertTrue(str(second).startswith(str(other_docs)))
+        self.assertEqual(run_git(w.repo, "symbolic-ref", "--short", "HEAD"), "leadhand/other")
+
+    def test_start_returns_the_unfinished_run_while_its_own_supervisor_holds_the_checkout(self):
+        w = FakeWorld(self, [card(1)], config=IN_PLACE)
+        first = w.start()
+        supervise(self, first)
+        self.assertEqual(w.start(), first)
 
     def test_worktree_runs_are_not_held_back_by_an_in_place_run(self):
         w = FakeWorld(self, [card(1)], config=IN_PLACE)

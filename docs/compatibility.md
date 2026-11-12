@@ -318,7 +318,10 @@ Known limits, until Plan 2's run guard (a caller check on the CLI):
   `unpark`, `pause`, `cancel`) and so pass its own gates, and `start --repo` reaches any
   repository the operator owns.
 - The run lock (L3): every command of the session inherits the `run.lock` descriptor, and
-  unlocking it drops the lock; a relaunch is still refused while the supervisor lives.
+  unlocking it drops the lock; a relaunch is still refused while the supervisor lives. An
+  in-place run's checkout claim (a lock on the checkout's directory that keeps `start` and
+  `run` of any other in-place run of the repository out while its supervisor lives) is
+  inherited the same way, and unlocking it lets an in-place run from another runs folder in.
 - Test hooks (L4): `LEADHAND_TESTING=1` turns on test-only behaviour (crash points, a fake
   Codex binary through `LEADHAND_TEST_CODEX_BIN`) that an environment-prefixed command could
   reach if the exclusion matched it.

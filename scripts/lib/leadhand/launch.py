@@ -9,7 +9,10 @@ earlier supervisor lives, even if that supervisor no longer holds the flock.
 
 Ownership while the supervisor lives. The locked descriptor is passed to the
 Claude child (`pass_fds`), so the lock stays held for the session's life even if
-the launcher dies. When the child exits, the launcher releases the lock. Only
+the launcher dies. When the child exits, the launcher releases the lock. An
+in-place run (its workspace is the repository's checkout) also claims the
+checkout itself (`CheckoutClaim`, R53) before its supervisor starts, and passes
+that descriptor to the child the same way. Only
 once it owns the run does it append `resumed`, and only when the run has events
 beyond `run_started` (an earlier supervisor worked it); a fresh run's first
 launch appends nothing. A run whose latest outcome is complete, incomplete
@@ -43,12 +46,15 @@ from pathlib import Path
 
 from . import procs
 from .config import ConfigError, load_config, load_run_config
+from .gitops import GitError, git
 from .state import RunPaths, append_event, read_events, run_paths, write_json_atomic
 
 SUPERVISOR_AGENT = "leadhand:supervisor"
 CLI_PATH = Path(__file__).resolve().parents[2] / "leadhand"   # scripts/leadhand
 EXIT_REFUSED = 3
 LOCK_FD_ENV = "LEADHAND_LOCK_FD"
+CHECKOUT_FD_ENV = "LEADHAND_CHECKOUT_FD"
+CHECKOUT_RECORD = "leadhand-checkout.json"      # in the checkout's git dir
 PLATFORM = sys.platform        # read at launch time; tests inject another platform
 KEEP_AWAKE_TIMEOUT = 10.0
 FORWARDED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
@@ -190,6 +196,96 @@ class RunLock:
             os.close(fd)
 
 
+class CheckoutBusy(RuntimeError):
+    """Another in-place run holds the checkout. `holder` is the run directory it recorded,
+    or None when no readable record names it."""
+
+    def __init__(self, repo: Path, holder: str | None):
+        self.holder = holder
+        super().__init__(f"another in-place run of {repo} holds the checkout: {holder or 'unknown'}")
+
+
+class CheckoutClaim:
+    """An in-place run's exclusive claim on its repository's checkout (R53): an exclusive
+    `flock` on the checkout's top directory itself, so it holds whichever runs folder a run
+    lives in, and two launches started together cannot both get it. A worker cannot remove or
+    replace that directory (it works inside it; its writable roots are the checkout and .git),
+    so nothing it can delete lets a second claim in. Who holds the claim is recorded in
+    <git dir>/leadhand-checkout.json, only to name the holder in a refusal: a worker can
+    delete or rewrite that record, which changes the message and nothing else."""
+
+    def __init__(self, repo: Path):
+        self.repo = Path(repo)
+        self.fd: int | None = None
+        self.recorded: tuple[Path, str] | None = None
+
+    def _record_path(self) -> Path | None:
+        """The record's path in the checkout's own git dir, or None when `repo` is not the top
+        of a Git checkout (nothing is then written)."""
+        try:
+            top, git_dir = git(self.repo, "rev-parse", "--show-toplevel", "--absolute-git-dir").splitlines()
+        except (GitError, ValueError):
+            return None
+        return Path(git_dir) / CHECKOUT_RECORD if os.path.realpath(top) == os.path.realpath(self.repo) else None
+
+    def holder(self) -> str | None:
+        path = self._record_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) if path is not None else None
+        except (OSError, ValueError):
+            return None
+        run_dir = data.get("run_dir") if isinstance(data, dict) else None
+        return run_dir if isinstance(run_dir, str) and run_dir.isprintable() else None
+
+    def acquire(self) -> int:
+        """Claim the checkout and return the locked descriptor, or raise CheckoutBusy."""
+        fd = os.open(self.repo, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            os.close(fd)
+            if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                raise CheckoutBusy(self.repo, self.holder()) from None
+            raise
+        self.fd = fd
+        return fd
+
+    def record(self, run_dir: Path) -> None:
+        """Name the run holding the claim (best effort; call only while holding it)."""
+        path = self._record_path()
+        if path is None:
+            return
+        try:
+            write_json_atomic(path, {"run_dir": str(run_dir)})
+        except OSError:
+            return
+        self.recorded = (path, str(run_dir))
+
+    def detach(self) -> None:
+        """Close this process's descriptor without unlocking (see RunLock.detach)."""
+        if self.fd is not None:
+            fd, self.fd = self.fd, None
+            os.close(fd)
+
+    def release(self) -> None:
+        """Remove the record while it still names this claim, then unlock and close. Call
+        only once the supervisor has exited."""
+        if self.fd is None:
+            return
+        fd, self.fd = self.fd, None
+        try:
+            if self.recorded is not None:
+                path, run_dir = self.recorded
+                try:
+                    if json.loads(path.read_text(encoding="utf-8")).get("run_dir") == run_dir:
+                        path.unlink()
+                except (OSError, ValueError, AttributeError):
+                    pass
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def launch_argv(*, claude_bin: str, agent: str, first_message: str, plugin_dir: Path | None,
                 settings: str | None, model: str | None = None, effort: str | None = None,
                 print_mode: bool = False) -> list[str]:
@@ -297,7 +393,9 @@ def _in_place(meta: dict) -> bool:
 def checkout_in_use(root: Path, meta: dict) -> Path | None:
     """For an in-place run (its workspace is the repository's checkout): another in-place run
     of the same repository, under the same runs folder, whose recorded supervisor is alive,
-    or None. An in-place run has the checkout to itself (R53); worktree runs never collide."""
+    or None. An in-place run has the checkout to itself (R53); worktree runs never collide.
+    `CheckoutClaim` is what keeps out an in-place run from another runs folder, or one whose
+    launch has not written holder.json yet."""
     if not _in_place(meta):
         return None
     repo, me = os.path.realpath(meta["repo"]), os.path.realpath(root)
@@ -387,6 +485,7 @@ def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "cla
         print(str(e), file=sys.stderr)
         return EXIT_REFUSED
 
+    claim = None
     try:
         ended = _ended(read_events(paths))
         if ended is not None and ended.get("outcome") != "blocked":
@@ -408,6 +507,17 @@ def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "cla
                 raise LaunchError(f"another in-place run of {meta['repo']} is being supervised: {busy}; "
                                   "an in-place run has the checkout to itself, so wait for that "
                                   "supervisor to stop")
+            if _in_place(meta):
+                # Atomic, and wherever the other run's folder lives (R53).
+                claim = CheckoutClaim(Path(meta["repo"]))
+                try:
+                    claim.acquire()
+                except CheckoutBusy as e:
+                    claim = None
+                    raise LaunchError(f"another in-place run of {meta['repo']} is being supervised: "
+                                      f"{e.holder or 'unknown'}; an in-place run has the checkout to "
+                                      "itself, so wait for that supervisor to stop") from None
+                claim.record(root)
             model, effort = _supervisor_route(meta, root)
             if shutil.which(claude_bin) is None:
                 raise LaunchError(f"{claude_bin} not found on PATH")
@@ -425,22 +535,27 @@ def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "cla
             print_mode=print_mode)
         env = {**os.environ, "LEADHAND_RUN_ID": run_id, "LEADHAND_RUN_DIR": str(root),
                "LEADHAND_CLI": str(CLI_PATH), LOCK_FD_ENV: str(fd)}
+        if claim is not None:
+            env[CHECKOUT_FD_ENV] = str(claim.fd)
         print(ATTENDED_WARNING.format(cli=CLI_PATH), file=sys.stderr, flush=True)
         if any(c.isspace() for c in str(CLI_PATH)):
             print(SPACES_WARNING.format(cli=CLI_PATH), file=sys.stderr, flush=True)
         sys.stdout.flush()
-        return _supervise(lock, fd, argv, workspace, env, plugin_dir=plugin)
+        return _supervise(lock, fd, argv, workspace, env, plugin_dir=plugin, claim=claim)
     finally:
+        if claim is not None:
+            claim.release()
         lock.release()
 
 
 def _supervise(lock: RunLock, fd: int, argv: list[str], workspace: Path, env: dict, *,
-               plugin_dir: Path | None = None) -> int:
-    """Start the child holding the lock fd, forward SIGINT/SIGTERM, wait for it.
+               plugin_dir: Path | None = None, claim: CheckoutClaim | None = None) -> int:
+    """Start the child holding the lock fd (and the checkout claim's), forward SIGINT/SIGTERM,
+    wait for it.
 
     Returns only after the child has exited; the caller then releases the lock.
     If anything raises while the child still runs, the lock is detached, not
-    released, so the supervisor keeps it.
+    released, so the supervisor keeps it (the claim too).
     """
     child: subprocess.Popen | None = None
     pending: list[int] = []
@@ -462,7 +577,8 @@ def _supervise(lock: RunLock, fd: int, argv: list[str], workspace: Path, env: di
         if pending:
             return 128 + pending[0]
         try:
-            child = subprocess.Popen(argv, cwd=str(workspace), env=env, pass_fds=(fd,))
+            child = subprocess.Popen(argv, cwd=str(workspace), env=env,
+                                     pass_fds=(fd,) if claim is None else (fd, claim.fd))
         except OSError as e:
             print(f"error: cannot start {argv[0]}: {e}", file=sys.stderr)
             return 1
@@ -478,6 +594,8 @@ def _supervise(lock: RunLock, fd: int, argv: list[str], workspace: Path, env: di
     finally:
         if child is not None and child.poll() is None:
             lock.detach()       # never unlock under a live supervisor
+            if claim is not None:
+                claim.detach()
         for s, h in previous.items():
             signal.signal(s, h)
         _stop_keep_awake(keep_awake)
@@ -494,10 +612,23 @@ def close_inherited_lock(environ=os.environ) -> None:
     inode) as $LEADHAND_RUN_DIR/run.lock, never any other descriptor, and never
     unlocks (closing one reference leaves the supervisor's lock in place). The
     variable is removed from `environ` either way, so children do not try again.
+    An in-place run's checkout claim ($LEADHAND_CHECKOUT_FD) is dropped the same way,
+    when it is the same file as the checkout run.json names (`repo`).
     """
     raw = environ.pop(LOCK_FD_ENV, None)
+    claim_raw = environ.pop(CHECKOUT_FD_ENV, None)
     run_dir = environ.get("LEADHAND_RUN_DIR")
-    if not raw or not run_dir:
+    if not run_dir:
+        return
+    paths = run_paths(Path(run_dir))
+    _close_if_same(raw, lambda: paths.lock)
+    _close_if_same(claim_raw, lambda: json.loads(paths.run_json.read_text(encoding="utf-8"))["repo"])
+
+
+def _close_if_same(raw: str | None, target) -> None:
+    """Close descriptor `raw` only when it is open and is the same file (device and inode)
+    as the path `target()` returns."""
+    if not raw:
         return
     try:
         fd = int(raw)
@@ -507,10 +638,10 @@ def close_inherited_lock(environ=os.environ) -> None:
         return
     try:
         held = os.fstat(fd)
-        lock = os.stat(run_paths(Path(run_dir)).lock)
-    except OSError:
+        want = os.stat(target())
+    except (OSError, ValueError, LookupError, TypeError):
         return
-    if (held.st_dev, held.st_ino) == (lock.st_dev, lock.st_ino):
+    if (held.st_dev, held.st_ino) == (want.st_dev, want.st_ino):
         try:
             os.close(fd)
         except OSError:

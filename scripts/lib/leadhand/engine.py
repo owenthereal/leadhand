@@ -432,13 +432,32 @@ def _start(deck_path: Path, repo: Path, config: Config | None, new: bool) -> tup
         existing = _find_unfinished(docs, str(deck_path), deck.digest, repo)
         if existing is not None:
             return existing, True, f"existing run: {existing}"
+    claim = None
     if not config.run.worktree:
         busy = _unfinished_in_place(docs, repo)
         if busy is not None:
             raise EngineError(f"another in-place run of {repo} is unfinished: {busy}; an in-place run "
                               "has the checkout to itself, so finish or cancel that run first, "
                               "or run in a worktree (run.worktree = true)")
+        # The checkout claim sees a supervised in-place run whatever runs folder it lives in, and
+        # keeps a launch out while this start switches the checkout (R53).
+        from leadhand.launch import CheckoutBusy, CheckoutClaim
+        claim = CheckoutClaim(repo)
+        try:
+            claim.acquire()
+        except CheckoutBusy as e:
+            raise EngineError(f"another in-place run of {repo} is being supervised: {e.holder or 'unknown'}; "
+                              "an in-place run has the checkout to itself, so wait for that supervisor "
+                              "to stop, or run in a worktree (run.worktree = true)") from None
+    try:
+        return _new_run(deck_path, repo, config, deck, raw, docs)
+    finally:
+        if claim is not None:
+            claim.release()
 
+
+def _new_run(deck_path: Path, repo: Path, config: Config, deck: Deck, raw: bytes,
+             docs: Path) -> tuple[Path, bool, str]:
     branch = _free_branch(docs, repo, deck.branch)
     slug = _slug(deck.title)
     root = new_run_dir(docs, slug, date.today())
