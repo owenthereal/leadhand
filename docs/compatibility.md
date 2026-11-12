@@ -296,6 +296,9 @@ exclusion), so any Claude worker of the session can run it too. What the CLI che
   `status` and `diff`) is unmarked before every workspace check and every commit leadhand
   makes for a worker, so the edit counts: a check's is a violation (the result is void and
   the workspace restored), an implementer's is committed or kept as leftovers like any other.
+  A sparse checkout's own skip-worktree entries (their files absent; a worktree run's
+  worktrees copy a sparse repository's patterns) are left alone. An in-place run is refused
+  at start and at every launch while its checkout is sparse or has such an entry.
 - Leadhand's Git calls run with `GIT_LFS_SKIP_SMUDGE=1`, so git-lfs never fetches an object
   (from a URL a worker's `.lfsconfig` could choose). Files under LFS are pointer files in
   leadhand's own checkouts; the clean filter stays on, so checked-out LFS content does not

@@ -51,7 +51,7 @@ class GitError(RuntimeError):
 
 
 def _run(cwd: Path, args: tuple[str, ...] | list[str], env: Mapping[str, str] | None = None,
-         timeout: float = GIT_TIMEOUT) -> subprocess.CompletedProcess[str]:
+         timeout: float = GIT_TIMEOUT, input: str | None = None) -> subprocess.CompletedProcess[str]:
     # Every git call in this module goes through here. None, "", "." or any relative
     # path would make git run against the process cwd (the operator's repo), so only
     # an existing absolute directory is accepted, before anything runs.
@@ -63,7 +63,8 @@ def _run(cwd: Path, args: tuple[str, ...] | list[str], env: Mapping[str, str] | 
         full_env.update(env)
     try:
         return subprocess.run(
-            ["git", *SAFE_CONFIG, *args], cwd=cwd, env=full_env, capture_output=True, stdin=subprocess.DEVNULL,
+            ["git", *SAFE_CONFIG, *args], cwd=cwd, env=full_env, capture_output=True,
+            **({"input": input} if input is not None else {"stdin": subprocess.DEVNULL}),
             text=True, encoding="utf-8", errors="surrogateescape", timeout=timeout,
         )
     except subprocess.TimeoutExpired as e:
@@ -78,9 +79,11 @@ def _fail(r: subprocess.CompletedProcess[str], cwd: Path) -> GitError:
     return GitError(f"git {cmd} failed with exit {r.returncode} (in {cwd}): {detail}")
 
 
-def git(cwd: Path, *args: str, env: Mapping[str, str] | None = None, timeout: float = GIT_TIMEOUT) -> str:
-    """Run git in `cwd`; return stdout without trailing newlines. `env` overlays os.environ."""
-    r = _run(cwd, args, env, timeout)
+def git(cwd: Path, *args: str, env: Mapping[str, str] | None = None, timeout: float = GIT_TIMEOUT,
+        input: str | None = None) -> str:
+    """Run git in `cwd`; return stdout without trailing newlines. `env` overlays os.environ;
+    `input` is fed on stdin."""
+    r = _run(cwd, args, env, timeout, input)
     if r.returncode != 0:
         raise _fail(r, cwd)
     return r.stdout.rstrip("\n")
@@ -258,17 +261,9 @@ def prepare_workspace(repo: Path, *, run_branch: str, base_sha: str, slug: str, 
     if not slug or "/" in slug or "\0" in slug or slug.startswith("."):
         raise GitError(f"not a valid workspace slug: {slug!r}")
     ref = f"refs/heads/{run_branch}"
-    # A fresh worktree has no hidden entries; the operator's checkout may (Codex 4546946532).
-    if not use_worktree and _sparse(repo):
-        raise GitError(f"{repo} is a sparse checkout (core.sparseCheckout): a run without a worktree "
-                       "needs the whole checkout; run in a worktree (run.worktree = true)")
-    hidden = hidden_index_entries(repo) if not use_worktree else []
-    if hidden:
-        shown = ", ".join(hidden[:10]) + (f" and {len(hidden) - 10} more" if len(hidden) > 10 else "")
-        raise GitError(f"tracked files in {repo} are hidden from Git's change checks (assume-unchanged or "
-                       f"skip-worktree): {shown}; a run without a worktree would not see an edit "
-                       "to them. Clear the flags (git update-index --no-assume-unchanged <path>, git "
-                       "update-index --no-skip-worktree <path>), or run in a worktree (run.worktree = true)")
+    problem = in_place_checkout_problem(repo) if not use_worktree else None
+    if problem:
+        raise GitError(problem)
     if not use_worktree and _current_branch(repo) != run_branch:
         if _has_changes(repo):
             # Checking out the run branch would carry them into the run.
@@ -357,24 +352,47 @@ def hidden_index_entries(ws: Path, timeout: float = GIT_TIMEOUT) -> list[str]:
     """Tracked paths, in the whole checkout and named from its top, whose index entry hides an
     edit from `status` and `diff`: assume-unchanged (a lowercase `git ls-files -v` tag) or
     skip-worktree (`S`); a reset overwrites (or keeps) such an edit unseen. An unmerged entry
-    (`M`) is not hidden: it shows as a change."""
-    return [entry[2:] for entry in _nul_list(git(ws, "ls-files", "-v", "-z", "--full-name", "--", ":/",
-                                                 timeout=timeout))
-            if entry[:1].islower() or entry[:2] == "S "]
+    (`M`) is not hidden: it shows as a change. In a sparse checkout, an `S` entry whose file is
+    absent is the sparse checkout's own (`git worktree add` copies a sparse repository's
+    patterns into a worktree run's worktrees): it hides no edit and is never listed."""
+    flagged = [(entry[:1], entry[2:]) for entry in _nul_list(git(ws, "ls-files", "-v", "-z", "--full-name",
+                                                                 "--", ":/", timeout=timeout))
+               if entry[:1].islower() or entry[:2] == "S "]
+    if any(tag == "S" for tag, _ in flagged) and _sparse(ws):
+        top, _ = top_and_prefix(ws, timeout)
+        flagged = [(tag, path) for tag, path in flagged if tag != "S" or os.path.lexists(top / path)]
+    return [path for _, path in flagged]
 
 
 def unhide_index_entries(ws: Path, timeout: float = GIT_TIMEOUT) -> list[str]:
-    """Clear assume-unchanged and skip-worktree wherever set, so an edit behind them shows in
-    `status` and `diff` again (Codex 4554880076): a worker can set them after it is dispatched,
-    and every check and commit reads the workspace through those. Returns the paths cleared."""
+    """Clear assume-unchanged and skip-worktree wherever `hidden_index_entries` finds them, so
+    an edit behind them shows in `status` and `diff` again (Codex 4554880076): a worker can set
+    them after it is dispatched, and every check and commit reads the workspace through those.
+    Returns the paths cleared."""
     hidden = hidden_index_entries(ws, timeout)
     if hidden:
         top, _ = top_and_prefix(ws, timeout)
-        for i in range(0, len(hidden), 500):        # argv stays short
-            chunk = hidden[i:i + 500]
-            for flag in ("--no-assume-unchanged", "--no-skip-worktree"):     # one mode per call
-                git(top, "update-index", flag, "--", *chunk, timeout=timeout)
+        paths = "".join(f"{p}\0" for p in hidden)
+        for flag in ("--no-assume-unchanged", "--no-skip-worktree"):     # one mode per call
+            git(top, "update-index", flag, "-z", "--stdin", input=paths, timeout=timeout)
     return hidden
+
+
+def in_place_checkout_problem(repo: Path) -> str | None:
+    """Why the operator's checkout cannot host a run without a worktree, or None: a sparse
+    checkout, or an edit hidden behind assume-unchanged or skip-worktree (Codex 4546946532).
+    Checked at start and at every launch, so a hidden entry found later is a worker's."""
+    if _sparse(repo):
+        return (f"{repo} is a sparse checkout (core.sparseCheckout): a run without a worktree "
+                "needs the whole checkout; run in a worktree (run.worktree = true)")
+    hidden = hidden_index_entries(repo)
+    if not hidden:
+        return None
+    shown = ", ".join(hidden[:10]) + (f" and {len(hidden) - 10} more" if len(hidden) > 10 else "")
+    return (f"tracked files in {repo} are hidden from Git's change checks (assume-unchanged or "
+            f"skip-worktree): {shown}; a run without a worktree would not see an edit to them. Clear "
+            "the flags (git update-index --no-assume-unchanged <path>, git update-index "
+            "--no-skip-worktree <path>), or run in a worktree (run.worktree = true)")
 
 
 def _sparse(ws: Path) -> bool:

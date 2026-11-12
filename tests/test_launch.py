@@ -775,6 +775,23 @@ class CheckoutClaimTests(LaunchTestCase):
                 os.close(fd)
             raise
 
+    def test_an_in_place_relaunch_is_refused_while_an_edit_is_hidden_behind_an_index_flag(self):
+        # Codex review 10: an operator's assume-unchanged edit made while the run was paused
+        # would otherwise be unhidden and committed into a card commit.
+        (self.repo / "notes.txt").write_text("committed\n")
+        run_git(self.repo, "add", "notes.txt")
+        run_git(self.repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet",
+                "-m", "notes")
+        run_git(self.repo, "update-index", "--assume-unchanged", "notes.txt")
+        (self.repo / "notes.txt").write_text("the operator's local edit\n")
+        self.progress_run()
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 1, err)
+        self.assertIn("hidden from Git's change checks", err)
+        self.assertIn("notes.txt", err)
+        self.assertEqual(self.starts(), [])
+        self.assertFalse([e for e in read_events(self.paths) if e["kind"] == "resumed"])
+
     def test_the_claim_is_released_and_its_record_removed_when_the_supervisor_exits(self):
         other = self.in_place_run("other docs")
         launcher = self.supervise(other)

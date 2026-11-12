@@ -46,7 +46,7 @@ from pathlib import Path
 
 from . import procs
 from .config import ConfigError, load_config, load_run_config
-from .gitops import checkout_top
+from .gitops import GitError, checkout_top, in_place_checkout_problem
 from .state import RunPaths, append_event, read_events, run_paths, write_json_atomic
 
 SUPERVISOR_AGENT = "leadhand:supervisor"
@@ -512,6 +512,13 @@ def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "cla
                                   "an in-place run has the checkout to itself, so wait for that "
                                   "supervisor to stop")
             if _in_place(meta):
+                # As at start: so a hidden edit found later is a worker's (Codex review 10).
+                try:
+                    problem = in_place_checkout_problem(Path(meta["repo"]))
+                except GitError:
+                    problem = None      # not a readable checkout: `next` refuses the run anyway
+                if problem:
+                    raise LaunchError(problem)
                 # Atomic, and wherever the other run's folder lives (R53).
                 claim = CheckoutClaim(Path(meta["repo"]))
                 try:
