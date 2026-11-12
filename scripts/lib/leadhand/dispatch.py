@@ -65,8 +65,8 @@ from typing import Any, Iterable, Mapping
 
 from leadhand import procs
 from leadhand.briefs import parse_report_head, worker_prompt
-from leadhand.gitops import (SAFE_CONFIG, SAFE_ENV, GitError, git, git_common_dir, resolves_in_place, stage_work,
-                             status_entries, untracked_files)
+from leadhand.gitops import (SAFE_CONFIG, SAFE_ENV, GitError, checkout_top, git, git_common_dir, resolves_in_place,
+                             stage_work, status_entries, untracked_files)
 from leadhand.state import (utc_now, append_attempt, crash_point, read_attempts, run_paths, state_lock,
                             write_json_atomic)
 from leadhand.usage import (CODEX_STREAM_SOURCE, UNKNOWN, Usage, charge, codex_usage_from_stream, estimate_cost,
@@ -926,13 +926,14 @@ def _launch(wd: Path, record: dict, argv: list[str], env: Mapping[str, str], cwd
 def untracked_to_take(run_dir: Path, ws: Path, paths: Iterable[str]) -> list[str]:
     """Of the workspace's untracked `paths`, the ones leadhand may sweep or commit: never a
     nested repository, a file the workspace had when the run started, or anything under the
-    run directory or its docs folder when they lie inside the workspace (R48')."""
+    run directory or its docs folder when they lie inside the workspace's checkout (R48').
+    `paths` are named from the checkout's top, which the workspace may lie below."""
     run_dir = Path(run_dir)
     start = set((_read_json(run_dir / UNTRACKED_AT_START) or {}).get("paths") or ())
-    real_ws = os.path.realpath(ws)
+    top = os.path.realpath(checkout_top(Path(ws))[0])
     fenced = []
     for d in (run_dir, run_dir.parent.parent):       # <docs_dir>/runs/<run>
-        rel = os.path.relpath(os.path.realpath(d), real_ws)
+        rel = os.path.relpath(os.path.realpath(d), top)
         if rel != os.pardir and not rel.startswith(os.pardir + os.sep):
             fenced.append("" if rel == os.curdir else rel.replace(os.sep, "/").rstrip("/") + "/")
     return [p for p in paths if not p.endswith("/") and p not in start

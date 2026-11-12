@@ -793,6 +793,40 @@ class RunnerCommitTests(Base):
         self.assertNotEqual(late["committed"], self.base_sha)
         self.assertEqual(run_git(self.repo, "rev-list", "--count", f"{self.base_sha}..HEAD"), "1")
 
+    def test_runner_commits_a_new_file_in_a_subdirectory_workspace(self):
+        # An in-place run started with --repo <checkout>/src: Git lists untracked files from
+        # the checkout's top ("src/new.py"), and the workspace is src.
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "a.py").write_text("A = 1\n")
+        run_git(self.repo, "add", "src/a.py")
+        run_git(self.repo, "commit", "--quiet", "--no-verify", "-m", "src")     # the fixture's hook refuses
+        self.base_sha = run_git(self.repo, "rev-parse", "HEAD")
+        sub = self.repo / "src"
+        (self.run_dir / "run.json").write_text(json.dumps(
+            {"run_id": self.run_dir.name, "repo": str(sub), "workspace": str(sub)}))
+        folder = sub / ".leadhand" / "1" / "d1"
+        folder.mkdir(parents=True)
+        (folder / "brief.md").write_text("# Brief\n## Card 1: Widget card\n")
+        req = self.request(cwd=sub, brief=folder / "brief.md", report=folder / "report.md",
+                           kind="implement", branch=CARD_BRANCH)
+        wd = self.worker_dir()
+        wd.mkdir(parents=True)
+        (sub / "new.py").write_text("NEW = 1\n")
+        (sub / "a.py").write_text("A = 2\n")
+        out = dsp._commit_work(wd, req)
+        self.assertEqual(out.get("committed"), run_git(self.repo, "rev-parse", "HEAD"), out)
+        self.assertEqual(sorted(self.head_files()), ["src/a.py", "src/new.py"])
+
+    def test_untracked_to_take_fences_the_run_folder_from_the_checkout_top(self):
+        # Untracked paths are named from the checkout's top, so the fence is too, even when the
+        # workspace is a subdirectory and the docs folder lies beside it in the checkout.
+        sub = self.repo / "src"
+        sub.mkdir()
+        run_dir = self.repo / "notes" / "runs" / "2026-11-10-demo run"
+        run_dir.mkdir(parents=True)
+        paths = ["notes/runs/2026-11-10-demo run/run.json", "notes/runs.md", "src/new.py"]
+        self.assertEqual(dsp.untracked_to_take(run_dir, sub, paths), ["src/new.py"])
+
     def test_failed_commit_is_blocked_environment_with_reason(self):
         for name in ("EMAIL", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
             os.environ.pop(name, None)

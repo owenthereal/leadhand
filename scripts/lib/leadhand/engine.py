@@ -1759,9 +1759,10 @@ def _finish_leftovers(ctx: _Run, events: list[dict]) -> bool:
                 and e.get("stage") == "restored"}
     pending = [e for e in events if e["kind"] == "violation" and _by(e) == "implementer"
                and e.get("stage") == "found" and e.get("n") not in restored]
+    top = checkout_top(ctx.ws)[0]     # Git names untracked paths from the checkout's top
     for f in pending:
         saved = None
-        loose = [p for p in f.get("untracked") or () if os.path.lexists(ctx.ws / p)]
+        loose = [p for p in f.get("untracked") or () if os.path.lexists(top / p)]
         if (_operation(ctx) or detect_violation(ctx.ws, f["expected_head"], f["expected_branch"]) is not None
                 or loose):
             saved = preserve_and_restore(ctx.ws, ref=f["ref"], expected_head=f["expected_head"],

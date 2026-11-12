@@ -10,7 +10,8 @@ from gitfixture import (
 from leadhand.gitops import (
     GitError, Violation, card_branch_name, changed_paths, cut_card_branch, default_base,
     detect_violation, fast_forward, git, git_common_dir, head, is_test_or_doc_path,
-    is_ancestor, needs_integration, preserve_and_restore, prepare_workspace, rebase_onto,
+    is_ancestor, needs_integration, preserve_and_restore, prepare_workspace, rebase_onto, stage_work,
+    untracked_files,
 )
 
 RUN = "leadhand/run-1"
@@ -564,6 +565,68 @@ class GitopsTests(unittest.TestCase):
             self.assertTrue(is_test_or_doc_path(p), p)
         for p in no:
             self.assertFalse(is_test_or_doc_path(p), p)
+
+
+class SubdirectoryWorkspaceTests(unittest.TestCase):
+    """An in-place run started with `--repo <checkout>/src` works in that subdirectory, while
+    Git lists paths relative to the checkout's top: staging and preserving must take them so."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="leadhand gitops sub "))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        hermetic(self, self.tmp)
+        self.repo = make_repo(self.tmp)
+        commit(self.repo, {"src/a.py": "A = 1\n"}, "src")
+        self.ws = self.repo / "src"
+        self.head = run_git(self.repo, "rev-parse", "HEAD")
+
+    def staged(self) -> list[str]:
+        return run_git(self.repo, "diff", "--cached", "--name-only", "HEAD").splitlines()
+
+    def test_stage_work_takes_a_new_file_in_the_subdirectory(self):
+        write(self.ws, {"new.py": "NEW = 1\n", "pkg/deep.py": "DEEP = 1\n"})
+        write(self.repo, {"src/a.py": "A = 2\n"})
+        new = untracked_files(self.ws)
+        self.assertEqual(sorted(new), ["src/new.py", "src/pkg/deep.py"])
+        staged, gitlinks = stage_work(self.ws, new_paths=new)
+        self.assertTrue(staged)
+        self.assertEqual(gitlinks, [])
+        self.assertEqual(sorted(self.staged()), ["src/a.py", "src/new.py", "src/pkg/deep.py"])
+
+    def test_stage_work_leaves_out_a_gitlink_in_the_subdirectory(self):
+        nested = self.ws / "sub"
+        nested.mkdir()
+        run_git(nested, "init", "--quiet")
+        commit(nested, {"x.txt": "first\n"}, "nested")
+        run_git(self.repo, "add", "src/sub")
+        run_git(self.repo, "commit", "--quiet", "-m", "nested")
+        commit(nested, {"x.txt": "moved\n"}, "move the nested repository")
+        staged, gitlinks = stage_work(self.ws, new_paths=[])
+        self.assertEqual(gitlinks, ["src/sub"])
+        self.assertFalse(staged)
+        self.assertEqual(self.staged(), [])
+
+    def test_preserve_keeps_and_removes_untracked_files_named_from_the_top(self):
+        write(self.ws, {"new.py": "NEW = 1\n", "pkg/deep.py": "DEEP = 1\n"})
+        write(self.repo, {"src/a.py": "A = 2\n"})
+        saved = preserve_and_restore(self.ws, ref="refs/leadhand/saved/1", expected_head=self.head,
+                                     expected_branch="main", untracked=["src/new.py", "src/pkg/deep.py"])
+        self.assertEqual(run_git(self.repo, "show", f"{saved}:src/new.py"), "NEW = 1")
+        self.assertEqual(run_git(self.repo, "show", f"{saved}:src/pkg/deep.py"), "DEEP = 1")
+        self.assertEqual(run_git(self.repo, "show", f"{saved}:src/a.py"), "A = 2")
+        self.assertFalse((self.ws / "new.py").exists())
+        self.assertFalse((self.ws / "pkg").exists())
+        self.assertEqual((self.ws / "a.py").read_text(), "A = 1\n")
+        self.assertEqual(run_git(self.repo, "status", "--porcelain"), "")
+
+    def test_preserve_never_removes_the_workspace_folder_itself(self):
+        ws = self.repo / "fresh"                  # holds nothing tracked
+        write(ws, {"only.py": "ONLY = 1\n"})
+        saved = preserve_and_restore(ws, ref="refs/leadhand/saved/1", expected_head=self.head,
+                                     expected_branch="main", untracked=["fresh/only.py"])
+        self.assertEqual(run_git(self.repo, "show", f"{saved}:fresh/only.py"), "ONLY = 1")
+        self.assertFalse((ws / "only.py").exists())
+        self.assertTrue(ws.is_dir())
 
 
 if __name__ == "__main__":

@@ -102,6 +102,31 @@ class InPlace(unittest.TestCase):
         out.flush()
         self.assertEqual(json.loads(raw.getvalue()), {"path": name, "title": "caf\u00e9"})
 
+    def test_run_started_in_a_subdirectory_preserves_a_parked_cards_untracked_file(self):
+        # --repo <checkout>/<sub dir>: Git names the leftover from the checkout's top.
+        w = FakeWorld(self, [card(1), card(2)], config=IN_PLACE)
+        sub = w.repo / "sub dir"
+        sub.mkdir()
+        with contextlib.redirect_stdout(io.StringIO()):
+            w.run_dir = engine.start(w.deck_path, repo=sub)
+        self.assertEqual(w.workspace(), sub.resolve())
+
+        def leave_untracked(world, ws, a):
+            write(ws, {"pkg/half-done.py": "# card 1's unfinished, uncommitted new file\n"})
+
+        w.script(1, "implement", {"tamper": leave_untracked, "status": "QUESTION"})
+        w.parks[1] = "decision needed: storage format"
+        w.run()
+        self.assertEqual([e["card"] for e in w.events("accepted")], [2])
+        found = [e for e in w.events("violation") if e.get("by") == "implementer" and e.get("stage") == "found"]
+        self.assertTrue(any("sub dir/pkg/half-done.py" in (e.get("untracked") or []) for e in found), found)
+        restored = [e for e in w.events("violation") if e.get("by") == "implementer" and e.get("stage") == "restored"]
+        self.assertTrue(restored, w.events("violation"))
+        self.assertEqual(run_git(w.repo, "show", f"{restored[-1]['saved']}:sub dir/pkg/half-done.py"),
+                         "# card 1's unfinished, uncommitted new file")
+        self.assertFalse((sub / "pkg" / "half-done.py").exists())
+        self.assertTrue(sub.is_dir())
+
 
 class Exclusive(unittest.TestCase):
     """R53: an in-place run claims the checkout; a second in-place run of the repository is

@@ -103,6 +103,13 @@ def checkout_top(path: Path) -> tuple[Path, Path | None]:
     return Path(top), Path(git_dir)
 
 
+def _top(ws: Path, timeout: float = GIT_TIMEOUT) -> Path:
+    """The top of the checkout `ws` lies in. Git names paths from there (`--full-name`, diff
+    and status output), and a workspace can be a subdirectory of it (an in-place run started
+    with `--repo <checkout>/<dir>`), so such paths are used from the top."""
+    return Path(git(ws, "rev-parse", "--show-toplevel", timeout=timeout))
+
+
 def head(ws: Path, ref: str = "HEAD") -> str:
     return git(ws, "rev-parse", "--verify", f"{ref}^{{commit}}")
 
@@ -443,6 +450,7 @@ def stage_work(ws: Path, *, new_paths: Sequence[str], deadline: float | None = N
             raise GitError("no time left before the deadline")
         return min(GIT_TIMEOUT, left)
 
+    ws = _top(ws, timeout())          # `new_paths` and the gitlinks below are named from the top
     git(ws, "add", "-u", "--", ":/", timeout=timeout())
     files = [p for p in new_paths if not p.endswith("/")]
     if files:
@@ -499,9 +507,10 @@ def preserve_and_restore(ws: Path, *, ref: str, expected_head: str, expected_bra
         saved = _snapshot_conflicted(ws)
     else:
         raise _fail(r, ws)
-    files = [p for p in untracked if not p.endswith("/") and os.path.lexists(ws / p)]
+    top = _top(ws)                    # `untracked` is named from the top
+    files = [p for p in untracked if not p.endswith("/") and os.path.lexists(top / p)]
     if files:
-        saved = _snapshot_untracked(ws, saved, files)
+        saved = _snapshot_untracked(top, saved, files)
     git(ws, "update-ref", "-m", "leadhand: preserve workspace", ref, saved)
     branch_ref = f"refs/heads/{expected_branch}"
     moved_tip = None
@@ -518,7 +527,7 @@ def preserve_and_restore(ws: Path, *, ref: str, expected_head: str, expected_bra
     git(ws, "checkout", "--quiet", "--force", "-B", expected_branch, expected_head, "--")
     git(ws, "reset", "--quiet", "--hard", expected_head)
     for p in files:
-        _remove_untracked(ws, p)
+        _remove_untracked(top, p, ws)
     return saved
 
 
@@ -541,16 +550,17 @@ def _snapshot_untracked(ws: Path, saved: str, paths: Sequence[str]) -> str:
     return git(ws, *NO_SIGN, "commit-tree", tree, "-p", saved, "-m", "leadhand: preserved untracked files")
 
 
-def _remove_untracked(ws: Path, rel: str) -> None:
-    """Remove one untracked file (a symlink itself, never its target), then any folders it
-    leaves empty, up to the worktree root."""
-    path = ws / rel
+def _remove_untracked(top: Path, rel: str, ws: Path) -> None:
+    """Remove one untracked file (`rel`, from the checkout top; a symlink itself, never its
+    target), then any folders it leaves empty, up to the checkout top, never the workspace
+    folder `ws` itself."""
+    path = top / rel
     if path.is_dir() and not path.is_symlink():
         return
     path.unlink(missing_ok=True)
     parent = path.parent
-    root = Path(ws).resolve()
-    while parent.resolve() != root and root in parent.resolve().parents:
+    root, keep = Path(top).resolve(), Path(ws).resolve()
+    while parent.resolve() not in (root, keep) and root in parent.resolve().parents:
         try:
             parent.rmdir()
         except OSError:
