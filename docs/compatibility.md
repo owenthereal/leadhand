@@ -284,9 +284,11 @@ exclusion), so any Claude worker of the session can run it too. What the CLI che
 - `run` refuses a CLI or `--plugin-dir` inside the run's workspace, and `start` an in-place
   run of the repository that holds the CLI.
 - The evidence base worktree is reset only when neither it nor a folder between the
-  repository and it is a symlink. A Codex evidence worker gets it as a writable folder
-  (`--add-dir`), on the same terms and only when it is a registered worktree of the
-  repository; otherwise the runner refuses to start Codex. No other kind of dispatch gets it.
+  repository and it is a symlink, and only when the run's events record adding it: a worktree
+  already at that path that the run did not add is refused, never reset or cleaned. A Codex
+  evidence worker gets it as a writable folder (`--add-dir`), on the same terms and only when
+  it is a registered worktree of the repository; otherwise the runner refuses to start Codex.
+  No other kind of dispatch gets it.
 - Leadhand's Git calls run with `GIT_LFS_SKIP_SMUDGE=1`, so git-lfs never fetches an object
   (from a URL a worker's `.lfsconfig` could choose). Files under LFS are pointer files in
   leadhand's own checkouts; the clean filter stays on, so checked-out LFS content does not

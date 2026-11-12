@@ -1974,10 +1974,14 @@ def _base_worktree(ctx: _Run) -> Path:
     evidence gate. Before every evidence request it is put back exactly: stale worktree
     records pruned, created when missing, then detached at the base, hard-reset and cleaned
     of every untracked and ignored file. Idempotent. It is kept after the run (beside the
-    run's own worktree) so the evidence can be re-checked; `git worktree remove` deletes it."""
+    run's own worktree) so the evidence can be re-checked; `git worktree remove` deletes it.
+    Only a worktree this run added is ever reset: `base_worktree_added` is recorded before
+    `git worktree add` (so a crash right after the add still finds it the run's), and a
+    worktree at the path that the run's events do not record is refused (Codex 4546501978)."""
     repo = Path(ctx.meta["repo"])
     path = _base_worktree_path(ctx)
     base = ctx.meta["base_sha"]
+    added = any(e["kind"] == "base_worktree_added" and e.get("path") == str(path) for e in read_events(ctx.paths))
 
     def in_place() -> None:
         # In an in-place run <repo>/.worktrees/ is worker-writable: a symlink there would aim
@@ -1991,8 +1995,13 @@ def _base_worktree(ctx: _Run) -> Path:
     registered = {os.path.realpath(ln[len("worktree "):]) for ln in listed if ln.startswith("worktree ")}
     if os.path.lexists(path) and os.path.realpath(path) not in registered:
         raise EngineError(f"{path} exists but is not a worktree of {repo}; move it aside")
+    if os.path.lexists(path) and not added:
+        raise EngineError(f"{path} is a worktree this run did not add; it is never reset for the evidence "
+                          "gate. Move it aside (git worktree move or remove), then run next again")
     if not os.path.lexists(path):
         ensure_excluded(repo, ".worktrees/")
+        if not added:
+            append_event(ctx.paths, "base_worktree_added", path=str(path))
         git(repo, "worktree", "add", "--quiet", "--detach", str(path), base)
     in_place()
     git(path, "checkout", "--quiet", "--force", "--detach", base, "--")

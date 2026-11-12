@@ -651,5 +651,57 @@ class NothingAccepted(unittest.TestCase):
         self.assertTrue(w.paths.report.is_file())
 
 
+class BaseWorktreeOwnership(unittest.TestCase):
+    """The evidence base worktree is checked out, hard-reset and cleaned before every evidence
+    request: only ever one this run recorded adding (Codex 4546501978), never an unrelated
+    worktree that happens to sit at its path."""
+
+    def foreign_worktree(self, w, path: Path):
+        run_git(w.repo, "worktree", "add", "--quiet", "-b", "operator-notes", str(path), w.base)
+        write(path, {"valuable.txt": "the operator's untracked notes\n"})
+        return path
+
+    def assert_untouched(self, w, path: Path):
+        self.assertEqual((path / "valuable.txt").read_text(), "the operator's untracked notes\n")
+        self.assertEqual(run_git(path, "symbolic-ref", "--short", "HEAD"), "operator-notes")
+
+    def test_in_place_run_refuses_a_foreign_worktree_at_its_base_path(self):
+        w = FakeWorld(self, [card(1)], config="[run]\nworktree = false\n", gates=True)
+        w.start()
+        path = self.foreign_worktree(w, w.repo / ".worktrees" / f"{w.run_dir.name}--base")
+        with self.assertRaises(engine.EngineError) as cm:
+            w.run()
+        self.assertIn("this run did not add", str(cm.exception))
+        self.assert_untouched(w, path)
+
+    def test_worktree_run_refuses_a_foreign_worktree_at_its_base_path(self):
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        ws = w.workspace()
+        path = self.foreign_worktree(w, ws.parent / f"{ws.name}--base")
+        with self.assertRaises(engine.EngineError) as cm:
+            w.run()
+        self.assertIn("this run did not add", str(cm.exception))
+        self.assert_untouched(w, path)
+
+    def test_a_base_worktree_added_before_a_crash_is_still_the_runs(self):
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        ctx = engine._load(w.run_dir, check_digest=False)
+        real = engine.git
+
+        def crash_after_add(cwd, *args, **kw):
+            out = real(cwd, *args, **kw)
+            if args[:2] == ("worktree", "add") and "--detach" in args:
+                raise KeyboardInterrupt("crash right after git worktree add")
+            return out
+
+        with mock.patch.object(engine, "git", crash_after_add), self.assertRaises(KeyboardInterrupt):
+            engine._base_worktree(ctx)
+        path = engine._base_worktree(ctx)
+        self.assertEqual(run_git(path, "rev-parse", "HEAD"), w.base)
+        self.assertEqual(w.run()[-1]["outcome"], "complete")
+
+
 if __name__ == "__main__":
     unittest.main()
