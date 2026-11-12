@@ -84,9 +84,10 @@ from leadhand.config import (SNAPSHOT, VENDORS, Config, ConfigError, Route, conf
                              load_config, load_run_config, unsupported_warnings)
 from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, parse_deck
 from leadhand.gitops import (CARD_INFIX, GitError, card_branch_name, changed_paths, checkout_top, cut_card_branch,
-                             default_base, detect_violation, ensure_excluded, fast_forward, git, head, is_ancestor,
-                             is_test_or_doc_path, needs_integration, prepare_workspace, preserve_and_restore,
-                             rebase_onto, resolves_in_place, stage_work, status_entries, untracked_files)
+                             default_base, detect_violation, ensure_excluded, fast_forward, git, head,
+                             hidden_index_entries, is_ancestor, is_test_or_doc_path, needs_integration,
+                             prepare_workspace, preserve_and_restore, rebase_onto, resolves_in_place, stage_work,
+                             status_entries, untracked_files)
 from leadhand.route import LadderExhausted, PinnedVendorMissing, Resolution, resolve
 from leadhand.state import (CardState, RunPaths, utc_now, allowed_next_step, append_attempt, append_event,
                             crash_point, decide_outcome, fold_cards, new_run_dir, read_attempts, read_events,
@@ -2007,9 +2008,9 @@ def _base_worktree(ctx: _Run) -> Path:
             if (git(path, "rev-parse", "--verify", "HEAD") != base
                     or git(path, "status", "--porcelain", "--ignored", "--untracked-files=all")):
                 return False
-            # `status` hides an edit behind assume-unchanged (lowercase tag; the reset would
-            # overwrite it) or skip-worktree (`S`; the reset would leave the base off its commit).
-            if any(entry[:2] != "H " for entry in git(path, "ls-files", "-v", "-z").split("\0") if entry):
+            # `status` hides an edit behind assume-unchanged (the reset would overwrite it) or
+            # skip-worktree (the reset would leave the base off its commit).
+            if hidden_index_entries(path):
                 return False
         except GitError:
             return False

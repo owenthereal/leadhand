@@ -672,7 +672,8 @@ class SubdirectoryWorkspaceTests(unittest.TestCase):
 
 class OperatorFilesInPlaceTests(unittest.TestCase):
     """An in-place run works in the operator's checkout: Git's checkout and merge overwrite an
-    ignored file by default, and rebase cannot be told not to (Codex 4546946539)."""
+    ignored file by default, and rebase cannot be told not to (Codex 4546946539); an edit
+    behind assume-unchanged or skip-worktree hides from every cleanliness check (4546946532)."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="leadhand gitops operator "))
@@ -728,6 +729,20 @@ class OperatorFilesInPlaceTests(unittest.TestCase):
         self.assertIn("local.env", str(cm.exception))
         self.assert_kept(card_branch)
         self.assertEqual(run_git(self.repo, "rev-parse", card_branch), before)
+
+    def test_start_refuses_hidden_index_entries_in_place(self):
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag=flag):
+                write(self.repo, {"README.md": "an edit hidden from status\n"})
+                run_git(self.repo, "update-index", flag, "README.md")
+                with self.assertRaises(GitError) as cm:
+                    prepare_workspace(self.repo, run_branch=RUN, base_sha=self.head, slug="run-1",
+                                      use_worktree=False)
+                self.assertIn("README.md", str(cm.exception))
+                self.assertIn(f"git update-index --no-{flag[2:]}", str(cm.exception))
+                self.assertEqual(run_git(self.repo, "branch", "--list", RUN), "")
+                run_git(self.repo, "update-index", f"--no-{flag[2:]}", "README.md")
+                run_git(self.repo, "checkout", "--quiet", "--", "README.md")
 
 
 if __name__ == "__main__":

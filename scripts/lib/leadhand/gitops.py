@@ -247,13 +247,21 @@ def prepare_workspace(repo: Path, *, run_branch: str, base_sha: str, slug: str, 
     `<slug>-3`, ... is used, so a run never takes over another run's worktree. A name is
     free when neither the worktree nor its evidence base worktree (`<name>--base`) exists.
     Without a worktree, a repo with uncommitted tracked changes is refused (unless it is
-    already on the run branch, i.e. a resumed run), and so is one where checking out the run
-    branch would overwrite a file Git does not track there now, an ignored one included
-    (Codex 4546946539); a refusal changes nothing."""
+    already on the run branch, i.e. a resumed run), so is one with an assume-unchanged or
+    skip-worktree index entry (an edit Git's checks do not see, Codex 4546946532), and one
+    where checking out the run branch would overwrite a file Git does not track there now,
+    an ignored one included (Codex 4546946539); a refusal changes nothing."""
     _check_branch_name(repo, run_branch)
     if not slug or "/" in slug or "\0" in slug or slug.startswith("."):
         raise GitError(f"not a valid workspace slug: {slug!r}")
     ref = f"refs/heads/{run_branch}"
+    hidden = hidden_index_entries(repo) if not use_worktree else []
+    if hidden:
+        # A fresh worktree has no such entries; the operator's checkout may (Codex 4546946532).
+        raise GitError(f"tracked files in {repo} are hidden from Git's change checks (assume-unchanged or "
+                       f"skip-worktree): {', '.join(hidden)}; a run without a worktree would not see an edit "
+                       "to them. Clear the flags (git update-index --no-assume-unchanged <path>, git "
+                       "update-index --no-skip-worktree <path>), or run in a worktree (run.worktree = true)")
     if not use_worktree and _current_branch(repo) != run_branch:
         if _has_changes(repo):
             # Checking out the run branch would carry them into the run.
@@ -333,6 +341,13 @@ def needs_integration(ws: Path, run_branch: str, card_branch: str) -> bool:
 def is_ancestor(ws: Path, ancestor: str, descendant: str) -> bool:
     """True when commit `ancestor` is in the history of `descendant` (or is it)."""
     return _test(ws, "merge-base", "--is-ancestor", ancestor, descendant)
+
+
+def hidden_index_entries(ws: Path) -> list[str]:
+    """Tracked paths whose index entry is not a plain cached one (`git ls-files -v` tag other
+    than `H`): assume-unchanged (a lowercase tag) or skip-worktree (`S`) hide an edit from
+    `status` and `diff`, and a reset overwrites (or keeps) it unseen."""
+    return [entry[2:] for entry in _nul_list(git(ws, "ls-files", "-v", "-z")) if entry[:2] != "H "]
 
 
 def _in_the_way(ws: Path, *targets: str) -> list[str]:
