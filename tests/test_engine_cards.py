@@ -184,6 +184,25 @@ class Loop(unittest.TestCase):
         verdicts = w.events("verdict_recorded")
         self.assertEqual(verdicts[0]["verdict"], "defects")
 
+    def test_clean_rereview_noting_fixed_findings_stays_clean(self):
+        # Only outstanding findings (numbered lines under ## Findings) overrule the verdict.
+        report = ("Verdict: clean\n## Findings\nNone\n## Notes\n"
+                  "1. [high] src/widget.py:1 — fixed; regression test passes.\n")
+        head = engine._head(report, "", None, False)
+        self.assertEqual(head["verdict"], "clean")
+        self.assertNotIn("cross_checked", head)
+
+    def test_clean_verdict_cross_check_reads_only_numbered_findings_lines(self):
+        def verdict(report):
+            return engine._head(report, "", None, False)["verdict"]
+        self.assertEqual(verdict("Verdict: clean\n## Findings\n2. [High] src/a.py:3 — leaks — close it\n"
+                                 "## Notes\nRead the diff.\n"), "defects")
+        self.assertEqual(verdict("Verdict: clean\n## Findings\n  1) [medium] src/a.py:3 — x — y\n"), "defects")
+        self.assertEqual(verdict("Verdict: clean\n## Findings\n1. [low] src/a.py:3 — nit — rename\n"
+                                 "- [high] earlier round: fixed\n## Notes\n1. [medium] fixed\n"), "clean")
+        self.assertEqual(verdict("Verdict: clean\n[high] src/a.py:3 outside any section\n"
+                                 "## Findings\nNone\n"), "clean")
+
     def test_test_only_fix_returns_check_diff(self):
         w = FakeWorld(self, [card(1)])
         w.start()

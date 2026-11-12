@@ -110,8 +110,11 @@ REPLY_FILE = "reply.txt"      # in the dispatch's scratch folder (R38)
 MAX_STEPS = 200               # mechanical steps in one next_action call
 SLUG_MAX = 40
 _TURN_LIMIT = re.compile(r"stopped at its \d+-turn limit", re.IGNORECASE)
-# A finding line in a reviewer report: "1. [high] ..." (also "- [medium] ...").
-_SEVERE_FINDING = re.compile(r"^\s*(?:\d+[.)]|[-*])?\s*\[(?:high|medium)\]", re.IGNORECASE | re.MULTILINE)
+# An outstanding severe finding in a reviewer report: a numbered line ("1. [high] ...") in the
+# ## Findings section, which runs to the next "## " heading. Elsewhere (## Notes describing
+# fixed findings, say) a severity tag is not a finding.
+_FINDINGS_SECTION = re.compile(r"^##[ \t]*Findings[ \t\r]*$(.*?)(?=^##\s|\Z)", re.IGNORECASE | re.MULTILINE | re.DOTALL)
+_SEVERE_FINDING = re.compile(r"^\s*\d+[.)]\s*\[(?:high|medium)\]", re.IGNORECASE | re.MULTILINE)
 _QUESTION = re.compile(r"^#+\s*Question\s*$(.*?)(?=^#+\s|\Z)", re.IGNORECASE | re.MULTILINE | re.DOTALL)
 
 
@@ -2924,7 +2927,8 @@ def _head(report: str | None, reply: str, codex: dsp.DispatchResult | None, stop
         out = {"status": value if key == "Status" else "READY", "blocked_by": blocked_by, "head": key,
                "verdict": value if key == "Verdict" else None, "result": value if key == "Result" else None,
                "source": source, "raw_kept": False}
-        if out["verdict"] == "clean" and _SEVERE_FINDING.search(text):
+        if out["verdict"] == "clean" and any(_SEVERE_FINDING.search(m.group(1))
+                                             for m in _FINDINGS_SECTION.finditer(text)):
             out["verdict"], out["cross_checked"] = "defects", True
         return out
 
