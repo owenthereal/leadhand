@@ -637,6 +637,20 @@ class SubdirectoryWorkspaceTests(unittest.TestCase):
         self.assertTrue(staged)
         self.assertEqual(self.staged(), ["src/new.py"])
 
+    def test_cleanliness_probes_see_the_whole_checkout_whatever_diff_relative_says(self):
+        # Codex 4546501970: diff.relative=true scopes `git diff` to the cwd and names paths from it.
+        run_git(self.repo, "config", "diff.relative", "true")
+        write(self.repo, {"README.md": "uncommitted at the top\n"})
+        with self.assertRaises(GitError) as cm:
+            prepare_workspace(self.ws, run_branch=RUN, base_sha=self.head, slug="run-1", use_worktree=False)
+        self.assertIn("uncommitted changes to tracked files", str(cm.exception))
+        v = detect_violation(self.ws, self.head, "main")
+        self.assertEqual(v.tracked_changes, ("README.md",))
+        run_git(self.repo, "add", "README.md")
+        self.assertTrue(detect_violation(self.ws, self.head, "main").index_dirty)
+        moved = commit(self.repo, {"README.md": "committed at the top\n"}, "top")
+        self.assertEqual(changed_paths(self.ws, self.head, moved), ["README.md"])
+
     def test_preserve_never_removes_the_workspace_folder_itself(self):
         ws = self.repo / "fresh"                  # holds nothing tracked
         write(ws, {"only.py": "ONLY = 1\n"})

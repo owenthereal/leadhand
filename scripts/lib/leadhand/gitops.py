@@ -25,8 +25,12 @@ FETCH_TIMEOUT = 600.0
 NO_SIGN = ("-c", "commit.gpgsign=false")
 # Passed on every Git call leadhand makes (ruling R45): no repository hook, no fsmonitor
 # command (also a nested repository's: command-line config reaches Git's child processes),
-# and nested repositories are never looked into.
-SAFE_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "diff.ignoreSubmodules=all")
+# and nested repositories are never looked into. Also settings that would change output
+# leadhand reads (Codex 4546501970): diff.relative would scope `git diff` to the cwd (a
+# subdirectory workspace) and name paths from it; diff.noprefix and diff.mnemonicPrefix
+# would change the patch a check_diff shows.
+SAFE_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "diff.ignoreSubmodules=all",
+               "-c", "diff.relative=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false")
 # Set in the environment of every Git call leadhand makes. GIT_LFS_SKIP_SMUDGE (security review
 # H3): a worker's .gitattributes can route any file through the operator's git-lfs filter, and
 # its .lfsconfig picks the URL a smudge would fetch from, outside every sandbox; with it git-lfs
