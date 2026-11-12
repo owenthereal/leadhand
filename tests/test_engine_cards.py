@@ -192,16 +192,25 @@ class Loop(unittest.TestCase):
         self.assertEqual(head["verdict"], "clean")
         self.assertNotIn("cross_checked", head)
 
-    def test_clean_verdict_cross_check_reads_only_numbered_findings_lines(self):
+    def test_clean_verdict_cross_check_reads_only_findings_lines(self):
         def verdict(report):
             return engine._head(report, "", None, False)["verdict"]
         self.assertEqual(verdict("Verdict: clean\n## Findings\n2. [High] src/a.py:3 — leaks — close it\n"
                                  "## Notes\nRead the diff.\n"), "defects")
         self.assertEqual(verdict("Verdict: clean\n## Findings\n  1) [medium] src/a.py:3 — x — y\n"), "defects")
         self.assertEqual(verdict("Verdict: clean\n## Findings\n1. [low] src/a.py:3 — nit — rename\n"
-                                 "- [high] earlier round: fixed\n## Notes\n1. [medium] fixed\n"), "clean")
+                                 "## Notes\n- [high] earlier round: fixed\n1. [medium] fixed\n"), "clean")
         self.assertEqual(verdict("Verdict: clean\n[high] src/a.py:3 outside any section\n"
                                  "## Findings\nNone\n"), "clean")
+
+    def test_clean_verdict_cross_check_counts_bullet_findings_lines(self):
+        def verdict(report):
+            return engine._head(report, "", None, False)["verdict"]
+        self.assertEqual(verdict("Verdict: clean\n## Findings\n- [high] src/a.py:3 — leaks — close it\n"), "defects")
+        self.assertEqual(verdict("Verdict: clean\n## Findings\n  * [Medium] src/a.py:3 — x — y\n"
+                                 "## Notes\nRead the diff.\n"), "defects")
+        self.assertEqual(verdict("Verdict: clean\n## Findings\n- [low] src/a.py:3 — nit — rename\n"
+                                 "## Notes\n- [high] earlier round: fixed\n* [medium] fixed\n"), "clean")
 
     def test_test_only_fix_returns_check_diff(self):
         w = FakeWorld(self, [card(1)])

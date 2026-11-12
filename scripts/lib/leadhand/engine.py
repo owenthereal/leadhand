@@ -110,11 +110,11 @@ REPLY_FILE = "reply.txt"      # in the dispatch's scratch folder (R38)
 MAX_STEPS = 200               # mechanical steps in one next_action call
 SLUG_MAX = 40
 _TURN_LIMIT = re.compile(r"stopped at its \d+-turn limit", re.IGNORECASE)
-# An outstanding severe finding in a reviewer report: a numbered line ("1. [high] ...") in the
-# ## Findings section, which runs to the next "## " heading. Elsewhere (## Notes describing
-# fixed findings, say) a severity tag is not a finding.
+# An outstanding severe finding in a reviewer report: a numbered or bulleted line ("1. [high] ...",
+# "- [medium] ...") in the ## Findings section, which runs to the next "## " heading. Elsewhere
+# (## Notes describing fixed findings, say) a severity tag is not a finding.
 _FINDINGS_SECTION = re.compile(r"^##[ \t]*Findings[ \t\r]*$(.*?)(?=^##\s|\Z)", re.IGNORECASE | re.MULTILINE | re.DOTALL)
-_SEVERE_FINDING = re.compile(r"^\s*\d+[.)]\s*\[(?:high|medium)\]", re.IGNORECASE | re.MULTILINE)
+_SEVERE_FINDING = re.compile(r"^\s*(?:\d+[.)]|[-*])\s*\[(?:high|medium)\]", re.IGNORECASE | re.MULTILINE)
 _QUESTION = re.compile(r"^#+\s*Question\s*$(.*?)(?=^#+\s|\Z)", re.IGNORECASE | re.MULTILINE | re.DOTALL)
 
 
