@@ -67,7 +67,6 @@ import re
 import secrets
 import shlex
 import shutil
-import stat
 import sys
 import tempfile
 import time
@@ -79,7 +78,7 @@ from typing import Any
 from leadhand import dispatch as dsp
 from leadhand import usage
 from leadhand.briefs import (CODEX_AGENT, ScratchError, agent_for, dispatch_message, parse_report_head,
-                             remove_scratch_file, scratch_dir, write_brief)
+                             read_scratch_file, remove_scratch_file, scratch_dir, write_brief)
 from leadhand.config import (SNAPSHOT, VENDORS, Config, ConfigError, Route, config_to_dict, docs_dir_for,
                              load_config, load_run_config, unsupported_warnings)
 from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, parse_deck
@@ -935,16 +934,18 @@ def _check_reply_file(ctx: _Run, d: _Dispatch, path: str) -> None:
         raise EngineError(f"refused: the reply file {expected} is a symlink or lies behind one")
 
 
-def _read_reply_file(path: str) -> str:
+def _read_reply_file(ctx: _Run, d: _Dispatch, path: str) -> str:
     """The reply file's text. A missing or unreadable file gives a note instead; the status then
-    comes from the report head, as for any reply without a status line. Never follows a symlink
-    and reads only a regular file."""
+    comes from the report head, as for any reply without a status line. Read through the
+    scratch folder's validated descriptor, so never through a symlink (the file's or a folder's
+    swapped in after `_check_reply_file`), and only a regular file."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, "rb") as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-                raise OSError(0, "not a regular file")
-            return f.read().decode("utf-8", errors="replace")
+        data = read_scratch_file(ctx.ws, d.req["card"], d.id, REPLY_FILE)
+        if data is None:
+            raise FileNotFoundError(2, "No such file or directory")
+        return data.decode("utf-8", errors="replace")
+    except ScratchError as e:
+        raise EngineError(str(e)) from None
     except OSError as e:
         return (f"(leadhand: the reply file {path} could not be read: {e.strerror or e}; "
                 "the status comes from the report)\n")
@@ -2963,32 +2964,38 @@ def _record_started(ctx: _Run, dispatch_id: str, worker_id: str) -> dict:
 
 
 def _copy_if_missing(src: Path | None, dest: Path, text: str | None = None,
-                     notes: list[str] | None = None) -> bool:
-    """Copy a worker's file into the run folder once. Only a regular file is copied, never
-    through a symlink (a worker could point one anywhere); anything else is noted."""
+                     notes: list[str] | None = None, req: dict | None = None) -> bool:
+    """Copy a worker's file into the run folder once: `text`, or the dispatch's scratch file
+    `src` (`req`'s brief or report). Only a regular file is copied, read through the scratch
+    folder's validated descriptor, never through a symlink, the file's or a folder's on the
+    way (a worker could point one anywhere, Codex 4546946519); anything else is noted."""
     if dest.exists():
         return True
     if text is None:
-        if src is None:
+        if src is None or req is None:
             return False
         try:
-            fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
-        except FileNotFoundError:
-            return False
-        except OSError as e:
+            data = _read_scratch(req, src)
+        except (ScratchError, OSError) as e:
             if notes is not None:
-                notes.append(f"{src} not copied: it is a symlink or cannot be opened ({e.strerror or e})")
+                notes.append(f"{src} not copied: it is a symlink, lies behind one, is not a regular file "
+                             f"or cannot be opened ({getattr(e, 'strerror', None) or e})")
             return False
-        with os.fdopen(fd, "rb") as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-                if notes is not None:
-                    notes.append(f"{src} not copied: not a regular file")
-                return False
-            data = f.read()
+        if data is None:
+            return False
     else:
         data = text.encode("utf-8", "surrogateescape")
     _write_bytes_atomic(dest, data)
     return True
+
+
+def _read_scratch(req: dict, path: Path) -> bytes | None:
+    """`path` (<ws>/.leadhand/<card or run>/<dispatch id>/<name>, as the dispatch request names
+    it) read through the scratch folder's validated descriptor; None when missing."""
+    ws = path.parents[3]
+    if scratch_dir(ws, req["card"], req["dispatch_id"]) / path.name != path:
+        raise OSError(0, "not in the dispatch's scratch folder")
+    return read_scratch_file(ws, req["card"], req["dispatch_id"], path.name)
 
 
 def _head(report: str | None, reply: str, codex: dsp.DispatchResult | None, stopped: bool,
@@ -3042,7 +3049,7 @@ def _record_result(ctx: _Run, dispatch_id: str, worker_id: str, reply: str = "",
         raise EngineError(f"dispatch {dispatch_id} started worker {d.started['worker_id']}, not {worker_id}")
     if d.req["vendor"] == "codex":
         return _record_codex_result(ctx, d, worker_id, stopped=stopped)
-    reply = _read_reply_file(reply_file) if reply_file is not None else (reply or "")
+    reply = _read_reply_file(ctx, d, reply_file) if reply_file is not None else (reply or "")
     return _store_result(ctx, d, worker_id, reply, stopped=stopped)
 
 
@@ -3082,7 +3089,7 @@ def _store_result(ctx: _Run, d: _Dispatch, worker_id: str, reply: str, *, stoppe
     folder.mkdir(parents=True, exist_ok=True)
     files, skipped = {}, []
     for name, src in (("brief", Path(req["brief"])), ("report", Path(req["report"]))):
-        if _copy_if_missing(src, folder / f"{name}.md", notes=skipped):
+        if _copy_if_missing(src, folder / f"{name}.md", notes=skipped, req=req):
             files[name] = str(folder / f"{name}.md")
     _copy_if_missing(None, folder / "reply.md", text=reply)
     files["reply"] = str(folder / "reply.md")

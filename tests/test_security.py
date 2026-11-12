@@ -1,6 +1,7 @@
 """Attacks from the security review (security-review.md), reproduced with fakes and scratch
 repositories. Each test is the reviewer's scenario; it must fail closed."""
 import contextlib
+import io
 import json
 import os
 import signal
@@ -507,6 +508,26 @@ class L1ReplyFile(unittest.TestCase):
         folder.rmdir()
         folder.symlink_to(elsewhere)
         self.assert_nothing_copied(self.record(reply))
+
+    def test_a_report_behind_a_symlinked_scratch_folder_is_never_copied(self):
+        # Codex 4546946519: O_NOFOLLOW guards only the last component; the folder is walked too.
+        folder = Path(self.a["reply_file"]).parent
+        elsewhere = self.w.tmp / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "report.md").write_text("Status: READY\nSECRET-KEY-MATERIAL\n")
+        (elsewhere / "brief.md").write_text("SECRET-KEY-MATERIAL\n")
+        for f in folder.iterdir():
+            f.unlink()
+        folder.rmdir()
+        folder.symlink_to(elsewhere)
+        with contextlib.redirect_stdout(io.StringIO()):
+            engine.record(self.w.run_dir, "result", dispatch_id=self.a["dispatch_id"], worker_id=self.worker,
+                          reply="Status: READY\n")
+        (done,) = self.w.events("result_recorded")
+        self.assertTrue(any("report" in note for note in done.get("files_skipped") or []), done)
+        for f in self.w.run_dir.rglob("*"):
+            if f.is_file():
+                self.assertNotIn("SECRET-KEY-MATERIAL", f.read_text(errors="replace"), f)
 
 
 class L2SymlinkedScratch(unittest.TestCase):

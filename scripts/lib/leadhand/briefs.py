@@ -12,6 +12,7 @@ import errno
 import os
 import re
 import shlex
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from string import Template
@@ -87,7 +88,7 @@ def scratch_dir(ws: Path, card: int | None, dispatch_id: str) -> Path:
 # -- scratch files ---------------------------------------------------------
 #
 # The CLI runs outside Claude Code's sandbox, and a worker can plant a symlink (or a file)
-# at a later dispatch's scratch folder. Every write or removal under <ws>/.leadhand/ walks
+# at a later dispatch's scratch folder. Every read, write or removal under <ws>/.leadhand/ walks
 # the folders from the workspace down with O_NOFOLLOW | O_DIRECTORY and acts relative to
 # the last folder's descriptor, so it never follows a symlink out of <ws>/.leadhand/ (a
 # folder swapped after the check is not followed either). A symlink or a non-folder on the
@@ -168,6 +169,27 @@ def write_scratch_file(ws: Path, card: int | None, dispatch_id: str, name: str, 
     finally:
         os.close(fd)
     return scratch_dir(ws, card, dispatch_id) / name
+
+
+def read_scratch_file(ws: Path, card: int | None, dispatch_id: str, name: str) -> bytes | None:
+    """The bytes of the regular file `name` in the dispatch's scratch folder, or None when it
+    or the folder is missing. Never through a symlink: a symlinked folder on the way raises
+    ScratchError; a symlink or anything but a regular file named `name` raises OSError."""
+    fd = _open_scratch(ws, card, dispatch_id, create=False)
+    if fd is None:
+        return None
+    try:
+        try:
+            f = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=fd)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(f, "rb") as src:
+            if not stat.S_ISREG(os.fstat(src.fileno()).st_mode):
+                raise OSError(0, "not a regular file")
+            return src.read()
+    finally:
+        os.close(fd)
 
 
 def remove_scratch_file(ws: Path, card: int | None, dispatch_id: str, name: str) -> None:
