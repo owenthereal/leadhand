@@ -670,5 +670,65 @@ class SubdirectoryWorkspaceTests(unittest.TestCase):
         self.assertTrue(ws.is_dir())
 
 
+class OperatorFilesInPlaceTests(unittest.TestCase):
+    """An in-place run works in the operator's checkout: Git's checkout and merge overwrite an
+    ignored file by default, and rebase cannot be told not to (Codex 4546946539)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="leadhand gitops operator "))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        hermetic(self, self.tmp)
+        self.repo = make_repo(self.tmp)
+        self.old = commit(self.repo, {"local.env": "historic\n"}, "track local.env")
+        run_git(self.repo, "rm", "--quiet", "--cached", "local.env")
+        run_git(self.repo, "commit", "--quiet", "-m", "stop tracking local.env")
+        self.head = run_git(self.repo, "rev-parse", "HEAD")
+        (git_common_dir(self.repo) / "info" / "exclude").write_text("local.env\n")
+        (self.repo / "local.env").write_text("the operator's settings\n")
+
+    def assert_kept(self, branch="main"):
+        self.assertEqual((self.repo / "local.env").read_text(), "the operator's settings\n")
+        self.assertEqual(current_branch(self.repo), branch)
+
+    def test_start_refuses_a_base_that_would_overwrite_an_ignored_file(self):
+        with self.assertRaises(GitError) as cm:
+            prepare_workspace(self.repo, run_branch=RUN, base_sha=self.old, slug="run-1", use_worktree=False)
+        self.assertIn("local.env", str(cm.exception))
+        self.assert_kept()
+        self.assertEqual(run_git(self.repo, "branch", "--list", RUN), "")
+
+    def test_switching_to_a_card_branch_never_overwrites_an_ignored_file(self):
+        prepare_workspace(self.repo, run_branch=RUN, base_sha=self.head, slug="run-1", use_worktree=False)
+        run_git(self.repo, "branch", f"{RUN}--card-1", self.old)       # a reused card branch tracking it
+        with self.assertRaises(GitError) as cm:
+            cut_card_branch(self.repo, RUN, 1)
+        self.assertIn("local.env", str(cm.exception))
+        self.assert_kept(RUN)
+
+    def test_fast_forward_never_overwrites_an_ignored_file(self):
+        prepare_workspace(self.repo, run_branch=RUN, base_sha=self.head, slug="run-1", use_worktree=False)
+        tracked = run_git(self.repo, "commit-tree", run_git(self.repo, "rev-parse", f"{self.old}^{{tree}}"),
+                          "-p", self.head, "-m", "track it again")
+        run_git(self.repo, "checkout", "--quiet", RUN)
+        with self.assertRaises(GitError) as cm:
+            fast_forward(self.repo, RUN, tracked)
+        self.assertIn("local.env", str(cm.exception))
+        self.assert_kept(RUN)
+        self.assertEqual(run_git(self.repo, "rev-parse", RUN), self.head)
+
+    def test_rebase_never_overwrites_an_ignored_file(self):
+        prepare_workspace(self.repo, run_branch=RUN, base_sha=self.head, slug="run-1", use_worktree=False)
+        card_branch, _ = cut_card_branch(self.repo, RUN, 1)
+        commit(self.repo, {"src/card.py": "CARD = 1\n"}, "card 1")
+        onto = run_git(self.repo, "commit-tree", run_git(self.repo, "rev-parse", f"{self.old}^{{tree}}"),
+                       "-p", self.head, "-m", "the run tip tracks it again")
+        before = run_git(self.repo, "rev-parse", card_branch)
+        with self.assertRaises(GitError) as cm:
+            rebase_onto(self.repo, card_branch, onto)
+        self.assertIn("local.env", str(cm.exception))
+        self.assert_kept(card_branch)
+        self.assertEqual(run_git(self.repo, "rev-parse", card_branch), before)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -247,23 +247,31 @@ def prepare_workspace(repo: Path, *, run_branch: str, base_sha: str, slug: str, 
     `<slug>-3`, ... is used, so a run never takes over another run's worktree. A name is
     free when neither the worktree nor its evidence base worktree (`<name>--base`) exists.
     Without a worktree, a repo with uncommitted tracked changes is refused (unless it is
-    already on the run branch, i.e. a resumed run)."""
+    already on the run branch, i.e. a resumed run), and so is one where checking out the run
+    branch would overwrite a file Git does not track there now, an ignored one included
+    (Codex 4546946539); a refusal changes nothing."""
     _check_branch_name(repo, run_branch)
     if not slug or "/" in slug or "\0" in slug or slug.startswith("."):
         raise GitError(f"not a valid workspace slug: {slug!r}")
-    if not use_worktree and _current_branch(repo) != run_branch and _has_changes(repo):
-        # Checking out the run branch would carry them into the run.
-        raise GitError(f"uncommitted changes to tracked files in {repo}; "
-                       "commit or set them aside before a run without a worktree")
+    ref = f"refs/heads/{run_branch}"
+    if not use_worktree and _current_branch(repo) != run_branch:
+        if _has_changes(repo):
+            # Checking out the run branch would carry them into the run.
+            raise GitError(f"uncommitted changes to tracked files in {repo}; "
+                           "commit or set them aside before a run without a worktree")
+        in_the_way = _in_the_way(repo, ref if _ref_exists(repo, ref) else base_sha)
+        if in_the_way:
+            raise GitError(f"checking out {run_branch} in {repo} would overwrite files Git does not track "
+                           f"there now (ignored ones included): {', '.join(in_the_way)}; move them aside "
+                           "before a run without a worktree, or run in a worktree (run.worktree = true)")
     ensure_excluded(repo, ".worktrees/")
     ensure_excluded(repo, ".leadhand/")
-    ref = f"refs/heads/{run_branch}"
     if not _ref_exists(repo, ref):
         # Empty old value: create only, never overwrite a branch made meanwhile.
         git(repo, "update-ref", "-m", "leadhand: create run branch", ref, head(repo, base_sha), "")
     if not use_worktree:
         if _current_branch(repo) != run_branch:
-            git(repo, "checkout", "--quiet", run_branch, "--")
+            git(repo, "checkout", "--quiet", "--no-overwrite-ignore", run_branch, "--")
         return repo
     registered = {os.path.realpath(w["worktree"]): w for w in _worktrees(repo) if "worktree" in w}
     base = head(repo, base_sha)
@@ -312,7 +320,8 @@ def cut_card_branch(ws: Path, run_branch: str, card: int | str, *, recorded: boo
         base = head(ws, f"refs/heads/{run_branch}")
         git(ws, "update-ref", "-m", "leadhand: cut card branch", ref, base, "")
     if _current_branch(ws) != branch:
-        git(ws, "checkout", "--quiet", branch, "--")
+        # Git refuses to overwrite an untracked file; without this flag it overwrites an ignored one.
+        git(ws, "checkout", "--quiet", "--no-overwrite-ignore", branch, "--")
     return branch, base
 
 
@@ -326,9 +335,27 @@ def is_ancestor(ws: Path, ancestor: str, descendant: str) -> bool:
     return _test(ws, "merge-base", "--is-ancestor", ancestor, descendant)
 
 
+def _in_the_way(ws: Path, *targets: str) -> list[str]:
+    """Files on disk that HEAD does not track but one of `targets` adds: checking a target
+    out would overwrite them. Git refuses that for an untracked file but overwrites an ignored
+    one by default, and rebase cannot be told not to."""
+    top, _ = top_and_prefix(ws)
+    added: set[str] = set()
+    for target in targets:
+        added.update(_nul_list(git(ws, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff",
+                                   "--diff-filter=A", "HEAD", target, "--")))
+    return sorted(p for p in added if os.path.lexists(top / p))
+
+
 def rebase_onto(ws: Path, card_branch: str, onto: str) -> list[str]:
     """Rebase `card_branch` onto `onto` in `ws`. [] on success; on conflict the rebase is
-    aborted (the branch is left unchanged) and the conflicted paths are returned."""
+    aborted (the branch is left unchanged) and the conflicted paths are returned. Refused
+    (GitError, nothing changed) when it would overwrite a file HEAD does not track, an
+    ignored one included."""
+    in_the_way = _in_the_way(ws, card_branch, onto)
+    if in_the_way:
+        raise GitError(f"rebasing {card_branch} onto {onto} in {ws} would overwrite files Git does not "
+                       f"track there now (ignored ones included): {', '.join(in_the_way)}; move them aside")
     r = _run(ws, (*NO_SIGN, "-c", "rebase.updateRefs=false", "rebase", "--quiet", "--no-autostash",
                   onto, card_branch))
     if r.returncode == 0:
@@ -371,7 +398,7 @@ def fast_forward(ws: Path, run_branch: str, to_sha: str) -> str:
     if not _test(ws, "merge-base", "--is-ancestor", current, target):
         raise GitError(f"not a fast-forward: {run_branch} is at {current}, which {target} does not contain")
     if _current_branch(ws) == run_branch:
-        git(ws, "merge", "--quiet", "--ff-only", target)
+        git(ws, "merge", "--quiet", "--ff-only", "--no-overwrite-ignore", target)
         return head(ws, ref)
     for w in _worktrees(ws):
         if w.get("branch") == ref:

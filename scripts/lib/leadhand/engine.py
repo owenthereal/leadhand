@@ -866,7 +866,8 @@ def _check_out(ctx: _Run, events: list[dict], card: int, branch: str) -> None:
     _no_open_dispatch(ctx, events, card)
     _ensure_clean(ctx, events, branch=current or branch, why=f"before switching to {branch}", untracked=True)
     if _current_branch(ctx) != branch:
-        git(ctx.ws, "checkout", "--quiet", branch, "--")
+        # Git refuses to overwrite an untracked file; without this flag it overwrites an ignored one.
+        git(ctx.ws, "checkout", "--quiet", "--no-overwrite-ignore", branch, "--")
 
 
 def _no_open_dispatch(ctx: _Run, events: list[dict], card: int) -> None:
