@@ -116,6 +116,22 @@ class GitopsTests(unittest.TestCase):
         self.assertEqual(current_branch(ws), branch)
         self.assertEqual(head(ws, branch), work)  # reused, not reset
 
+    def test_cut_card_branch_refuses_an_existing_branch_the_run_did_not_record(self):
+        repo, ws, base = self.workspace()
+        run_git(ws, "branch", "leadhand/run-1--card-2", base)
+        run_git(ws, "checkout", "--quiet", "leadhand/run-1--card-2")
+        theirs = commit(ws, {"theirs.txt": "1\n"}, "not this run's")
+        run_git(ws, "checkout", "--quiet", RUN)
+        with self.assertRaisesRegex(GitError, "leadhand/run-1--card-2"):
+            cut_card_branch(ws, RUN, 2, recorded=False)
+        self.assertEqual(current_branch(ws), RUN)
+        self.assertEqual(head(ws, "leadhand/run-1--card-2"), theirs)
+        # A recorded one is reused; an unrecorded one at the run tip (a cut whose record
+        # was lost to a crash) holds nothing of its own and is taken up.
+        self.assertEqual(cut_card_branch(ws, RUN, 2, recorded=True)[0], "leadhand/run-1--card-2")
+        run_git(ws, "branch", "leadhand/run-1--card-3", RUN)
+        self.assertEqual(cut_card_branch(ws, RUN, 3, recorded=False), ("leadhand/run-1--card-3", base))
+
     def test_fast_forward_is_idempotent(self):
         repo, ws, base = self.workspace()
         branch, _, tip = self.card(ws, 1, {"a.txt": "a\n"})

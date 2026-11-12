@@ -83,7 +83,7 @@ from leadhand.briefs import (CODEX_AGENT, ScratchError, agent_for, dispatch_mess
 from leadhand.config import (SNAPSHOT, VENDORS, Config, ConfigError, Route, config_to_dict, docs_dir_for,
                              load_config, load_run_config, unsupported_warnings)
 from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, parse_deck
-from leadhand.gitops import (GitError, card_branch_name, changed_paths, cut_card_branch, default_base,
+from leadhand.gitops import (CARD_INFIX, GitError, card_branch_name, changed_paths, cut_card_branch, default_base,
                              detect_violation, ensure_excluded, fast_forward, git, head, is_ancestor,
                              is_test_or_doc_path, needs_integration, prepare_workspace, preserve_and_restore,
                              rebase_onto, resolves_in_place, stage_work, status_entries, untracked_files)
@@ -361,10 +361,17 @@ def _free_branch(docs: Path, repo: Path, requested: str) -> str:
     """The deck's branch, or its first free numeric suffix (`-2`, `-3`, ...) when another run
     of this repo owns it or the branch already exists (left by a start that crashed before
     run.json, or made by someone else): a new run never reuses another run's branch, card
-    branches or worktree (R26')."""
+    branches or worktree (R26'). A name is also taken when a branch under its card prefix
+    (`<name>--card-*`, the final branch included) exists, so the run never takes up a card
+    branch it did not cut (R54)."""
     taken = {meta.get("branch") for _, meta in _runs(docs) if meta.get("repo") == str(repo)}
-    taken |= {ref.removeprefix("refs/heads/")
-              for ref in git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/").splitlines()}
+    for ref in git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/").splitlines():
+        name = ref.removeprefix("refs/heads/")
+        taken.add(name)
+        at = name.find(CARD_INFIX)
+        while at != -1:
+            taken.add(name[:at])
+            at = name.find(CARD_INFIX, at + 1)
     branch, n = requested, 1
     while branch in taken:
         n += 1
@@ -577,7 +584,9 @@ def _step(ctx: _Run, events: list[dict]) -> dict | None:
         if _ensure_clean(ctx, events, branch=current or ctx.branch, why=f"before cutting card {n}",
                          untracked=True):
             return None
-        branch, base = cut_card_branch(ctx.ws, ctx.branch, n)
+        name = card_branch_name(ctx.branch, n)
+        recorded = any(e["kind"] == "card_cut" and e.get("branch") == name for e in events)
+        branch, base = cut_card_branch(ctx.ws, ctx.branch, n, recorded=recorded)
         append_event(ctx.paths, "card_cut", card=n, branch=branch, base=base)
         return None
     if c.state == "cut":

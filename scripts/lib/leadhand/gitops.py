@@ -261,17 +261,26 @@ def prepare_workspace(repo: Path, *, run_branch: str, base_sha: str, slug: str, 
 # -- cards -----------------------------------------------------------------
 
 
+CARD_INFIX = "--card-"
+
+
 def card_branch_name(run_branch: str, card: int | str) -> str:
-    return f"{run_branch}--card-{card}"
+    return f"{run_branch}{CARD_INFIX}{card}"
 
 
-def cut_card_branch(ws: Path, run_branch: str, card: int | str) -> tuple[str, str]:
+def cut_card_branch(ws: Path, run_branch: str, card: int | str, *, recorded: bool = True) -> tuple[str, str]:
     """Check out the card branch in `ws`, creating it at the run tip when missing.
-    Returns (branch, base); for a reused branch the base is its merge base with the run."""
+    Returns (branch, base); for a reused branch the base is its merge base with the run.
+    `recorded` says whether the run's events record cutting this branch: an existing branch
+    they don't record is not the run's and is refused (R54), unless it is exactly at the run
+    tip (a cut whose record a crash lost: it holds nothing of its own)."""
     branch = card_branch_name(run_branch, card)
     _check_branch_name(ws, branch)
     ref = f"refs/heads/{branch}"
     if _ref_exists(ws, ref):
+        if not recorded and head(ws, ref) != head(ws, f"refs/heads/{run_branch}"):
+            raise GitError(f"the card branch {branch} already exists but this run did not cut it; "
+                           "rename or delete it, or start a new run")
         base = git(ws, "merge-base", f"refs/heads/{run_branch}", ref)
     else:
         base = head(ws, f"refs/heads/{run_branch}")

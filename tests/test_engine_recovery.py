@@ -157,6 +157,44 @@ class RunCollisions(unittest.TestCase):
         w.run()
         self.assertEqual(w.branch_tip("leadhand/demo"), theirs)
 
+    def _unrelated_branch(self, w, name):
+        run_git(w.repo, "checkout", "--quiet", "-b", name)
+        theirs = commit(w.repo, {"src/unrelated.txt": "not this run's\n"}, "someone else's card")
+        run_git(w.repo, "checkout", "--quiet", "main")
+        return theirs
+
+    def test_existing_card_branch_makes_its_run_branch_name_taken(self):
+        # R54: leadhand/demo itself is free, but leadhand/demo--card-1 is not this run's.
+        w = FakeWorld(self, card_list(), gates=True)
+        theirs = self._unrelated_branch(w, "leadhand/demo--card-1")
+        w.start()
+        self.assertEqual(w.meta()["branch"], "leadhand/demo-2")
+        done = w.run()[-1]
+        self.assertEqual(done["outcome"], "complete", done["reasons"])
+        self.assertEqual(w.events("card_cut")[0]["branch"], "leadhand/demo-2--card-1")
+        landed = run_git(w.repo, "diff", "--name-only", w.base, "refs/heads/leadhand/demo-2").splitlines()
+        self.assertNotIn("src/unrelated.txt", landed)
+        self.assertEqual(w.branch_tip("leadhand/demo--card-1"), theirs)
+        self.assertFalse(run_git(w.repo, "branch", "--list", "leadhand/demo"))
+
+    def test_existing_final_branch_makes_its_run_branch_name_taken(self):
+        w = FakeWorld(self, card_list())
+        self._unrelated_branch(w, "leadhand/demo--card-final")
+        w.start()
+        self.assertEqual(w.meta()["branch"], "leadhand/demo-2")
+
+    def test_card_branch_the_run_did_not_cut_is_refused(self):
+        w = FakeWorld(self, card_list())
+        w.start()
+        self.assertEqual(w.meta()["branch"], "leadhand/demo")
+        # Someone makes the card branch after the run started, before the run cuts it.
+        theirs = self._unrelated_branch(w, "leadhand/demo--card-1")
+        with self.assertRaisesRegex(Exception, "leadhand/demo--card-1"):
+            w.next()
+        self.assertEqual(w.events("card_cut"), [])
+        self.assertEqual(w.branch_tip("leadhand/demo--card-1"), theirs)
+        self.assertEqual(w.branch_tip("leadhand/demo"), w.base)
+
     def test_new_run_without_worktree_ignores_a_stale_scratch_report(self):
         w = FakeWorld(self, card_list(), config="[run]\nworktree = false\n")
         w.start()
