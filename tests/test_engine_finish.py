@@ -729,6 +729,24 @@ class BaseWorktreeOwnership(unittest.TestCase):
             engine._base_worktree(ctx)
         self.assertEqual((path / "valuable.txt").read_text(), "written there while the run was down\n")
 
+    def test_a_crash_window_worktree_hiding_a_tracked_edit_is_refused(self):
+        # `status` does not show an edit behind assume-unchanged (or a skip-worktree file),
+        # but the reset would overwrite it (or leave the evidence base off its commit).
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag=flag):
+                w = FakeWorld(self, [card(1)], gates=True)
+                w.start()
+                ctx = engine._load(w.run_dir, check_digest=False)
+                path = engine._base_worktree_path(ctx)
+                append_event(w.paths, "base_worktree_added", path=str(path))
+                run_git(w.repo, "worktree", "add", "--quiet", "--detach", str(path), w.base)
+                write(path, {"README.md": "an edit someone hid from status\n"})
+                run_git(path, "update-index", flag, "README.md")
+                self.assertEqual(run_git(path, "status", "--porcelain", "--ignored", "--untracked-files=all"), "")
+                with self.assertRaises(engine.EngineError):
+                    engine._base_worktree(ctx)
+                self.assertEqual((path / "README.md").read_text(), "an edit someone hid from status\n")
+
     def test_a_base_worktree_added_before_a_crash_is_still_the_runs(self):
         w = FakeWorld(self, [card(1)], gates=True)
         w.start()

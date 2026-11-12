@@ -1982,7 +1982,8 @@ def _base_worktree(ctx: _Run) -> Path:
     replaces it lacks the marker) and `base_worktree_ready` is recorded. A worktree at the
     path is the run's only when its marker names the run; in the crash window (an add
     recorded without its `base_worktree_ready`), one detached at the base commit with nothing
-    in `status --ignored` is adopted, as resetting it loses nothing. Anything else is refused."""
+    in `status --ignored` and no assume-unchanged or skip-worktree entry is adopted, as
+    resetting it loses nothing. Anything else is refused."""
     repo = Path(ctx.meta["repo"])
     path = _base_worktree_path(ctx)
     base = ctx.meta["base_sha"]
@@ -2004,6 +2005,10 @@ def _base_worktree(ctx: _Run) -> Path:
         try:
             if (git(path, "rev-parse", "--verify", "HEAD") != base
                     or git(path, "status", "--porcelain", "--ignored", "--untracked-files=all")):
+                return False
+            # `status` hides an edit behind assume-unchanged (lowercase tag; the reset would
+            # overwrite it) or skip-worktree (`S`; the reset would leave the base off its commit).
+            if any(entry[:2] != "H " for entry in git(path, "ls-files", "-v", "-z").split("\0") if entry):
                 return False
         except GitError:
             return False

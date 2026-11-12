@@ -286,7 +286,8 @@ exclusion), so any Claude worker of the session can run it too. What the CLI che
 - The evidence base worktree is reset only when neither it nor a folder between the
   repository and it is a symlink, and only when it is the run's own: its admin dir carries the
   run's marker (written right after the run adds it), or, after a crash between the add and
-  the marker, it is detached at the base commit with nothing in `status --ignored`. Any other
+  the marker, it is detached at the base commit with nothing in `status --ignored` and no
+  assume-unchanged or skip-worktree entry. Any other
   worktree at that path is refused, never reset or cleaned. A Codex
   evidence worker gets it as a writable folder (`--add-dir`), on the same terms and only when
   it is a registered worktree of the repository; otherwise the runner refuses to start Codex.
