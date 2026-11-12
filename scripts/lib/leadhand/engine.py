@@ -3258,7 +3258,7 @@ def timer(run_dir: Path, dispatch_id: str, *, interval: float = TIMER_INTERVAL) 
 # Commands
 
 def _print_json(value: dict) -> None:
-    print(json.dumps(value, ensure_ascii=False), flush=True)
+    print(json.dumps(value, ensure_ascii=True), flush=True)     # escapes keep undecodable names
 
 
 def _guard(fn):

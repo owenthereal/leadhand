@@ -1,6 +1,7 @@
 """An in-place run (`run.worktree = false`) never sweeps or commits the operator's own
 untracked files (ruling R48'): the files untracked at start are recorded and left alone."""
 import contextlib
+import io
 import json
 import os
 import subprocess
@@ -86,6 +87,17 @@ class InPlace(unittest.TestCase):
         self.assertEqual(recorded["paths"], [name])
         self.assertEqual(w.meta()["branch"], "leadhand/demo")
         self.assertEqual(w.next()["action"], "dispatch")
+
+    def test_json_output_escapes_undecodable_names(self):
+        # A surrogate-escaped name (Git's listing of a non-UTF-8 file name) must not break the
+        # CLI's JSON output on a strict UTF-8 stdout.
+        name = b"notes-\xff.txt".decode("utf-8", "surrogateescape")
+        raw = io.BytesIO()
+        out = io.TextIOWrapper(raw, encoding="utf-8", errors="strict")
+        with contextlib.redirect_stdout(out):
+            engine._print_json({"path": name, "title": "caf\u00e9"})
+        out.flush()
+        self.assertEqual(json.loads(raw.getvalue()), {"path": name, "title": "caf\u00e9"})
 
 
 class Exclusive(unittest.TestCase):
