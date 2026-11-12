@@ -5,8 +5,11 @@ import unittest
 
 from fakeworld import FakeWorld, card
 from gitfixture import run_git, write
+from leadhand import engine
+from leadhand.state import append_event
 
 CODEX_CARD = "codex gpt-6-luna low"
+IN_PLACE = "[run]\nworktree = false\n"
 
 
 class InPlace(unittest.TestCase):
@@ -31,6 +34,44 @@ class InPlace(unittest.TestCase):
         self.assertNotIn("scratch/todo list.txt", landed)
         swept = [p for e in w.events("violation") for p in e.get("untracked") or []]
         self.assertEqual(swept, [])
+
+
+class Exclusive(unittest.TestCase):
+    """R53: an in-place run claims the checkout; a second in-place run of the repository is
+    refused while the first is unfinished. Worktree runs are unaffected."""
+
+    def test_second_in_place_run_is_refused_while_the_first_is_unfinished(self):
+        w = FakeWorld(self, [card(1)], config=IN_PLACE)
+        first = w.start()
+        w.write_deck([card(1)], branch="leadhand/other")
+        with self.assertRaises(engine.EngineError) as cm:
+            w.start()
+        self.assertIn(str(first), str(cm.exception))
+        self.assertEqual(run_git(w.repo, "symbolic-ref", "--short", "HEAD"), "leadhand/demo")
+        self.assertFalse(run_git(w.repo, "branch", "--list", "leadhand/other"))
+        self.assertEqual(sorted(p.name for p in (w.docs / "runs").iterdir()), [first.name])
+        with self.assertRaises(engine.EngineError):
+            w.start(new=True)
+
+        # A blocked run is still unfinished (it continues); a finished one frees the checkout.
+        w.run_dir = first
+        append_event(w.paths, "outcome", outcome="blocked", qualifier="paused", reasons=[])
+        with self.assertRaises(engine.EngineError):
+            w.start()
+        append_event(w.paths, "resumed", note="")
+        append_event(w.paths, "outcome", outcome="complete", qualifier="", reasons=[])
+        second = w.start()
+        self.assertNotEqual(second, first)
+        self.assertEqual(w.meta()["branch"], "leadhand/other")
+
+    def test_worktree_runs_are_not_held_back_by_an_in_place_run(self):
+        w = FakeWorld(self, [card(1)], config=IN_PLACE)
+        w.start()
+        w.config_file.write_text(f'docs_dir = "{w.docs}"\n', encoding="utf-8")
+        w.write_deck([card(1)], branch="leadhand/other")
+        second = w.start()
+        self.assertEqual(w.run_dir, second)
+        self.assertNotEqual(w.workspace().resolve(), w.repo.resolve())
 
 
 if __name__ == "__main__":

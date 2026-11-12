@@ -577,5 +577,62 @@ class InheritedLockTests(LaunchTestCase):
             self.assertEqual(cli.main(["version"]), 0)
 
 
+class InPlaceCheckoutTests(LaunchTestCase):
+    """R53: an in-place run (its workspace is the repository itself) has the checkout to
+    itself; a launch is refused while another in-place run of the repo has a live supervisor."""
+
+    def in_place(self, run_json: Path, run_id: str = RUN_ID):
+        meta = json.loads(run_json.read_text(encoding="utf-8"))
+        write_json_atomic(run_json, {**meta, "run_id": run_id, "workspace": str(self.repo)})
+
+    def other_run(self, name: str, *, in_place: bool, live: bool) -> Path:
+        other = self.run_dir.parent / name
+        other.mkdir()
+        paths = run_paths(other)
+        write_json_atomic(paths.run_json, {
+            "run_id": "f" * 12, "repo": str(self.repo),
+            "workspace": str(self.repo if in_place else self.repo / ".worktrees" / name),
+            "deck_source": str(self.tmp / "other deck.md"), "supervisor_sessions": []})
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                stdin=subprocess.DEVNULL)
+        self.procs.append(proc)
+        start = wait_for(lambda: procs.process_start_time(proc.pid), "the other supervisor")
+        if not live:
+            proc.kill()
+            proc.wait(timeout=WAIT)
+        write_json_atomic(paths.holder, {"run_id": "f" * 12, "launcher_pid": 1, "supervisor_pid": proc.pid,
+                                         "supervisor_start": start, "started_at": "2026-11-10T00:00:00.000Z"})
+        self.other_proc = proc
+        return other
+
+    def test_in_place_launch_is_refused_while_another_in_place_run_is_supervised(self):
+        self.in_place(self.paths.run_json)
+        self.progress_run()
+        other = self.other_run("2026-11-10-other run", in_place=True, live=True)
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 1, err)
+        self.assertIn(str(other), err)
+        self.assertEqual(self.starts(), [])
+        self.assertFalse([e for e in read_events(self.paths) if e["kind"] == "resumed"])
+
+        self.other_proc.kill()
+        self.other_proc.wait(timeout=WAIT)
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_in_place_launch_ignores_dead_supervisors_and_worktree_runs(self):
+        self.in_place(self.paths.run_json)
+        self.other_run("2026-11-10-dead run", in_place=True, live=False)
+        self.other_run("2026-11-10-worktree run", in_place=False, live=True)
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 0, err)
+
+    def test_worktree_launch_is_not_held_back_by_an_in_place_run(self):
+        self.other_run("2026-11-10-other run", in_place=True, live=True)
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 0, err)
+
+
 if __name__ == "__main__":
     unittest.main()

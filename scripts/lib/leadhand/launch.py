@@ -288,6 +288,34 @@ def _workspace(meta: dict) -> Path:
     return Path(ws)
 
 
+def _in_place(meta: dict) -> bool:
+    ws, repo = meta.get("workspace"), meta.get("repo")
+    return (isinstance(ws, str) and isinstance(repo, str) and bool(ws) and bool(repo)
+            and os.path.realpath(ws) == os.path.realpath(repo))
+
+
+def checkout_in_use(root: Path, meta: dict) -> Path | None:
+    """For an in-place run (its workspace is the repository's checkout): another in-place run
+    of the same repository, under the same runs folder, whose recorded supervisor is alive,
+    or None. An in-place run has the checkout to itself (R53); worktree runs never collide."""
+    if not _in_place(meta):
+        return None
+    repo, me = os.path.realpath(meta["repo"]), os.path.realpath(root)
+    for rj in sorted(root.parent.glob("*/run.json")):
+        other = rj.parent
+        if os.path.realpath(other) == me:
+            continue
+        try:
+            theirs = json.loads(rj.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(theirs, dict) or not _in_place(theirs) or os.path.realpath(theirs["repo"]) != repo:
+            continue
+        if RunLock._supervisor_alive(RunLock(run_paths(other), "")._holder()):
+            return other
+    return None
+
+
 def tools_inside(workspace: Path, plugin_dir: Path | None = None) -> str | None:
     """Why a run in `workspace` must not launch, or None: the leadhand CLI (which runs outside
     the sandbox) or the plugin directory the supervisor loads lies inside the workspace, where
@@ -375,6 +403,11 @@ def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "cla
             problem = tools_inside(workspace, plugin_dir)
             if problem:
                 raise LaunchError(problem)
+            busy = checkout_in_use(root, meta)
+            if busy is not None:
+                raise LaunchError(f"another in-place run of {meta['repo']} is being supervised: {busy}; "
+                                  "an in-place run has the checkout to itself, so wait for that "
+                                  "supervisor to stop")
             model, effort = _supervisor_route(meta, root)
             if shutil.which(claude_bin) is None:
                 raise LaunchError(f"{claude_bin} not found on PATH")

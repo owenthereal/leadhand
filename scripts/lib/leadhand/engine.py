@@ -357,6 +357,29 @@ def _find_unfinished(docs: Path, source: str, digest: str, repo: Path) -> Path |
     return max(found)[2] if found else None
 
 
+def _in_place_run(meta: dict) -> bool:
+    """Whether a run's workspace is its repository's own checkout (run.worktree = false)."""
+    ws, repo = meta.get("workspace"), meta.get("repo")
+    return (isinstance(ws, str) and isinstance(repo, str) and bool(ws) and bool(repo)
+            and os.path.realpath(ws) == os.path.realpath(repo))
+
+
+def _unfinished_in_place(docs: Path, repo: Path) -> Path | None:
+    """An unfinished (no outcome, or blocked) in-place run of this repository, or None. An
+    in-place run claims the checkout until it ends (R53)."""
+    real_repo = os.path.realpath(repo)
+    for root, meta in sorted(_runs(docs), key=lambda r: str(r[0])):
+        if not _in_place_run(meta) or os.path.realpath(meta["repo"]) != real_repo:
+            continue
+        try:
+            ended = _ended(read_events(run_paths(root)))
+        except (OSError, ValueError):
+            return root                     # unreadable: it may still be at work there
+        if ended is None or ended.get("outcome") == "blocked":
+            return root
+    return None
+
+
 def _free_branch(docs: Path, repo: Path, requested: str) -> str:
     """The deck's branch, or its first free numeric suffix (`-2`, `-3`, ...) when another run
     of this repo owns it or the branch already exists (left by a start that crashed before
@@ -406,6 +429,12 @@ def _start(deck_path: Path, repo: Path, config: Config | None, new: bool) -> tup
         existing = _find_unfinished(docs, str(deck_path), deck.digest, repo)
         if existing is not None:
             return existing, True, f"existing run: {existing}"
+    if not config.run.worktree:
+        busy = _unfinished_in_place(docs, repo)
+        if busy is not None:
+            raise EngineError(f"another in-place run of {repo} is unfinished: {busy}; an in-place run "
+                              "has the checkout to itself, so finish or cancel that run first, "
+                              "or run in a worktree (run.worktree = true)")
 
     branch = _free_branch(docs, repo, deck.branch)
     slug = _slug(deck.title)
