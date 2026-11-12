@@ -864,6 +864,29 @@ class RunnerCommitTests(Base):
         self.assertEqual(self.head_files(), ["src/new.py"])
         self.assertTrue((self.repo / "other" / "user notes.txt").exists())
 
+    def test_a_fifo_left_at_the_report_never_hangs_the_commit(self):
+        # Codex review 9: the runner reads the report outside the sandbox; a FIFO would block it.
+        req = self.commit_request()
+        wd = self.worker_dir()
+        wd.mkdir(parents=True)
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "widget.py").write_text("WIDGET = 1\n")
+        req.report.unlink(missing_ok=True)
+        os.mkfifo(req.report)
+
+        def unblock():
+            with contextlib.suppress(OSError):
+                fd = os.open(req.report, os.O_WRONLY | os.O_NONBLOCK)
+                os.close(fd)
+        self.addCleanup(unblock)
+        out = {}
+        t = threading.Thread(target=lambda: out.update(dsp._commit_work(wd, req)), daemon=True)
+        t.start()
+        t.join(timeout=20)
+        self.assertFalse(t.is_alive(), "the commit blocked on the FIFO")
+        self.assertEqual(out.get("committed"), run_git(self.repo, "rev-parse", "HEAD"), out)
+        self.assertEqual(run_git(self.repo, "log", "-1", "--format=%s"), "implement card 1: Widget card")
+
     def test_failed_commit_is_blocked_environment_with_reason(self):
         for name in ("EMAIL", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
             os.environ.pop(name, None)

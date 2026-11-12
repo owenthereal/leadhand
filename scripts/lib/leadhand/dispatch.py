@@ -64,7 +64,7 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
 from leadhand import procs
-from leadhand.briefs import parse_report_head, worker_prompt
+from leadhand.briefs import ScratchError, parse_report_head, read_scratch_file, scratch_dir, worker_prompt
 from leadhand.gitops import (GIT_TIMEOUT, SAFE_CONFIG, SAFE_ENV, GitError, git, git_common_dir, resolves_in_place,
                              stage_work, status_entries, top_and_prefix, untracked_files)
 from leadhand.state import (utc_now, append_attempt, crash_point, read_attempts, run_paths, state_lock,
@@ -614,13 +614,25 @@ def _charge_usage(req: DispatchRequest, wd: Path, *, thread: str | None, launche
     return c.usage, [cid], ("stream" if c.source == CODEX_STREAM_SOURCE else "session")
 
 
+def _scratch_text(req: DispatchRequest, path: Path) -> str:
+    """The dispatch's scratch file `path` (its brief or report), read through the scratch
+    folder's validated descriptor: never through a symlink, and never a FIFO or anything else
+    but a regular file (opening a FIFO would block the runner). "" when missing or refused."""
+    path = Path(path)
+    try:
+        ws = path.parents[3]                        # <ws>/.leadhand/<card or run>/<dispatch id>/<name>
+        if scratch_dir(ws, req.card, req.dispatch_id) / path.name != path:
+            return ""
+        data = read_scratch_file(ws, req.card, req.dispatch_id, path.name)
+    except (IndexError, ScratchError, OSError):
+        return ""
+    return (data or b"").decode("utf-8", errors="replace")
+
+
 def _commit_subject(req: DispatchRequest) -> str:
     """The first line of the report's `## Summary`, else the card title from the brief."""
     subject = ""
-    try:
-        lines = req.report.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        lines = []
+    lines = _scratch_text(req, req.report).splitlines()
     for i, line in enumerate(lines):
         if line.strip().lower() == "## summary":
             subject = next((ln.strip() for ln in lines[i + 1:] if ln.strip()), "")
@@ -628,10 +640,7 @@ def _commit_subject(req: DispatchRequest) -> str:
                 subject = ""
             break
     if not subject:
-        try:
-            brief = req.brief.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            brief = ""
+        brief = _scratch_text(req, req.brief)
         m = re.search(r"^## Card \d+: (.+)$", brief, re.MULTILINE)
         subject = m.group(1).strip() if m else f"leadhand dispatch {req.dispatch_id}"
     prefix = f"{req.kind} card {req.card}" if req.card is not None else f"{req.kind}"
