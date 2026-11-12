@@ -783,43 +783,37 @@ class BaseWorktreeOwnership(unittest.TestCase):
 
 
 class SparseCheckout(unittest.TestCase):
-    """`git worktree add` copies a sparse checkout's patterns: a worktree run and its evidence
-    base start with skip-worktree entries for the files outside them. Those are Git's own,
-    never a worker's hidden edit (Codex review 10, fix round 1)."""
+    """R63: sparse checkouts are not supported in this version, in any run mode; so every
+    assume-unchanged or skip-worktree entry seen after a worker is the worker's, a sparse
+    checkout it turned on itself included (Codex review 10, fix round 2)."""
 
-    def test_a_worktree_run_in_a_sparse_checkout_completes(self):
-        w = FakeWorld(self, [card(1), card(2)], gates=True)
-        w.base = commit(w.repo, {"far/away.txt": "outside the sparse patterns\n"}, "far")
-        w.write_deck([card(1), card(2)])
-        run_git(w.repo, "sparse-checkout", "set", "--no-cone", "/README.md", "/src/", "/tests/", "/docs/")
-        self.assertFalse((w.repo / "far").exists())
-        w.start()
-        done = w.run()[-1]
-        self.assertEqual(done["outcome"], "complete", done["reasons"])
-        self.assertEqual([e for e in w.events("violation")], [])
-        self.assertEqual([e["card"] for e in w.events("accepted") if e["card"] != "final"], [1, 2])
-        self.assertIn("S far/away.txt", run_git(w.workspace(), "ls-files", "-v").splitlines())
-        bw = w.workspace().parent / f"{w.workspace().name}--base"
-        self.assertIn("S far/away.txt", run_git(bw, "ls-files", "-v").splitlines())
-
-    def test_a_worker_flag_in_a_sparse_checkout_is_still_a_violation(self):
-        def tamper(world, ws, a):
-            run_git(ws, "update-index", "--skip-worktree", "README.md")
-            write(ws, {"README.md": "edited by the reviewer, hidden\n"})
+    def test_a_worktree_run_in_a_sparse_checkout_is_refused_at_start(self):
         w = FakeWorld(self, [card(1)])
         w.base = commit(w.repo, {"far/away.txt": "outside the sparse patterns\n"}, "far")
         w.write_deck([card(1)])
-        run_git(w.repo, "sparse-checkout", "set", "--no-cone", "/README.md", "/src/", "/tests/", "/docs/")
+        run_git(w.repo, "sparse-checkout", "set", "--no-cone", "/README.md", "/src/")
+        with self.assertRaises(engine.EngineError) as cm:
+            w.start()
+        self.assertIn("sparse checkouts are not supported", str(cm.exception))
+        self.assertFalse((w.docs / "runs").exists())
+
+    def test_a_sparse_checkout_a_reviewer_turns_on_is_a_violation(self):
+        # Turning sparse checkout on hides README.md (skip-worktree, file removed): the gates
+        # would check a tree without it. Leadhand unhides it, counts it, and turns sparse off.
+        def tamper(world, ws, a):
+            run_git(ws, "sparse-checkout", "set", "--no-cone", "/src/")
+        w = FakeWorld(self, [card(1)])
         w.start()
         w.script(1, "review", {"tamper": tamper}, {})
         w.run()
         found = [e for e in w.events("violation") if e.get("stage") == "found"]
-        # In a sparse checkout Git itself clears skip-worktree on a file that is present, so
-        # the edit may show before leadhand unhides it: either way it is this review's violation.
         self.assertEqual([e.get("dispatch_id") for e in found], ["c1-a1-review-1"])
+        self.assertIn("README.md", found[0]["hidden"])
         self.assertIn("README.md", found[0]["paths"])
-        self.assertEqual((w.workspace() / "README.md").read_text(), "hello\n")
-        self.assertIn("S far/away.txt", run_git(w.workspace(), "ls-files", "-v").splitlines())
+        ws = w.workspace()
+        self.assertEqual((ws / "README.md").read_text(), "hello\n")
+        self.assertNotIn("S README.md", run_git(ws, "ls-files", "-v").splitlines())
+        self.assertEqual(run_git(ws, "config", "--bool", "--get", "core.sparseCheckout", check=False), "false")
 
 
 if __name__ == "__main__":

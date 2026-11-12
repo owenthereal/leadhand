@@ -351,17 +351,12 @@ def is_ancestor(ws: Path, ancestor: str, descendant: str) -> bool:
 def hidden_index_entries(ws: Path, timeout: float = GIT_TIMEOUT) -> list[str]:
     """Tracked paths, in the whole checkout and named from its top, whose index entry hides an
     edit from `status` and `diff`: assume-unchanged (a lowercase `git ls-files -v` tag) or
-    skip-worktree (`S`); a reset overwrites (or keeps) such an edit unseen. An unmerged entry
-    (`M`) is not hidden: it shows as a change. In a sparse checkout, an `S` entry whose file is
-    absent is the sparse checkout's own (`git worktree add` copies a sparse repository's
-    patterns into a worktree run's worktrees): it hides no edit and is never listed."""
-    flagged = [(entry[:1], entry[2:]) for entry in _nul_list(git(ws, "ls-files", "-v", "-z", "--full-name",
-                                                                 "--", ":/", timeout=timeout))
-               if entry[:1].islower() or entry[:2] == "S "]
-    if any(tag == "S" for tag, _ in flagged) and _sparse(ws):
-        top, _ = top_and_prefix(ws, timeout)
-        flagged = [(tag, path) for tag, path in flagged if tag != "S" or os.path.lexists(top / path)]
-    return [path for _, path in flagged]
+    skip-worktree (`S`; with the file removed, a deletion); a reset overwrites (or keeps) such
+    an edit unseen. An unmerged entry (`M`) is not hidden: it shows as a change. Sparse
+    checkouts are not supported (R63), so a sparse checkout's own entries count too."""
+    return [entry[2:] for entry in _nul_list(git(ws, "ls-files", "-v", "-z", "--full-name", "--", ":/",
+                                                 timeout=timeout))
+            if entry[:1].islower() or entry[:2] == "S "]
 
 
 def unhide_index_entries(ws: Path, timeout: float = GIT_TIMEOUT) -> list[str]:
@@ -375,16 +370,31 @@ def unhide_index_entries(ws: Path, timeout: float = GIT_TIMEOUT) -> list[str]:
         paths = "".join(f"{p}\0" for p in hidden)
         for flag in ("--no-assume-unchanged", "--no-skip-worktree"):     # one mode per call
             git(top, "update-index", flag, "-z", "--stdin", input=paths, timeout=timeout)
+        if is_sparse(top):
+            # A sparse checkout a worker turned on (R63 refuses one at start and launch): off,
+            # or the next checkout would hide the same entries again. With the flags already
+            # cleared it changes no file, so the edits and deletions stay visible.
+            git(top, "sparse-checkout", "disable", timeout=timeout)
     return hidden
+
+
+def sparse_checkout_problem(repo: Path) -> str | None:
+    """Why a run cannot use `repo`'s checkout because it is sparse (R63), or None. `git
+    worktree add` copies a sparse checkout into a worktree run's worktrees, so this holds for
+    every run mode."""
+    if not is_sparse(repo):
+        return None
+    return (f"{repo} is a sparse checkout (core.sparseCheckout): sparse checkouts are not supported "
+            "in this version; turn it off (git sparse-checkout disable) to run leadhand here")
 
 
 def in_place_checkout_problem(repo: Path) -> str | None:
     """Why the operator's checkout cannot host a run without a worktree, or None: a sparse
     checkout, or an edit hidden behind assume-unchanged or skip-worktree (Codex 4546946532).
     Checked at start and at every launch, so a hidden entry found later is a worker's."""
-    if _sparse(repo):
-        return (f"{repo} is a sparse checkout (core.sparseCheckout): a run without a worktree "
-                "needs the whole checkout; run in a worktree (run.worktree = true)")
+    sparse = sparse_checkout_problem(repo)
+    if sparse:
+        return sparse
     hidden = hidden_index_entries(repo)
     if not hidden:
         return None
@@ -395,8 +405,12 @@ def in_place_checkout_problem(repo: Path) -> str | None:
             "--no-skip-worktree <path>), or run in a worktree (run.worktree = true)")
 
 
-def _sparse(ws: Path) -> bool:
-    r = _run(ws, ("config", "--bool", "--get", "core.sparseCheckout"))
+def is_sparse(ws: Path) -> bool:
+    """Whether `ws`'s checkout is sparse (core.sparseCheckout, as that worktree sees it)."""
+    try:
+        r = _run(ws, ("config", "--bool", "--get", "core.sparseCheckout"))
+    except GitError:
+        return False
     return r.returncode == 0 and r.stdout.strip() == "true"
 
 

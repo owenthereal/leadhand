@@ -792,6 +792,20 @@ class CheckoutClaimTests(LaunchTestCase):
         self.assertEqual(self.starts(), [])
         self.assertFalse([e for e in read_events(self.paths) if e["kind"] == "resumed"])
 
+    def test_a_worktree_run_launch_is_refused_while_the_repository_is_sparse(self):
+        (self.repo / "far").mkdir()
+        (self.repo / "far" / "away.txt").write_text("far\n")
+        run_git(self.repo, "add", "far/away.txt")
+        run_git(self.repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet",
+                "-m", "far")
+        run_git(self.repo, "sparse-checkout", "set", "--no-cone", "/README.md")
+        meta = json.loads(self.paths.run_json.read_text(encoding="utf-8"))
+        write_json_atomic(self.paths.run_json, {**meta, "workspace": str(self.workspace)})
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 1, err)
+        self.assertIn("sparse checkouts are not supported", err)
+        self.assertEqual(self.starts(), [])
+
     def test_the_claim_is_released_and_its_record_removed_when_the_supervisor_exits(self):
         other = self.in_place_run("other docs")
         launcher = self.supervise(other)

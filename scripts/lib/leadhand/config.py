@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from leadhand.gitops import checkout_top
+from leadhand.gitops import checkout_top, sparse_checkout_problem
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 VENDORS = ("claude", "codex")
@@ -307,6 +307,9 @@ def unsupported_settings(config: Config, repo: Path | None = None) -> list[str]:
         docs = Path(os.path.realpath(docs_dir_for(config, Path(repo))))
         if docs == root or root in docs.parents:
             out.append(f"not supported in this version: docs_dir inside the repository ({docs})")
+        sparse = sparse_checkout_problem(Path(repo))
+        if sparse:
+            out.append(f"not supported in this version: {sparse}")
     if config.after_run.step != "none":
         out.append(f"not supported in this version: after_run.step = {config.after_run.step}")
     if config.after_run.on_incomplete != "none":

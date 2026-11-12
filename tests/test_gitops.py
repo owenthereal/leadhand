@@ -884,8 +884,7 @@ class OperatorFilesInPlaceTests(unittest.TestCase):
         with self.assertRaises(GitError) as cm:
             prepare_workspace(self.repo, run_branch=RUN, base_sha=self.head, slug="run-1", use_worktree=False)
         message = str(cm.exception)
-        self.assertIn("sparse", message)
-        self.assertIn("run.worktree = true", message)
+        self.assertIn("sparse checkouts are not supported", message)
         self.assertNotIn("--no-skip-worktree", message)
         self.assertLess(len(message), 600, message)
 
