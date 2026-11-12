@@ -887,6 +887,20 @@ class RunnerCommitTests(Base):
         self.assertEqual(out.get("committed"), run_git(self.repo, "rev-parse", "HEAD"), out)
         self.assertEqual(run_git(self.repo, "log", "-1", "--format=%s"), "implement card 1: Widget card")
 
+    def test_runner_commits_an_edit_hidden_behind_an_index_flag(self):
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag=flag):
+                run_git(self.repo, "reset", "--quiet", "--hard", self.base_sha)
+                req = self.commit_request(dispatch_id=f"d{flag[2:5]}")
+                wd = self.worker_dir(req.dispatch_id)
+                wd.mkdir(parents=True)
+                run_git(self.repo, "update-index", flag, "README.md")
+                (self.repo / "README.md").write_text("edited, hidden from status\n")
+                out = dsp._commit_work(wd, req)
+                self.assertEqual(out.get("committed"), run_git(self.repo, "rev-parse", "HEAD"), out)
+                self.assertEqual(run_git(self.repo, "show", "HEAD:README.md"), "edited, hidden from status")
+                self.assertEqual(run_git(self.repo, "ls-files", "-v", "--", "README.md"), "H README.md")
+
     def test_failed_commit_is_blocked_environment_with_reason(self):
         for name in ("EMAIL", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
             os.environ.pop(name, None)

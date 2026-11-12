@@ -280,6 +280,41 @@ class Violations(unittest.TestCase):
         keep = v["preserved"][f"refs/heads/{CARD1}"]
         self.assertEqual(run_git(w.repo, "rev-parse", keep), moved["new"])
 
+    def test_reviewer_hiding_an_edit_behind_an_index_flag_is_violation(self):
+        # Codex 4554880076: assume-unchanged or skip-worktree hides an edit from status and diff.
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag=flag):
+                def tamper(world, ws, a, flag=flag):
+                    run_git(ws, "update-index", flag, "README.md")
+                    write(ws, {"README.md": "edited by the reviewer, hidden\n"})
+
+                w = self.world("review", tamper)
+                w.run()
+                (v,) = found(w)
+                self.assertEqual(v["dispatch_id"], "c1-a1-review-1")
+                self.assertIn("README.md", v["paths"])
+                self.assertEqual(v["hidden"], ["README.md"])
+                self.check_rerun(w, "review", "c1-a1-review-1", "c1-a1-review-2")
+                ws = w.workspace()
+                self.assertEqual(run_git(ws, "ls-files", "-v", "--", "README.md"), "H README.md")
+                self.assertEqual((ws / "README.md").read_text(), "hello\n")
+                self.assertEqual(run_git(w.repo, "show", f"{v['ref']}:README.md"), "edited by the reviewer, hidden")
+
+    def test_a_partial_commit_takes_an_edit_hidden_behind_an_index_flag(self):
+        w = FakeWorld(self, [card(1)])
+        w.start()
+        a = w.next()
+        w.launch(a)
+        ws = w.workspace()
+        run_git(ws, "update-index", "--assume-unchanged", "README.md")
+        write(ws, {"README.md": "a stopped worker's hidden edit\n"})
+        ctx = engine._load(w.run_dir, check_digest=False)
+        from leadhand.state import read_events
+        d = engine._dispatches(read_events(w.paths))[a["dispatch_id"]]
+        out = engine._commit_partial(ctx, d)
+        self.assertIn("partial_commit", out, out)
+        self.assertEqual(run_git(ws, "show", "HEAD:README.md"), "a stopped worker's hidden edit")
+
     def test_verifier_staged_change_is_violation(self):
         w = parked_world(self)
         engine.unpark(w.run_dir, card=1, note=NOTE)

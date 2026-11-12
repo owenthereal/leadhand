@@ -86,7 +86,7 @@ from leadhand.gitops import (CARD_INFIX, KEEP_IGNORED, GitError, card_branch_nam
                              cut_card_branch, default_base, detect_violation, ensure_excluded, fast_forward, git, head,
                              hidden_index_entries, is_ancestor, is_test_or_doc_path, needs_integration,
                              prepare_workspace, preserve_and_restore, rebase_onto, resolves_in_place, stage_work,
-                             status_entries, untracked_files)
+                             status_entries, unhide_index_entries, untracked_files)
 from leadhand.route import LadderExhausted, PinnedVendorMissing, Resolution, resolve
 from leadhand.state import (CardState, RunPaths, utc_now, allowed_next_step, append_attempt, append_event,
                             crash_point, decide_outcome, fold_cards, new_run_dir, read_attempts, read_events,
@@ -1668,7 +1668,7 @@ def _find_violation(ctx: _Run, d: _Dispatch, events: list[dict]) -> dict | None:
                         dispatch_kind=d.kind, n=n, ref=ref if v is not None else None, paths=_violation_paths(ctx, v),
                         head_moved=bool(v and v.head_moved), index_dirty=bool(v and v.index_dirty),
                         expected_head=req.get("expected_head"), expected_branch=req.get("expected_branch"),
-                        refs=moved, preserved=preserved)
+                        refs=moved, preserved=preserved, **({"hidden": list(v.hidden)} if v and v.hidden else {}))
 
 
 def _violation_paths(ctx: _Run, v) -> list[str]:
@@ -1747,7 +1747,8 @@ def _ensure_clean(ctx: _Run, events: list[dict], *, branch: str, why: str, after
                          ref=f"refs/leadhand/{ctx.meta['run_id']}/leftovers/{n}", paths=_violation_paths(ctx, v),
                          operation=op, head_moved=bool(v and v.head_moved), index_dirty=bool(v and v.index_dirty),
                          expected_head=tip, expected_branch=branch, after_dispatch=after_dispatch, why=why,
-                         **({"untracked": loose} if loose else {}))
+                         **({"untracked": loose} if loose else {}),
+                         **({"hidden": list(v.hidden)} if v and v.hidden else {}))
     _finish_leftovers(ctx, [found])
     return found
 
@@ -2050,6 +2051,7 @@ def _base_worktree(ctx: _Run) -> Path:
         git(repo, "worktree", "add", "--quiet", "--detach", str(path), base)
         claim()
     in_place()
+    unhide_index_entries(path)                  # or a skip-worktree edit would survive the reset
     git(path, "checkout", "--quiet", "--force", "--detach", base, "--")
     git(path, "reset", "--quiet", "--hard", base)
     git(path, "clean", "-q", "-f", "-d", "-x")
@@ -2064,11 +2066,12 @@ def _base_violation(ctx: _Run, d: _Dispatch, events: list[dict]) -> bool:
     path = Path((d.req.get("extra") or {}).get("base_worktree") or _base_worktree_path(ctx))
     base = ctx.meta["base_sha"]
     try:
+        hidden = unhide_index_entries(path)     # an edit hidden behind an index flag shows again
         now = git(path, "rev-parse", "--verify", "HEAD")
         dirty = git(path, "status", "--porcelain", "--untracked-files=no")
     except (GitError, OSError):
-        now, dirty = None, ""
-    if now == base and not dirty:
+        hidden, now, dirty = [], None, ""
+    if now == base and not dirty and not hidden:
         return False
     n = 1 + sum(1 for e in events if e["kind"] == "violation" and _by(e) != "implementer"
                 and e.get("stage") == "found")
@@ -3194,6 +3197,7 @@ def _commit_partial(ctx: _Run, d: _Dispatch) -> dict[str, str]:
     try:
         if _current_branch(ctx) != branch or _operation(ctx) is not None:
             return {}
+        unhide_index_entries(ctx.ws)            # an edit a worker hid behind an index flag is its work too
         tracked, loose = status_entries(ctx.ws)
         earlier = set(d.req.get("untracked") or ())
         new = [p for p in _foreign_untracked(ctx, loose) if p not in earlier]

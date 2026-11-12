@@ -353,12 +353,28 @@ def is_ancestor(ws: Path, ancestor: str, descendant: str) -> bool:
     return _test(ws, "merge-base", "--is-ancestor", ancestor, descendant)
 
 
-def hidden_index_entries(ws: Path) -> list[str]:
-    """Tracked paths whose index entry hides an edit from `status` and `diff`: assume-unchanged
-    (a lowercase `git ls-files -v` tag) or skip-worktree (`S`); a reset overwrites (or keeps)
-    such an edit unseen. An unmerged entry (`M`) is not hidden: it shows as a change."""
-    return [entry[2:] for entry in _nul_list(git(ws, "ls-files", "-v", "-z"))
+def hidden_index_entries(ws: Path, timeout: float = GIT_TIMEOUT) -> list[str]:
+    """Tracked paths, in the whole checkout and named from its top, whose index entry hides an
+    edit from `status` and `diff`: assume-unchanged (a lowercase `git ls-files -v` tag) or
+    skip-worktree (`S`); a reset overwrites (or keeps) such an edit unseen. An unmerged entry
+    (`M`) is not hidden: it shows as a change."""
+    return [entry[2:] for entry in _nul_list(git(ws, "ls-files", "-v", "-z", "--full-name", "--", ":/",
+                                                 timeout=timeout))
             if entry[:1].islower() or entry[:2] == "S "]
+
+
+def unhide_index_entries(ws: Path, timeout: float = GIT_TIMEOUT) -> list[str]:
+    """Clear assume-unchanged and skip-worktree wherever set, so an edit behind them shows in
+    `status` and `diff` again (Codex 4554880076): a worker can set them after it is dispatched,
+    and every check and commit reads the workspace through those. Returns the paths cleared."""
+    hidden = hidden_index_entries(ws, timeout)
+    if hidden:
+        top, _ = top_and_prefix(ws, timeout)
+        for i in range(0, len(hidden), 500):        # argv stays short
+            chunk = hidden[i:i + 500]
+            for flag in ("--no-assume-unchanged", "--no-skip-worktree"):     # one mode per call
+                git(top, "update-index", flag, "--", *chunk, timeout=timeout)
+    return hidden
 
 
 def _sparse(ws: Path) -> bool:
@@ -519,16 +535,20 @@ class Violation:
     head_moved: bool  # HEAD is not `expected_head` on `expected_branch`
     index_dirty: bool  # the index differs from HEAD
     tracked_changes: tuple[str, ...]  # tracked files whose working copy differs from the index
+    hidden: tuple[str, ...] = ()  # entries found assume-unchanged or skip-worktree (now cleared)
 
 
 def detect_violation(ws: Path, expected_head: str, expected_branch: str) -> Violation | None:
     """None when `ws` is on `expected_branch` at `expected_head` with a clean index and
-    clean tracked files. Untracked files (build output) are not a violation."""
+    clean tracked files. Untracked files (build output) are not a violation. An index entry
+    marked assume-unchanged or skip-worktree is a violation too: the mark is cleared first,
+    so an edit behind it counts as the tracked change it is."""
+    hidden = tuple(unhide_index_entries(ws))
     head_moved = _current_branch(ws) != expected_branch or head(ws) != expected_head
     index_dirty = _index_dirty(ws)
     tracked = tuple(_unstaged_paths(ws))
-    if head_moved or index_dirty or tracked:
-        return Violation(head_moved, index_dirty, tracked)
+    if head_moved or index_dirty or tracked or hidden:
+        return Violation(head_moved, index_dirty, tracked, hidden)
     return None
 
 

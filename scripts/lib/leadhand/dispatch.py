@@ -66,7 +66,7 @@ from typing import Any, Iterable, Mapping
 from leadhand import procs
 from leadhand.briefs import ScratchError, parse_report_head, read_scratch_file, scratch_dir, worker_prompt
 from leadhand.gitops import (GIT_TIMEOUT, SAFE_CONFIG, SAFE_ENV, GitError, git, git_common_dir, resolves_in_place,
-                             stage_work, status_entries, top_and_prefix, untracked_files)
+                             stage_work, status_entries, top_and_prefix, unhide_index_entries, untracked_files)
 from leadhand.state import (utc_now, append_attempt, crash_point, read_attempts, run_paths, state_lock,
                             write_json_atomic)
 from leadhand.usage import (CODEX_STREAM_SOURCE, UNKNOWN, Usage, charge, codex_usage_from_stream, estimate_cost,
@@ -711,6 +711,8 @@ def _commit_work(wd: Path, req: DispatchRequest, *, deadline: float | None = Non
         # failed at launch, so no untracked file is taken.)
         snap = _read_json(wd / UNTRACKED)
         earlier = set((snap or {}).get("paths") or ())
+        # An edit the worker hid behind assume-unchanged or skip-worktree is its work too.
+        unhide_index_entries(ws, timeout=bound())
         tracked, loose = status_entries(ws, timeout=bound())
         new = ([p for p in untracked_to_take(req.run_dir, ws, loose, timeout=bound()) if p not in earlier]
                if snap is None or snap.get("paths") is not None else [])

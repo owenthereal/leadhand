@@ -442,6 +442,22 @@ class Guards(unittest.TestCase):
         self.assertEqual([e["dispatch_id"] for e in w.events("gate_result") if e["gate"] == "evidence"],
                          ["run-evidence-2"])
 
+    def test_evidence_base_edit_hidden_behind_an_index_flag_is_violation(self):
+        def tamper(world, ws, a):
+            bw = world.repo / ".worktrees" / f"{world.run_dir.name}--base"
+            run_git(bw, "update-index", "--assume-unchanged", "README.md")
+            write(bw, {"README.md": "edited in the base, hidden\n"})
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        w.script(None, "evidence", {"tamper": tamper}, {})
+        done = w.run()[-1]
+        self.assertEqual(done["outcome"], "complete")
+        (v,) = found_violations(w)
+        self.assertEqual((v["dispatch_id"], v["dispatch_kind"]), ("run-evidence-1", "evidence"))
+        bw = w.repo / ".worktrees" / f"{w.run_dir.name}--base"
+        self.assertEqual(run_git(bw, "ls-files", "-v", "--", "README.md"), "H README.md")
+        self.assertEqual((bw / "README.md").read_text(), "hello\n")
+
     def test_gate_violation_reruns_with_a_fresh_worker(self):
         def tamper(world, ws, a):
             write(ws, {"README.md": "changed by the final reviewer\n"})

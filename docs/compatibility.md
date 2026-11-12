@@ -292,6 +292,10 @@ exclusion), so any Claude worker of the session can run it too. What the CLI che
   evidence worker gets it as a writable folder (`--add-dir`), on the same terms and only when
   it is a registered worktree of the repository; otherwise the runner refuses to start Codex.
   No other kind of dispatch gets it.
+- An index entry a worker marks assume-unchanged or skip-worktree (which hides an edit from
+  `status` and `diff`) is unmarked before every workspace check and every commit leadhand
+  makes for a worker, so the edit counts: a check's is a violation (the result is void and
+  the workspace restored), an implementer's is committed or kept as leftovers like any other.
 - Leadhand's Git calls run with `GIT_LFS_SKIP_SMUDGE=1`, so git-lfs never fetches an object
   (from a URL a worker's `.lfsconfig` could choose). Files under LFS are pointer files in
   leadhand's own checkouts; the clean filter stays on, so checked-out LFS content does not
