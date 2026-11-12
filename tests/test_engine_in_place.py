@@ -1,7 +1,9 @@
 """An in-place run (`run.worktree = false`) never sweeps or commits the operator's own
 untracked files (ruling R48'): the files untracked at start are recorded and left alone."""
+import contextlib
 import json
 import unittest
+from unittest import mock
 
 from fakeworld import FakeWorld, card
 from gitfixture import run_git, write
@@ -34,6 +36,24 @@ class InPlace(unittest.TestCase):
         self.assertNotIn("scratch/todo list.txt", landed)
         swept = [p for e in w.events("violation") for p in e.get("untracked") or []]
         self.assertEqual(swept, [])
+
+    def test_undecodable_untracked_filename_survives_start(self):
+        # Git lists a non-UTF-8 name surrogateescape-decoded; run state must still be written.
+        w = FakeWorld(self, [card(1)], config=IN_PLACE)
+        name = b"notes-\xff.txt".decode("utf-8", "surrogateescape")
+        try:
+            (w.repo / name).write_text("operator notes\n", encoding="utf-8")
+            listing = contextlib.nullcontext()
+        except OSError:
+            # The file system only takes UTF-8 names (APFS): have Git's listing carry it instead.
+            real = engine.untracked_files
+            listing = mock.patch.object(engine, "untracked_files", lambda ws: [*real(ws), name])
+        with listing:
+            w.start()
+        recorded = json.loads((w.run_dir / "untracked-at-start.json").read_text(encoding="utf-8"))
+        self.assertEqual(recorded["paths"], [name])
+        self.assertEqual(w.meta()["branch"], "leadhand/demo")
+        self.assertEqual(w.next()["action"], "dispatch")
 
 
 class Exclusive(unittest.TestCase):

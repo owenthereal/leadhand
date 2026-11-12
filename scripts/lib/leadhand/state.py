@@ -253,7 +253,9 @@ def _append(paths: RunPaths, file: Path,
                 start = _rfind_newline(fd, size - 1) + 1
                 last = _parse_line(os.pread(fd, size - 1 - start, start), file)
             record = build(last)
-            data = (json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+            # ASCII with JSON escapes: a path Git gave surrogateescape-decoded (a non-UTF-8
+            # file name) is written as \udcXX and read back as the same string.
+            data = (json.dumps(record, ensure_ascii=True, separators=(",", ":"))
                     + "\n").encode("utf-8")
             view = memoryview(data)
             while view:  # O_APPEND: the kernel writes at the end of the file
@@ -354,7 +356,7 @@ def write_json_atomic(path: Path, data: dict) -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            json.dump(data, f, indent=2, ensure_ascii=True)     # escapes keep undecodable names
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())

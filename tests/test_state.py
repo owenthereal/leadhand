@@ -286,6 +286,18 @@ class AppendTests(RunDirCase):
 
 
 class WriteJsonAtomicTests(RunDirCase):
+    def test_undecodable_filenames_round_trip_through_json_and_jsonl(self):
+        # Git paths are decoded with surrogateescape; run state keeps them as JSON escapes.
+        name = b"notes-\xff.txt".decode("utf-8", "surrogateescape")
+        self.assertEqual(name, "notes-\udcff.txt")
+        target = self.root / "untracked-at-start.json"
+        state.write_json_atomic(target, {"paths": [name, "caf\u00e9.txt"]})
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["paths"], [name, "caf\u00e9.txt"])
+        state.append_event(self.paths, "run_started", run_id="r", base_sha="0" * 40, branch="b", paths=[name])
+        state.append_attempt(self.paths, {"paths": [name]})
+        self.assertEqual(state.read_events(self.paths)[0]["paths"], [name])
+        self.assertEqual(state.read_attempts(self.paths), [{"paths": [name]}])
+
     def test_write_json_atomic_leaves_no_temp_files(self):
         target = self.root / "status.json"
         state.write_json_atomic(target, {"a": 1})
