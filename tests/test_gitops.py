@@ -651,6 +651,15 @@ class SubdirectoryWorkspaceTests(unittest.TestCase):
         moved = commit(self.repo, {"README.md": "committed at the top\n"}, "top")
         self.assertEqual(changed_paths(self.ws, self.head, moved), ["README.md"])
 
+    def test_patches_keep_the_standard_prefixes_whatever_the_users_diff_settings(self):
+        moved = commit(self.repo, {"src/a.py": "A = 2\n"}, "change")
+        for key, value in (("diff.noprefix", "true"), ("diff.mnemonicPrefix", "true"),
+                           ("diff.srcPrefix", "old/"), ("diff.dstPrefix", "new/")):
+            run_git(self.repo, "config", key, value)
+        patch = git(self.ws, "diff", "--no-ext-diff", "--no-color", self.head, moved, "--")
+        self.assertIn("diff --git a/src/a.py b/src/a.py\n", patch)
+        self.assertIn("--- a/src/a.py\n+++ b/src/a.py\n", patch)
+
     def test_preserve_never_removes_the_workspace_folder_itself(self):
         ws = self.repo / "fresh"                  # holds nothing tracked
         write(ws, {"only.py": "ONLY = 1\n"})
