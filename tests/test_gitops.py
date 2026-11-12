@@ -3,10 +3,12 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from gitfixture import (
     commit, current_branch, hermetic, make_origin, make_repo, run_git, update_origin, write,
 )
+from leadhand import gitops
 from leadhand.gitops import (
     GitError, Violation, card_branch_name, changed_paths, cut_card_branch, default_base,
     detect_violation, fast_forward, git, git_common_dir, head, is_test_or_doc_path,
@@ -814,6 +816,24 @@ class OperatorFilesInPlaceTests(unittest.TestCase):
             rebase_onto(self.repo, card_branch, onto)
         self.assertIn("cache", str(cm.exception))
         self.assertEqual((self.repo / "cache" / "mine.txt").read_text(), "the operator's\n")
+
+    def test_a_fold_equal_name_that_is_another_file_is_still_in_the_way(self):
+        # Python's casefold equates names some case-insensitive file systems keep apart (HFS+,
+        # exFAT: `straße` and `STRASSE`). A fold that equates two distinct files here stands in.
+        commit(self.repo, {"notes_local": "tracked\n"}, "tracked notes")
+        self.head = run_git(self.repo, "rev-parse", "HEAD")
+        prepare_workspace(self.repo, run_branch=RUN, base_sha=self.head, slug="run-1", use_worktree=False)
+        card_branch, _ = cut_card_branch(self.repo, RUN, 1)
+        commit(self.repo, {"src/card.py": "CARD = 1\n"}, "card 1")
+        with (git_common_dir(self.repo) / "info" / "exclude").open("a") as f:
+            f.write("notes-local\n")
+        (self.repo / "notes-local").write_text("the operator's\n")
+        onto = self.commit_elsewhere(self.head, {"notes-local": "tracked now\n"}, message="the run tracks it")
+        broad = lambda top: (lambda name: name.replace("-", "_"))
+        with mock.patch.object(gitops, "_path_fold", broad), self.assertRaises(GitError) as cm:
+            rebase_onto(self.repo, card_branch, onto)
+        self.assertIn("notes-local", str(cm.exception))
+        self.assertEqual((self.repo / "notes-local").read_text(), "the operator's\n")
 
     def test_a_case_only_rename_is_not_in_the_way_on_a_case_insensitive_file_system(self):
         probe = self.tmp / "Case Probe"

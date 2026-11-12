@@ -391,12 +391,16 @@ def _in_the_way(ws: Path, *, targets: Sequence[str] = (), ranges: Sequence[str] 
     if not found:
         return []
     # On a case-insensitive file system a tracked `NOTES.md` is what `Notes.md` finds on disk
-    # (a case-only rename): compare case-folded (and NFC-normalized) there.
+    # (a case-only rename): a name that matches a tracked one case-folded (and NFC-normalized)
+    # is excused there, but only when both name the same file on disk. Python's casefold
+    # equates names some file systems keep apart (HFS+, exFAT: `straße`, `STRASSE`).
     fold = _path_fold(top)
-    tracked = {fold(t) for t in _nul_list(git(ws, "ls-files", "-z", "--full-name", "--", ":/"))}
+    tracked: dict[str, list[str]] = {}
+    for t in _nul_list(git(ws, "ls-files", "-z", "--full-name", "--", ":/")):
+        tracked.setdefault(fold(t), []).append(t)
     out = []
     for path in sorted(found):
-        if fold(path) in tracked:
+        if any(t == path or _same_file(top / t, top / path) for t in tracked.get(fold(path), ())):
             continue
         full = top / path
         if os.path.isdir(full) and not os.path.islink(full) and not _nul_list(
@@ -404,6 +408,13 @@ def _in_the_way(ws: Path, *, targets: Sequence[str] = (), ranges: Sequence[str] 
             continue                                # a folder holding only tracked files
         out.append(path)
     return out
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samestat(os.lstat(a), os.lstat(b))
+    except OSError:
+        return False
 
 
 def _path_fold(top: Path):
