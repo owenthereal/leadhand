@@ -1,0 +1,104 @@
+profile = "standard"           # lean | standard | thorough: every role's effort -1 / 0 / +1
+docs_dir = "~/.leadhand/{repo}"
+# docs_dir holds runs/<date>-<slug>/ (deck, events, status, ledger, attempts,
+# copied briefs and reports, report.md), runs.md and decisions.md.
+
+[run]
+worktree = true
+test_first = "when-cheap"      # when-cheap | always | off
+evidence = "record"            # record: a gap makes the outcome incomplete; block: the run stops at the gap
+card_review = "always"         # always | by-risk
+cost_limit_usd = 0             # estimated; 0 = none. Crossing it pauses the run and asks.
+branch_prefix = "leadhand/"
+
+[after_run]
+step = "none"                  # none | pr | skill:<name> | command:<cmd>
+on_incomplete = "none"         # none | draft-pr
+repeat_safe = false            # for skill/command steps: safe to run twice?
+check = ""                     # for skill/command steps: command that reports whether the hand-off already happened
+
+[capacity]
+codex_pause_percent = 95
+
+[codex]
+network = false
+writable_dirs = []             # extra writable folders, e.g. build caches outside the repo
+
+[limits]                       # per role; Claude uses maxTurns, Codex counts steps
+implementer = { steps = 150, minutes = 60 }
+reviewer    = { steps = 60,  minutes = 20 }
+verifier    = { steps = 40,  minutes = 30 }
+scout       = { steps = 30,  minutes = 10 }
+
+[roles.implementer]
+codex  = "gpt-6.1-terra high"
+claude = "sonnet medium"
+prefer = "codex"
+
+[roles.implementer_hard]
+codex  = "gpt-6.1-sol high"
+claude = "opus high"
+prefer = "codex"
+
+[roles.reviewer]
+claude = "sonnet medium"
+codex  = "gpt-6.1-terra medium"
+prefer = "other"               # the vendor the implementer did not use
+
+[roles.reviewer_hard]          # high-risk or Hard cards, and the security review
+claude = "opus high"
+codex  = "gpt-6.1-sol high"
+prefer = "other"
+
+[roles.final_reviewer]
+claude = "fable medium"
+codex  = "gpt-6-astra medium"
+prefer = "claude"
+
+[roles.verifier]
+claude = "sonnet medium"
+codex  = "gpt-6.1-terra medium"
+prefer = "claude"
+
+[roles.scout]
+claude = "haiku low"
+codex  = "gpt-6-luna low"
+prefer = "claude"
+
+[roles.dealer]
+claude = "opus medium"
+
+[roles.supervisor]
+claude = "opus medium"
+
+[notify]
+command = ""                   # optional; run on finish, block, or a decision needed
+
+[prices]                       # $/MTok for estimates; editable. Codex models are not priced.
+[prices.opus]
+input = 4
+output = 20
+cache_read = 0.20
+cache_write_5m = 5
+cache_write_1h = 8
+
+[prices.sonnet]
+input = 2
+output = 10
+cache_read = 0.10
+cache_write_5m = 2.5
+cache_write_1h = 4
+
+[prices.haiku]
+input = 0.10
+output = 0.50
+cache_read = 0.01
+cache_write_5m = 0.125
+cache_write_1h = 0.20
+
+[prices.fable]
+input = 8
+output = 40
+cache_read = 0.20
+cache_write_5m = 10
+cache_write_1h = 16

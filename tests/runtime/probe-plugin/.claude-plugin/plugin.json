@@ -1,0 +1,5 @@
+{
+  "name": "lhprobe",
+  "version": "0.0.1",
+  "description": "Throwaway plugin used by leadhand's runtime probes. Not for use."
+}

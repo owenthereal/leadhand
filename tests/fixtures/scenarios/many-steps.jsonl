@@ -1,0 +1,24 @@
+{"type": "thread.started", "thread_id": "{thread}"}
+{"type": "turn.started"}
+{"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "command": "echo 1", "aggregated_output": "1", "exit_code": 0, "status": "completed"}}
+{"action": "sleep", "seconds": 0.3}
+{"type": "item.completed", "item": {"id": "item_2", "type": "command_execution", "command": "echo 2", "aggregated_output": "2", "exit_code": 0, "status": "completed"}}
+{"action": "sleep", "seconds": 0.3}
+{"type": "item.completed", "item": {"id": "item_3", "type": "command_execution", "command": "echo 3", "aggregated_output": "3", "exit_code": 0, "status": "completed"}}
+{"action": "sleep", "seconds": 0.3}
+{"type": "item.completed", "item": {"id": "item_4", "type": "command_execution", "command": "echo 4", "aggregated_output": "4", "exit_code": 0, "status": "completed"}}
+{"action": "sleep", "seconds": 0.3}
+{"type": "item.completed", "item": {"id": "item_5", "type": "command_execution", "command": "echo 5", "aggregated_output": "5", "exit_code": 0, "status": "completed"}}
+{"action": "sleep", "seconds": 0.3}
+{"type": "item.completed", "item": {"id": "item_6", "type": "command_execution", "command": "echo 6", "aggregated_output": "6", "exit_code": 0, "status": "completed"}}
+{"action": "sleep", "seconds": 0.3}
+{"type": "item.completed", "item": {"id": "item_7", "type": "command_execution", "command": "echo 7", "aggregated_output": "7", "exit_code": 0, "status": "completed"}}
+{"action": "sleep", "seconds": 0.3}
+{"type": "item.completed", "item": {"id": "item_8", "type": "command_execution", "command": "echo 8", "aggregated_output": "8", "exit_code": 0, "status": "completed"}}
+{"action": "sleep", "seconds": 0.3}
+{"type": "item.completed", "item": {"id": "item_9", "type": "command_execution", "command": "echo 9", "aggregated_output": "9", "exit_code": 0, "status": "completed"}}
+{"action": "sleep", "seconds": 0.3}
+{"type": "item.completed", "item": {"id": "item_10", "type": "command_execution", "command": "echo 10", "aggregated_output": "10", "exit_code": 0, "status": "completed"}}
+{"action": "sleep", "seconds": 0.3}
+{"action": "sleep", "seconds": 30}
+{"action": "last_message", "text": "Status: READY\n"}
