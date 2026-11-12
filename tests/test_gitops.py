@@ -619,6 +619,24 @@ class SubdirectoryWorkspaceTests(unittest.TestCase):
         self.assertEqual((self.ws / "a.py").read_text(), "A = 1\n")
         self.assertEqual(run_git(self.repo, "status", "--porcelain"), "")
 
+    def test_preserve_leaves_untracked_files_outside_the_workspace_alone(self):
+        write(self.repo, {"other/user notes.txt": "the operator's\n"})
+        write(self.ws, {"new.py": "NEW = 1\n"})
+        saved = preserve_and_restore(self.ws, ref="refs/leadhand/saved/1", expected_head=self.head,
+                                     expected_branch="main", untracked=["other/user notes.txt", "src/new.py"])
+        self.assertEqual(run_git(self.repo, "show", f"{saved}:src/new.py"), "NEW = 1")
+        self.assertNotIn("other/user notes.txt",
+                         run_git(self.repo, "ls-tree", "-r", "--name-only", saved).splitlines())
+        self.assertEqual((self.repo / "other" / "user notes.txt").read_text(), "the operator's\n")
+        self.assertFalse((self.ws / "new.py").exists())
+
+    def test_stage_work_never_takes_a_new_file_outside_the_workspace(self):
+        write(self.repo, {"other/user notes.txt": "the operator's\n"})
+        write(self.ws, {"new.py": "NEW = 1\n"})
+        staged, _ = stage_work(self.ws, new_paths=["other/user notes.txt", "src/new.py"])
+        self.assertTrue(staged)
+        self.assertEqual(self.staged(), ["src/new.py"])
+
     def test_preserve_never_removes_the_workspace_folder_itself(self):
         ws = self.repo / "fresh"                  # holds nothing tracked
         write(ws, {"only.py": "ONLY = 1\n"})

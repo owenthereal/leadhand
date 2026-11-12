@@ -103,11 +103,14 @@ def checkout_top(path: Path) -> tuple[Path, Path | None]:
     return Path(top), Path(git_dir)
 
 
-def _top(ws: Path, timeout: float = GIT_TIMEOUT) -> Path:
-    """The top of the checkout `ws` lies in. Git names paths from there (`--full-name`, diff
-    and status output), and a workspace can be a subdirectory of it (an in-place run started
-    with `--repo <checkout>/<dir>`), so such paths are used from the top."""
-    return Path(git(ws, "rev-parse", "--show-toplevel", timeout=timeout))
+def top_and_prefix(ws: Path, timeout: float = GIT_TIMEOUT) -> tuple[Path, str]:
+    """The top of the checkout `ws` lies in, and `ws`'s place below it as Git names paths
+    ("" at the top, else "<dir>/"). Git names paths from the top (`--full-name`, diff and
+    status output), and a workspace can be a subdirectory of it (an in-place run started
+    with `--repo <checkout>/<dir>`): such paths are used from the top, and only those under
+    the prefix belong to the workspace. Raises GitError rather than guess."""
+    top, _, prefix = git(ws, "rev-parse", "--show-toplevel", "--show-prefix", timeout=timeout).partition("\n")
+    return Path(top), prefix
 
 
 def head(ws: Path, ref: str = "HEAD") -> str:
@@ -440,7 +443,8 @@ def stage_work(ws: Path, *, new_paths: Sequence[str], deadline: float | None = N
     """Stage a worker's changes for leadhand's own commit: every tracked change (`add -u`)
     and the untracked files in `new_paths` (those that appeared during the dispatch), never
     any other untracked file, and never a gitlink (a nested repository or submodule
-    pointer: one that got staged is unstaged again, R45). `deadline` (time.monotonic)
+    pointer: one that got staged is unstaged again, R45), and never a new file outside the
+    workspace when it is a subdirectory of its checkout. `deadline` (time.monotonic)
     bounds every Git call. Returns (whether anything is staged, the gitlinks left out)."""
     def timeout() -> float:
         if deadline is None:
@@ -450,9 +454,10 @@ def stage_work(ws: Path, *, new_paths: Sequence[str], deadline: float | None = N
             raise GitError("no time left before the deadline")
         return min(GIT_TIMEOUT, left)
 
-    ws = _top(ws, timeout())          # `new_paths` and the gitlinks below are named from the top
+    # `new_paths` and the gitlinks below are named from the top; only the workspace's are taken.
+    ws, prefix = top_and_prefix(ws, timeout())
     git(ws, "add", "-u", "--", ":/", timeout=timeout())
-    files = [p for p in new_paths if not p.endswith("/")]
+    files = [p for p in new_paths if not p.endswith("/") and p.startswith(prefix)]
     if files:
         spec = _pathspec_file(ws, files)
         try:
@@ -495,8 +500,9 @@ def preserve_and_restore(ws: Path, *, ref: str, expected_head: str, expected_bra
     `ref` and its siblings always describe one violation. In-progress rebase, am,
     cherry-pick and merge states are cleared. `refs/stash` is never touched. Untracked
     files are left alone, except the ones named in `untracked` (files Git does not ignore;
-    a nested repository's folder is skipped): those are kept in the saved commit, a child
-    of the saved state whose tree adds them, and removed from the worktree."""
+    a nested repository's folder, and anything outside a workspace that is a subdirectory of
+    its checkout, is skipped): those are kept in the saved commit, a child of the saved state
+    whose tree adds them, and removed from the worktree."""
     if not ref.startswith("refs/") or _run(ws, ("check-ref-format", ref)).returncode != 0:
         raise GitError(f"not a valid ref to preserve under: {ref!r}")
     _check_branch_name(ws, expected_branch)
@@ -507,8 +513,9 @@ def preserve_and_restore(ws: Path, *, ref: str, expected_head: str, expected_bra
         saved = _snapshot_conflicted(ws)
     else:
         raise _fail(r, ws)
-    top = _top(ws)                    # `untracked` is named from the top
-    files = [p for p in untracked if not p.endswith("/") and os.path.lexists(top / p)]
+    # `untracked` is named from the top; only the workspace's are taken.
+    top, prefix = top_and_prefix(ws)
+    files = [p for p in untracked if not p.endswith("/") and p.startswith(prefix) and os.path.lexists(top / p)]
     if files:
         saved = _snapshot_untracked(top, saved, files)
     git(ws, "update-ref", "-m", "leadhand: preserve workspace", ref, saved)

@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from leadhand.gitops import checkout_top
+
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 VENDORS = ("claude", "codex")
 PRICE_KEYS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")
@@ -295,12 +297,14 @@ def docs_dir_for(config: Config, repo: Path) -> Path:
 
 def unsupported_settings(config: Config, repo: Path | None = None) -> list[str]:
     """Settings this version refuses (an error in check, and start refuses). With `repo`,
-    also a docs_dir that resolves inside the repository (a relative one is resolved
-    against the repository): the run's own files would sit in the workspace (ruling R48)."""
+    also a docs_dir that resolves inside the repository's checkout (a relative one is resolved
+    against the repository; a repository given as a subdirectory is checked against its
+    checkout's top): the run's own files would sit in the Git tree leadhand stages, stashes and
+    cleans (ruling R48)."""
     out = []
     if repo is not None:
-        root = Path(os.path.realpath(repo))
-        docs = Path(os.path.realpath(docs_dir_for(config, root)))
+        root = Path(os.path.realpath(checkout_top(Path(repo))[0]))
+        docs = Path(os.path.realpath(docs_dir_for(config, Path(repo))))
         if docs == root or root in docs.parents:
             out.append(f"not supported in this version: docs_dir inside the repository ({docs})")
     if config.after_run.step != "none":

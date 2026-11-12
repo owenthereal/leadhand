@@ -19,6 +19,7 @@ from leadhand import cli, dispatch as dsp, procs
 from leadhand.briefs import worker_prompt
 from leadhand.dispatch import (DispatchError, DispatchRequest, DispatchStillRunning, blocking_env,
                                cancel, codex_argv, dispatch)
+from leadhand.gitops import GitError
 from leadhand.state import read_attempts, run_paths
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -826,6 +827,42 @@ class RunnerCommitTests(Base):
         run_dir.mkdir(parents=True)
         paths = ["notes/runs/2026-11-10-demo run/run.json", "notes/runs.md", "src/new.py"]
         self.assertEqual(dsp.untracked_to_take(run_dir, sub, paths), ["src/new.py"])
+
+    def test_untracked_to_take_keeps_only_paths_inside_a_subdirectory_workspace(self):
+        sub = self.repo / "src"
+        sub.mkdir()
+        paths = ["other/user notes.txt", "srcx/near.py", "src/new.py", "src/pkg/deep.py"]
+        self.assertEqual(dsp.untracked_to_take(self.run_dir, sub, paths), ["src/new.py", "src/pkg/deep.py"])
+        self.assertEqual(dsp.untracked_to_take(self.run_dir, self.repo, paths), paths)
+
+    def test_untracked_to_take_fails_closed_when_the_checkout_top_is_unknown(self):
+        outside = self.tmp / "not a checkout"
+        outside.mkdir()
+        with self.assertRaises(GitError):
+            dsp.untracked_to_take(self.run_dir, outside, ["new.py"])
+
+    def test_runner_commit_leaves_untracked_files_outside_a_subdirectory_workspace(self):
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "a.py").write_text("A = 1\n")
+        run_git(self.repo, "add", "src/a.py")
+        run_git(self.repo, "commit", "--quiet", "--no-verify", "-m", "src")     # the fixture's hook refuses
+        sub = self.repo / "src"
+        (self.run_dir / "run.json").write_text(json.dumps(
+            {"run_id": self.run_dir.name, "repo": str(sub), "workspace": str(sub)}))
+        folder = sub / ".leadhand" / "1" / "d1"
+        folder.mkdir(parents=True)
+        (folder / "brief.md").write_text("# Brief\n## Card 1: Widget card\n")
+        req = self.request(cwd=sub, brief=folder / "brief.md", report=folder / "report.md",
+                           kind="implement", branch=CARD_BRANCH)
+        wd = self.worker_dir()
+        wd.mkdir(parents=True)
+        (sub / "new.py").write_text("NEW = 1\n")
+        (self.repo / "other").mkdir()
+        (self.repo / "other" / "user notes.txt").write_text("the operator's\n")
+        out = dsp._commit_work(wd, req)
+        self.assertEqual(out.get("committed"), run_git(self.repo, "rev-parse", "HEAD"), out)
+        self.assertEqual(self.head_files(), ["src/new.py"])
+        self.assertTrue((self.repo / "other" / "user notes.txt").exists())
 
     def test_failed_commit_is_blocked_environment_with_reason(self):
         for name in ("EMAIL", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):

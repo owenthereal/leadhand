@@ -65,8 +65,8 @@ from typing import Any, Iterable, Mapping
 
 from leadhand import procs
 from leadhand.briefs import parse_report_head, worker_prompt
-from leadhand.gitops import (SAFE_CONFIG, SAFE_ENV, GitError, checkout_top, git, git_common_dir, resolves_in_place,
-                             stage_work, status_entries, untracked_files)
+from leadhand.gitops import (GIT_TIMEOUT, SAFE_CONFIG, SAFE_ENV, GitError, git, git_common_dir, resolves_in_place,
+                             stage_work, status_entries, top_and_prefix, untracked_files)
 from leadhand.state import (utc_now, append_attempt, crash_point, read_attempts, run_paths, state_lock,
                             write_json_atomic)
 from leadhand.usage import (CODEX_STREAM_SOURCE, UNKNOWN, Usage, charge, codex_usage_from_stream, estimate_cost,
@@ -703,7 +703,7 @@ def _commit_work(wd: Path, req: DispatchRequest, *, deadline: float | None = Non
         snap = _read_json(wd / UNTRACKED)
         earlier = set((snap or {}).get("paths") or ())
         tracked, loose = status_entries(ws, timeout=bound())
-        new = ([p for p in untracked_to_take(req.run_dir, ws, loose) if p not in earlier]
+        new = ([p for p in untracked_to_take(req.run_dir, ws, loose, timeout=bound()) if p not in earlier]
                if snap is None or snap.get("paths") is not None else [])
         changes = tracked or bool(new)
         r = run("symbolic-ref", "--quiet", "--short", "HEAD", ok=False)
@@ -923,20 +923,22 @@ def _launch(wd: Path, record: dict, argv: list[str], env: Mapping[str, str], cwd
     return proc
 
 
-def untracked_to_take(run_dir: Path, ws: Path, paths: Iterable[str]) -> list[str]:
+def untracked_to_take(run_dir: Path, ws: Path, paths: Iterable[str], timeout: float = GIT_TIMEOUT) -> list[str]:
     """Of the workspace's untracked `paths`, the ones leadhand may sweep or commit: never a
-    nested repository, a file the workspace had when the run started, or anything under the
-    run directory or its docs folder when they lie inside the workspace's checkout (R48').
-    `paths` are named from the checkout's top, which the workspace may lie below."""
+    nested repository, a file the workspace had when the run started, anything under the
+    run directory or its docs folder when they lie inside the workspace's checkout (R48'),
+    or anything outside the workspace when it is a subdirectory of its checkout. `paths` are
+    named from the checkout's top. GitError when the top cannot be found (`timeout` bounds it)."""
     run_dir = Path(run_dir)
     start = set((_read_json(run_dir / UNTRACKED_AT_START) or {}).get("paths") or ())
-    top = os.path.realpath(checkout_top(Path(ws))[0])
+    root, prefix = top_and_prefix(Path(ws), timeout)
+    top = os.path.realpath(root)
     fenced = []
     for d in (run_dir, run_dir.parent.parent):       # <docs_dir>/runs/<run>
         rel = os.path.relpath(os.path.realpath(d), top)
         if rel != os.pardir and not rel.startswith(os.pardir + os.sep):
             fenced.append("" if rel == os.curdir else rel.replace(os.sep, "/").rstrip("/") + "/")
-    return [p for p in paths if not p.endswith("/") and p not in start
+    return [p for p in paths if not p.endswith("/") and p.startswith(prefix) and p not in start
             and not any(p.startswith(f) for f in fenced)]
 
 

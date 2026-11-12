@@ -127,6 +127,42 @@ class InPlace(unittest.TestCase):
         self.assertFalse((sub / "pkg" / "half-done.py").exists())
         self.assertTrue(sub.is_dir())
 
+    def test_run_started_in_a_subdirectory_leaves_untracked_files_outside_it_alone(self):
+        w = FakeWorld(self, [card(1), card(2)], config=IN_PLACE)
+        sub = w.repo / "sub dir"
+        sub.mkdir()
+        with contextlib.redirect_stdout(io.StringIO()):
+            w.run_dir = engine.start(w.deck_path, repo=sub)
+        notes = w.repo / "other" / "user notes.txt"
+
+        def leave_untracked(world, ws, a):
+            write(ws, {"pkg/half-done.py": "# card 1's unfinished, uncommitted new file\n"})
+            write(world.repo, {"other/user notes.txt": "the operator's, written during the run\n"})
+
+        w.script(1, "implement", {"tamper": leave_untracked, "status": "QUESTION"})
+        w.parks[1] = "decision needed: storage format"
+        w.run()
+        self.assertEqual([e["card"] for e in w.events("accepted")], [2])
+        self.assertEqual(notes.read_text(), "the operator's, written during the run\n")
+        self.assertFalse((sub / "pkg" / "half-done.py").exists())
+        swept = [p for e in w.events("violation") for p in e.get("untracked") or []]
+        self.assertNotIn("other/user notes.txt", swept)
+        landed = run_git(w.repo, "diff", "--name-only", w.base, f"refs/heads/{w.meta()['branch']}").splitlines()
+        self.assertNotIn("other/user notes.txt", landed)
+
+    def test_docs_dir_elsewhere_in_the_checkout_of_a_subdirectory_run_is_refused(self):
+        # R48: the run's files never share the Git tree leadhand stages, stashes and cleans,
+        # which for a subdirectory run is the whole checkout.
+        w = FakeWorld(self, [card(1)], config=IN_PLACE)
+        sub = w.repo / "sub dir"
+        sub.mkdir()
+        w.config_file.write_text(f'docs_dir = "../lh docs"\n{IN_PLACE}', encoding="utf-8")
+        with self.assertRaises(engine.EngineError) as cm, contextlib.redirect_stdout(io.StringIO()):
+            engine.start(w.deck_path, repo=sub)
+        self.assertIn(f"not supported in this version: docs_dir inside the repository "
+                      f"({(w.repo / 'lh docs').resolve()})", str(cm.exception))
+        self.assertFalse((w.repo / "lh docs").exists())
+
 
 class Exclusive(unittest.TestCase):
     """R53: an in-place run claims the checkout; a second in-place run of the repository is
