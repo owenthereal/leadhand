@@ -107,6 +107,7 @@ OPERATIONS = (("rebase-merge", "rebase"), ("rebase-apply", "rebase"), ("MERGE_HE
 CODEX_GRACE_MINUTES = 5       # the Codex runner enforces its own limit; the proxy gets this much more
 TIMER_INTERVAL = 10.0
 REPLY_FILE = "reply.txt"      # in the dispatch's scratch folder (R38)
+BASE_MARKER = "leadhand-run"  # in the evidence base worktree's admin dir: the run that added it
 MAX_STEPS = 200               # mechanical steps in one next_action call
 SLUG_MAX = 40
 _TURN_LIMIT = re.compile(r"stopped at its \d+-turn limit", re.IGNORECASE)
@@ -1975,13 +1976,46 @@ def _base_worktree(ctx: _Run) -> Path:
     records pruned, created when missing, then detached at the base, hard-reset and cleaned
     of every untracked and ignored file. Idempotent. It is kept after the run (beside the
     run's own worktree) so the evidence can be re-checked; `git worktree remove` deletes it.
-    Only a worktree this run added is ever reset: `base_worktree_added` is recorded before
-    `git worktree add` (so a crash right after the add still finds it the run's), and a
-    worktree at the path that the run's events do not record is refused (Codex 4546501978)."""
+    Only a worktree this run added is ever reset (Codex 4546501978): `base_worktree_added` is
+    recorded before `git worktree add`; after it, the run's ID is written to the worktree's
+    admin dir (`leadhand-run`, which `git worktree remove` deletes, so a worktree that later
+    replaces it lacks the marker) and `base_worktree_ready` is recorded. A worktree at the
+    path is the run's only when its marker names the run; in the crash window (an add
+    recorded without its `base_worktree_ready`), one detached at the base commit with nothing
+    in `status --ignored` is adopted, as resetting it loses nothing. Anything else is refused."""
     repo = Path(ctx.meta["repo"])
     path = _base_worktree_path(ctx)
     base = ctx.meta["base_sha"]
-    added = any(e["kind"] == "base_worktree_added" and e.get("path") == str(path) for e in read_events(ctx.paths))
+    run_id = ctx.meta["run_id"]
+    last = {e["kind"]: e["seq"] for e in read_events(ctx.paths)
+            if e["kind"] in ("base_worktree_added", "base_worktree_ready") and e.get("path") == str(path)}
+    crash_window = last.get("base_worktree_added", -1) > last.get("base_worktree_ready", -1)
+
+    def marker() -> Path:
+        return Path(git(path, "rev-parse", "--absolute-git-dir")) / BASE_MARKER
+
+    def mine() -> bool:
+        try:
+            return marker().read_text(encoding="utf-8").strip() == run_id
+        except (GitError, OSError, UnicodeDecodeError):
+            return False
+
+    def holds_nothing() -> bool:
+        try:
+            if (git(path, "rev-parse", "--verify", "HEAD") != base
+                    or git(path, "status", "--porcelain", "--ignored", "--untracked-files=all")):
+                return False
+        except GitError:
+            return False
+        try:
+            git(path, "symbolic-ref", "--quiet", "HEAD")
+        except GitError:
+            return True                     # detached
+        return False                        # on a branch: someone's
+
+    def claim() -> None:
+        marker().write_text(run_id + "\n", encoding="utf-8")
+        append_event(ctx.paths, "base_worktree_ready", path=str(path))
 
     def in_place() -> None:
         # In an in-place run <repo>/.worktrees/ is worker-writable: a symlink there would aim
@@ -1995,14 +2029,16 @@ def _base_worktree(ctx: _Run) -> Path:
     registered = {os.path.realpath(ln[len("worktree "):]) for ln in listed if ln.startswith("worktree ")}
     if os.path.lexists(path) and os.path.realpath(path) not in registered:
         raise EngineError(f"{path} exists but is not a worktree of {repo}; move it aside")
-    if os.path.lexists(path) and not added:
-        raise EngineError(f"{path} is a worktree this run did not add; it is never reset for the evidence "
-                          "gate. Move it aside (git worktree move or remove), then run next again")
+    if os.path.lexists(path) and not mine():
+        if not (crash_window and holds_nothing()):
+            raise EngineError(f"{path} is a worktree this run did not add; it is never reset for the evidence "
+                              "gate. Move it aside (git worktree move or remove), then run next again")
+        claim()
     if not os.path.lexists(path):
         ensure_excluded(repo, ".worktrees/")
-        if not added:
-            append_event(ctx.paths, "base_worktree_added", path=str(path))
+        append_event(ctx.paths, "base_worktree_added", path=str(path))
         git(repo, "worktree", "add", "--quiet", "--detach", str(path), base)
+        claim()
     in_place()
     git(path, "checkout", "--quiet", "--force", "--detach", base, "--")
     git(path, "reset", "--quiet", "--hard", base)

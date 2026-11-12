@@ -195,6 +195,7 @@ EVENT_KINDS: tuple[str, ...] = (
     "resumed",
     "reconciled",
     "base_worktree_added",  # intent: the evidence base worktree is about to be added at `path`
+    "base_worktree_ready",  # completion: the worktree at `path` carries this run's marker
 )
 
 CRASH_POINTS: tuple[str, ...] = (

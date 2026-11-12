@@ -367,7 +367,7 @@ class CrashPointTests(unittest.TestCase):
             "integration_started", "rebased", "conflict", "accept_started", "accepted",
             "parked", "unparked", "ruling", "violation", "gate_started", "gate_result",
             "outcome", "report_written", "paused", "cancelled", "resumed", "reconciled",
-            "base_worktree_added"})
+            "base_worktree_added", "base_worktree_ready"})
         self.assertEqual(len(state.EVENT_KINDS), len(set(state.EVENT_KINDS)))
 
 

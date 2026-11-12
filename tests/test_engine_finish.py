@@ -684,6 +684,51 @@ class BaseWorktreeOwnership(unittest.TestCase):
         self.assertIn("this run did not add", str(cm.exception))
         self.assert_untouched(w, path)
 
+    def test_a_foreign_worktree_after_a_failed_add_is_refused(self):
+        # The intent was recorded, then the add failed or crashed, and a worktree appeared there.
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        ctx = engine._load(w.run_dir, check_digest=False)
+        path = engine._base_worktree_path(ctx)
+        append_event(w.paths, "base_worktree_added", path=str(path))
+        self.foreign_worktree(w, path)
+        with self.assertRaises(engine.EngineError) as cm:
+            engine._base_worktree(ctx)
+        self.assertIn("this run did not add", str(cm.exception))
+        self.assert_untouched(w, path)
+
+    def test_a_foreign_worktree_replacing_the_runs_base_worktree_is_refused(self):
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        ctx = engine._load(w.run_dir, check_digest=False)
+        path = engine._base_worktree(ctx)
+        run_git(w.repo, "worktree", "remove", "--force", str(path))
+        self.foreign_worktree(w, path)
+        with self.assertRaises(engine.EngineError) as cm:
+            engine._base_worktree(ctx)
+        self.assertIn("this run did not add", str(cm.exception))
+        self.assert_untouched(w, path)
+
+    def test_a_base_worktree_left_by_a_crash_is_refused_once_it_holds_work(self):
+        w = FakeWorld(self, [card(1)], gates=True)
+        w.start()
+        ctx = engine._load(w.run_dir, check_digest=False)
+        real = engine.git
+
+        def crash_after_add(cwd, *args, **kw):
+            out = real(cwd, *args, **kw)
+            if args[:2] == ("worktree", "add") and "--detach" in args:
+                raise KeyboardInterrupt("crash right after git worktree add")
+            return out
+
+        with mock.patch.object(engine, "git", crash_after_add), self.assertRaises(KeyboardInterrupt):
+            engine._base_worktree(ctx)
+        path = engine._base_worktree_path(ctx)
+        write(path, {"valuable.txt": "written there while the run was down\n"})
+        with self.assertRaises(engine.EngineError):
+            engine._base_worktree(ctx)
+        self.assertEqual((path / "valuable.txt").read_text(), "written there while the run was down\n")
+
     def test_a_base_worktree_added_before_a_crash_is_still_the_runs(self):
         w = FakeWorld(self, [card(1)], gates=True)
         w.start()
