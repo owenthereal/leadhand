@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import unicodedata
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
@@ -389,8 +390,34 @@ def _in_the_way(ws: Path, *, targets: Sequence[str] = (), ranges: Sequence[str] 
                 found.add("/".join(parts[:i]))
     if not found:
         return []
-    tracked = set(_nul_list(git(ws, "ls-files", "-z", "--full-name", "--", ":/")))
-    return sorted(found - tracked)
+    # On a case-insensitive file system a tracked `NOTES.md` is what `Notes.md` finds on disk
+    # (a case-only rename): compare case-folded (and NFC-normalized) there.
+    fold = _path_fold(top)
+    tracked = {fold(t) for t in _nul_list(git(ws, "ls-files", "-z", "--full-name", "--", ":/"))}
+    out = []
+    for path in sorted(found):
+        if fold(path) in tracked:
+            continue
+        full = top / path
+        if os.path.isdir(full) and not os.path.islink(full) and not _nul_list(
+                git(ws, "ls-files", "--others", "--directory", "-z", "--", f":/{path}")):
+            continue                                # a folder holding only tracked files
+        out.append(path)
+    return out
+
+
+def _path_fold(top: Path):
+    """How the file system at `top` compares names: case-folded and NFC-normalized when it is
+    case-insensitive (probed on the checkout's own `.git`, not assumed from the platform),
+    else as they are."""
+    dot_git, other = top / ".git", top / ".GIT"
+    try:
+        insensitive = os.path.samestat(os.lstat(dot_git), os.lstat(other))
+    except OSError:
+        insensitive = False
+    if not insensitive:
+        return lambda name: name
+    return lambda name: unicodedata.normalize("NFC", name).casefold()
 
 
 def rebase_onto(ws: Path, card_branch: str, onto: str, *, protect_ignored: bool = True) -> list[str]:

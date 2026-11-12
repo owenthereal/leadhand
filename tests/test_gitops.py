@@ -784,6 +784,60 @@ class OperatorFilesInPlaceTests(unittest.TestCase):
         self.assertEqual(run_git(self.repo, "branch", "--list", RUN), "")
         self.assertEqual((git_common_dir(self.repo) / "info" / "exclude").read_text(), exclude)
 
+    def test_a_folder_of_tracked_files_a_rebase_turns_into_a_file_is_not_in_the_way(self):
+        commit(self.repo, {"cfg/a": "tracked\n"}, "cfg is a folder")
+        self.head = run_git(self.repo, "rev-parse", "HEAD")
+        prepare_workspace(self.repo, run_branch=RUN, base_sha=self.head, slug="run-1", use_worktree=False)
+        card_branch, _ = cut_card_branch(self.repo, RUN, 1)
+        commit(self.repo, {"src/card.py": "CARD = 1\n"}, "card 1")
+        wt = self.tmp / "scratch cfg"
+        run_git(self.repo, "worktree", "add", "--quiet", "--detach", str(wt), self.head)
+        run_git(wt, "rm", "--quiet", "-r", "cfg")
+        write(wt, {"cfg": "now a file\n"})
+        run_git(wt, "add", "cfg")
+        run_git(wt, "commit", "--quiet", "-m", "cfg is a file")
+        onto = run_git(wt, "rev-parse", "HEAD")
+        run_git(self.repo, "worktree", "remove", "--force", str(wt))
+        self.assertEqual(rebase_onto(self.repo, card_branch, onto), [])
+        self.assertEqual((self.repo / "cfg").read_text(), "now a file\n")
+        self.assert_kept(card_branch)
+
+    def test_rebase_never_replaces_a_folder_holding_an_ignored_file_with_a_file(self):
+        prepare_workspace(self.repo, run_branch=RUN, base_sha=self.head, slug="run-1", use_worktree=False)
+        card_branch, _ = cut_card_branch(self.repo, RUN, 1)
+        commit(self.repo, {"src/card.py": "CARD = 1\n"}, "card 1")
+        with (git_common_dir(self.repo) / "info" / "exclude").open("a") as f:
+            f.write("cache/\n")
+        write(self.repo, {"cache/mine.txt": "the operator's\n"})
+        onto = self.commit_elsewhere(self.head, {"cache": "a tracked file\n"}, message="cache is a file")
+        with self.assertRaises(GitError) as cm:
+            rebase_onto(self.repo, card_branch, onto)
+        self.assertIn("cache", str(cm.exception))
+        self.assertEqual((self.repo / "cache" / "mine.txt").read_text(), "the operator's\n")
+
+    def test_a_case_only_rename_is_not_in_the_way_on_a_case_insensitive_file_system(self):
+        probe = self.tmp / "Case Probe"
+        probe.write_text("x")
+        insensitive = (self.tmp / "case probe").exists()
+        probe.unlink()
+        if not insensitive:
+            self.skipTest("the file system here is case-sensitive; a case-only rename is two paths")
+        commit(self.repo, {"Notes.md": "notes\n"}, "notes")
+        self.head = run_git(self.repo, "rev-parse", "HEAD")
+        wt = self.tmp / "scratch rename"
+        run_git(self.repo, "worktree", "add", "--quiet", "--detach", str(wt), self.head)
+        run_git(wt, "mv", "Notes.md", "NOTES.md")
+        run_git(wt, "commit", "--quiet", "-m", "rename the notes")
+        renamed = run_git(wt, "rev-parse", "HEAD")
+        run_git(self.repo, "worktree", "remove", "--force", str(wt))
+        prepare_workspace(self.repo, run_branch=RUN, base_sha=self.head, slug="run-1", use_worktree=False)
+        run_git(self.repo, "branch", f"{RUN}--card-1", renamed)
+        card_branch, _ = cut_card_branch(self.repo, RUN, 1)
+        onto = self.commit_elsewhere(self.head, {"src/run.py": "RUN = 1\n"}, message="the run moved on")
+        self.assertEqual(rebase_onto(self.repo, card_branch, onto), [])
+        self.assertEqual(run_git(self.repo, "ls-files", "--", "NOTES.md"), "NOTES.md")
+        self.assert_kept(card_branch)
+
     def test_a_worktree_run_may_overwrite_an_ignored_file_it_holds(self):
         # In a worktree run an ignored file is a worker's or a build's: never the operator's.
         wt = self.tmp / "run worktree"
