@@ -83,8 +83,8 @@ from leadhand.briefs import (CODEX_AGENT, ScratchError, agent_for, dispatch_mess
 from leadhand.config import (SNAPSHOT, VENDORS, Config, ConfigError, Route, config_to_dict, docs_dir_for,
                              load_config, load_run_config, unsupported_warnings)
 from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, parse_deck
-from leadhand.gitops import (CARD_INFIX, GitError, card_branch_name, changed_paths, cut_card_branch, default_base,
-                             detect_violation, ensure_excluded, fast_forward, git, head, is_ancestor,
+from leadhand.gitops import (CARD_INFIX, GitError, card_branch_name, changed_paths, checkout_top, cut_card_branch,
+                             default_base, detect_violation, ensure_excluded, fast_forward, git, head, is_ancestor,
                              is_test_or_doc_path, needs_integration, prepare_workspace, preserve_and_restore,
                              rebase_onto, resolves_in_place, stage_work, status_entries, untracked_files)
 from leadhand.route import LadderExhausted, PinnedVendorMissing, Resolution, resolve
@@ -368,11 +368,12 @@ def _in_place_run(meta: dict) -> bool:
 
 
 def _unfinished_in_place(docs: Path, repo: Path) -> Path | None:
-    """An unfinished (no outcome, or blocked) in-place run of this repository, or None. An
-    in-place run claims the checkout until it ends (R53)."""
-    real_repo = os.path.realpath(repo)
+    """An unfinished (no outcome, or blocked) in-place run of this repository's checkout, or
+    None. An in-place run claims the checkout until it ends (R53); runs are compared by their
+    checkout's top, so a run started from a subdirectory is the same checkout."""
+    top = os.path.realpath(checkout_top(repo)[0])
     for root, meta in sorted(_runs(docs), key=lambda r: str(r[0])):
-        if not _in_place_run(meta) or os.path.realpath(meta["repo"]) != real_repo:
+        if not _in_place_run(meta) or os.path.realpath(checkout_top(Path(meta["repo"]))[0]) != top:
             continue
         try:
             ended = _ended(read_events(run_paths(root)))
@@ -441,14 +442,15 @@ def _start(deck_path: Path, repo: Path, config: Config | None, new: bool) -> tup
                               "or run in a worktree (run.worktree = true)")
         # The checkout claim sees a supervised in-place run whatever runs folder it lives in, and
         # keeps a launch out while this start switches the checkout (R53).
-        from leadhand.launch import CheckoutBusy, CheckoutClaim
+        from leadhand.launch import CheckoutBusy, CheckoutClaim, CheckoutError
         claim = CheckoutClaim(repo)
         try:
             claim.acquire()
         except CheckoutBusy as e:
-            raise EngineError(f"another in-place run of {repo} is being supervised: {e.holder or 'unknown'}; "
-                              "an in-place run has the checkout to itself, so wait for that supervisor "
-                              "to stop, or run in a worktree (run.worktree = true)") from None
+            raise EngineError(f"{e}; an in-place run has the checkout to itself, so wait for that run's "
+                              "supervisor to stop, or run in a worktree (run.worktree = true)") from None
+        except CheckoutError as e:
+            raise EngineError(str(e)) from None
     try:
         return _new_run(deck_path, repo, config, deck, raw, docs)
     finally:

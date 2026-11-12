@@ -185,7 +185,7 @@ class Loop(unittest.TestCase):
         self.assertEqual(verdicts[0]["verdict"], "defects")
 
     def test_clean_rereview_noting_fixed_findings_stays_clean(self):
-        # Only outstanding findings (numbered lines under ## Findings) overrule the verdict.
+        # Only outstanding findings (numbered or bulleted lines under ## Findings) overrule the verdict.
         report = ("Verdict: clean\n## Findings\nNone\n## Notes\n"
                   "1. [high] src/widget.py:1 — fixed; regression test passes.\n")
         head = engine._head(report, "", None, False)

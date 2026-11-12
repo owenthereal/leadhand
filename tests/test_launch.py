@@ -7,6 +7,7 @@ process through `launch.run`; the rest run in-process.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import io
 import json
@@ -14,6 +15,7 @@ import os
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -683,12 +685,17 @@ class CheckoutClaimTests(LaunchTestCase):
         os.kill(launcher.pid, signal.SIGTERM)
         launcher.communicate(timeout=WAIT)
 
+    def held(self, holder: Path | None = None) -> str:
+        """The refusal's account of the claim: the checkout top, then the last recorded holder."""
+        top = f"another in-place run holds the checkout {os.path.realpath(self.repo)}"
+        return f"{top} (last recorded holder: {holder});" if holder is not None else f"{top};"
+
     def test_in_place_launch_is_refused_while_a_run_in_another_runs_folder_is_supervised(self):
         other = self.in_place_run("other docs")
         launcher = self.supervise(other)
         code, _, err = self.run_inprocess()
         self.assertEqual(code, 1, err)
-        self.assertIn(f"another in-place run of {self.repo} is being supervised: {other}", err)
+        self.assertIn(self.held(other), err)
         self.assertEqual(len(self.starts()), 1)
         self.stop(launcher)
         code, _, err = self.run_inprocess()
@@ -703,7 +710,7 @@ class CheckoutClaimTests(LaunchTestCase):
         run_paths(other).holder.unlink()
         code, _, err = self.run_inprocess()
         self.assertEqual(code, 1, err)
-        self.assertIn(f"is being supervised: {other}", err)
+        self.assertIn(self.held(other), err)
         self.assertEqual(len(self.starts()), 1)
         self.stop(launcher)
 
@@ -715,10 +722,58 @@ class CheckoutClaimTests(LaunchTestCase):
         record.unlink()
         code, _, err = self.run_inprocess()
         self.assertEqual(code, 1, err)
-        self.assertIn(f"another in-place run of {self.repo} is being supervised: unknown", err)
+        self.assertIn(self.held(), err)
         self.assertEqual(len(self.starts()), 1)
         self.stop(launcher)
         self.assertFalse(record.exists())
+
+    def test_in_place_launch_from_a_subdirectory_of_a_claimed_checkout_is_refused(self):
+        other = self.in_place_run("other docs")
+        launcher = self.supervise(other)
+        sub = self.repo / "sub dir"
+        sub.mkdir()
+        meta = json.loads(self.paths.run_json.read_text(encoding="utf-8"))
+        write_json_atomic(self.paths.run_json, {**meta, "repo": str(sub), "workspace": str(sub)})
+        code, _, err = self.run_inprocess()
+        self.assertEqual(code, 1, err)
+        self.assertIn(self.held(other), err)
+        self.assertEqual(len(self.starts()), 1)
+        self.stop(launcher)
+
+    def test_a_checkout_that_cannot_be_flocked_is_refused_with_a_clear_error(self):
+        # NFS and CIFS emulate flock with byte-range locks, which a directory cannot take.
+        real = fcntl.flock
+
+        def flock(fd, op):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EBADF, os.strerror(errno.EBADF))
+            return real(fd, op)
+
+        with mock.patch.object(launch.fcntl, "flock", flock):
+            code, _, err = self.run_inprocess()
+        self.assertEqual(code, 1, err)
+        self.assertIn(f"cannot lock the checkout {os.path.realpath(self.repo)}", err)
+        self.assertIn("run.worktree = true", err)
+        self.assertNotIn("[Errno", err)
+        self.assertEqual(self.starts(), [])
+
+    def test_cli_closes_an_inherited_claim_on_the_checkout_top_of_a_subdirectory_run(self):
+        sub = self.repo / "sub dir"
+        sub.mkdir()
+        meta = json.loads(self.paths.run_json.read_text(encoding="utf-8"))
+        write_json_atomic(self.paths.run_json, {**meta, "repo": str(sub), "workspace": str(sub)})
+        fd = os.open(self.repo, os.O_RDONLY)
+        try:
+            env = {"LEADHAND_CHECKOUT_FD": str(fd), "LEADHAND_RUN_DIR": str(self.run_dir)}
+            with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+                from leadhand import cli
+                self.assertEqual(cli.main(["version"]), 0)
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
 
     def test_the_claim_is_released_and_its_record_removed_when_the_supervisor_exits(self):
         other = self.in_place_run("other docs")

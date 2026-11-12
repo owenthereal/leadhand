@@ -46,7 +46,7 @@ from pathlib import Path
 
 from . import procs
 from .config import ConfigError, load_config, load_run_config
-from .gitops import GitError, git
+from .gitops import checkout_top
 from .state import RunPaths, append_event, read_events, run_paths, write_json_atomic
 
 SUPERVISOR_AGENT = "leadhand:supervisor"
@@ -196,40 +196,39 @@ class RunLock:
             os.close(fd)
 
 
-class CheckoutBusy(RuntimeError):
-    """Another in-place run holds the checkout. `holder` is the run directory it recorded,
-    or None when no readable record names it."""
+class CheckoutError(RuntimeError):
+    """The checkout cannot be claimed."""
 
-    def __init__(self, repo: Path, holder: str | None):
+
+class CheckoutBusy(CheckoutError):
+    """Another in-place run (or a start of one) holds the checkout. `holder` is the run
+    directory last recorded for the claim, or None; the record is advisory and can be stale."""
+
+    def __init__(self, top: Path, holder: str | None):
         self.holder = holder
-        super().__init__(f"another in-place run of {repo} holds the checkout: {holder or 'unknown'}")
+        held_by = f" (last recorded holder: {holder})" if holder else ""
+        super().__init__(f"another in-place run holds the checkout {top}{held_by}")
 
 
 class CheckoutClaim:
     """An in-place run's exclusive claim on its repository's checkout (R53): an exclusive
-    `flock` on the checkout's top directory itself, so it holds whichever runs folder a run
-    lives in, and two launches started together cannot both get it. A worker cannot remove or
-    replace that directory (it works inside it; its writable roots are the checkout and .git),
-    so nothing it can delete lets a second claim in. Who holds the claim is recorded in
-    <git dir>/leadhand-checkout.json, only to name the holder in a refusal: a worker can
-    delete or rewrite that record, which changes the message and nothing else."""
+    `flock` on the checkout's top directory itself (`git rev-parse --show-toplevel` of the run's
+    repo, so a run started from a subdirectory claims the same checkout), so it holds whichever
+    runs folder a run lives in, and two launches started together cannot both get it. A worker
+    cannot remove or replace that directory (it works inside it; its writable roots are the
+    checkout and .git), so nothing it can delete lets a second claim in. Who holds the claim
+    is recorded in <git dir>/leadhand-checkout.json, only to name the last recorded holder in a
+    refusal: a worker can delete or rewrite that record, which changes the message and nothing
+    else."""
 
     def __init__(self, repo: Path):
-        self.repo = Path(repo)
+        self.top, git_dir = checkout_top(Path(repo))
+        self.record_path = git_dir / CHECKOUT_RECORD if git_dir is not None else None
         self.fd: int | None = None
         self.recorded: tuple[Path, str] | None = None
 
-    def _record_path(self) -> Path | None:
-        """The record's path in the checkout's own git dir, or None when `repo` is not the top
-        of a Git checkout (nothing is then written)."""
-        try:
-            top, git_dir = git(self.repo, "rev-parse", "--show-toplevel", "--absolute-git-dir").splitlines()
-        except (GitError, ValueError):
-            return None
-        return Path(git_dir) / CHECKOUT_RECORD if os.path.realpath(top) == os.path.realpath(self.repo) else None
-
     def holder(self) -> str | None:
-        path = self._record_path()
+        path = self.record_path
         try:
             data = json.loads(path.read_text(encoding="utf-8")) if path is not None else None
         except (OSError, ValueError):
@@ -239,20 +238,25 @@ class CheckoutClaim:
 
     def acquire(self) -> int:
         """Claim the checkout and return the locked descriptor, or raise CheckoutBusy."""
-        fd = os.open(self.repo, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        fd = os.open(self.top, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as e:
             os.close(fd)
             if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
-                raise CheckoutBusy(self.repo, self.holder()) from None
+                raise CheckoutBusy(self.top, self.holder()) from None
+            if e.errno in (errno.EBADF, errno.EINVAL, errno.ENOLCK, errno.EOPNOTSUPP):
+                # NFS and CIFS emulate flock with byte-range locks, which a directory cannot take.
+                raise CheckoutError(f"cannot lock the checkout {self.top} ({e.strerror}): its file system "
+                                    "does not support the lock an in-place run takes on it; run in a "
+                                    "worktree (run.worktree = true)") from None
             raise
         self.fd = fd
         return fd
 
     def record(self, run_dir: Path) -> None:
         """Name the run holding the claim (best effort; call only while holding it)."""
-        path = self._record_path()
+        path = self.record_path
         if path is None:
             return
         try:
@@ -514,9 +518,11 @@ def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "cla
                     claim.acquire()
                 except CheckoutBusy as e:
                     claim = None
-                    raise LaunchError(f"another in-place run of {meta['repo']} is being supervised: "
-                                      f"{e.holder or 'unknown'}; an in-place run has the checkout to "
-                                      "itself, so wait for that supervisor to stop") from None
+                    raise LaunchError(f"{e}; an in-place run has the checkout to itself, so wait for "
+                                      "that run's supervisor to stop") from None
+                except CheckoutError as e:
+                    claim = None
+                    raise LaunchError(str(e)) from None
                 claim.record(root)
             model, effort = _supervisor_route(meta, root)
             if shutil.which(claude_bin) is None:
@@ -613,7 +619,7 @@ def close_inherited_lock(environ=os.environ) -> None:
     unlocks (closing one reference leaves the supervisor's lock in place). The
     variable is removed from `environ` either way, so children do not try again.
     An in-place run's checkout claim ($LEADHAND_CHECKOUT_FD) is dropped the same way,
-    when it is the same file as the checkout run.json names (`repo`).
+    when it is the same file as the top of the checkout run.json names (`repo`).
     """
     raw = environ.pop(LOCK_FD_ENV, None)
     claim_raw = environ.pop(CHECKOUT_FD_ENV, None)
@@ -622,7 +628,8 @@ def close_inherited_lock(environ=os.environ) -> None:
         return
     paths = run_paths(Path(run_dir))
     _close_if_same(raw, lambda: paths.lock)
-    _close_if_same(claim_raw, lambda: json.loads(paths.run_json.read_text(encoding="utf-8"))["repo"])
+    _close_if_same(claim_raw, lambda: checkout_top(
+        Path(json.loads(paths.run_json.read_text(encoding="utf-8"))["repo"]))[0])
 
 
 def _close_if_same(raw: str | None, target) -> None:

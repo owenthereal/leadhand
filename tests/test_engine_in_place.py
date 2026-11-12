@@ -1,9 +1,12 @@
 """An in-place run (`run.worktree = false`) never sweeps or commits the operator's own
 untracked files (ruling R48'): the files untracked at start are recorded and left alone."""
 import contextlib
+import errno
+import fcntl
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -137,18 +140,64 @@ class Exclusive(unittest.TestCase):
         w.write_deck([card(1)], branch="leadhand/other")
         with self.assertRaises(engine.EngineError) as cm:
             w.start()
-        self.assertIn(f"another in-place run of {w.repo.resolve()} is being supervised: {first}",
-                      str(cm.exception))
+        self.assertIn(f"another in-place run holds the checkout {w.repo.resolve()} "
+                      f"(last recorded holder: {first});", str(cm.exception))
         self.assertEqual(run_git(w.repo, "symbolic-ref", "--short", "HEAD"), "leadhand/demo")
         self.assertFalse(run_git(w.repo, "branch", "--list", "leadhand/other"))
         self.assertFalse(other_docs.exists())
 
-        # Once its supervisor stops, the checkout is free again.
+        # Once its supervisor stops and the run ends, the checkout is free again.
         launcher.terminate()
         launcher.wait(timeout=15)
+        append_event(w.paths, "resumed", note="")
+        append_event(w.paths, "outcome", outcome="complete", qualifier="", reasons=[])
         second = w.start()
         self.assertTrue(str(second).startswith(str(other_docs)))
         self.assertEqual(run_git(w.repo, "symbolic-ref", "--short", "HEAD"), "leadhand/other")
+
+    def start_in(self, w, repo: Path, docs: Path):
+        w.config_file.write_text(f'docs_dir = "{docs}"\n{IN_PLACE}', encoding="utf-8")
+        w.write_deck([card(1)], branch="leadhand/other")
+        with contextlib.redirect_stdout(io.StringIO()):
+            return engine.start(w.deck_path, repo=repo)
+
+    def test_in_place_start_from_a_subdirectory_is_refused_while_the_checkout_is_supervised(self):
+        w = FakeWorld(self, [card(1)], config=IN_PLACE)
+        first = w.start()
+        supervise(self, first)
+        sub = w.repo / "sub dir"
+        sub.mkdir()
+        with self.assertRaises(engine.EngineError) as cm:
+            self.start_in(w, sub, w.tmp / "other docs")
+        self.assertIn(f"another in-place run holds the checkout {w.repo.resolve()} "
+                      f"(last recorded holder: {first});", str(cm.exception))
+        self.assertEqual(run_git(w.repo, "symbolic-ref", "--short", "HEAD"), "leadhand/demo")
+        self.assertFalse(run_git(w.repo, "branch", "--list", "leadhand/other"))
+
+    def test_in_place_start_from_a_subdirectory_is_refused_while_a_run_is_unfinished(self):
+        w = FakeWorld(self, [card(1)], config=IN_PLACE)
+        first = w.start()
+        sub = w.repo / "sub dir"
+        sub.mkdir()
+        with self.assertRaises(engine.EngineError) as cm:
+            self.start_in(w, sub, w.docs)
+        self.assertIn(f"is unfinished: {first}", str(cm.exception))
+        self.assertEqual(run_git(w.repo, "symbolic-ref", "--short", "HEAD"), "leadhand/demo")
+
+    def test_a_checkout_that_cannot_be_flocked_refuses_an_in_place_start_clearly(self):
+        w = FakeWorld(self, [card(1)], config=IN_PLACE)
+        real = fcntl.flock
+
+        def flock(fd, op):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EBADF, os.strerror(errno.EBADF))
+            return real(fd, op)
+
+        with mock.patch.object(fcntl, "flock", flock), self.assertRaises(engine.EngineError) as cm:
+            w.start()
+        self.assertIn(f"cannot lock the checkout {w.repo.resolve()}", str(cm.exception))
+        self.assertIn("run.worktree = true", str(cm.exception))
+        self.assertFalse((w.docs / "runs").exists())
 
     def test_start_returns_the_unfinished_run_while_its_own_supervisor_holds_the_checkout(self):
         w = FakeWorld(self, [card(1)], config=IN_PLACE)

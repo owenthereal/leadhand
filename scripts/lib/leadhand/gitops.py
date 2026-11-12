@@ -93,6 +93,16 @@ def git_common_dir(repo: Path) -> Path:
     return Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
 
 
+def checkout_top(path: Path) -> tuple[Path, Path | None]:
+    """(top directory, git dir) of the checkout `path` lies in; (`path`, None) when it is not
+    in a Git checkout."""
+    try:
+        top, git_dir = git(path, "rev-parse", "--show-toplevel", "--absolute-git-dir").splitlines()
+    except (GitError, ValueError):
+        return Path(path), None
+    return Path(top), Path(git_dir)
+
+
 def head(ws: Path, ref: str = "HEAD") -> str:
     return git(ws, "rev-parse", "--verify", f"{ref}^{{commit}}")
 
