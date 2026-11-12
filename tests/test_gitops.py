@@ -730,6 +730,91 @@ class OperatorFilesInPlaceTests(unittest.TestCase):
         self.assert_kept(card_branch)
         self.assertEqual(run_git(self.repo, "rev-parse", card_branch), before)
 
+    def commit_elsewhere(self, parent: str, files: dict, remove=(), message="elsewhere") -> str:
+        """A commit on `parent` made in a scratch worktree, never in the operator's checkout."""
+        wt = self.tmp / f"scratch {len(list(self.tmp.iterdir()))}"
+        run_git(self.repo, "worktree", "add", "--quiet", "--detach", str(wt), parent)
+        write(wt, files)
+        if files:
+            run_git(wt, "add", "--force", "--", *files)
+        if remove:
+            run_git(wt, "rm", "--quiet", "--", *remove)
+        run_git(wt, "commit", "--quiet", "--allow-empty", "-m", message)
+        sha = run_git(wt, "rev-parse", "HEAD")
+        run_git(self.repo, "worktree", "remove", "--force", str(wt))
+        return sha
+
+    def test_rebase_never_overwrites_an_ignored_file_an_intermediate_commit_adds(self):
+        prepare_workspace(self.repo, run_branch=RUN, base_sha=self.head, slug="run-1", use_worktree=False)
+        card_branch, _ = cut_card_branch(self.repo, RUN, 1)
+        adds = self.commit_elsewhere(self.head, {"local.env": "a worker's\n"}, message="add it")
+        removes = self.commit_elsewhere(adds, {}, remove=["local.env"], message="drop it")
+        run_git(self.repo, "update-ref", f"refs/heads/{card_branch}", removes)
+        onto = self.commit_elsewhere(self.head, {"src/run.py": "RUN = 1\n"}, message="the run moved on")
+        with self.assertRaises(GitError) as cm:
+            rebase_onto(self.repo, card_branch, onto)
+        self.assertIn("local.env", str(cm.exception))
+        self.assert_kept(card_branch)
+        self.assertEqual(run_git(self.repo, "rev-parse", card_branch), removes)
+
+    def ignored_cache_file(self):
+        with (git_common_dir(self.repo) / "info" / "exclude").open("a") as f:
+            f.write("cache\n")
+        (self.repo / "cache").write_text("the operator's cache file\n")
+
+    def test_rebase_never_replaces_an_ignored_file_with_a_folder(self):
+        prepare_workspace(self.repo, run_branch=RUN, base_sha=self.head, slug="run-1", use_worktree=False)
+        card_branch, _ = cut_card_branch(self.repo, RUN, 1)
+        commit(self.repo, {"src/card.py": "CARD = 1\n"}, "card 1")
+        self.ignored_cache_file()
+        onto = self.commit_elsewhere(self.head, {"cache/t": "tracked\n"}, message="the run tracks cache/")
+        with self.assertRaises(GitError) as cm:
+            rebase_onto(self.repo, card_branch, onto)
+        self.assertIn("cache", str(cm.exception))
+        self.assertEqual((self.repo / "cache").read_text(), "the operator's cache file\n")
+
+    def test_start_refuses_a_folder_over_an_ignored_file_before_changing_anything(self):
+        self.ignored_cache_file()
+        base = self.commit_elsewhere(self.head, {"cache/t": "tracked\n"}, message="tracks cache/")
+        exclude = (git_common_dir(self.repo) / "info" / "exclude").read_text()
+        with self.assertRaises(GitError) as cm:
+            prepare_workspace(self.repo, run_branch=RUN, base_sha=base, slug="run-1", use_worktree=False)
+        self.assertIn("cache", str(cm.exception))
+        self.assertEqual((self.repo / "cache").read_text(), "the operator's cache file\n")
+        self.assertEqual(run_git(self.repo, "branch", "--list", RUN), "")
+        self.assertEqual((git_common_dir(self.repo) / "info" / "exclude").read_text(), exclude)
+
+    def test_a_worktree_run_may_overwrite_an_ignored_file_it_holds(self):
+        # In a worktree run an ignored file is a worker's or a build's: never the operator's.
+        wt = self.tmp / "run worktree"
+        run_git(self.repo, "worktree", "add", "--quiet", "-b", RUN, str(wt), self.head)
+        run_git(self.repo, "branch", f"{RUN}--card-1", self.old)
+        (wt / "local.env").write_text("a worker's leftover\n")
+        cut_card_branch(wt, RUN, 1, protect_ignored=False)
+        self.assertEqual((wt / "local.env").read_text(), "historic\n")
+        self.assertEqual(current_branch(wt), f"{RUN}--card-1")
+
+    def test_a_conflicted_merge_is_refused_as_uncommitted_changes(self):
+        side = self.commit_elsewhere(self.head, {"README.md": "theirs\n"}, message="theirs")
+        commit(self.repo, {"README.md": "ours\n"}, "ours")
+        run_git(self.repo, "merge", "--quiet", side, check=False)
+        with self.assertRaises(GitError) as cm:
+            prepare_workspace(self.repo, run_branch=RUN, base_sha=self.head, slug="run-1", use_worktree=False)
+        self.assertIn("uncommitted changes", str(cm.exception))
+        self.assertNotIn("hidden", str(cm.exception))
+        run_git(self.repo, "merge", "--abort")
+
+    def test_a_sparse_checkout_is_refused_in_place_with_short_advice(self):
+        commit(self.repo, {f"far/f{i}.txt": f"{i}\n" for i in range(30)}, "many files")
+        run_git(self.repo, "sparse-checkout", "set", "--no-cone", "/README.md")
+        with self.assertRaises(GitError) as cm:
+            prepare_workspace(self.repo, run_branch=RUN, base_sha=self.head, slug="run-1", use_worktree=False)
+        message = str(cm.exception)
+        self.assertIn("sparse", message)
+        self.assertIn("run.worktree = true", message)
+        self.assertNotIn("--no-skip-worktree", message)
+        self.assertLess(len(message), 600, message)
+
     def test_start_refuses_hidden_index_entries_in_place(self):
         for flag in ("--assume-unchanged", "--skip-worktree"):
             with self.subTest(flag=flag):

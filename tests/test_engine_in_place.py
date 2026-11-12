@@ -163,6 +163,23 @@ class InPlace(unittest.TestCase):
                       f"({(w.repo / 'lh docs').resolve()})", str(cm.exception))
         self.assertFalse((w.repo / "lh docs").exists())
 
+    def test_ignored_file_protection_is_for_in_place_runs_only(self):
+        # An ignored file in a worktree run's own worktree is a worker's or a build's.
+        for config, expected in ((IN_PLACE, True), ("", False)):
+            with self.subTest(in_place=expected):
+                w = FakeWorld(self, [card(1)], config=config)
+                w.start()
+                seen = []
+                real = engine.cut_card_branch
+
+                def spy(*args, **kw):
+                    seen.append(kw.get("protect_ignored"))
+                    return real(*args, **kw)
+
+                with mock.patch.object(engine, "cut_card_branch", spy):
+                    w.next()
+                self.assertEqual(seen, [expected])
+
 
 class Exclusive(unittest.TestCase):
     """R53: an in-place run claims the checkout; a second in-place run of the repository is

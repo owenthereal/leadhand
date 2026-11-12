@@ -82,8 +82,8 @@ from leadhand.briefs import (CODEX_AGENT, ScratchError, agent_for, dispatch_mess
 from leadhand.config import (SNAPSHOT, VENDORS, Config, ConfigError, Route, config_to_dict, docs_dir_for,
                              load_config, load_run_config, unsupported_warnings)
 from leadhand.deck import Card, Deck, DeckError, check_deck, dependency_order, parse_deck
-from leadhand.gitops import (CARD_INFIX, GitError, card_branch_name, changed_paths, checkout_top, cut_card_branch,
-                             default_base, detect_violation, ensure_excluded, fast_forward, git, head,
+from leadhand.gitops import (CARD_INFIX, KEEP_IGNORED, GitError, card_branch_name, changed_paths, checkout_top,
+                             cut_card_branch, default_base, detect_violation, ensure_excluded, fast_forward, git, head,
                              hidden_index_entries, is_ancestor, is_test_or_doc_path, needs_integration,
                              prepare_workspace, preserve_and_restore, rebase_onto, resolves_in_place, stage_work,
                              status_entries, untracked_files)
@@ -640,7 +640,8 @@ def _step(ctx: _Run, events: list[dict]) -> dict | None:
             return None
         name = card_branch_name(ctx.branch, n)
         recorded = any(e["kind"] == "card_cut" and e.get("branch") == name for e in events)
-        branch, base = cut_card_branch(ctx.ws, ctx.branch, n, recorded=recorded)
+        branch, base = cut_card_branch(ctx.ws, ctx.branch, n, recorded=recorded,
+                                       protect_ignored=_in_place_run(ctx.meta))
         append_event(ctx.paths, "card_cut", card=n, branch=branch, base=base)
         return None
     if c.state == "cut":
@@ -866,8 +867,8 @@ def _check_out(ctx: _Run, events: list[dict], card: int, branch: str) -> None:
     _no_open_dispatch(ctx, events, card)
     _ensure_clean(ctx, events, branch=current or branch, why=f"before switching to {branch}", untracked=True)
     if _current_branch(ctx) != branch:
-        # Git refuses to overwrite an untracked file; without this flag it overwrites an ignored one.
-        git(ctx.ws, "checkout", "--quiet", "--no-overwrite-ignore", branch, "--")
+        # Git refuses to overwrite an untracked file; in place, never an ignored one either.
+        git(ctx.ws, "checkout", "--quiet", *KEEP_IGNORED[_in_place_run(ctx.meta)], branch, "--")
 
 
 def _no_open_dispatch(ctx: _Run, events: list[dict], card: int) -> None:
@@ -1282,7 +1283,7 @@ def _accept(ctx: _Run, card: int, target: str | None) -> None:
 
 def _finish_accept(ctx: _Run, card: int, target: str) -> None:
     """Idempotent: a run branch that already contains the target is left where it is."""
-    fast_forward(ctx.ws, ctx.branch, target)
+    fast_forward(ctx.ws, ctx.branch, target, protect_ignored=_in_place_run(ctx.meta))
     crash_point("after_fast_forward")
     append_event(ctx.paths, "accepted", card=card, sha=target)
 
@@ -1321,7 +1322,8 @@ def _rebase(ctx: _Run, card: int, branch: str, integ: dict) -> None:
     crash_point("before_rebase")
     _ensure_clean(ctx, read_events(ctx.paths), branch=branch, why=f"before rebasing card {card}", untracked=True)
     onto = integ["onto"]
-    conflicts = [] if _contains(ctx, branch, onto) else rebase_onto(ctx.ws, branch, onto)
+    conflicts = ([] if _contains(ctx, branch, onto)
+                 else rebase_onto(ctx.ws, branch, onto, protect_ignored=_in_place_run(ctx.meta)))
     crash_point("after_rebase")
     if conflicts:
         append_event(ctx.paths, "conflict", card=card, onto=onto, paths=conflicts)
@@ -2249,7 +2251,7 @@ def _after_run_result(ctx: _Run, d: _Dispatch, events: list[dict], index: dict[s
     if not started:
         append_event(ctx.paths, "accept_started", card=FINAL, wave=wave, target=target, dispatch_id=d.id)
         crash_point("before_fast_forward")
-    fast_forward(ctx.ws, ctx.branch, target)
+    fast_forward(ctx.ws, ctx.branch, target, protect_ignored=_in_place_run(ctx.meta))
     crash_point("after_fast_forward")
     append_event(ctx.paths, "accepted", card=FINAL, wave=wave, sha=target, dispatch_id=d.id)
     return True, None

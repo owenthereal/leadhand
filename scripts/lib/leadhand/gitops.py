@@ -20,6 +20,8 @@ from typing import Collection, Mapping, Sequence
 
 GIT_TIMEOUT = 120.0
 FETCH_TIMEOUT = 600.0
+# The checkout and merge option per `protect_ignored`: refuse to overwrite an ignored file.
+KEEP_IGNORED = {True: ("--no-overwrite-ignore",), False: ()}
 # Commits the library itself creates (rebase, stash create) are never signed:
 # signing may prompt, and these commits are leadhand's own bookkeeping.
 NO_SIGN = ("-c", "commit.gpgsign=false")
@@ -255,11 +257,15 @@ def prepare_workspace(repo: Path, *, run_branch: str, base_sha: str, slug: str, 
     if not slug or "/" in slug or "\0" in slug or slug.startswith("."):
         raise GitError(f"not a valid workspace slug: {slug!r}")
     ref = f"refs/heads/{run_branch}"
+    # A fresh worktree has no hidden entries; the operator's checkout may (Codex 4546946532).
+    if not use_worktree and _sparse(repo):
+        raise GitError(f"{repo} is a sparse checkout (core.sparseCheckout): a run without a worktree "
+                       "needs the whole checkout; run in a worktree (run.worktree = true)")
     hidden = hidden_index_entries(repo) if not use_worktree else []
     if hidden:
-        # A fresh worktree has no such entries; the operator's checkout may (Codex 4546946532).
+        shown = ", ".join(hidden[:10]) + (f" and {len(hidden) - 10} more" if len(hidden) > 10 else "")
         raise GitError(f"tracked files in {repo} are hidden from Git's change checks (assume-unchanged or "
-                       f"skip-worktree): {', '.join(hidden)}; a run without a worktree would not see an edit "
+                       f"skip-worktree): {shown}; a run without a worktree would not see an edit "
                        "to them. Clear the flags (git update-index --no-assume-unchanged <path>, git "
                        "update-index --no-skip-worktree <path>), or run in a worktree (run.worktree = true)")
     if not use_worktree and _current_branch(repo) != run_branch:
@@ -267,7 +273,7 @@ def prepare_workspace(repo: Path, *, run_branch: str, base_sha: str, slug: str, 
             # Checking out the run branch would carry them into the run.
             raise GitError(f"uncommitted changes to tracked files in {repo}; "
                            "commit or set them aside before a run without a worktree")
-        in_the_way = _in_the_way(repo, ref if _ref_exists(repo, ref) else base_sha)
+        in_the_way = _in_the_way(repo, targets=(ref if _ref_exists(repo, ref) else base_sha,))
         if in_the_way:
             raise GitError(f"checking out {run_branch} in {repo} would overwrite files Git does not track "
                            f"there now (ignored ones included): {', '.join(in_the_way)}; move them aside "
@@ -310,12 +316,15 @@ def card_branch_name(run_branch: str, card: int | str) -> str:
     return f"{run_branch}{CARD_INFIX}{card}"
 
 
-def cut_card_branch(ws: Path, run_branch: str, card: int | str, *, recorded: bool = True) -> tuple[str, str]:
+def cut_card_branch(ws: Path, run_branch: str, card: int | str, *, recorded: bool = True,
+                    protect_ignored: bool = True) -> tuple[str, str]:
     """Check out the card branch in `ws`, creating it at the run tip when missing.
     Returns (branch, base); for a reused branch the base is its merge base with the run.
     `recorded` says whether the run's events record cutting this branch: an existing branch
     they don't record is not the run's and is refused (R54), unless it is exactly at the run
-    tip (a cut whose record a crash lost: it holds nothing of its own)."""
+    tip (a cut whose record a crash lost: it holds nothing of its own). `protect_ignored`
+    (an in-place run: the operator's checkout) refuses to overwrite an ignored file; in a
+    worktree run's own worktree such a file is a worker's or a build's."""
     branch = card_branch_name(run_branch, card)
     _check_branch_name(ws, branch)
     ref = f"refs/heads/{branch}"
@@ -329,7 +338,7 @@ def cut_card_branch(ws: Path, run_branch: str, card: int | str, *, recorded: boo
         git(ws, "update-ref", "-m", "leadhand: cut card branch", ref, base, "")
     if _current_branch(ws) != branch:
         # Git refuses to overwrite an untracked file; without this flag it overwrites an ignored one.
-        git(ws, "checkout", "--quiet", "--no-overwrite-ignore", branch, "--")
+        git(ws, "checkout", "--quiet", *KEEP_IGNORED[protect_ignored], branch, "--")
     return branch, base
 
 
@@ -344,30 +353,53 @@ def is_ancestor(ws: Path, ancestor: str, descendant: str) -> bool:
 
 
 def hidden_index_entries(ws: Path) -> list[str]:
-    """Tracked paths whose index entry is not a plain cached one (`git ls-files -v` tag other
-    than `H`): assume-unchanged (a lowercase tag) or skip-worktree (`S`) hide an edit from
-    `status` and `diff`, and a reset overwrites (or keeps) it unseen."""
-    return [entry[2:] for entry in _nul_list(git(ws, "ls-files", "-v", "-z")) if entry[:2] != "H "]
+    """Tracked paths whose index entry hides an edit from `status` and `diff`: assume-unchanged
+    (a lowercase `git ls-files -v` tag) or skip-worktree (`S`); a reset overwrites (or keeps)
+    such an edit unseen. An unmerged entry (`M`) is not hidden: it shows as a change."""
+    return [entry[2:] for entry in _nul_list(git(ws, "ls-files", "-v", "-z"))
+            if entry[:1].islower() or entry[:2] == "S "]
 
 
-def _in_the_way(ws: Path, *targets: str) -> list[str]:
-    """Files on disk that HEAD does not track but one of `targets` adds: checking a target
-    out would overwrite them. Git refuses that for an untracked file but overwrites an ignored
-    one by default, and rebase cannot be told not to."""
+def _sparse(ws: Path) -> bool:
+    r = _run(ws, ("config", "--bool", "--get", "core.sparseCheckout"))
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def _in_the_way(ws: Path, *, targets: Sequence[str] = (), ranges: Sequence[str] = ()) -> list[str]:
+    """What HEAD does not track but is on disk where moving the checkout to one of `targets`,
+    or replaying the commits of `ranges` (`a..b`) one by one, could write: every path those
+    touch that exists on disk, and every parent folder of one that is a file or a symlink.
+    Git refuses to overwrite an untracked file, but overwrites an ignored one by default, and
+    rebase cannot be told not to."""
     top, _ = top_and_prefix(ws)
-    added: set[str] = set()
+    touched: set[str] = set()
     for target in targets:
-        added.update(_nul_list(git(ws, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff",
-                                   "--diff-filter=A", "HEAD", target, "--")))
-    return sorted(p for p in added if os.path.lexists(top / p))
+        touched.update(_nul_list(git(ws, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff",
+                                     "HEAD", target, "--")))
+    for commits in ranges:
+        touched.update(_nul_list(git(ws, "log", "--format=", "--name-only", "-z", "--no-renames", commits, "--")))
+    found: set[str] = set()
+    for path in touched:
+        if os.path.lexists(top / path):
+            found.add(path)
+        parts = path.split("/")
+        for i in range(1, len(parts)):
+            folder = top.joinpath(*parts[:i])
+            if os.path.lexists(folder) and (os.path.islink(folder) or not os.path.isdir(folder)):
+                found.add("/".join(parts[:i]))
+    if not found:
+        return []
+    tracked = set(_nul_list(git(ws, "ls-files", "-z", "--full-name", "--", ":/")))
+    return sorted(found - tracked)
 
 
-def rebase_onto(ws: Path, card_branch: str, onto: str) -> list[str]:
+def rebase_onto(ws: Path, card_branch: str, onto: str, *, protect_ignored: bool = True) -> list[str]:
     """Rebase `card_branch` onto `onto` in `ws`. [] on success; on conflict the rebase is
-    aborted (the branch is left unchanged) and the conflicted paths are returned. Refused
-    (GitError, nothing changed) when it would overwrite a file HEAD does not track, an
-    ignored one included."""
-    in_the_way = _in_the_way(ws, card_branch, onto)
+    aborted (the branch is left unchanged) and the conflicted paths are returned. With
+    `protect_ignored` (an in-place run), refused (GitError, nothing changed) when the rebase
+    could write over a file HEAD does not track, an ignored one included, at any step."""
+    in_the_way = _in_the_way(ws, targets=(card_branch, onto),
+                             ranges=(f"{onto}..{card_branch}",)) if protect_ignored else []
     if in_the_way:
         raise GitError(f"rebasing {card_branch} onto {onto} in {ws} would overwrite files Git does not "
                        f"track there now (ignored ones included): {', '.join(in_the_way)}; move them aside")
@@ -402,9 +434,10 @@ def _clear_operations(ws: Path) -> None:
         git(ws, "cherry-pick", "--quit")
 
 
-def fast_forward(ws: Path, run_branch: str, to_sha: str) -> str:
+def fast_forward(ws: Path, run_branch: str, to_sha: str, *, protect_ignored: bool = True) -> str:
     """Move `run_branch` forward to `to_sha` and return the run tip. Idempotent: a run
-    branch that already contains `to_sha` is left alone. GitError if not a fast-forward."""
+    branch that already contains `to_sha` is left alone. GitError if not a fast-forward.
+    `protect_ignored`: see cut_card_branch."""
     ref = f"refs/heads/{run_branch}"
     target = head(ws, to_sha)
     current = head(ws, ref)
@@ -413,7 +446,7 @@ def fast_forward(ws: Path, run_branch: str, to_sha: str) -> str:
     if not _test(ws, "merge-base", "--is-ancestor", current, target):
         raise GitError(f"not a fast-forward: {run_branch} is at {current}, which {target} does not contain")
     if _current_branch(ws) == run_branch:
-        git(ws, "merge", "--quiet", "--ff-only", "--no-overwrite-ignore", target)
+        git(ws, "merge", "--quiet", "--ff-only", *KEEP_IGNORED[protect_ignored], target)
         return head(ws, ref)
     for w in _worktrees(ws):
         if w.get("branch") == ref:
