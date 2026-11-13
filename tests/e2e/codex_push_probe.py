@@ -40,6 +40,7 @@ fails (failures are findings); 2 on a usage error or under CLAUDECODE.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -55,8 +56,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-CLI = ROOT / "scripts" / "leadhand"
-sys.path.insert(0, str(ROOT / "scripts" / "lib"))
+# The leadhand binary under test: LEADHAND_BIN, else the Python CLI in this checkout. Resolved,
+# as the CLI resolves its own path: commands run from other folders, and checks match this path.
+CLI = Path(os.environ.get("LEADHAND_BIN") or ROOT / "scripts" / "leadhand").resolve()
 
 DISPATCH_ID = "push-probe-1"
 MODEL, EFFORT = "gpt-6-luna", "low"
@@ -195,6 +197,52 @@ def sections(output: str) -> dict[str, tuple[int | None, str]]:
         e = EXIT_RE.search(body)
         out[m.group(1)] = (int(e.group(1)) if e else None, body[: e.start()] if e else body)
     return out
+
+
+# --------------------------------------------------------------------------
+# Session files, located without the leadhand package (copied from
+# scripts/lib/leadhand/usage.py). run_e2e.py imports these too.
+
+def _default_projects_dir() -> Path:
+    return Path.home() / ".claude" / "projects"
+
+
+def _default_sessions_dir() -> Path:
+    home = os.environ.get("CODEX_HOME")
+    return (Path(home) if home else Path.home() / ".codex") / "sessions"
+
+
+def _newest(pattern: str) -> Path | None:
+    matches = [Path(p) for p in glob.glob(pattern)]
+    if not matches:
+        return None
+
+    def mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+    return max(matches, key=lambda p: (mtime(p), str(p)))
+
+
+def _safe_id(value: str) -> bool:
+    return bool(value) and "/" not in value and os.sep not in value and "\0" not in value
+
+
+def _claude_session_transcript(session_id: str, projects_dir: Path | None = None) -> Path | None:
+    """`<projects_dir>/*/<session_id>.jsonl`, or None."""
+    if not _safe_id(session_id):
+        return None
+    base = glob.escape(str(projects_dir if projects_dir is not None else _default_projects_dir()))
+    return _newest(os.path.join(base, "*", f"{glob.escape(session_id)}.jsonl"))
+
+
+def _codex_session_file(thread_id: str, sessions_dir: Path | None = None) -> Path | None:
+    """`<sessions_dir>/YYYY/MM/DD/*<thread_id>.jsonl`, or None."""
+    if not _safe_id(thread_id):
+        return None
+    base = glob.escape(str(sessions_dir if sessions_dir is not None else _default_sessions_dir()))
+    return _newest(os.path.join(base, "*", "*", "*", f"*{glob.escape(thread_id)}.jsonl"))
 
 
 class Probe:
@@ -455,12 +503,11 @@ class Probe:
         if self.ssh_log().exists():
             shutil.copy2(self.ssh_log(), self.art / "fake-ssh.log")
         try:
-            from leadhand import usage
             res = json.loads((run / "workers" / DISPATCH_ID / "result.json").read_text(encoding="utf-8"))
-            rollout = usage.codex_session_file(res.get("session_id") or "")
+            rollout = _codex_session_file(res.get("session_id") or "")
             if rollout:
                 shutil.copy2(rollout, self.art / rollout.name)
-        except (FileNotFoundError, ValueError, OSError, ImportError):
+        except (FileNotFoundError, ValueError, OSError):
             pass
 
     def cleanup(self) -> None:

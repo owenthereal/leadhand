@@ -164,6 +164,16 @@ class NoPackageImport(unittest.TestCase):
                  for m in IMPORT.finditer(p.read_text(encoding="utf-8"))]
         self.assertEqual(found, [])
 
+    def test_e2e_drivers_never_import_leadhand(self):
+        e2e = HERE.parent / "e2e"
+        files = sorted(e2e.glob("*.py"))
+        self.assertIn(e2e / "run_e2e.py", files)
+        self.assertIn(e2e / "codex_push_probe.py", files)
+        found = [f"{p.name}:{text.count(chr(10), 0, m.start(1)) + 1}: {m.group(0).strip()}"
+                 for p in files for text in [p.read_text(encoding="utf-8")]
+                 for m in IMPORT.finditer(text)]
+        self.assertEqual(found, [])
+
 
 class Tags(unittest.TestCase):
     def test_reference_only_skips_under_rust(self):
