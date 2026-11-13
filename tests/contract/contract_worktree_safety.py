@@ -6,6 +6,9 @@ Written for stage 1 from tests/test_engine_in_place.py, the in-place cases of
 tests/test_gitops.py and the rulings they rest on (core run: Codex round 10, R30, R54', R60,
 R63, R64; docs/compatibility.md, Security). In-place runs are gone (deliberate change 1); what
 they tested that also holds for a run in its own worktree is a worktree scenario here.
+SavedState and Workspace, at the end, convert the rest of tests/test_gitops.py's GitopsTests that
+a run shows from outside: a violation's saved commit and sibling refs, the run's worktree and
+the excludes, and leadhand's own commits made unsigned.
 
 FakeSupervisor plays the run skill; a worker misbehaves through its step's `tamper`, which
 runs in the harness against the run's worktree. Every safety outcome is judged from Git and
@@ -21,6 +24,7 @@ from pathlib import Path
 
 from contract_cards import BY_RISK, CODEX_CARD, codex_world, commit_on, relaunch_env
 from contract_finish import base_wt, drive_until_refused, gate_names, marker
+from contract_integration import NOTE, parked_world, unpark
 from gitfixture import IDENTITY, commit, current_branch, run_git, write
 from harness import read_json
 from supervisor import FakeSupervisor, card
@@ -556,6 +560,287 @@ class OperatorCheckout(unittest.TestCase):
                      "config/settings.toml"):
             self.assertNotIn(path, landed)
         self.assertIn("src/card2/c2-a1-implement-1.txt", landed)
+
+
+# --------------------------------------------------------------------------
+# A violation's saved state: what tests/test_gitops.py checks of preserve_and_restore
+
+def git_path(ws: Path, name: str) -> Path:
+    return Path(run_git(ws, "rev-parse", "--path-format=absolute", "--git-path", name))
+
+
+def ref_exists(repo: Path, ref: str) -> bool:
+    return run_git(repo, "rev-parse", "--verify", "--quiet", ref, check=False) != ""
+
+
+def sign_nothing_or_fail(repo: Path) -> None:
+    """Every commit made with the repository's own settings tries to sign, and signing fails."""
+    run_git(repo, "config", "commit.gpgsign", "true")
+    run_git(repo, "config", "gpg.program", "false")
+
+
+class SavedState(unittest.TestCase):
+    """A reviewer leaves card 1's worktree in some state: a moved or deleted branch, a Git
+    operation stopped on a conflict, an autostash, staged work. The violation saves it under
+    refs/leadhand/<run id>/violations/<n> (a stash-style commit: first parent the HEAD it found,
+    second the index) with sibling refs `<ref>-branch` (the card branch's moved tip, when HEAD
+    was elsewhere) and `<ref>-autostash` (an operation's autostash), which the `restored` event
+    lists as `siblings`; then the worktree is back on the card branch at the expected head,
+    clean, with no operation in progress, and the review runs again. Judged from Git."""
+
+    def reviewed(self, tamper, *, files=None, before=None) -> tuple[FakeSupervisor, dict, dict]:
+        """Card 1's implementer writes `files` (or its default file); the first review tampers.
+        `before(world)` runs before `start`. Returns the world, the `found` and `restored` events."""
+        w = FakeSupervisor(self, [card(1)])
+        if before:
+            before(w)
+        w.start()
+        if files:
+            w.script(1, "implement", {"files": files})
+        w.script(1, "review", {"tamper": tamper}, {})
+        self.assertEqual(w.run()[-1]["action"], "done")
+        (v,) = found(w)
+        self.assertEqual((v["dispatch_id"], v["ref"]),
+                         ("c1-a1-review-1", f"refs/leadhand/{w.meta()['run_id']}/violations/1"))
+        (done,) = [e for e in w.events("violation") if e.get("stage") == "restored"]
+        self.assertEqual(run_git(w.repo, "rev-parse", v["ref"]), done["saved"])
+        self.assertEqual(w.dispatch_ids(), ["c1-a1-implement-1", "c1-a1-review-1", "c1-a1-review-2"])
+        self.assertEqual([e["card"] for e in w.events("accepted")], [1])
+        return w, v, done
+
+    def assert_back_on_the_card(self, w: FakeSupervisor, v: dict) -> Path:
+        ws = w.workspace()
+        self.assertEqual(current_branch(ws), CARD1)
+        self.assertEqual(run_git(ws, "rev-parse", "HEAD"), v["expected_head"])
+        self.assertEqual(w.events("accepted")[0]["sha"], v["expected_head"])
+        self.assertEqual(run_git(ws, "status", "--porcelain", "--untracked-files=no"), "")
+        for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "rebase-merge", "rebase-apply", "sequencer"):
+            self.assertFalse(git_path(ws, name).exists(), name)
+        self.assertEqual(run_git(ws, "stash", "list"), "")              # refs/stash untouched
+        return ws
+
+    def test_a_moved_card_tip_is_kept_when_head_is_detached(self):
+        def tamper(world, ws, a):
+            h = run_git(ws, "rev-parse", "HEAD")
+            commit(ws, {"src/stray.txt": "stray\n"}, "reviewer commit on the card branch")
+            run_git(ws, "checkout", "--quiet", "--detach", h)
+
+        w, v, done = self.reviewed(tamper)
+        stray = v["refs"][f"refs/heads/{CARD1}"]["new"]
+        self.assertTrue(v["head_moved"])
+        self.assertEqual(done["saved"], v["expected_head"])
+        self.assertEqual(done["siblings"], [f"{v['ref']}-branch"])
+        self.assertEqual(run_git(w.repo, "rev-parse", f"{v['ref']}-branch"), stray)
+        self.assertEqual(run_git(w.repo, "show", f"{stray}:src/stray.txt"), "stray")
+        self.assert_back_on_the_card(w, v)
+
+    def test_a_moved_card_tip_is_kept_when_another_branch_is_checked_out(self):
+        def tamper(world, ws, a):
+            commit(ws, {"src/stray.txt": "stray\n"}, "reviewer commit on the card branch")
+            run_git(ws, "checkout", "--quiet", RUN)
+
+        w, v, done = self.reviewed(tamper)
+        stray = v["refs"][f"refs/heads/{CARD1}"]["new"]
+        self.assertEqual(done["saved"], w.base)                          # the run branch's head
+        self.assertEqual(done["siblings"], [f"{v['ref']}-branch"])
+        self.assertEqual(run_git(w.repo, "rev-parse", f"{v['ref']}-branch"), stray)
+        self.assert_back_on_the_card(w, v)
+
+    def test_a_deleted_card_branch_is_recreated(self):
+        def tamper(world, ws, a):
+            run_git(ws, "checkout", "--quiet", RUN)
+            run_git(ws, "branch", "--quiet", "-D", CARD1)
+
+        w, v, done = self.reviewed(tamper)
+        self.assertIsNone(v["refs"][f"refs/heads/{CARD1}"]["new"])
+        self.assertEqual(done["siblings"], [])
+        self.assertFalse(ref_exists(w.repo, f"{v['ref']}-branch"))
+        self.assert_back_on_the_card(w, v)
+
+    def test_a_card_tip_already_in_the_saved_commit_is_not_kept_twice(self):
+        def tamper(world, ws, a):
+            commit(ws, {"README.md": "committed\n"}, "reviewer commit")
+            write(ws, {"README.md": "dirty\n"})
+
+        w, v, done = self.reviewed(tamper)
+        moved = v["refs"][f"refs/heads/{CARD1}"]["new"]
+        self.assertEqual(run_git(w.repo, "rev-parse", f"{v['ref']}^1"), moved)
+        self.assertEqual(run_git(w.repo, "show", f"{v['ref']}:README.md"), "dirty")
+        self.assertEqual(done["siblings"], [])
+        self.assertFalse(ref_exists(w.repo, f"{v['ref']}-branch"))
+        ws = self.assert_back_on_the_card(w, v)
+        self.assertEqual((ws / "README.md").read_text(encoding="utf-8"), "hello\n")
+
+    def test_a_conflicted_merge_is_saved_and_cleared_without_signing(self):
+        # The saved commit of an unmerged index is leadhand's own commit: never signed.
+        side = {}
+
+        def make_side(w):
+            (side["sha"],) = side_branch(w.repo, "side", [{"README.md": "side\n"}])
+            sign_nothing_or_fail(w.repo)
+
+        def tamper(world, ws, a):
+            run_git(ws, "merge", "--no-edit", "side", check=False)
+            self.assertTrue(run_git(ws, "ls-files", "-u"))              # an unmerged index
+
+        w, v, done = self.reviewed(tamper, files={"README.md": "card\n"}, before=make_side)
+        saved = v["ref"]
+        self.assertEqual(run_git(w.repo, "rev-parse", f"{saved}^1"), v["expected_head"])
+        self.assertEqual(run_git(w.repo, "rev-parse", f"{saved}^2"), side["sha"])
+        self.assertIn("<<<<<<<", run_git(w.repo, "show", f"{saved}:README.md"))
+        ws = self.assert_back_on_the_card(w, v)
+        self.assertEqual((ws / "README.md").read_text(encoding="utf-8"), "card\n")
+
+    def test_a_conflicted_rebase_or_cherry_pick_is_saved_and_cleared(self):
+        for operation in ("rebase", "cherry-pick"):
+            with self.subTest(operation=operation):
+                picks = {}
+
+                def make_other(w):
+                    picks["1"], picks["2"] = side_branch(w.repo, "other", [{"README.md": "other\n"},
+                                                                           {"src/g.txt": "g\n"}])
+
+                def tamper(world, ws, a, operation=operation):
+                    if operation == "rebase":
+                        run_git(ws, "rebase", "other", check=False)
+                        self.assertTrue(git_path(ws, "rebase-merge").exists() or git_path(ws, "rebase-apply").exists())
+                    else:
+                        run_git(ws, "cherry-pick", picks["1"], picks["2"], check=False)
+                        self.assertTrue(git_path(ws, "sequencer").exists())
+
+                w, v, done = self.reviewed(tamper, files={"README.md": "card\n"}, before=make_other)
+                self.assertIn("<<<<<<<", run_git(w.repo, "show", f"{v['ref']}:README.md"))
+                ws = self.assert_back_on_the_card(w, v)
+                self.assertEqual((ws / "README.md").read_text(encoding="utf-8"), "card\n")
+
+    def test_an_operations_autostash_is_kept_beside_the_saved_commit(self):
+        for operation in ("merge", "rebase"):
+            with self.subTest(operation=operation):
+                def make_side(w):
+                    side_branch(w.repo, "side", [{"README.md": "side\n"}])
+
+                def tamper(world, ws, a, operation=operation):
+                    write(ws, {CARD1_FILE: "dirty\n"})                  # the reviewer's edit, autostashed
+                    if operation == "merge":
+                        run_git(ws, "merge", "--autostash", "--no-edit", "side", check=False)
+                        self.assertTrue(ref_exists(ws, "MERGE_AUTOSTASH"))
+                    else:
+                        run_git(ws, "rebase", "--autostash", "side", check=False)
+                        self.assertTrue(git_path(ws, "rebase-merge/autostash").exists()
+                                        or git_path(ws, "rebase-apply/autostash").exists())
+
+                w, v, done = self.reviewed(tamper, files={"README.md": "card\n", CARD1_FILE: "card file\n"},
+                                           before=make_side)
+                self.assertIn("<<<<<<<", run_git(w.repo, "show", f"{v['ref']}:README.md"))
+                self.assertEqual(done["siblings"], [f"{v['ref']}-autostash"])
+                self.assertEqual(run_git(w.repo, "show", f"{v['ref']}-autostash:{CARD1_FILE}"), "dirty")
+                ws = self.assert_back_on_the_card(w, v)
+                self.assertFalse(ref_exists(ws, "MERGE_AUTOSTASH"))
+                self.assertEqual((ws / CARD1_FILE).read_text(encoding="utf-8"), "card file\n")
+
+    def test_a_staged_change_whose_working_copy_was_put_back_is_kept(self):
+        def tamper(world, ws, a):
+            write(ws, {"README.md": "staged\n"})
+            run_git(ws, "add", "--", "README.md")
+            write(ws, {"README.md": "hello\n"})
+
+        w, v, done = self.reviewed(tamper)
+        self.assertTrue(v["index_dirty"])
+        self.assertEqual(run_git(w.repo, "show", f"{v['ref']}^2:README.md"), "staged")
+        self.assertEqual(run_git(w.repo, "show", f"{v['ref']}:README.md"), "hello")
+        self.assert_back_on_the_card(w, v)
+
+    def test_restore_returns_to_the_card_from_another_branch_and_keeps_untracked_files(self):
+        def tamper(world, ws, a):
+            run_git(ws, "checkout", "--quiet", "-b", "elsewhere")
+            commit(ws, {"src/g.txt": "g\n"}, "elsewhere")
+            write(ws, {"README.md": "staged\n", "scratch.log": "keep me\n"})
+            run_git(ws, "add", "--", "README.md")
+
+        w, v, done = self.reviewed(tamper)
+        moved = run_git(w.repo, "rev-parse", "refs/heads/elsewhere")
+        self.assertEqual(run_git(w.repo, "rev-parse", f"{v['ref']}^1"), moved)
+        ws = self.assert_back_on_the_card(w, v)
+        self.assertEqual(run_git(ws, "diff", "--cached", "--name-only"), "")
+        self.assertEqual((ws / "scratch.log").read_text(encoding="utf-8"), "keep me\n")
+        self.assertFalse((ws / "src" / "g.txt").exists())
+
+    def test_a_tracked_edit_and_a_deletion_are_both_listed(self):
+        def tamper(world, ws, a):
+            write(ws, {CARD1_FILE: "edited\n"})
+            (ws / "README.md").unlink()
+
+        w, v, done = self.reviewed(tamper)
+        self.assertEqual((v["head_moved"], v["index_dirty"], v["paths"]), (False, False, ["README.md", CARD1_FILE]))
+        ws = self.assert_back_on_the_card(w, v)
+        self.assertEqual((ws / "README.md").read_text(encoding="utf-8"), "hello\n")
+
+    def test_paths_with_spaces_and_non_ascii_names(self):
+        spaced, accented = "src/my dir/a file.txt", "src/café notes.md"
+
+        def tamper(world, ws, a):
+            write(ws, {spaced: "edited\n"})
+
+        w, v, done = self.reviewed(tamper, files={spaced: "a\n", accented: "n\n"})
+        self.assertEqual(v["paths"], [spaced])
+        self.assertEqual(run_git(w.repo, "show", f"{v['ref']}:{spaced}"), "edited")
+        ws = self.assert_back_on_the_card(w, v)
+        self.assertEqual((ws / spaced).read_text(encoding="utf-8"), "a\n")
+        tip = w.events("accepted")[0]["sha"]
+        self.assertEqual(run_git(w.repo, "show", f"{tip}:{accented}"), "n")
+
+    def test_a_stat_only_touch_and_untracked_output_are_not_a_violation(self):
+        def tamper(world, ws, a):
+            write(ws, {"build/out.o": "bin\n", "new file.txt": "x\n"})
+            os.utime(ws / CARD1_FILE)
+
+        w = FakeSupervisor(self, [card(1)])
+        w.start()
+        w.script(1, "review", {"tamper": tamper})
+        self.assertEqual(w.run()[-1]["action"], "done")
+        self.assertEqual(w.events("violation"), [])
+        self.assertEqual(w.dispatch_ids(), ["c1-a1-implement-1", "c1-a1-review-1"])
+
+
+def side_branch(repo: Path, name: str, files: list[dict]) -> list[str]:
+    """Branch `name` off main in the operator's checkout, one commit per entry of `files`, then
+    back on main; returns the commits."""
+    run_git(repo, "checkout", "--quiet", "-b", name)
+    shas = [commit(repo, f, f"{name} {i}") for i, f in enumerate(files, 1)]
+    run_git(repo, "checkout", "--quiet", "main")
+    return shas
+
+
+# --------------------------------------------------------------------------
+# The run's worktree and the excludes `start` adds (test_gitops.py)
+
+class Workspace(unittest.TestCase):
+    def test_start_adds_each_exclude_once_and_the_run_worktree_on_the_run_branch(self):
+        w = FakeSupervisor(self, [card(1)])
+        first = w.start()
+        second = w.start(new=True)
+        for run in (first, second):
+            meta = read_json(run / "run.json")
+            ws = Path(meta["workspace"])
+            self.assertEqual(ws, w.repo.resolve() / ".worktrees" / run.name)
+            self.assertEqual(current_branch(ws), meta["branch"])
+            self.assertEqual(run_git(ws, "rev-parse", "HEAD"), w.base)
+        exclude = (w.repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+        self.assertEqual((exclude.count(".worktrees/"), exclude.count(".leadhand/")), (1, 1))
+        write(w.repo, {".leadhand/state.json": "{}\n"})
+        self.assertEqual(run_git(w.repo, "status", "--porcelain"), "")
+
+    def test_the_integration_rebase_is_never_signed(self):
+        # Card 1 is parked while card 2 is accepted; once unparked it is rebased onto the run tip
+        # by leadhand itself, in a repository where every signing attempt fails.
+        w = parked_world(self)
+        sign_nothing_or_fail(w.repo)
+        unpark(w, 1, NOTE)
+        self.assertEqual(w.run()[-1]["action"], "done")
+        (rebased,) = w.events("rebased")
+        self.assertEqual([e["card"] for e in w.events("accepted")], [2, 1])
+        self.assertEqual(w.branch_tip(RUN), w.events("accepted")[1]["sha"])
+        self.assertEqual(run_git(w.repo, "log", "-1", "--format=%G?", rebased["tip"]), "N")
 
 
 if __name__ == "__main__":

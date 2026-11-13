@@ -24,6 +24,9 @@ with an operator's global Git configuration holding a fake git-lfs filter whose 
 "fetch" unless GIT_LFS_SKIP_SMUDGE=1; the control (plain Git with the same configuration does
 fetch from the worker's URL) runs last, inside the same test, so it never feeds the binary's
 checks.
+
+GitSafety, at the end, is converted from tests/test_git_safety.py: leadhand's own Git calls run
+no hook or fsmonitor command, and the runner never commits a gitlink.
 """
 import json
 import os
@@ -38,7 +41,7 @@ from contract_cards import CODEX_CARD, codex_world
 from contract_dispatch import World, holds, wait_for
 from contract_finish import base_wt, drive_until_refused, gate_names, marker
 from contract_launch import World as LaunchWorld
-from gitfixture import make_repo, run_git, write
+from gitfixture import commit, make_repo, run_git, write
 from harness import FAKES, read_json, run_cli, same_process, started_by
 from supervisor import FakeSupervisor, card
 
@@ -759,6 +762,105 @@ class L6ToolsInsideTheWorkspace(unittest.TestCase):
         r = self.w.run("--plugin-dir", self.w.elsewhere)
         self.assertEqual(r.code, 0, r)
         self.assertEqual(len(self.w.starts()), 1)
+
+
+# --------------------------------------------------------------------------
+# I6, I7 (R45): leadhand's Git calls run no hook or fsmonitor, and the runner commits no gitlink
+
+HOOKS = ("post-checkout", "pre-commit", "post-commit", "reference-transaction")
+
+
+def marker_script(path: Path, marker: Path) -> Path:
+    path.write_text(f'#!/bin/sh\necho "ran $0 in $(pwd)" >> "{marker}"\n', encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+class GitSafety(unittest.TestCase):
+    """Converted from tests/test_git_safety.py. The operator's repository has hooks that log to a
+    marker file (in its hooks folder, which the run's worktrees share) and an fsmonitor command
+    that logs to it too, both in its own configuration and in a dirty nested repository committed
+    as a gitlink, as in the Python test. A whole run (start, card cuts, a reviewer's violation
+    preserved and restored, the runner's commit of Codex's work, accepts, the end-of-run gates
+    with the evidence base worktree) must leave no mark. Nothing else runs Git in the run: the
+    Codex implementers leave their work for the runner to commit, and the Claude reviewers run no
+    Git. Whether the trap is armed is checked last, inside the same test, with plain Git in the
+    binary's environment."""
+
+    def test_leadhand_git_calls_run_no_fsmonitor_or_hook(self):
+        w = codex_world(self, [card(1), card(2)], gates=True)
+        marker = w.tmp / "MARKER"
+        evil = marker_script(w.tmp / "evil.sh", marker)
+        quoted = f"'{evil}'"                    # fsmonitor runs through the shell; the path has a space
+        sub = make_repo(w.repo, name="sub")
+        run_git(sub, "config", "core.fsmonitor", quoted)
+        run_git(w.repo, "add", "sub")
+        run_git(w.repo, "commit", "--quiet", "-m", "add the nested repo")
+        run_git(w.repo, "config", "core.fsmonitor", quoted)
+        hooks = Path(run_git(w.repo, "rev-parse", "--path-format=absolute", "--git-path", "hooks"))
+        hooks.mkdir(parents=True, exist_ok=True)
+        for name in HOOKS:
+            marker_script(hooks / name, marker)
+        w.base = run_git(w.repo, "rev-parse", "HEAD")
+        w.write_deck([card(1), card(2)])
+        marker.unlink(missing_ok=True)
+        write(sub, {"README.md": "dirty\n"})    # a dirty nested repo is what triggers its fsmonitor
+
+        def leave_a_change(world, ws, a):
+            write(ws, {"README.md": "a reviewer's edit\n"})
+
+        w.start()
+        w.script(1, "review", {"tamper": leave_a_change})
+        for n in (1, 2):                        # Codex leaves its work for the runner to commit
+            w.script(n, "implement", {"commit": False})
+        self.assertEqual(w.run()[-1]["action"], "done")
+        self.assertEqual([e["card"] for e in w.events("accepted")], [1, 2])
+        (found,) = [e for e in w.events("violation") if e.get("stage") == "found"]
+        self.assertEqual(found["paths"], ["README.md"])
+        self.assertEqual(run_git(w.repo, "show", f"{found['ref']}:README.md"), "a reviewer's edit")
+        self.assertEqual(run_git(w.repo, "log", "-1", "--format=%(trailers:key=Leadhand-Dispatch,valueonly)",
+                                 w.events("accepted")[1]["sha"]), "c2-a1-implement-1")
+        self.assertIn("evidence", gate_names(w))
+        self.assertFalse(marker.exists(), marker.read_text(encoding="utf-8") if marker.exists() else "")
+        # Control: plain Git in the binary's environment runs both.
+        env = {k: v for k, v in w.env.items() if not k.startswith("LEADHAND")}
+        for cwd, args in ((w.repo, ("status", "--porcelain")), (w.repo, ("update-ref", "refs/control", "HEAD"))):
+            subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, timeout=60,
+                           stdin=subprocess.DEVNULL)
+        ran = marker.read_text(encoding="utf-8") if marker.exists() else ""
+        self.assertIn("evil.sh", ran)
+        self.assertIn("reference-transaction", ran)
+
+    def test_runner_never_commits_a_gitlink(self):
+        # The Codex worker moves a tracked nested repository, makes a new one and edits a file;
+        # each nested repository is a folder whose .git file points at a repository outside the
+        # workspace, as a submodule's does. The runner commits the file, and neither gitlink.
+        w = codex_world(self, [card(1, route=CODEX_CARD)])
+        tracked = make_repo(w.tmp, name="tracked nested")
+        old = run_git(tracked, "rev-parse", "HEAD")
+        run_git(w.repo, "update-index", "--add", "--cacheinfo", f"160000,{old},src/tracked sub")
+        run_git(w.repo, "commit", "--quiet", "-m", "a submodule pointer")
+        w.base = run_git(w.repo, "rev-parse", "HEAD")
+        w.write_deck([card(1, route=CODEX_CARD)])
+        commit(tracked, {"README.md": "moved\n"}, "moved")
+        fresh = make_repo(w.tmp, name="new nested")
+        w.start()
+        w.script(1, "implement", {"commit": False, "files": {
+            "src/tracked sub/.git": f"gitdir: {run_git(tracked, 'rev-parse', '--absolute-git-dir')}\n",
+            "src/tracked sub/README.md": "moved\n",
+            "src/new sub/.git": f"gitdir: {run_git(fresh, 'rev-parse', '--absolute-git-dir')}\n",
+            "src/new sub/README.md": "hello\n",
+            "src/widget.py": "W = 1\n"}})
+        self.assertEqual(w.run()[-1]["action"], "done")
+        (accepted,) = w.events("accepted")
+        tip = accepted["sha"]
+        tree = run_git(w.repo, "ls-tree", "-r", tip)
+        self.assertNotIn("new sub", tree)
+        self.assertIn("src/widget.py", tree)
+        self.assertEqual(run_git(w.repo, "rev-parse", f"{tip}:src/tracked sub"), old)
+        result = read_json(w.run_dir / "workers" / "c1-a1-implement-1" / "result.json")
+        self.assertEqual(result["committed"], tip)
+        self.assertEqual(result.get("gitlinks_skipped"), ["src/tracked sub"])
 
 
 if __name__ == "__main__":

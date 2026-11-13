@@ -2,11 +2,12 @@
 """Launcher scenarios: `run`, which owns a run and starts its Claude Code supervisor, and
 `launch-line`, which prints the command that does.
 
-Converted from tests/test_launch.py. Every scenario runs on a run that `start` made (one card,
-a worktree workspace, the supervisor route `sonnet low` in the run's config.json), with
-tests/fakes/claude as the `claude` found on PATH. It reads what the launch leaves: the fake's
-log (its argv, working directory, LEADHAND_* environment, pid and parent, and the signals it
-got), holder.json, events.jsonl, run.lock (by taking the flock itself), exit codes and stderr.
+Converted from tests/test_launch.py, with the self-path hook of tests/test_test_hooks.py
+(SelfPathHook). Every scenario runs on a run that `start` made (one card, a worktree workspace,
+the supervisor route `sonnet low` in the run's config.json), with tests/fakes/claude as the
+`claude` found on PATH. It reads what the launch leaves: the fake's log (its argv, working
+directory, LEADHAND_* environment, pid and parent, and the signals it got), holder.json,
+events.jsonl, run.lock (by taking the flock itself), exit codes and stderr.
 
 Spec contract item 11 (the `claude` argument order, environment, working directory, first
 message and settings overlay) and item 12 (every lock is flock(2) on the same files): a test
@@ -468,6 +469,44 @@ class LaunchLine(LaunchCase):
         self.assertEqual(r.code, 0, r)
         self.assertNotIn("plugin_dir", self.w.holder())
         self.assertEqual(self.w.holder()["supervisor_pid"], self.w.starts()[1]["pid"])
+
+
+class SelfPathHook(LaunchCase):
+    """The testing hook LEADHAND_TEST_CLI (converted from tests/test_test_hooks.py): under
+    LEADHAND_TESTING=1 it takes the place of the binary's own path wherever the binary names
+    itself; without LEADHAND_TESTING=1 it is ignored."""
+    ROUTER = "/x/router"
+
+    def test_self_path_override_is_honoured_only_under_leadhand_testing(self):
+        deck = str(self.w.paths.deck)
+        for testing, honoured in (("1", True), ("0", False)):
+            with self.subTest(testing=testing):
+                env = dict(self.w.env, LEADHAND_TESTING=testing, LEADHAND_TEST_CLI=self.ROUTER)
+                r = run_cli("launch-line", self.w.run_dir, env=env, cwd=self.w.elsewhere).ok()
+                words = shlex.split(r.stdout)
+                self.assertEqual(words[1:], ["run", deck], r)
+                if honoured:
+                    self.assertEqual(words[0], self.ROUTER, r)
+                else:
+                    self.assertTrue(harness.names_bin(words[0]), r)
+        # Without the hook, under LEADHAND_TESTING=1, the binary names itself.
+        line = self.w.launch_line(self.w.run_dir).ok().stdout
+        self.assertTrue(harness.is_bin_command(line[:-1], "", " " + shlex.join(["run", deck])), line)
+
+    def test_launch_and_pause_name_the_override(self):
+        r = self.w.run(LEADHAND_TEST_CLI=self.ROUTER)
+        self.assertEqual(r.code, 0, r)
+        start = self.w.starts()[0]
+        self.assertEqual(start["argv"][-1], f"Run the leadhand deck in {self.w.run_dir}. leadhand CLI: "
+                                            f"{self.ROUTER}{FIRST_MESSAGE_END}")
+        argv = start["argv"]
+        self.assertEqual(json.loads(argv[argv.index("--settings") + 1]),
+                         {"sandbox": {"excludedCommands": [f"{self.ROUTER} *"]}})
+        self.assertEqual(start["env"]["LEADHAND_CLI"], self.ROUTER)
+        r = run_cli("pause", self.w.run_dir, env=dict(self.w.env, LEADHAND_TEST_CLI=self.ROUTER),
+                    cwd=self.w.elsewhere).ok()
+        self.assertTrue(r.stdout.rstrip("\n").endswith(
+            f"Continue it later with: {self.ROUTER} run {shlex.quote(str(self.w.run_dir))}"), r)
 
 
 # --------------------------------------------------------------------------

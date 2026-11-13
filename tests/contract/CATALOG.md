@@ -16,7 +16,7 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_agents.py::AgentTests::test_verifier_evidence_rule_follows_the_spec | plugin file check (contract_plugin_files) |
 | test_cli.py::CliTests::test_unknown_command_exits_2 | contract_cli.Usage.test_unknown_command_exits_2 |
 | test_cli.py::CliTests::test_version_prints_package_version | contract_cli.Version.test_prints_package_version |
-| test_supervisor_files.py::SupervisorFileTests::test_run_skill_commands_match_cli | contract_cli.PluginCommands.test_every_cli_command_in_the_run_skill_is_a_registered_command |
+| test_supervisor_files.py::SupervisorFileTests::test_run_skill_commands_match_cli | contract_cli.PluginCommands.test_every_cli_command_in_the_run_skill_is_a_registered_command; contract_plugin_files.SupervisorFiles.test_run_skill_cli_calls_are_plain_commands |
 | test_supervisor_files.py::SupervisorFileTests::test_run_skill_covers_every_action | plugin file check (contract_plugin_files) |
 | test_supervisor_files.py::SupervisorFileTests::test_run_skill_covers_run_level_dispatches | plugin file check (contract_plugin_files) |
 | test_supervisor_files.py::SupervisorFileTests::test_run_skill_records_started_before_waiting | plugin file check (contract_plugin_files) |
@@ -561,3 +561,103 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_gitops.py::OperatorFilesInPlaceTests::test_a_conflicted_merge_is_refused_as_uncommitted_changes | dropped with in-place mode |
 | test_gitops.py::OperatorFilesInPlaceTests::test_a_sparse_checkout_is_refused_in_place_with_short_advice | contract_worktree_safety.SparseCheckouts.test_sparse_checkout_refused_by_check_start_and_run |
 | test_gitops.py::OperatorFilesInPlaceTests::test_start_refuses_hidden_index_entries_in_place | dropped with in-place mode |
+| test_git_safety.py::EngineGitCalls::test_engine_git_calls_run_no_fsmonitor_or_hook | contract_security.GitSafety.test_leadhand_git_calls_run_no_fsmonitor_or_hook |
+| test_git_safety.py::EngineGitCalls::test_safe_options_are_passed_on_every_call | contract_security.GitSafety.test_leadhand_git_calls_run_no_fsmonitor_or_hook |
+| test_git_safety.py::RunnerGitlinks::test_runner_never_commits_a_gitlink | contract_security.GitSafety.test_runner_never_commits_a_gitlink |
+| test_gitops.py::GitopsTests::test_default_base_uses_origin_default_branch | internal: Rust unit test (git) |
+| test_gitops.py::GitopsTests::test_default_base_without_origin_uses_local_default | internal: Rust unit test (git) |
+| test_gitops.py::GitopsTests::test_prepare_workspace_is_idempotent_and_excludes_paths | contract_worktree_safety.Workspace.test_start_adds_each_exclude_once_and_the_run_worktree_on_the_run_branch |
+| test_gitops.py::GitopsTests::test_cut_card_branch_from_run_tip_and_reuse | contract_smoke.Smoke.test_two_cards_accepted_in_order; contract_integration.Integration.test_resumed_parked_card_is_rebased_rereviewed_verified_and_fast_forwarded |
+| test_gitops.py::GitopsTests::test_fast_forward_is_idempotent | contract_cards.Crashes.test_crash_after_fast_forward_before_accepted_reconciles |
+| test_gitops.py::GitopsTests::test_fast_forward_refuses_divergence | contract_cards.RunHeadCheck.test_run_branch_moved_between_dispatches_fails_the_run |
+| test_gitops.py::GitopsTests::test_needs_integration_after_independent_accept | contract_integration.Integration.test_resumed_parked_card_is_rebased_rereviewed_verified_and_fast_forwarded |
+| test_gitops.py::GitopsTests::test_is_ancestor | internal: Rust unit test (git) |
+| test_gitops.py::GitopsTests::test_rebase_onto_success | contract_integration.Integration.test_resumed_parked_card_is_rebased_rereviewed_verified_and_fast_forwarded |
+| test_gitops.py::GitopsTests::test_rebase_onto_conflict_returns_paths_and_leaves_branch_unchanged | contract_integration.Integration.test_integration_conflict_requests_integrate_attempt |
+| test_gitops.py::GitopsTests::test_detect_violation_head_moved | contract_integration.Violations.test_reviewer_moving_head_is_violation; contract_worktree_safety.SavedState.test_a_moved_card_tip_is_kept_when_head_is_detached |
+| test_gitops.py::GitopsTests::test_detect_violation_index_dirty | contract_integration.Violations.test_verifier_staged_change_is_violation |
+| test_gitops.py::GitopsTests::test_detect_violation_tracked_change | contract_integration.Violations.test_reviewer_tracked_change_voids_review_and_reruns; contract_worktree_safety.SavedState.test_a_tracked_edit_and_a_deletion_are_both_listed |
+| test_gitops.py::GitopsTests::test_untracked_build_output_is_not_a_violation | contract_integration.Violations.test_untracked_build_output_is_not_a_violation; contract_worktree_safety.SavedState.test_a_stat_only_touch_and_untracked_output_are_not_a_violation |
+| test_gitops.py::GitopsTests::test_preserve_keeps_staged_and_unstaged_versions_separately | contract_integration.Violations.test_violation_preserves_index_and_worktree_on_ref |
+| test_gitops.py::GitopsTests::test_preserve_keeps_staged_change_whose_working_copy_was_restored | contract_worktree_safety.SavedState.test_a_staged_change_whose_working_copy_was_put_back_is_kept |
+| test_gitops.py::GitopsTests::test_restore_leaves_expected_head_and_clean_index | contract_integration.Violations.test_reviewer_moving_head_is_violation; contract_worktree_safety.SavedState.test_restore_returns_to_the_card_from_another_branch_and_keeps_untracked_files |
+| test_gitops.py::GitopsTests::test_preserve_refuses_a_ref_outside_refs | internal: Rust unit test (git) |
+| test_gitops.py::GitopsTests::test_commits_created_by_library_are_never_signed | contract_worktree_safety.SavedState.test_a_conflicted_merge_is_saved_and_cleared_without_signing; contract_worktree_safety.Workspace.test_the_integration_rebase_is_never_signed |
+| test_gitops.py::GitopsTests::test_preserve_keeps_a_moved_branch_tip_when_head_is_detached | contract_worktree_safety.SavedState.test_a_moved_card_tip_is_kept_when_head_is_detached |
+| test_gitops.py::GitopsTests::test_preserve_keeps_a_moved_branch_tip_when_another_branch_is_checked_out | contract_worktree_safety.SavedState.test_a_moved_card_tip_is_kept_when_another_branch_is_checked_out |
+| test_gitops.py::GitopsTests::test_preserve_recreates_a_deleted_branch | contract_worktree_safety.SavedState.test_a_deleted_card_branch_is_recreated |
+| test_gitops.py::GitopsTests::test_preserve_does_not_keep_a_branch_tip_already_in_the_saved_commit | contract_worktree_safety.SavedState.test_a_card_tip_already_in_the_saved_commit_is_not_kept_twice |
+| test_gitops.py::GitopsTests::test_preserve_saves_and_clears_a_conflicted_merge | contract_worktree_safety.SavedState.test_a_conflicted_merge_is_saved_and_cleared_without_signing |
+| test_gitops.py::GitopsTests::test_preserve_saves_and_clears_a_conflicted_rebase_and_cherry_pick | contract_worktree_safety.SavedState.test_a_conflicted_rebase_or_cherry_pick_is_saved_and_cleared |
+| test_gitops.py::GitopsTests::test_preserve_keeps_a_conflicted_merge_autostash | contract_worktree_safety.SavedState.test_an_operations_autostash_is_kept_beside_the_saved_commit |
+| test_gitops.py::GitopsTests::test_preserve_keeps_a_conflicted_rebase_autostash | contract_worktree_safety.SavedState.test_an_operations_autostash_is_kept_beside_the_saved_commit |
+| test_gitops.py::GitopsTests::test_preserve_drops_a_stale_branch_sibling | internal: Rust unit test (git) |
+| test_gitops.py::GitopsTests::test_prepare_workspace_rejects_unsafe_slugs | internal: Rust unit test (git) |
+| test_gitops.py::GitopsTests::test_paths_with_spaces | contract_worktree_safety.SavedState.test_paths_with_spaces_and_non_ascii_names; contract_cards.Paths.test_spaces_everywhere_from_unrelated_cwd |
+| test_gitops.py::GitopsTests::test_git_helpers_refuse_paths_outside_the_fixture | internal: Rust unit test (testing-tools) |
+| test_gitops.py::GitopsTests::test_git_refuses_a_missing_workspace_directory | internal: Rust unit test (git) |
+| test_gitops.py::GitopsTests::test_git_error_includes_stderr | internal: Rust unit test (git) |
+| test_gitops.py::GitopsTests::test_is_test_or_doc_path | contract_cards.Loop.test_which_paths_make_a_fix_test_only |
+| test_state.py::RunPathsTests::test_run_paths_names | internal: Rust unit test (state) |
+| test_state.py::RunPathsTests::test_new_run_dir_suffixes_existing | contract_cards.Start.test_run_folders_are_dated_and_suffixed |
+| test_state.py::RunPathsTests::test_new_run_dir_rejects_path_in_slug | internal: Rust unit test (state) |
+| test_state.py::LockTests::test_state_lock_is_reentrant_within_a_process | internal: Rust unit test (state) |
+| test_state.py::LockTests::test_state_lock_released_after_exception | internal: Rust unit test (state) |
+| test_state.py::LockTests::test_state_lock_is_not_the_run_lock | internal: Rust unit test (state) |
+| test_state.py::AppendTests::test_append_event_assigns_seq_and_fsyncs | contract_cards.Start.test_every_event_line_carries_seq_ts_and_kind |
+| test_state.py::AppendTests::test_append_attempt_and_read_attempts | internal: Rust unit test (state) |
+| test_state.py::AppendTests::test_read_missing_files_are_empty | internal: Rust unit test (state) |
+| test_state.py::AppendTests::test_read_events_ignores_partial_trailing_line | contract_status.Status.test_partial_last_line_is_ignored; contract_recovery.Reconcile.test_restart_after_truncated_final_event_then_append |
+| test_state.py::AppendTests::test_read_events_ignores_complete_json_without_newline | contract_status.Status.test_complete_json_without_a_newline_is_ignored |
+| test_state.py::AppendTests::test_read_attempts_ignores_partial_trailing_line | contract_recovery.Reconcile.test_appends_repair_a_torn_last_line_in_any_record_file |
+| test_state.py::AppendTests::test_read_events_raises_on_corrupt_complete_line | contract_status.Status.test_corrupt_event_line_is_an_attention_line_not_a_failure; contract_finish.Start.test_start_skips_an_old_run_whose_event_log_is_unreadable |
+| test_state.py::AppendTests::test_read_holds_state_lock_so_tail_repair_cannot_tear_it | internal: Rust unit test (state) |
+| test_state.py::AppendTests::test_read_of_missing_run_dir_is_empty | internal: Rust unit test (state) |
+| test_state.py::AppendTests::test_append_after_truncated_final_record_stays_valid | contract_recovery.Reconcile.test_restart_after_truncated_final_event_then_append |
+| test_state.py::AppendTests::test_append_when_whole_file_is_one_partial_line | contract_recovery.Reconcile.test_appends_repair_a_torn_last_line_in_any_record_file |
+| test_state.py::AppendTests::test_append_jsonl_repairs_partial_line_in_any_file | contract_recovery.Reconcile.test_appends_repair_a_torn_last_line_in_any_record_file |
+| test_state.py::AppendTests::test_failed_serialisation_leaves_file_intact | internal: Rust unit test (state) |
+| test_state.py::AppendTests::test_unknown_event_kind_rejected | internal: Rust unit test (state) |
+| test_state.py::AppendTests::test_reserved_field_names_rejected | internal: Rust unit test (state) |
+| test_state.py::AppendTests::test_concurrent_appends_from_threads | internal: Rust unit test (state) |
+| test_state.py::AppendTests::test_concurrent_appends_from_two_processes_keep_whole_lines_and_unique_seq | contract_usage.Concurrency.test_concurrent_supervisor_and_runner_charges_keep_exact_totals |
+| test_state.py::WriteJsonAtomicTests::test_undecodable_filenames_round_trip_through_json_and_jsonl | contract_worktree_safety.WorktreeRewrites.test_json_output_escapes_undecodable_names |
+| test_state.py::WriteJsonAtomicTests::test_write_json_atomic_leaves_no_temp_files | internal: Rust unit test (state) |
+| test_state.py::WriteJsonAtomicTests::test_write_json_atomic_error_keeps_old_content_and_no_temp | internal: Rust unit test (state) |
+| test_state.py::WriteJsonAtomicTests::test_write_json_atomic_replace_failure_cleans_up | internal: Rust unit test (state) |
+| test_state.py::WriteJsonAtomicTests::test_write_json_atomic_fsyncs | internal: Rust unit test (state) |
+| test_state.py::CrashPointTests::test_crash_point_exits_97_only_when_testing | contract_recovery.CrashProtocol.test_a_crash_point_exits_97_only_when_testing_and_named |
+| test_state.py::CrashPointTests::test_crash_points_listed | contract_recovery.EveryCrashPoint.test_restart_from_every_crash_point_reaches_same_final_state; contract_recovery.PauseCancel.test_crash_after_cancel_request_finishes_the_cancel_on_restart |
+| test_state.py::CrashPointTests::test_event_kinds_listed | internal: Rust unit test (state) |
+| test_state.py::FoldCardsTests::test_fold_cards_tracks_requested_started_and_accepting | internal: Rust unit test (state) |
+| test_state.py::FoldCardsTests::test_fold_cards_fix_round | internal: Rust unit test (state) |
+| test_state.py::FoldCardsTests::test_fold_cards_integration_resets_verdict | internal: Rust unit test (state) |
+| test_state.py::FoldCardsTests::test_fold_cards_park_and_unpark | internal: Rust unit test (state) |
+| test_state.py::FoldCardsTests::test_fold_cards_unparked_without_branch_is_pending | internal: Rust unit test (state) |
+| test_state.py::FoldCardsTests::test_fold_cards_accepted_is_terminal_and_unknown_cards_ignored | internal: Rust unit test (state) |
+| test_state.py::FoldCardsTests::test_fold_cards_ignores_stale_dispatch_events | internal: Rust unit test (state) |
+| test_state.py::FoldCardsTests::test_fold_cards_parked_stays_parked_on_late_events | internal: Rust unit test (state) |
+| test_state.py::FoldCardsTests::test_fold_cards_accepted_overrides_parked | internal: Rust unit test (state) |
+| test_state.py::FoldCardsTests::test_fold_cards_exposes_dispatch_kind_for_phase_disambiguation | internal: Rust unit test (state) |
+| test_state.py::FoldCardsTests::test_card_states_constant | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_all_accepted_and_current_is_complete | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_removed_cards_count_as_done | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_complete_requires_current_gates | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_parked_card_makes_incomplete | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_unfinished_card_makes_incomplete | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_open_findings_make_incomplete | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_holds_make_incomplete | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_reasons_accumulate | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_cancel_is_incomplete_cancelled | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_pause_is_blocked_paused | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_blocked_qualifiers | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_unreconciled_is_failed | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_verification_failed_is_failed | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_first_match_wins | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_outcome_values | internal: Rust unit test (state) |
+| test_state.py::OutcomeTests::test_allowed_next_step_matrix | internal: Rust unit test (state) |
+| test_test_hooks.py::ClockOffset::test_now_adds_offset_only_when_testing | contract_cards.ClockOffsetHook.test_clock_offset_is_honoured_only_under_leadhand_testing |
+| test_test_hooks.py::ClockOffset::test_clock_offset_reaches_cli_deadlines | contract_cards.ClockOffsetHook.test_clock_offset_is_honoured_only_under_leadhand_testing |
+| test_test_hooks.py::SelfPath::test_self_path_override_names_dispatch_line_and_runner | contract_cards.Paths.test_spaced_cli_path_from_unrelated_cwd |
+| test_test_hooks.py::SelfPath::test_cli_path_ignores_override_without_testing | contract_launch.SelfPathHook.test_self_path_override_is_honoured_only_under_leadhand_testing |
+| test_test_hooks.py::SelfPath::test_launch_line_uses_override | contract_launch.SelfPathHook.test_launch_and_pause_name_the_override; contract_launch.SelfPathHook.test_self_path_override_is_honoured_only_under_leadhand_testing |

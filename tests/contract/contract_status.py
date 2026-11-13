@@ -108,6 +108,19 @@ class Status(unittest.TestCase):
         self.assertTrue(lines[0].startswith("Running · "), lines)
         self.assertTrue(lines[1].startswith("Card 1: "), lines)
 
+    def test_complete_json_without_a_newline_is_ignored(self):
+        # A record is a line: a last record without its newline is an interrupted append, unread
+        # even when its JSON is whole (test_state.py).
+        w = RunDir(self, cards=2)
+        w.accept(1)
+        with open(w.paths.events, "ab") as f:
+            f.write(b'{"seq": 99, "ts": "2026-01-01T00:00:00Z", "kind": "accepted", "card": 2, "sha": "'
+                    + b"b" * 40 + b'"}')
+        lines = status(w)
+        self.assertTrue(lines[0].endswith(" · 1 of 2 accepted"), lines)
+        # no attention lines: the card rows follow the headline
+        self.assertTrue(lines[1].startswith("Card 1: "), lines)
+
     def test_usage_comes_from_charges_and_excludes_nothing_by_role(self):
         w = RunDir(self, cards=1)
         w.charge("c1", "implementer", tokens=(1000, 100))

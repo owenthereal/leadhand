@@ -5,7 +5,8 @@ untracked files, as `start`, `next`, `record`, `timer`, `unpark`, `cancel`, `sta
 
 Converted from tests/test_engine_cards.py, test_engine_by_risk.py, test_engine_decisions.py,
 test_engine_reply_file.py, test_engine_codex_result.py, test_engine_codex_e2e.py,
-test_engine_run_branch.py and test_engine_untracked.py. The happy path is
+test_engine_run_branch.py and test_engine_untracked.py, with the clock offset of
+test_test_hooks.py. The happy path is
 contract_smoke.Smoke.test_two_cards_accepted_in_order.
 
 FakeSupervisor plays the run skill. Where a Python test called `engine.record` or
@@ -19,7 +20,7 @@ import os
 import shlex
 import time
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import harness
@@ -301,6 +302,39 @@ class Loop(EngineCase):
             "## Notes\n- [high] earlier round: fixed\n* [medium] fixed\n"])
         self.assertEqual([heads[n]["verdict"] for n in (1, 2, 3)], ["defects", "defects", "clean"])
 
+    def test_which_paths_make_a_fix_test_only(self):
+        # Ruling R13 (test_gitops.py's is_test_or_doc_path): test and doc folders count at the top
+        # level only; test files and docs by name anywhere; dependency and build inputs are
+        # production. A fix touching only the first kind is a `check_diff`, else a rereview.
+        yes = ["tests/test_x.py", "test/a.c", "spec/a_spec.rb", "docs/guide.html", "tests/deep/helper.py",
+               "test_foo.py", "src/foo_test.go", "src/foo.test.ts", "src/foo.spec.js",
+               "README.md", "notes/usage.rst", "notes/todo.txt"]
+        no = ["src/main.py", "scripts/build.sh", "src/contest.py", "src/latest.py", "docs", "tests", "src/tester.py",
+              "pkg/tests/helper.py", "pkg/spec/x.py", "app/docs/views.py",
+              "requirements.txt", "requirements-dev.txt", "tests/requirements.txt", "constraints.txt",
+              "CMakeLists.txt", "src/CMakeLists.txt"]
+
+        def after_the_fix(paths: list[str]) -> dict:
+            w = FakeSupervisor(self, [card(1)])
+            w.start()
+            w.script(1, "review", {"verdict": "defects"})
+            w.script(1, "fix", {"files": {p: "fixed\n" for p in paths}})
+            for _ in range(30):
+                a = w.next()
+                if a["action"] == "check_diff" or a.get("kind") == "rereview":
+                    self.assertIn("c1-a1-fix-1", w.dispatch_ids())
+                    return a
+                w.act(a)
+            raise AssertionError("no action after the fix")
+
+        a = after_the_fix(yes)
+        self.assertEqual(a["action"], "check_diff", a)
+        self.assertEqual(sorted(a["paths"]), sorted(yes))
+        for path in no:
+            with self.subTest(path=path):
+                a = after_the_fix([path])
+                self.assertEqual((a["action"], a["kind"]), ("dispatch", "rereview"), a)
+
     def test_test_only_fix_returns_check_diff(self):
         w = FakeSupervisor(self, [card(1)])
         w.start()
@@ -432,6 +466,35 @@ class Loop(EngineCase):
 
 
 class Start(EngineCase):
+    def test_run_folders_are_dated_and_suffixed(self):
+        # <docs_dir>/runs/<local date>-<slug>, then the first free -2, -3 (test_state.py).
+        w = FakeSupervisor(self, [card(1)])
+        before = date.today()
+        first = w.start()
+        second = w.start(new=True)
+        third = w.start(new=True)
+        after = date.today()
+        self.assertEqual(first.parent, w.docs / "runs")
+        self.assertIn(first.name, {f"{d.isoformat()}-demo-deck" for d in (before, after)})
+        self.assertEqual([second, third], [first.parent / f"{first.name}-2", first.parent / f"{first.name}-3"])
+        for run in (first, second, third):
+            self.assertTrue((run / "run.json").is_file(), run)
+
+    def test_every_event_line_carries_seq_ts_and_kind(self):
+        # events.jsonl: one JSON object per line, numbered from 1 with no gap, each with its UTC
+        # time and its kind (test_state.py).
+        w = FakeSupervisor(self, [card(1), card(2)])
+        w.start()
+        w.run()
+        self.assertTrue(w.paths.events.read_bytes().endswith(b"\n"))
+        events = read_jsonl(w.paths.events)
+        self.assertGreater(len(events), 10)
+        self.assertEqual([e["seq"] for e in events], list(range(1, len(events) + 1)))
+        self.assertEqual(events[0]["kind"], "run_started")
+        for e in events:
+            self.assertRegex(e["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$")
+            self.assertIsInstance(e["kind"], str)
+
     def test_start_returns_existing_unfinished_run_unless_new(self):
         w = FakeSupervisor(self, [card(1)])
         first = w.start()
@@ -1284,6 +1347,31 @@ class Paths(EngineCase):
         self.assertEqual(out.stdout.splitlines()[0], "Status: READY", out)
         self.assertEqual(read_json(run_dir / "workers" / a["dispatch_id"] / "result.json")["status"], "READY")
         self.assertEqual(run_git(w.repo, "show", f"{CARD1}:src/card1/c1-a1-implement-1.txt"), "c1-a1-implement-1")
+
+
+# --------------------------------------------------------------------------
+# test_test_hooks.py: the clock offset
+
+class ClockOffsetHook(EngineCase):
+    def test_clock_offset_is_honoured_only_under_leadhand_testing(self):
+        # Observed through the deadline `record started` gives a worker (the CLI's clock plus the
+        # dispatch's budget): one fresh run per case, the same card, so the same budget.
+        def deadline_lead(**env) -> float:
+            w = FakeSupervisor(self, [card(1)])
+            w.start()
+            a = w.next()
+            self.assertEqual(a["action"], "dispatch", a)
+            before = time.time()
+            e = run_cli("record", w.run_dir, "started", "--dispatch", a["dispatch_id"], "--worker", "agent0001",
+                        env=dict(w.env, **env), cwd=w.tmp).ok().json()
+            self.assertEqual(e["kind"], "worker_started", e)
+            return datetime.fromisoformat(e["deadline"]).timestamp() - before
+
+        plain = deadline_lead()
+        shifted = deadline_lead(LEADHAND_TEST_CLOCK_OFFSET="3600")
+        ignored = deadline_lead(LEADHAND_TEST_CLOCK_OFFSET="3600", LEADHAND_TESTING="0")
+        self.assertAlmostEqual(shifted - plain, 3600, delta=60)
+        self.assertAlmostEqual(ignored, plain, delta=60)
 
 
 if __name__ == "__main__":

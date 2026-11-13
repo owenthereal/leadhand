@@ -190,6 +190,33 @@ class Reconcile(unittest.TestCase):
         (rec,) = w.events("reconciled")
         self.assertEqual(rec["resumed_seq"], parsed[-1]["seq"])
 
+    def test_appends_repair_a_torn_last_line_in_any_record_file(self):
+        # A crash in the middle of an append leaves a partial last line: in charges.jsonl after one
+        # whole record, and as the whole of attempts.jsonl. The next append drops it and stays
+        # line-aligned (test_state.py).
+        w = FakeSupervisor(self, [card(1)])
+        w.session("supervisor-1")
+        w.start()
+        w.next()                                        # charges the supervisor's session
+        whole = w.paths.charges.read_bytes()
+        self.assertTrue(whole.endswith(b"\n") and whole.count(b"\n") == 1, whole)
+        self.assertFalse(w.paths.attempts.exists())
+        with open(w.paths.charges, "ab") as f:
+            f.write(b'{"n": 2')
+        w.paths.attempts.write_bytes(b'{"partial": "attem')
+        a = w.next()
+        w.act(a)
+        records = {}
+        for path in (w.paths.charges, w.paths.attempts):
+            raw = path.read_bytes()
+            self.assertTrue(raw.endswith(b"\n"), raw)
+            records[path.name] = [json.loads(line) for line in raw.split(b"\n")[:-1]]
+        self.assertTrue(w.paths.charges.read_bytes().startswith(whole))
+        charges = records["charges.jsonl"]
+        self.assertGreater(len(charges), 1)
+        self.assertNotIn("n", [k for c in charges for k in c])
+        self.assertEqual([x["dispatch"] for x in records["attempts.jsonl"]], [a["dispatch_id"]])
+
     def test_report_without_recorded_result_is_recorded(self):
         w = FakeSupervisor(self, [card(1)])
         w.session("supervisor-1")
@@ -1546,6 +1573,35 @@ class Untested(unittest.TestCase):
                          stdin=reply)
         self.assertEqual(event["status"], "READY")
         self.assertEqual(len(w.charges()), 1)
+
+
+# --------------------------------------------------------------------------
+# test_state.py: the crash protocol's gate
+
+class CrashProtocol(unittest.TestCase):
+    def test_a_crash_point_exits_97_only_when_testing_and_named(self):
+        # `record result` passes before_result_record. It exits 97 there, recording nothing, only
+        # under LEADHAND_TESTING=1 with LEADHAND_CRASH_AT naming that point.
+        cases = (({"LEADHAND_TESTING": "1", "LEADHAND_CRASH_AT": "before_result_record"}, 97),
+                 ({"LEADHAND_CRASH_AT": "before_result_record"}, 0),
+                 ({"LEADHAND_TESTING": "0", "LEADHAND_CRASH_AT": "before_result_record"}, 0),
+                 ({"LEADHAND_TESTING": "1"}, 0),
+                 ({"LEADHAND_TESTING": "1", "LEADHAND_CRASH_AT": "after_rebase"}, 0))
+        for overrides, code in cases:
+            with self.subTest(env=overrides):
+                w = FakeSupervisor(self, [card(1)])
+                w.start()
+                a = w.next()
+                worker = w.launch(a)
+                reply = w.perform(a, worker)
+                env = {k: v for k, v in w.env.items() if k not in ("LEADHAND_TESTING", "LEADHAND_CRASH_AT")}
+                r = harness.run_cli("record", w.run_dir, "result", "--dispatch", a["dispatch_id"], "--worker",
+                                    worker, "--reply", "-", env=dict(env, **overrides), cwd=w.tmp, stdin=reply)
+                self.assertEqual(r.code, code, r)
+                recorded_ = [e["dispatch_id"] for e in w.events("result_recorded")]
+                self.assertEqual(recorded_, [] if code == 97 else [a["dispatch_id"]])
+                if code == 0:
+                    self.assertEqual(r.json()["status"], "READY")
 
 
 if __name__ == "__main__":
