@@ -58,6 +58,28 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def append_record(state_lock: Path, file: Path, build) -> dict:
+    """Append one record as one line under `state_lock`, as the CLI does; `build` gets the
+    file's last record (or None)."""
+    fd = os.open(state_lock, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        records = read_records(file)
+        record = build(records[-1] if records else None)
+        with open(file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n")
+    finally:
+        os.close(fd)
+    return record
+
+
+def append_event(run_dir: Path, kind: str, **f) -> dict:
+    """Append event `kind` to run directory `run_dir`'s events.jsonl, with the next seq."""
+    paths = run_paths(run_dir)
+    return append_record(paths.state_lock, paths.events, lambda last: {
+        "seq": 1 if last is None else last["seq"] + 1, "ts": utc_now(), "kind": kind, **f})
+
+
 DECK = """# Deck: Demo deck
 Source: docs/plan.md
 Base: main @ 0123456789abcdef0123456789abcdef01234567
@@ -94,22 +116,10 @@ class RunDir:
         self.ev("run_started", run_id="abc123", base_sha="0123456789abcdef", branch="leadhand/demo-2")
 
     def _append(self, file: Path, build) -> dict:
-        """Append one record as one line under state.lock, as the CLI does; `build` gets the
-        file's last record (or None)."""
-        fd = os.open(self.paths.state_lock, os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            records = read_records(file)
-            record = build(records[-1] if records else None)
-            with open(file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n")
-        finally:
-            os.close(fd)
-        return record
+        return append_record(self.paths.state_lock, file, build)
 
     def ev(self, kind, **f):
-        return self._append(self.paths.events, lambda last: {
-            "seq": 1 if last is None else last["seq"] + 1, "ts": utc_now(), "kind": kind, **f})
+        return append_event(self.root, kind, **f)
 
     def accept(self, n, sha="a" * 40):
         self.ev("card_cut", card=n, branch=f"leadhand/demo-2/c{n}", base="b")

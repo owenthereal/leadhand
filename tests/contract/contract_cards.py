@@ -15,8 +15,6 @@ tests/fakes/codex as Codex (LEADHAND_TEST_CODEX_BIN). Whether a Codex process is
 is judged from the fake's own log (its pid and the time of its `start` line), never from what
 the binary recorded alone; branches, commits and trees are read from Git.
 """
-import fcntl
-import json
 import os
 import shlex
 import time
@@ -31,7 +29,7 @@ from contract_launch import path_without_self
 from contract_status import is_unpark_line
 from gitfixture import run_git, write
 from harness import FAKES, read_json, read_jsonl, run_cli, started_by, temp_root
-from rundir import read_records, utc_now
+from rundir import append_event
 from supervisor import NO_HOOKS, FakeSupervisor, card
 
 RUN = "leadhand/demo"
@@ -84,20 +82,6 @@ def drive_to(w: FakeSupervisor, kind: str) -> dict:
             return a
         w.act(a)
     raise AssertionError(f"no {kind} dispatch")
-
-
-def append_event(run_dir: Path, kind: str, **fields) -> None:
-    """Append an event line to events.jsonl under state.lock, as the CLI does."""
-    root = Path(run_dir)
-    fd = os.open(root / "state.lock", os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        events = read_records(root / "events.jsonl")
-        line = {"seq": events[-1]["seq"] + 1 if events else 1, "ts": utc_now(), "kind": kind, **fields}
-        with open(root / "events.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(line, ensure_ascii=True, separators=(",", ":")) + "\n")
-    finally:
-        os.close(fd)
 
 
 def codex_start(w: FakeSupervisor) -> dict:
@@ -954,6 +938,36 @@ class ReplyFile(EngineCase):
         self.assertIn("reply file", note)
         self.assertIn(a["reply_file"], note)
 
+    def test_new_request_removes_a_stale_reply_file(self):
+        # Dispatch IDs are deterministic, so a reply file or report already at a new request's
+        # scratch path is stale: before the first request, and planted by an earlier worker.
+        w = FakeSupervisor(self, [card(1)])
+        w.start()
+        ws = w.workspace()
+
+        def plant(did):
+            folder = ws / ".leadhand" / "1" / did
+            folder.mkdir(parents=True, exist_ok=True)
+            for name in ("reply.txt", "report.md"):
+                (folder / name).write_text("Status: READY\nstale\n", encoding="utf-8")
+            return folder
+
+        implement = plant("c1-a1-implement-1")
+        w.script(1, "implement", {"tamper": lambda world, ws, a: plant("c1-a1-review-1")})
+        a = w.next()
+        self.assertEqual(Path(a["reply_file"]), implement / "reply.txt")
+        self.assertEqual(Path(a["report"]), implement / "report.md")
+        self.assertFalse((implement / "reply.txt").exists())
+        self.assertFalse((implement / "report.md").exists())
+        w.act(a)
+        self.assertTrue((ws / ".leadhand" / "1" / "c1-a1-review-1" / "reply.txt").exists())
+        review = w.next()
+        self.assertEqual(review["dispatch_id"], "c1-a1-review-1")
+        folder = ws / ".leadhand" / "1" / "c1-a1-review-1"
+        self.assertEqual(Path(review["reply_file"]), folder / "reply.txt")
+        self.assertFalse((folder / "reply.txt").exists())
+        self.assertFalse((folder / "report.md").exists())
+
 
 # --------------------------------------------------------------------------
 # test_engine_codex_result.py: a Codex-route dispatch's result comes only from the runner's
@@ -1227,6 +1241,49 @@ class Paths(EngineCase):
             self.assertTrue(harness.names_bin(words[0]), words)          # S1-R11: by file
             self.assertEqual(words[1:], tail, r)
             self.assertTrue(harness.is_bin_command(r.stdout[:-1], "", " " + shlex.join(tail)), r)
+
+    def test_spaced_cli_path_from_unrelated_cwd(self):
+        # Ruling S1-R14: the CLI's own path gets a space through LEADHAND_TEST_CLI, a symlink to
+        # the binary in a directory whose name has a space. The dispatch line and the launch line
+        # quote it, and the dispatch line runs to completion through it.
+        w = codex_world(self, [card(1)])
+        elsewhere = temp_root(self, "lh unrelated cwd ")
+        link = temp_root(self, "lh cli ") / "lead hand bin" / "leadhand"
+        link.parent.mkdir()
+        link.symlink_to(harness.BIN)
+        self.assertTrue(harness.names_bin(str(link)))
+        w.env.update(LEADHAND_TEST_CLI=str(link), PATH=path_without_self(w.env["PATH"]))
+        for path in (w.repo, w.docs, w.deck_path, link):
+            self.assertIn(" ", str(path))
+
+        run_dir = run_line(run_cli("start", w.deck_path, "--repo", w.repo, env=w.env, cwd=elsewhere).ok())
+        w.run_dir = run_dir
+        a = run_cli("next", run_dir, env=w.env, cwd=elsewhere).ok().json()
+        self.assertEqual((a["action"], a["agent"]), ("dispatch", "leadhand:codex"), a)
+        self.assertEqual(len(a["message"].splitlines()), 1)
+        argv = shlex.split(a["message"])
+        self.assertEqual(argv[0], str(link))                    # the spaced path, quoted as one word
+        self.assertTrue(harness.names_bin(argv[0]), argv)      # S1-R11: by file
+        self.assertEqual(argv[1], "dispatch")
+        self.assertEqual(argv[argv.index("--run") + 1], str(run_dir))
+
+        r = run_cli("launch-line", run_dir, env=w.env, cwd=elsewhere).ok()
+        words = shlex.split(r.stdout)
+        self.assertEqual(words, [str(link), "run", str(run_dir / "deck.md")], r)
+        self.assertTrue(harness.is_bin_command(r.stdout[:-1], "", " " + shlex.join(words[1:])), r)
+
+        # The printed dispatch line runs, from the unrelated directory, through the spaced path.
+        recorded(w, "started", "--dispatch", a["dispatch_id"], "--worker", "agent-proxy")
+        line, env = w.proxy_argv_env(a, {})
+        self.assertEqual(line, argv)
+        for _ in range(20):
+            out = harness.run_argv(line, env=env, cwd=elsewhere, timeout=180)
+            if out.code != 75:
+                break
+        self.assertEqual(out.code, 0, out)
+        self.assertEqual(out.stdout.splitlines()[0], "Status: READY", out)
+        self.assertEqual(read_json(run_dir / "workers" / a["dispatch_id"] / "result.json")["status"], "READY")
+        self.assertEqual(run_git(w.repo, "show", f"{CARD1}:src/card1/c1-a1-implement-1.txt"), "c1-a1-implement-1")
 
 
 if __name__ == "__main__":

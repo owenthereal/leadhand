@@ -306,7 +306,7 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_engine_reply_file.py::ReplyFile::test_cli_records_reply_from_a_file_with_spaces_in_its_path | contract_cards.ReplyFile.test_cli_records_reply_from_a_file_with_spaces_in_its_path |
 | test_engine_reply_file.py::ReplyFile::test_reply_and_reply_file_are_exclusive | contract_cards.ReplyFile.test_reply_and_reply_file_are_exclusive |
 | test_engine_reply_file.py::ReplyFile::test_missing_reply_file_falls_back_to_the_report_head_with_a_note | contract_cards.ReplyFile.test_missing_reply_file_falls_back_to_the_report_head_with_a_note |
-| test_engine_reply_file.py::ReplyFile::test_new_request_removes_a_stale_reply_file | dropped with in-place mode |
+| test_engine_reply_file.py::ReplyFile::test_new_request_removes_a_stale_reply_file | contract_cards.ReplyFile.test_new_request_removes_a_stale_reply_file |
 | test_engine_codex_result.py::CodexResultFromRunner::test_early_still_running_reply_waits_and_starts_no_second_implementer | contract_cards.CodexResultFromRunner.test_early_still_running_reply_waits_and_starts_no_second_implementer |
 | test_engine_codex_result.py::CodexResultFromRunner::test_invented_verdict_without_a_worker_is_not_accepted | contract_cards.CodexResultFromRunner.test_invented_verdict_without_a_worker_is_not_accepted |
 | test_engine_codex_result.py::CodexResultFromRunner::test_skipping_a_codex_card_stops_its_runner | contract_cards.CodexResultFromRunner.test_skipping_a_codex_card_stops_its_runner |
@@ -324,7 +324,7 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_briefs.py::BriefTests::test_card_briefs_require_card_base_and_branch | contract_briefs.Briefs.test_card_briefs_render_card_base_and_branch |
 | test_briefs.py::BriefTests::test_review_needs_implementer_report_unless_test_first_off | contract_briefs.Briefs.test_review_names_the_implementer_report |
 | test_briefs.py::BriefTests::test_integrate_permits_rebase_onto_run_tip | contract_briefs.Briefs.test_integrate_permits_rebase_onto_run_tip |
-| test_briefs.py::BriefTests::test_final_briefs_list_scope | contract_briefs.Briefs.test_final_briefs_list_scope |
+| test_briefs.py::BriefTests::test_final_briefs_list_scope | contract_briefs.Briefs.test_final_briefs_list_scope; contract_briefs.Briefs.test_final_briefs_cover_only_the_accepted_cards |
 | test_briefs.py::BriefTests::test_evidence_requires_cards | internal: Rust unit test (briefs) |
 | test_briefs.py::BriefTests::test_answer_quotes_every_ruling_line | contract_briefs.Briefs.test_answer_quotes_every_ruling_line |
 | test_briefs.py::BriefTests::test_verify_says_skip_for_empty_commands | internal: Rust unit test (briefs) |
@@ -333,7 +333,7 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_briefs.py::BriefTests::test_scratch_dir_is_ignored_by_git | contract_briefs.Briefs.test_scratch_dir_is_ignored_by_git |
 | test_briefs.py::BriefTests::test_agent_for_maps_every_role_and_vendor | contract_briefs.Briefs.test_agent_for_maps_every_role_and_vendor; contract_cards.Codex.test_codex_route_dispatches_proxy_with_null_agent_model; contract_cards.CodexResultFromRunner.test_invented_verdict_without_a_worker_is_not_accepted |
 | test_briefs.py::BriefTests::test_claude_dispatch_message_names_paths | contract_briefs.Briefs.test_claude_dispatch_message_names_paths |
-| test_briefs.py::BriefTests::test_codex_dispatch_message_is_one_quoted_command | contract_briefs.Briefs.test_codex_dispatch_message_is_one_quoted_command |
+| test_briefs.py::BriefTests::test_codex_dispatch_message_is_one_quoted_command | contract_briefs.Briefs.test_codex_dispatch_message_is_one_quoted_command; contract_briefs.Briefs.test_codex_dispatch_message_quotes_shell_metacharacters |
 | test_briefs.py::BriefTests::test_worker_prompt_for_codex_workers | contract_briefs.Briefs.test_worker_prompt_for_codex_workers |
 | test_briefs.py::BriefTests::test_codex_implementer_prompt_forbids_commits_and_claude_agents_do_not | contract_briefs.Briefs.test_codex_implementer_prompt_forbids_commits_and_claude_agents_do_not |
 | test_briefs.py::BriefTests::test_parse_report_head_variants | contract_briefs.Briefs.test_parse_report_head_variants |

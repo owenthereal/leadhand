@@ -8,6 +8,7 @@ the brief that `next` wrote, asserting the rendered lines. Template-only checks 
 effect (a missing value or an unknown kind raising, the report-head parser on its own) are
 catalogued as Rust unit tests. The card section is read with contract_deck.card_section.
 """
+import json
 import shlex
 import unittest
 from pathlib import Path
@@ -316,6 +317,25 @@ class Briefs(unittest.TestCase):
         self.assertIn("- Allowed paths: src/, tests/, lib/b.py", fix)
         self.assertIn("- Branch: leadhand/demo--card-final", fix)
 
+    def test_final_briefs_cover_only_the_accepted_cards(self):
+        # Card 1 is parked, card 2 (medium risk) is accepted, and the security gate finds
+        # defects: the run-level briefs and the fix wave's allowed paths cover card 2 only.
+        one = card(1, title="Parse the widget header")
+        two = card(2, title="Second", risk="medium", allowed="lib/b.py, src/")
+        w = BriefWorld(self, [one, two], gates=True)
+        w.start()
+        w.script(1, "implement", {"status": "QUESTION"})
+        w.parks[1] = "product decision: storage format"
+        w.script(None, "security", {"verdict": "defects"})
+        w.run()
+        self.assertEqual([e["card"] for e in w.events("accepted")], [2, "final"])   # card 2, then the fix wave
+        _, fix = w.brief("run-w1-final_fix-1")
+        self.assertIn("- Allowed paths: lib/b.py, src/", fix)
+        for did in ("run-w1-final_fix-1", "run-final_review-1", "run-evidence-1"):
+            _, lines = w.brief(did)
+            self.assertIn("- Card 2: Second", lines, did)
+            self.assertFalse([line for line in lines if line.startswith("- Card 1:")], did)
+
     # -- where briefs live ---------------------------------------------------------------
 
     def test_brief_and_report_paths_are_inside_workspace_scratch(self):
@@ -371,6 +391,22 @@ class Briefs(unittest.TestCase):
         self.assertEqual(argv[argv.index("--report") + 1], a["report"])
         self.assertEqual(argv[argv.index("--cwd") + 1], str(w.workspace()))
         self.assertEqual(argv[argv.index("--run") + 1], str(w.run_dir))
+
+    def test_codex_dispatch_message_quotes_shell_metacharacters(self):
+        # The argv carries user-controlled paths: a docs_dir with a quote, a dollar sign and a
+        # semicolon must come back from shlex.split exactly.
+        w = FakeSupervisor(self, [card(1)], installed=("claude", "codex"))
+        docs = w.tmp / "it's $HOME; rm -rf"
+        w.config_file.write_text(f"docs_dir = {json.dumps(str(docs))}\n", encoding="utf-8")
+        w.start()
+        self.assertTrue(str(w.run_dir).startswith(str(docs)), w.run_dir)
+        a = w.next()
+        self.assertEqual(a["agent"], "leadhand:codex")
+        self.assertEqual(len(a["message"].splitlines()), 1)
+        argv = shlex.split(a["message"])
+        self.assertTrue(harness.names_bin(argv[0]), argv)
+        self.assertEqual(argv[argv.index("--run") + 1], str(w.run_dir))
+        self.assertEqual(argv[argv.index("--dispatch-id") + 1], a["dispatch_id"])
 
     def prompts(self) -> dict[str, str]:
         """The prompt Codex got for an implementer, a Hard implementer and a reviewer dispatch,
