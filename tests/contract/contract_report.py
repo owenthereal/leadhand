@@ -7,7 +7,7 @@ read from the report.md that `report` writes.
 import shlex
 import unittest
 
-from harness import is_bin_command, run_cli
+from harness import is_bin_command, reference_only, run_cli
 from rundir import RunDir
 
 SECTIONS = ["## Needs your attention", "## Result", "## Evidence", "## Unresolved", "## Cards", "## Rulings",
@@ -105,9 +105,18 @@ class Report(unittest.TestCase):
         w = finished(self)
         r = run_cli("report", w.root, env=w.env, cwd=w.root.parent)
         self.assertEqual(r.code, 0, r)
-        self.assertEqual(r.stdout, f"{w.paths.report}\n", r)
+        # a complete run: Rust may print more (the branch release, S1-R15); the path is a line of it
+        self.assertIn(str(w.paths.report), r.stdout.splitlines(), r)
         self.assertTrue(w.paths.report.read_text(encoding="utf-8")
                         .startswith("# Run report: Demo deck\n\nOutcome: complete\n"))
+
+    @reference_only
+    def test_report_cli_prints_only_the_report_path(self):
+        """S1-R15: the exact `report` stdout of a complete run, which the branch release may extend."""
+        w = finished(self)
+        r = run_cli("report", w.root, env=w.env, cwd=w.root.parent)
+        self.assertEqual(r.code, 0, r)
+        self.assertEqual(r.stdout, f"{w.paths.report}\n", r)
 
 
 class FixRound(unittest.TestCase):
