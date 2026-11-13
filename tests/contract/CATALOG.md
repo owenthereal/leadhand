@@ -535,7 +535,7 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_engine_in_place.py::Exclusive::test_worktree_runs_are_not_held_back_by_an_in_place_run | dropped with in-place mode |
 | test_gitops.py::GitopsTests::test_prepare_workspace_without_worktree_uses_checkout | dropped with in-place mode |
 | test_gitops.py::GitopsTests::test_cut_card_branch_refuses_an_existing_branch_the_run_did_not_record | contract_worktree_safety.UnrecordedCardBranch.test_unrecorded_card_branch_adopted_only_at_run_tip |
-| test_gitops.py::GitopsTests::test_fast_forward_moves_a_run_branch_checked_out_in_the_workspace | dropped with in-place mode |
+| test_gitops.py::GitopsTests::test_fast_forward_moves_a_run_branch_checked_out_in_the_workspace | contract_worktree_safety.WorktreeRewrites.test_accept_moves_a_run_branch_checked_out_in_the_worktree |
 | test_gitops.py::GitopsTests::test_prepare_workspace_without_worktree_refuses_uncommitted_changes | dropped with in-place mode |
 | test_gitops.py::GitopsTests::test_default_base_after_a_run_without_worktree | dropped with in-place mode |
 | test_gitops.py::SubdirectoryWorkspaceTests::test_stage_work_takes_a_new_file_in_the_subdirectory | dropped with in-place mode |

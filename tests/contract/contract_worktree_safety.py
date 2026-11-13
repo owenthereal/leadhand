@@ -19,9 +19,10 @@ import subprocess
 import unittest
 from pathlib import Path
 
-from contract_cards import CODEX_CARD, codex_world, commit_on, relaunch_env
+from contract_cards import BY_RISK, CODEX_CARD, codex_world, commit_on, relaunch_env
 from contract_finish import base_wt, drive_until_refused, gate_names, marker
 from gitfixture import IDENTITY, commit, current_branch, run_git, write
+from harness import read_json
 from supervisor import FakeSupervisor, card
 
 RUN = "leadhand/demo"
@@ -422,6 +423,30 @@ class WorktreeRewrites(unittest.TestCase):
         self.assertEqual(run_git(w.repo, "show", f"{RUN}:local.env"), "card one's settings")
         self.assertEqual(found(w, by="implementer"), [])
 
+    def test_accept_moves_a_run_branch_checked_out_in_the_worktree(self):
+        # A low-risk card under by-risk review is accepted straight from its implementer's
+        # result, with no workspace check between. An implementer that commits on its card
+        # branch and then leaves the run's worktree on the run branch has the acceptance
+        # fast-forward a branch checked out there: the branch moves, and the worktree with it,
+        # clean and holding the card's work.
+        def to_run_branch(world, ws, a):
+            run_git(ws, "checkout", "--quiet", RUN)
+
+        w = FakeSupervisor(self, [card(1)], config=BY_RISK)
+        w.start()
+        w.script(1, "implement", {"tamper": to_run_branch})
+        self.assertEqual(w.run()[-1]["action"], "done")
+        self.assertEqual(w.dispatch_ids(), ["c1-a1-implement-1"])
+        (accepted,) = w.events("accepted")
+        tip = accepted["sha"]
+        self.assertEqual(run_git(w.repo, "rev-parse", f"refs/heads/{CARD1}"), tip)
+        self.assertEqual(w.branch_tip(RUN), tip)
+        ws = w.workspace()
+        self.assertEqual(current_branch(ws), RUN)
+        self.assertEqual(run_git(ws, "rev-parse", "HEAD"), tip)
+        self.assertEqual(run_git(ws, "status", "--porcelain"), "")
+        self.assertEqual((ws / CARD1_FILE).read_text(encoding="utf-8"), "c1-a1-implement-1\n")
+
     def test_check_diff_patch_keeps_the_standard_prefixes_whatever_the_repo_diff_settings(self):
         # The operator's diff settings in the repository's configuration, which the run's
         # worktree shares, never change the patch a test-only fix's diff check reads.
@@ -510,6 +535,10 @@ class OperatorCheckout(unittest.TestCase):
         before = state()
         self.assertIn("h config/settings.toml", run_git(repo, "ls-files", "-v").splitlines())
         w.start()
+        # Every run records the untracked files its workspace holds at start (R48'), a worktree
+        # run too: a fresh worktree holds none, and the operator's own untracked files are in
+        # their checkout, not in it.
+        self.assertEqual(read_json(w.run_dir / "untracked-at-start.json"), {"paths": []})
         w.script(2, "implement", {"commit": False})
         done = w.run()[-1]
         self.assertEqual(done["outcome"], "complete", done)
