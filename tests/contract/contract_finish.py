@@ -519,7 +519,8 @@ class Guards(unittest.TestCase):
 
     def test_accepted_work_missing_from_the_run_branch_fails_the_run(self):
         # Card 1 is accepted; while card 2 waits on the supervisor and no worker is out, the run
-        # branch is moved back to the base. The run ends failed, naming the lost accepted commit.
+        # branch is moved back to the base and the run is relaunched. Reconciling after the
+        # relaunch finds card 1's accepted work missing from the run branch: the run ends failed.
         w = FakeSupervisor(self, [card(1), card(2, depends=[1])], gates=True)
         w.start()
         w.script(2, "implement", {"status": "QUESTION"})
@@ -532,13 +533,12 @@ class Guards(unittest.TestCase):
         (accepted,) = w.events("accepted")
         self.assertEqual(w.branch_tip(RUN), accepted["sha"])
         run_git(w.repo, "update-ref", f"refs/heads/{RUN}", w.base)
-        w.cli("record", w.run_dir, "park", "--card", "2", "--reason", "operator: skip").ok()
+        w.cli("run", w.run_dir, env=relaunch_env()).ok()
+        self.assertTrue(w.events("resumed"))
         done = w.run()[-1]
         self.assertEqual(done["outcome"], "failed")
-        # Python's `_end` alone words this "accepted work missing from the run branch"; through the
-        # CLI the restart check finds it first and names the accepted commit the branch lost.
-        self.assertTrue(any("could not be reconciled" in r and RUN in r and accepted["sha"][:12] in r
-                            for r in done["reasons"]), done["reasons"])
+        self.assertTrue(any("accepted work missing from the run branch" in r
+                            and f"card 1 at {accepted['sha'][:12]}" in r for r in done["reasons"]), done["reasons"])
         self.assertEqual(w.branch_tip(RUN), w.base)
         self.assertIn("| failed |", runs_lines(w)[0])
 
@@ -1073,12 +1073,13 @@ class CopyFiles(unittest.TestCase):
 
 
 SLOW_GIT = r'''#!/usr/bin/env python3
-"""git, except that leadhand's own commit of a worker's changes takes 2.5 s; meanwhile the
-worker folders' heartbeats are looked at, after the wait."""
+"""git, except that every `git commit` takes 2.5 s (in this scenario only the runner commits:
+the fake Codex leaves its change uncommitted); after the wait, the worker folders' heartbeats
+are looked at."""
 import json, os, sys, time
 from pathlib import Path
 args = sys.argv[1:]
-if "commit" in args and any(a.startswith("Leadhand-Dispatch: ") for a in args):
+if "commit" in args:
     began = time.time()
     time.sleep(2.5)
     beats = {str(p): p.stat().st_mtime for p in Path(os.environ["SLOW_GIT_WORKERS"]).glob("*/heartbeat")}
@@ -1111,6 +1112,40 @@ class RunnerFinalize(unittest.TestCase):
         beat = str(w.run_dir / "workers" / a["dispatch_id"] / "heartbeat")
         self.assertIn(beat, slow["beats"])
         self.assertGreaterEqual(slow["beats"][beat], slow["began"])     # touched while the commit ran
+
+    def test_non_utf8_git_output_does_not_kill_the_commit(self):
+        # The card branch's HEAD is a commit whose message `git log` prints as bytes that are not
+        # UTF-8 (e9 and ff, under an encoding iconv does not know, so Git cannot re-encode it).
+        # With a commit intent already in the worker folder (planted, as the Python test did),
+        # the runner reads that message back with `git log -1 --format=%B HEAD` before it
+        # commits what the Codex worker left uncommitted: it must still commit.
+        w = codex_world(self, [card(1, route="codex gpt-6-luna low")])
+        w.start()
+        w.script(1, "implement", {"commit": False})
+        a = w.next()
+        self.assertEqual((a["kind"], a["agent"]), ("implement", "leadhand:codex"))
+        ws = w.workspace()
+        branch = f"{RUN}--card-1"
+        self.assertEqual(run_git(ws, "symbolic-ref", "--short", "HEAD"), branch)
+        msg = w.tmp / "non-utf8 message"
+        msg.write_bytes(b"caf\xe9 \xff\n")
+        run_git(ws, "-c", "i18n.commitEncoding=x-not-an-encoding", "commit", "--quiet", "--allow-empty",
+                "-F", str(msg))
+        odd = run_git(ws, "rev-parse", "HEAD")
+        shown = subprocess.run(["git", "log", "-1", "--format=%B", odd], cwd=ws, env=w.env,
+                               capture_output=True, check=True).stdout
+        self.assertIn(b"caf\xe9 \xff", shown)       # what the runner reads back is not UTF-8
+        wd = w.run_dir / "workers" / a["dispatch_id"]
+        wd.mkdir(parents=True, exist_ok=True)
+        (wd / "commit.json").write_text(json.dumps({"head_before": "0" * 40}), encoding="utf-8")
+        w.act(a)
+        (res,) = [e for e in w.events("result_recorded") if e["dispatch_id"] == a["dispatch_id"]]
+        self.assertTrue(res.get("committed"), res)
+        # judged from Git: the runner's commit is on the card branch, on top of the odd one,
+        # with the work the Codex worker left uncommitted
+        self.assertEqual(run_git(w.repo, "rev-parse", f"refs/heads/{branch}"), res["committed"])
+        self.assertEqual(run_git(w.repo, "rev-parse", f"{res['committed']}~1"), odd)
+        self.assertEqual(run_git(w.repo, "show", f"{branch}:src/card1/{a['dispatch_id']}.txt"), a["dispatch_id"])
 
 
 if __name__ == "__main__":

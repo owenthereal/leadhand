@@ -96,7 +96,7 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_report.py::ReportTests::test_incomplete_report_puts_parked_cards_under_attention | contract_report.Report.test_incomplete_report_puts_parked_cards_under_attention |
 | test_report.py::ReportTests::test_report_usage_includes_supervisor_and_proxy_and_unknown_count | contract_report.Report.test_report_usage_includes_supervisor_and_proxy_and_unknown_count |
 | test_report.py::ReportTests::test_routing_counts_worker_attempts_not_proxy | contract_report.Report.test_routing_counts_worker_attempts_not_proxy |
-| test_report.py::ReportTests::test_write_report_and_cli | contract_report.Report.test_write_report_and_cli; contract_report.Report.test_report_cli_prints_only_the_report_path |
+| test_report.py::ReportTests::test_write_report_and_cli | contract_report.Report.test_write_report_and_cli |
 | test_report.py::FixRoundTests::test_unresolved_lists_parked_cards_with_branches_and_open_findings | contract_report.FixRound.test_unresolved_lists_parked_cards_with_branches_and_open_findings |
 | test_report.py::FixRoundTests::test_attention_has_next_action_for_parked_cards | contract_report.FixRound.test_attention_has_next_action_for_parked_cards |
 | test_report.py::FixRoundTests::test_evidence_shows_last_result_per_gate_and_marks_stale | contract_report.FixRound.test_evidence_shows_last_result_per_gate_and_marks_stale |
@@ -419,4 +419,4 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_final_review_minors.py::Start::test_start_skips_an_old_run_whose_event_log_is_unreadable | contract_finish.Start.test_start_skips_an_old_run_whose_event_log_is_unreadable |
 | test_final_review_minors.py::CopyFiles::test_a_symlinked_report_is_not_followed | contract_finish.CopyFiles.test_a_symlinked_report_is_not_followed |
 | test_final_review_minors.py::RunnerFinalize::test_heartbeat_is_touched_while_finalizing | contract_finish.RunnerFinalize.test_heartbeat_is_touched_while_finalizing |
-| test_final_review_minors.py::RunnerFinalize::test_non_utf8_git_output_does_not_kill_the_commit | internal: Rust unit test (dispatch) |
+| test_final_review_minors.py::RunnerFinalize::test_non_utf8_git_output_does_not_kill_the_commit | contract_finish.RunnerFinalize.test_non_utf8_git_output_does_not_kill_the_commit |
