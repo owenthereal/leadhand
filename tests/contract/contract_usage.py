@@ -409,6 +409,29 @@ class Locators(unittest.TestCase):
         self.assertFalse(c["usage"]["known"])
         self.assertEqual(c["checkpoint"], {"messages": {}})
 
+    def test_relative_transcript_path_is_rejected(self):
+        # A relative CLAUDE_CONFIG_DIR locates the transcript by a relative path, which the
+        # charge refuses (ruling S1-R13: pinned as Python behaves).
+        w = claude_run(self)
+        a = w.next()
+        did = a["dispatch_id"]
+        w.cli("record", w.run_dir, "started", "--dispatch", did, "--worker", "abc").ok()
+        transcript = w.claude_home / "projects" / "p" / "s" / "subagents" / "agent-abc.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(text(claude_line("m1", 5)), encoding="utf-8")
+        reply = Path(a["reply_file"])
+        reply.parent.mkdir(parents=True, exist_ok=True)
+        reply.write_text(f"Status: READY\nReport: {a['report']}\n", encoding="utf-8")
+        relative = w.claude_home.relative_to(w.tmp)          # "claude home": the cli runs in w.tmp
+        self.assertIn(" ", str(relative))
+        r = w.cli("record", w.run_dir, "result", "--dispatch", did, "--worker", "abc", "--reply-file", reply,
+                  env={"CLAUDE_CONFIG_DIR": str(relative)})
+        self.assertEqual(r.code, 1, r)
+        self.assertIn(f"error: transcript path must be absolute: {relative}/projects/p/s/subagents/agent-abc.jsonl",
+                      r.stderr.splitlines(), r)
+        self.assertFalse(w.paths.charges.exists() and w.paths.charges.read_text(encoding="utf-8").strip(),
+                         "a charge was appended")
+
     def test_missing_projects_dir_is_none(self):
         w = claude_run(self)
         self.assertFalse((w.claude_home / "projects").exists())
