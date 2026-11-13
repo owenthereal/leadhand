@@ -195,6 +195,15 @@ def is_bin_command(text: str, before: str, after: str) -> bool:
     return len(words) == 1 and names_bin(words[0])
 
 
+def names_bin_between(text: str, before: str, after: str) -> bool:
+    """True when `text` is exactly `before`, then a path naming BIN (names_bin), then exactly
+    `after`, the path taken verbatim (not a shell word): for text that is not a command line,
+    such as the launch's first message or its sandbox exclusion."""
+    if not (text.startswith(before) and text.endswith(after) and len(text) > len(before) + len(after)):
+        return False
+    return names_bin(text[len(before):len(text) - len(after)])
+
+
 # --------------------------------------------------------------------------
 # Reading what the binary wrote
 

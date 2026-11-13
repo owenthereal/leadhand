@@ -2,7 +2,8 @@
 """A fake `claude` for leadhand's launcher tests. Never touches the network.
 
 Appends one JSON line to $FAKE_CLAUDE_LOG when it starts: its argv, cwd, pid, ppid and
-the LEADHAND_* environment variables the launcher sets (null when unset). Then
+the LEADHAND_* environment variables the launcher sets (null when unset). Every line also
+has "time", the wall-clock time it was written (time.time()). Then
 it sleeps $FAKE_CLAUDE_SLEEP seconds (default 0) and exits $FAKE_CLAUDE_EXIT
 (default 0).
 
@@ -27,7 +28,7 @@ def log(record: dict) -> None:
     if not path:
         return
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
+        f.write(json.dumps({"time": time.time(), **record}) + "\n")
         f.flush()
         os.fsync(f.fileno())
 

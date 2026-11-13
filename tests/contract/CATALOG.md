@@ -214,3 +214,48 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_procs.py::ProcsTests::test_ps_fallback_parses_lstart_with_spaces | internal: Rust unit test (procs) |
 | test_procs.py::ProcsTests::test_tagged_processes_finds_a_process_by_an_environment_entry | internal: Rust unit test (procs) |
 | test_procs.py::ProcsTests::test_missing_pid | internal: Rust unit test (procs) |
+| test_launch.py::ArgvTests::test_launch_argv_order_and_auto_mode | contract_launch.Argv.test_argv_order_and_auto_mode; contract_launch.Argv.test_no_supervisor_route_means_no_model_or_effort |
+| test_launch.py::ArgvTests::test_run_passes_supervisor_model_effort_and_cli_settings | contract_launch.Argv.test_run_passes_supervisor_model_effort_and_cli_settings |
+| test_launch.py::ArgvTests::test_print_mode_adds_headless_stream_flags_before_the_prompt | contract_launch.Argv.test_print_mode_adds_headless_stream_flags_before_the_prompt |
+| test_launch.py::ArgvTests::test_cli_print_option_is_hidden_and_off_by_default | contract_launch.Argv.test_print_option_is_hidden_and_off_by_default |
+| test_launch.py::ArgvTests::test_first_message_names_skill_invocation | contract_launch.Argv.test_first_message_names_skill_invocation |
+| test_launch.py::ArgvTests::test_attended_use_warning_printed | contract_launch.Argv.test_attended_use_warning_printed |
+| test_launch.py::ArgvTests::test_keep_awake_prefix_per_platform | contract_launch.KeepAwake.test_keep_awake_runs_beside_claude_which_stays_the_direct_child; contract_launch.KeepAwake.test_only_the_platforms_keep_awake_tool_is_used |
+| test_launch.py::ChildTests::test_supervisor_cwd_is_workspace_when_launched_elsewhere | contract_launch.Child.test_supervisor_cwd_is_workspace_when_launched_elsewhere |
+| test_launch.py::ChildTests::test_env_has_run_id_dir_and_cli | contract_launch.Child.test_env_has_run_id_dir_and_cli |
+| test_launch.py::ChildTests::test_run_accepts_deck_md_path | contract_launch.Child.test_run_accepts_deck_md_path |
+| test_launch.py::ChildTests::test_not_a_run_is_an_error_and_starts_nothing | contract_launch.Child.test_not_a_run_is_an_error_and_starts_nothing |
+| test_launch.py::ChildTests::test_child_exit_code_returned | contract_launch.Child.test_child_exit_code_returned |
+| test_launch.py::ChildTests::test_launch_line_quotes_paths_with_spaces | contract_launch.LaunchLine.test_launch_line_quotes_paths_with_spaces |
+| test_launch.py::OwnershipTests::test_refused_launch_changes_nothing | contract_launch.Ownership.test_refused_launch_changes_nothing |
+| test_launch.py::OwnershipTests::test_cli_run_refusal_exits_3 | contract_launch.Ownership.test_cli_run_refusal_exits_3 |
+| test_launch.py::OwnershipTests::test_lock_held_by_supervisor_after_launcher_killed | contract_launch.Ownership.test_lock_held_by_supervisor_after_launcher_killed |
+| test_launch.py::OwnershipTests::test_lock_fd_alone_blocks_takeover | contract_launch.Ownership.test_lock_fd_alone_blocks_takeover |
+| test_launch.py::OwnershipTests::test_recorded_live_supervisor_blocks_takeover | contract_launch.Ownership.test_recorded_live_supervisor_blocks_takeover |
+| test_launch.py::OwnershipTests::test_resumed_appended_only_after_acquire | contract_launch.Ownership.test_resumed_appended_only_after_acquire |
+| test_launch.py::OwnershipTests::test_first_launch_of_a_fresh_run_appends_no_resumed | contract_launch.Ownership.test_first_launch_of_a_fresh_run_appends_no_resumed |
+| test_launch.py::OwnershipTests::test_holder_records_launcher_and_supervisor | contract_launch.Ownership.test_holder_records_launcher_and_supervisor |
+| test_launch.py::OwnershipTests::test_signals_forwarded_to_child | contract_launch.Ownership.test_signals_forwarded_to_child |
+| test_launch.py::FollowUpTests::test_linux_inhibitor_runs_beside_claude_which_stays_the_direct_child | contract_launch.KeepAwake.test_keep_awake_runs_beside_claude_which_stays_the_direct_child |
+| test_launch.py::FollowUpTests::test_cli_path_with_spaces_warns_sandbox_exclusion_may_not_match | contract_launch.Argv.test_cli_path_with_spaces_warns_sandbox_exclusion_may_not_match |
+| test_launch.py::FollowUpTests::test_signal_after_child_exit_is_not_forwarded | internal: Rust unit test (launch) |
+| test_launch.py::FollowUpTests::test_launch_line_defaults_to_recorded_plugin_dir | contract_launch.LaunchLine.test_launch_line_defaults_to_recorded_plugin_dir |
+| test_launch.py::FollowUpTests::test_busy_lock_with_dead_recorded_supervisor_says_not_running | contract_launch.Ownership.test_busy_lock_with_dead_recorded_supervisor_says_not_running |
+| test_launch.py::InheritedLockTests::test_relaunch_succeeds_while_a_cli_child_of_the_killed_supervisor_runs | contract_launch.InheritedLock.test_relaunch_succeeds_while_a_cli_child_of_the_killed_supervisor_runs |
+| test_launch.py::InheritedLockTests::test_cli_closes_inherited_run_lock_fd | contract_launch.InheritedLock.test_cli_closes_inherited_run_lock_fd |
+| test_launch.py::InheritedLockTests::test_cli_leaves_an_unrelated_fd_open | contract_launch.InheritedLock.test_cli_leaves_an_unrelated_fd_open |
+| test_launch.py::InPlaceCheckoutTests::test_in_place_launch_is_refused_while_another_in_place_run_is_supervised | dropped with in-place mode |
+| test_launch.py::InPlaceCheckoutTests::test_in_place_launch_ignores_dead_supervisors_and_worktree_runs | dropped with in-place mode |
+| test_launch.py::InPlaceCheckoutTests::test_worktree_launch_is_not_held_back_by_an_in_place_run | contract_launch.Ownership.test_another_runs_live_supervisor_does_not_hold_back_a_launch |
+| test_launch.py::CheckoutClaimTests::test_in_place_launch_is_refused_while_a_run_in_another_runs_folder_is_supervised | dropped with in-place mode |
+| test_launch.py::CheckoutClaimTests::test_in_place_launch_is_refused_before_the_other_launch_records_its_supervisor | dropped with in-place mode |
+| test_launch.py::CheckoutClaimTests::test_a_worker_deleting_the_claim_record_does_not_free_the_checkout | dropped with in-place mode |
+| test_launch.py::CheckoutClaimTests::test_in_place_launch_from_a_subdirectory_of_a_claimed_checkout_is_refused | dropped with in-place mode |
+| test_launch.py::CheckoutClaimTests::test_a_checkout_that_cannot_be_flocked_is_refused_with_a_clear_error | dropped with in-place mode |
+| test_launch.py::CheckoutClaimTests::test_cli_closes_an_inherited_claim_on_the_checkout_top_of_a_subdirectory_run | dropped with in-place mode |
+| test_launch.py::CheckoutClaimTests::test_an_in_place_relaunch_is_refused_while_an_edit_is_hidden_behind_an_index_flag | dropped with in-place mode |
+| test_launch.py::CheckoutClaimTests::test_a_worktree_run_launch_is_refused_while_the_repository_is_sparse | contract_launch.Child.test_a_worktree_run_launch_is_refused_while_the_repository_is_sparse |
+| test_launch.py::CheckoutClaimTests::test_the_claim_is_released_and_its_record_removed_when_the_supervisor_exits | dropped with in-place mode |
+| test_launch.py::CheckoutClaimTests::test_worktree_launch_is_not_held_back_by_a_claimed_checkout | contract_launch.Ownership.test_another_runs_live_supervisor_does_not_hold_back_a_launch |
+| test_launch.py::CheckoutClaimTests::test_a_cli_child_of_a_killed_supervisor_does_not_keep_the_checkout_claimed | dropped with in-place mode |
+| test_launch.py::CheckoutClaimTests::test_cli_leaves_an_unrelated_fd_named_as_the_checkout_claim_open | dropped with in-place mode |

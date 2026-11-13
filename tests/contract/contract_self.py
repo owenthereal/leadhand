@@ -116,6 +116,15 @@ class SelfPath(unittest.TestCase):
         # an unquoted path with a space is two shell words, not one
         self.assertFalse(harness.is_bin_command(before + str(self.real) + after, before, after))
 
+    def test_bin_between_takes_the_path_verbatim_and_checks_the_rest_exactly(self):
+        before, after = "leadhand CLI: ", ". Then go."
+        self.assertTrue(harness.names_bin_between(before + str(self.linked) + after, before, after))
+        self.assertFalse(harness.names_bin_between(before + str(self.other) + after, before, after))
+        self.assertFalse(harness.names_bin_between(before + str(self.real) + after + " x", before, after))
+        self.assertFalse(harness.names_bin_between(before + shlex.quote(str(self.real) + " x") + after,
+                                                   before, after))
+        self.assertFalse(harness.names_bin_between(before + after, before, after))
+
 
 class HermeticEnv(unittest.TestCase):
     def test_inherited_hooks_are_dropped(self):
