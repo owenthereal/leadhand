@@ -16,7 +16,7 @@ from typing import Any, Callable
 from leadhand import gitops
 from leadhand import usage as usage_mod
 from leadhand.config import ConfigError, docs_dir_for, load_config, load_run_config
-from leadhand.dispatch import CLI_PATH
+from leadhand.dispatch import cli_path
 from leadhand.deck import DeckError, parse_deck
 from leadhand.state import (CardState, RunPaths, fold_cards, read_attempts, read_events, run_paths,
                             utc_now, write_json_atomic, _read_bytes)
@@ -320,7 +320,7 @@ def build_status(run_dir: Path, sessions_dir: Path | None = None, meter: tuple |
     # `unpark` is a next step only while the run can continue: unfinished, or ended blocked.
     actionable = outcome is None or outcome.get("outcome") == "blocked"
     attention = [f"Card {n} parked: {cards[n].park_reason or 'no reason recorded'}"
-                 + (f" — next: {shlex.quote(str(CLI_PATH))} unpark {shlex.quote(str(snap.root.absolute()))}"
+                 + (f" — next: {shlex.quote(str(cli_path()))} unpark {shlex.quote(str(snap.root.absolute()))}"
                     f" --card {n} --note '…'" if actionable else "") for n in parked]
     attention.extend(violation_lines(snap.events))
     state_name = "running"

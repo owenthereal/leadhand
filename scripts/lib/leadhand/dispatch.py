@@ -304,6 +304,29 @@ def _toml_string(value: str) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
+def cli_override() -> Path | None:
+    """The CLI path tests name in LEADHAND_TEST_CLI (a router standing in for this CLI),
+    honoured only under LEADHAND_TESTING=1; otherwise None."""
+    override = os.environ.get("LEADHAND_TEST_CLI")
+    if os.environ.get("LEADHAND_TESTING") == "1" and override:
+        return Path(override)
+    return None
+
+
+def cli_path() -> Path:
+    """The path that names this CLI in commands it prints or runs: CLI_PATH, unless overridden."""
+    return cli_override() or CLI_PATH
+
+
+def self_argv(*args: str) -> list[str]:
+    """The argv that runs this CLI with `args`: the override directly, else CLI_PATH under
+    this Python."""
+    override = cli_override()
+    if override is not None:
+        return [str(override), *args]
+    return [sys.executable, "-B", str(CLI_PATH), *args]
+
+
 def codex_executable() -> str:
     """The Codex program: always `codex` as found on PATH (ruling R49). request.json is
     writable by anything that can write the run directory, so it never names an
@@ -1222,7 +1245,7 @@ def _supersede(wd: Path) -> None:
 
 
 def _spawn_runner(wd: Path) -> subprocess.Popen:
-    cmd = [sys.executable, "-B", str(CLI_PATH), "dispatch-runner", str(wd)]
+    cmd = self_argv("dispatch-runner", str(wd))
     with open(wd / RUNNER_OUT, "ab") as out, open(wd / RUNNER_ERR, "ab") as err:
         p = subprocess.Popen(cmd, cwd=wd, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
                              start_new_session=True, close_fds=True)
