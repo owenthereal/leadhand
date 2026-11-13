@@ -1,12 +1,18 @@
-"""The deck format and its checks, as `check` (one problem per line) and `route` report them.
+"""The deck format and its checks, as `check` (one problem per line) and `route` report them,
+and the parsed card as the worker's brief renders it ("The card, verbatim").
 
-Converted from tests/test_deck.py. The parser-only tests (parsed fields, dependency order,
-digest) are catalogued as Rust unit tests.
+Converted from tests/test_deck.py. Dependency order, the digest and the spec example's header
+are catalogued as Rust unit tests.
 """
 import unittest
 
+from pathlib import Path
+
 from gitfixture import commit, make_repo
-from harness import hermetic_env, run_cli, temp_root
+from harness import ROOT, hermetic_env, run_cli, temp_root
+from supervisor import FakeSupervisor, card
+
+FIXTURE = ROOT / "tests" / "fixtures" / "deck-basic.md"
 
 CARD = """
 ## Card {n}: Title {n}
@@ -185,6 +191,71 @@ class Deck(DeckTestCase):
         r = self.check(bad, repo)
         self.assertEqual(r.code, 1, r)
         self.assertIn("scout", r.stdout)
+
+
+def card_section(brief: str, number: int) -> list[str]:
+    """The lines of card `number` as the brief renders it, from its heading to the next heading."""
+    lines = brief.splitlines()
+    start = lines.index(next(line for line in lines if line.startswith(f"## Card {number}:")))
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("#")), len(lines))
+    return lines[start:end]
+
+
+class Briefs(unittest.TestCase):
+    """What the parser took from a card, read back from the card's first implement brief."""
+
+    def brief_card(self, cards, number, **kw) -> list[str]:
+        w = FakeSupervisor(self, cards, **kw)
+        w.start()
+        for _ in range(20):
+            a = w.next()
+            if a["action"] == "dispatch" and a["card"] == number and a["kind"] == "implement":
+                return card_section(Path(a["brief"]).read_text(encoding="utf-8"), number)
+            self.assertNotEqual(a["action"], "done", a)
+            w.act(a)
+        self.fail(f"card {number} was never dispatched")
+
+    def test_basic_fixture_cards_reach_the_brief(self):
+        text = FIXTURE.read_text(encoding="utf-8")
+        cards = ["## Card " + part for part in text.split("\n## Card ")[1:]]
+        self.assertEqual(len(cards), 2)
+        one = self.brief_card(cards, 1)
+        self.assertIn("- Hard: no", one)
+        self.assertIn("- Allowed paths: src/, tests/", one)
+        self.assertEqual(one[-1], "see plan Task 1.", one)
+        two = self.brief_card(cards, 2)
+        self.assertIn("- Hard: no", two)
+        self.assertIn("- Depends on: 1", two)
+        self.assertFalse([line for line in two if line.startswith("- Route:")], two)
+        self.assertEqual(len([line for line in two if line.startswith("- Inferred: ")]), 2, two)
+        # The requirement maps to both cards, and the base is the header's commit.
+        tmp = temp_root(self, "lh deck ")
+        env = hermetic_env(self, tmp)
+        repo = make_repo(tmp)
+        r = run_cli("check", FIXTURE, "--repo", repo, env=env, cwd=tmp)
+        self.assertIn(f"error: base commit 3f2a9c1 not found in {repo.resolve()}", r.stdout.splitlines(), r)
+        self.assertFalse([line for line in r.stdout.splitlines() if "requirement" in line], r)
+
+    def test_hard_yes_reason_is_rendered(self):
+        for sep in ("—", "–", "-", ":"):
+            with self.subTest(sep=sep):
+                one = card(1).replace("- Hard: no\n", f"- Hard: yes {sep} no test can check it\n")
+                self.assertIn("- Hard: yes — no test can check it", self.brief_card([one], 1))
+
+    def test_fields_after_context_are_parsed(self):
+        two = (card(2).replace("- Depends on: none\n", "")
+               + "\nContext: see plan.\n- Depends on: 1\n- Route: codex gpt-6.1-sol xhigh\n"
+               "- Inferred: one\n- Inferred: two\n")
+        lines = self.brief_card([card(1), two], 2, installed=("claude", "codex"))
+        self.assertIn("- Depends on: 1", lines)
+        self.assertIn("- Route: codex gpt-6.1-sol xhigh", lines)
+        self.assertEqual([line for line in lines if line.startswith("- Inferred: ")],
+                         ["- Inferred: one", "- Inferred: two"])
+        self.assertEqual(lines[-2:], ["", "see plan."], lines)
+
+    def test_unknown_key_bullet_is_context(self):
+        lines = self.brief_card([card(1) + "\n- Files: src/a.py\n"], 1)
+        self.assertEqual(lines[-2:], ["", "- Files: src/a.py"], lines)
 
 
 if __name__ == "__main__":

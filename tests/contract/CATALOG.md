@@ -21,12 +21,12 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_supervisor_files.py::SupervisorFileTests::test_run_skill_covers_run_level_dispatches | plugin file check (contract_plugin_files) |
 | test_supervisor_files.py::SupervisorFileTests::test_run_skill_records_started_before_waiting | plugin file check (contract_plugin_files) |
 | test_supervisor_files.py::SupervisorFileTests::test_supervisor_frontmatter | plugin file check (contract_plugin_files) |
-| test_deck.py::DeckTests::test_parse_basic_fixture | internal: Rust unit test (deck) |
+| test_deck.py::DeckTests::test_parse_basic_fixture | contract_deck.Briefs.test_basic_fixture_cards_reach_the_brief |
 | test_deck.py::DeckTests::test_spec_example_header_parses | internal: Rust unit test (deck) |
 | test_deck.py::DeckTests::test_hard_yes_requires_reason | contract_deck.Deck.test_hard_yes_requires_reason |
-| test_deck.py::DeckTests::test_hard_yes_with_reason_forms | contract_deck.Deck.test_hard_yes_with_reason_forms |
-| test_deck.py::DeckTests::test_fields_after_context_are_parsed | contract_deck.Deck.test_fields_after_context_are_parsed |
-| test_deck.py::DeckTests::test_unknown_key_bullet_is_context | internal: Rust unit test (deck) |
+| test_deck.py::DeckTests::test_hard_yes_with_reason_forms | contract_deck.Deck.test_hard_yes_with_reason_forms; contract_deck.Briefs.test_hard_yes_reason_is_rendered |
+| test_deck.py::DeckTests::test_fields_after_context_are_parsed | contract_deck.Deck.test_fields_after_context_are_parsed; contract_deck.Briefs.test_fields_after_context_are_parsed |
+| test_deck.py::DeckTests::test_unknown_key_bullet_is_context | contract_deck.Briefs.test_unknown_key_bullet_is_context |
 | test_deck.py::DeckTests::test_unknown_key_bullet_warns | contract_deck.Deck.test_unknown_key_bullet_warns |
 | test_deck.py::DeckTests::test_scout_card_rejected_in_this_version | contract_deck.Deck.test_scout_card_rejected_in_this_version |
 | test_deck.py::DeckTests::test_unsupported_config_reported_as_errors | contract_deck.Deck.test_unsupported_config_reported_as_errors |
@@ -59,7 +59,7 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_route.py::RouteTests::test_hard_card_uses_implementer_hard | contract_route.Route.test_hard_card_uses_implementer_hard |
 | test_route.py::RouteTests::test_reviewer_other_vendor_than_implementer | contract_route.Route.test_reviewer_other_vendor_than_implementer |
 | test_route.py::RouteTests::test_high_risk_reviewer_uses_reviewer_hard_plus_one | contract_route.Route.test_high_risk_reviewer_uses_reviewer_hard_plus_one |
-| test_route.py::RouteTests::test_security_uses_reviewer_hard | internal: Rust unit test (route) |
+| test_route.py::RouteTests::test_security_uses_reviewer_hard | contract_route.SecurityGate.test_security_uses_reviewer_hard |
 | test_route.py::RouteTests::test_profile_lean_lowers_every_role | contract_route.Route.test_profile_lean_lowers_every_role |
 | test_route.py::RouteTests::test_pin_wins_for_first_two_attempts | contract_route.Route.test_pin_wins_for_first_two_attempts |
 | test_route.py::RouteTests::test_ladder_attempts_1_to_4_then_exhausted | contract_route.Route.test_ladder_attempts_1_to_4_then_exhausted |

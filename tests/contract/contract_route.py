@@ -7,6 +7,7 @@ as `--installed`, as the reference test does.
 import unittest
 
 from harness import ROOT, hermetic_env, run_cli, temp_root
+from supervisor import FakeSupervisor, card
 
 FIXTURE = ROOT / "tests" / "fixtures" / "deck-basic.md"
 BOTH = "claude,codex"
@@ -192,6 +193,19 @@ class Route(RouteTestCase):
                     env=self.env, cwd=self.tmp)
         self.assertEqual(r.code, 1, r)
         self.assertIn("no card 99", r.stderr)
+
+
+class SecurityGate(unittest.TestCase):
+    def test_security_uses_reviewer_hard(self):
+        # `route` has no security input; the end-of-run security gate resolves the reviewer
+        # with security set. A medium-risk card makes the gate run and adds no risk step.
+        w = FakeSupervisor(self, [card(1, risk="medium")], installed=("claude", "codex"), gates=True)
+        w.start()
+        self.assertEqual(w.run()[-1]["action"], "done")
+        gates = [a for a in w.run_started if a["kind"] == "security"]
+        self.assertEqual(len(gates), 1, w.run_started)
+        self.assertEqual(gates[0]["role"], "reviewer_hard")
+        self.assertEqual(gates[0]["route"], {"vendor": "claude", "model": "opus", "effort": "high"})
 
 
 if __name__ == "__main__":
