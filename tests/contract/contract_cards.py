@@ -1004,7 +1004,7 @@ class ReplyFile(EngineCase):
         Path(a["reply_file"]).write_text(w.perform(a, worker), encoding="utf-8")
         r = record(w, "result", "--dispatch", a["dispatch_id"], "--worker", worker,
                    "--reply", "Status: READY", "--reply-file", a["reply_file"])
-        self.assertNotEqual(r.code, 0, r)
+        self.assertEqual(r.code, 2, r)                  # a usage error
         self.assertEqual(w.events("result_recorded"), [])
         self.assertEqual(w.next()["action"], "wait")
 

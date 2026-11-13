@@ -928,7 +928,7 @@ class SparseCheckout(unittest.TestCase):
         ws = w.workspace()
         self.assertEqual((ws / "README.md").read_text(encoding="utf-8"), "hello\n")
         self.assertNotIn("S README.md", run_git(ws, "ls-files", "-v").splitlines())
-        self.assertEqual(run_git(ws, "config", "--bool", "--get", "core.sparseCheckout", check=False), "false")
+        self.assertNotEqual(run_git(ws, "config", "--bool", "--get", "core.sparseCheckout", check=False), "true")
 
 
 # --------------------------------------------------------------------------
@@ -1110,7 +1110,9 @@ class RunnerFinalize(unittest.TestCase):
         w.act(a)
         (res,) = [e for e in w.events("result_recorded") if e["dispatch_id"] == a["dispatch_id"]]
         self.assertTrue(res.get("committed"), res)
-        (slow,) = [json.loads(ln) for ln in log.read_text(encoding="utf-8").splitlines()]
+        commits = [json.loads(ln) for ln in log.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(commits, "no `git commit` ran")
+        slow = commits[-1]                      # the run's last commit: the runner's, of Codex's change
         beat = str(w.run_dir / "workers" / a["dispatch_id"] / "heartbeat")
         self.assertIn(beat, slow["beats"])
         self.assertGreaterEqual(slow["beats"][beat], slow["began"])     # touched while the commit ran

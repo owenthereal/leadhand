@@ -48,6 +48,7 @@ class Unsupported(unittest.TestCase):
         w = FakeSupervisor(self, [card(1)])
         r = w.cli("check", w.deck_path, "--repo", w.repo)
         self.assertEqual(r.code, 0, r)
+        self.assertIn("ok: 1 cards", r.stdout.splitlines(), r)
         self.assertEqual([line for line in r.stdout.splitlines() if NOT_SUPPORTED in line], [], r)
 
 

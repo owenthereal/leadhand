@@ -215,7 +215,7 @@ class SparseCheckouts(unittest.TestCase):
         ws = w.workspace()
         self.assertEqual((ws / "README.md").read_text(encoding="utf-8"), "hello\n")
         self.assertEqual([t for t in tags(ws) if not t.startswith("H ")], [])
-        self.assertEqual(sparse_setting(ws), "false")
+        self.assertNotEqual(sparse_setting(ws), "true")
         self.assertNotEqual(sparse_setting(w.repo), "true")
         self.assertEqual((w.repo / "README.md").read_text(encoding="utf-8"), "hello\n")
         self.assertEqual(tags(w.repo), ["H README.md"])

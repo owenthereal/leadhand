@@ -147,9 +147,9 @@ Other lines:
 
 - **Errors.** `error: <message>` on stderr, with exit 1, is the error form for every command
   except `check` (stdout, above) and `dispatch-runner` (`leadhand: <message>` on stderr).
-- **A failed `status.json` write.** `next` rewrites status.json at every checkpoint. When that
-  fails, it prints `leadhand: could not write status.json: <error>` on stderr and carries on.
-  A contract test reads this line.
+- **A failed `status.json` write.** `next` and `record` rewrite status.json at every
+  checkpoint. When that fails, they print `leadhand: could not write status.json: <error>` on
+  stderr and carry on. A contract test reads this line.
 - **Briefs are contract output** (S1-R10). Their text lines carry the card's fields and the
   settings that shape the work, so a field or setting a brief renders is asserted there.
   Briefs are written to `<ws>/.leadhand/<card or run>/<dispatch id>/brief.md` and copied to the
@@ -161,7 +161,7 @@ Other lines:
 |---|---|
 | 0 | Success. |
 | 1 | An error, with `error: …` on stderr (`check` prints it on stdout). Also `check` finding an error in the deck, and `route` with an exhausted ladder. |
-| 2 | A usage error. The wording may differ: Rust's comes from clap (deliberate change 4). Tests assert the code and a non-empty stderr only. |
+| 2 | A usage error, with a message on stderr. The wording may differ: Rust's comes from clap (deliberate change 4). Tests assert the code only. |
 | 3 | `run` refused because the run is owned (the ownership message on stderr). Also a second `dispatch-runner` for a worker folder that already has a live runner (`leadhand: another runner owns <dir>`). |
 | 75 | `dispatch` still running: run the same command again. Printed after the 540 s foreground wait. |
 | 97 | A test crash point. Testing builds only (`LEADHAND_TESTING=1`). |
@@ -182,7 +182,7 @@ lowercased, every run of characters other than `[a-z0-9]` becomes `-`, then it i
 | `run.json` | `start` (then `next` adds supervisor sessions) | JSON: `run_id` (12 hex digits), `repo`, `deck_source`, `deck_digest` (sha256 hex), `base_ref`, `base_sha`, `branch`, `branch_requested`, `workspace` (absolute), `slug`, `created_at`, `supervisor_sessions` (a list of Claude session IDs). |
 | `config.json` | `start` | JSON: the effective configuration, snapshotted, so the run never reads the live files again (S1-R8). See below. |
 | `events.jsonl` | every command that changes state | JSON lines, the source of truth. See "Run state". |
-| `status.json` | `next` (each checkpoint) | JSON: `run_id`, `deck`, `state`, `headline`, `activity`, `progress` (`{accepted, total}`), `attention` (a list of strings), `cards` (rows), `usage` (`{estimated_usd, unknown_attempts, by_role, codex_meter: {percent, observed_at}}`), `updated_at`. |
+| `status.json` | `next` and `record` (each checkpoint) | JSON: `run_id`, `deck`, `state`, `headline`, `activity`, `progress` (`{accepted, total}`), `attention` (a list of strings), `cards` (rows), `usage` (`{estimated_usd, unknown_attempts, by_role, codex_meter: {percent, observed_at}}`), `updated_at`. |
 | `meter-start.json` | the first `status.json` write | JSON: `{percent, observed_at}`, the Codex meter before the run. |
 | `attempts.jsonl` | `record result` (Claude workers and Codex proxies, `recorded_by: "engine"`); the runner (Codex workers) | JSON lines. Each line has `dispatch`, `run`, `card`, `attempt`, `role`, `vendor`, `model`, `effort`, `worker_id`, `started_at`, `ended_at`, `steps`, `charge_ids`, `usage`, `usage_known`, `cost_estimate`, `exit_reason`, `status` and `blocked_by`. Engine records add `agent` and `recorded_by`; runner records add `usage_source`, `generation` and `possibly_incomplete`. |
 | `charges.jsonl` | `next`, `record result` and the runner | JSON lines: `charge_id`, `source` (`claude`, `codex-stream`, …), `key`, `dispatch_id` (`supervisor` for the supervisor's own session), `role`, `usage` (`{input, cached, cache_write_5m, cache_write_1h, output, reasoning, known, model}`), `checkpoint`, `ts`. |
@@ -256,6 +256,21 @@ Configuration sources, merged in this order: the preset, the user file, then the
 - the commit outcome: `committed` (a sha or null), `changes`, and any of `commit_skipped`,
   `commit_error`, `gitlinks_skipped` (the gitlinks left out, R45), `worker_status` and
   `worker_exit_reason`.
+
+### Timing that parity tests depend on
+
+Contract tests wait on these, so a Rust binary keeps the same values. The foreground wait
+(540 s) and the heartbeat (touched every second, stale after 60 s) are given above.
+
+| Name in the Python | Value | What it times |
+|---|---|---|
+| `HUNG_RECHECK` | 5 s | A live runner whose heartbeat is stale is looked at again for this long, its heartbeat unchanged, before it counts as hung. |
+| `SIGNAL_STEP` | 5 s | The stop ladder's spacing: SIGINT to Codex's group, SIGTERM 5 s later, SIGKILL 5 s after that. |
+| `KILL_RETRY` | 5 s | After SIGKILL, it is sent again this often until the processes are confirmed gone. |
+| `CANCEL_ACK` | 5 s | A runner that has not acknowledged a cancel (`stopping.json`) this long after the request is hung, and is killed. |
+| `SPAWN_GRACE` | 60 s | A runner `dispatch` spawned that has not yet written `runner.json` counts as starting for this long after `spawn.json`'s `at`. |
+| `CANCEL_FINISH_MARGIN` | 2 s | Kept back from a cancel's deadline for charging and writing the result. |
+| `TIMER_INTERVAL` (engine) | 10 s | How often `timer` looks for a result, a pause or cancel flag, or a finished runner; it never sleeps past the worker's deadline. |
 
 ## 6. Lines in `<docs_dir>/runs.md`
 
@@ -604,8 +619,11 @@ pinned only in `@reference_only` tests:
 
 - in-place runs (change 1);
 - `status` with no argument (change 3);
-- usage-error wording (change 4);
-- the version string (change 6).
+- usage-error wording (change 4).
+
+The version string (change 6) is the exception. Rust reports Python's version through stage 2,
+so a parity test pins `leadhand 0.1.0` (`contract_cli.Version`). Stage 3 changes that test at
+the cut-over.
 
 **The branch release (change 2, S1-R15).** When a run ends `complete`, `incomplete` or
 `failed`, Rust (not Python) does three things:
