@@ -25,6 +25,7 @@ it named. The keep-awake tools on PATH are fakes, so no real `caffeinate` or `sy
 runs. CLAUDECODE is left as inherited: the CLI does not read it.
 """
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -40,6 +41,7 @@ import harness
 from gitfixture import commit, run_git
 from harness import BIN, FAKES, Result, read_json, read_jsonl, run_cli, same_process, started_by
 from rundir import read_records, run_paths
+from contract_dispatch import World as DispatchWorld
 from supervisor import FakeSupervisor, card
 
 WAIT = 15.0
@@ -714,30 +716,64 @@ class InheritedLock(LaunchCase):
         p.stdin.close()
         self.assertEqual(self.w.finish(p).ok().json()["kind"], "result_recorded")
 
+    def feed(self, fifo: Path, proc: subprocess.Popen):
+        """Open `fifo` for writing once a reader has it open (polled while `proc` runs) and write
+        BIG into it; returns the open writer (the cleanup closes it). Once the write returns, the
+        reader has read most of it, so it is past its startup; it then waits for the rest."""
+        def opened():
+            try:
+                return os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as e:
+                if e.errno == errno.ENXIO:          # no reader yet
+                    return None
+                raise
+        fd = wait_for(opened, "the CLI child to open its stdin", proc=proc)
+        os.set_blocking(fd, True)
+        writer = os.fdopen(fd, "wb")
+        self.addCleanup(writer.close)
+        writer.write(self.BIG.encode())
+        writer.flush()
+        return writer
+
     def test_relaunch_succeeds_while_a_cli_child_of_the_killed_supervisor_runs(self):
-        did = self.w.progress()
+        run_dir, did = self.started_dispatch()
         exported = self.w.tmp / "lock fd env"
-        # The supervisor's long-lived CLI command (a background `timer`), started the way Claude
-        # Code starts a Bash command: inheriting every descriptor.
-        spawn = json.dumps(["/bin/sh", "-c", 'printf %s "${LEADHAND_LOCK_FD-}" > "$0"; exec "$1" timer "$2" --dispatch "$3"',
-                            str(exported), str(BIN), str(self.w.run_dir), did])
+        fifo = self.w.tmp / "reply fifo"
+        os.mkfifo(fifo)
+        # The supervisor's long-lived CLI command (`record ... --reply -`, reading its reply from
+        # a pipe the test writes), started the way Claude Code starts a Bash command: inheriting
+        # every descriptor.
+        spawn = json.dumps(["/bin/sh", "-c",
+                            'printf %s "${LEADHAND_LOCK_FD-}" > "$0"; '
+                            'exec "$1" record "$2" result --dispatch "$3" --worker fake-agent --reply - < "$4"',
+                            str(exported), str(BIN), str(run_dir), did, str(fifo)])
         launcher = self.w.launcher(sleep="60", FAKE_CLAUDE_SPAWN=spawn)
         sup = self.w.wait_supervisor(proc=launcher)
         rec = wait_for(lambda: next((r for r in self.w.records() if r.get("spawned")), None), "the CLI child to run")
         child = {"pid": rec["spawned"], "start": started_by(rec["spawned"], rec["time"])}
         self.assertTrue(child["start"], "the CLI child exited at once")
-        wait_for(lambda: exported.exists() and exported.read_text(encoding="utf-8"), "the CLI child's environment")
+        writer = self.feed(fifo, launcher)
         self.assertTrue(exported.read_text(encoding="utf-8").isdigit(), "launcher did not export LEADHAND_LOCK_FD")
+        # The CLI child is past its startup. It closed its copy of the descriptor and never
+        # unlocked it: the lock is shared with the launcher and the supervisor, so while they
+        # live the run stays locked and a second launch is refused.
+        self.assertTrue(self.w.alive(sup) and self.w.alive(child) and launcher.poll() is None)
+        self.assertFalse(lockable(self.w.paths.lock), "a CLI child unlocked the live supervisor's run.lock")
+        r = self.w.run()
+        self.assertEqual(r.code, 3, r)
+        self.assertEqual(len(self.w.starts()), 1)
         launcher.kill()
         launcher.wait(timeout=WAIT)
         os.kill(sup["pid"], signal.SIGKILL)
         self.w.wait_gone(sup)
         # The supervisor is gone; its CLI child is not, and does not keep the run locked.
-        wait_for(lambda: lockable(self.w.paths.lock), "run.lock to be free")
         self.assertTrue(self.w.alive(child), "the CLI child exited early")
+        self.assertTrue(lockable(self.w.paths.lock), "the CLI child kept the run locked")
         r = self.w.run()
         self.assertEqual(r.code, 0, r)
         self.assertTrue(self.w.alive(child))
+        writer.close()                          # EOF: the CLI child records the result and exits
+        self.w.wait_gone(child)
 
     def test_cli_closes_inherited_run_lock_fd(self):
         p = self.holding(self.w.paths.lock, run_dir=self.w.run_dir)
@@ -764,6 +800,39 @@ class InheritedLock(LaunchCase):
             with self.subTest(LEADHAND_LOCK_FD=value):
                 env = dict(self.w.env, LEADHAND_LOCK_FD=value, LEADHAND_RUN_DIR=str(self.w.run_dir))
                 self.assertEqual(run_cli("version", env=env, cwd=self.w.elsewhere).ok().stdout, version)
+
+
+class LockFdEnvironment(unittest.TestCase):
+    """R41(a): every command drops LEADHAND_LOCK_FD from its environment, whatever it decides
+    about the descriptor, so nothing it starts inherits the variable. Observed through a Codex
+    dispatch: the fake Codex logs its whole environment."""
+
+    def dispatch_with(self, w: DispatchWorld, did: str, path: Path) -> dict:
+        """The `dispatch` line run with a descriptor on `path` inherited and named in
+        LEADHAND_LOCK_FD, and LEADHAND_RUN_DIR naming the run; returns the fake Codex's
+        environment."""
+        w.scenario("ready")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            env = dict(w.env, LEADHAND_LOCK_FD=str(fd), LEADHAND_RUN_DIR=str(w.run_dir))
+            p = subprocess.run([str(BIN), *(str(a) for a in w.args(did))], cwd=w.tmp, env=env, pass_fds=(fd,),
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+        finally:
+            os.close(fd)
+        self.assertEqual(p.returncode, 0, p)
+        starts = [r for r in w.records("start") if r["argv"][-3:-1] == ["-o", str(w.wd(did) / "last-message.md")]]
+        self.assertEqual(len(starts), 1)
+        return starts[0]["env"]
+
+    def test_a_worker_never_inherits_lead_hand_lock_fd(self):
+        w = DispatchWorld(self)
+        unrelated = w.tmp / "unrelated.txt"
+        unrelated.write_text("x", encoding="utf-8")
+        for did, path in (("d1", w.run_dir / "run.lock"), ("d2", unrelated)):
+            with self.subTest(fd_on=path.name):
+                env = self.dispatch_with(w, did, path)
+                self.assertEqual(env["LEADHAND_RUN_ID"], w.run_id)       # the worker's env was logged
+                self.assertFalse("LEADHAND_LOCK_FD" in env, "the worker inherited LEADHAND_LOCK_FD")
 
 
 if __name__ == "__main__":

@@ -241,9 +241,9 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_launch.py::FollowUpTests::test_signal_after_child_exit_is_not_forwarded | internal: Rust unit test (launch) |
 | test_launch.py::FollowUpTests::test_launch_line_defaults_to_recorded_plugin_dir | contract_launch.LaunchLine.test_launch_line_defaults_to_recorded_plugin_dir |
 | test_launch.py::FollowUpTests::test_busy_lock_with_dead_recorded_supervisor_says_not_running | contract_launch.Ownership.test_busy_lock_with_dead_recorded_supervisor_says_not_running |
-| test_launch.py::InheritedLockTests::test_relaunch_succeeds_while_a_cli_child_of_the_killed_supervisor_runs | contract_launch.InheritedLock.test_relaunch_succeeds_while_a_cli_child_of_the_killed_supervisor_runs |
-| test_launch.py::InheritedLockTests::test_cli_closes_inherited_run_lock_fd | contract_launch.InheritedLock.test_cli_closes_inherited_run_lock_fd |
-| test_launch.py::InheritedLockTests::test_cli_leaves_an_unrelated_fd_open | contract_launch.InheritedLock.test_cli_leaves_an_unrelated_fd_open |
+| test_launch.py::InheritedLockTests::test_relaunch_succeeds_while_a_cli_child_of_the_killed_supervisor_runs | contract_launch.InheritedLock.test_relaunch_succeeds_while_a_cli_child_of_the_killed_supervisor_runs; contract_launch.LockFdEnvironment.test_a_worker_never_inherits_lead_hand_lock_fd |
+| test_launch.py::InheritedLockTests::test_cli_closes_inherited_run_lock_fd | contract_launch.InheritedLock.test_cli_closes_inherited_run_lock_fd; contract_launch.LockFdEnvironment.test_a_worker_never_inherits_lead_hand_lock_fd |
+| test_launch.py::InheritedLockTests::test_cli_leaves_an_unrelated_fd_open | contract_launch.InheritedLock.test_cli_leaves_an_unrelated_fd_open; contract_launch.LockFdEnvironment.test_a_worker_never_inherits_lead_hand_lock_fd |
 | test_launch.py::InPlaceCheckoutTests::test_in_place_launch_is_refused_while_another_in_place_run_is_supervised | dropped with in-place mode |
 | test_launch.py::InPlaceCheckoutTests::test_in_place_launch_ignores_dead_supervisors_and_worktree_runs | dropped with in-place mode |
 | test_launch.py::InPlaceCheckoutTests::test_worktree_launch_is_not_held_back_by_an_in_place_run | contract_launch.Ownership.test_another_runs_live_supervisor_does_not_hold_back_a_launch |
