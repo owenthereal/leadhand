@@ -102,3 +102,61 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_report.py::FixRoundTests::test_evidence_shows_last_result_per_gate_and_marks_stale | contract_report.FixRound.test_evidence_shows_last_result_per_gate_and_marks_stale |
 | test_report.py::FixRoundTests::test_report_is_written_atomically_without_leftover_temp_files | contract_report.FixRound.test_report_is_written_atomically_without_leftover_temp_files |
 | test_report.py::FixRoundTests::test_world_is_hermetic_about_codex_home | contract_report.FixRound.test_world_is_hermetic_about_codex_home |
+| test_dispatch.py::ArgvTests::test_argv_passes_network_false_explicitly | contract_dispatch.CodexCommandLine.test_argv_passes_network_false_explicitly |
+| test_dispatch.py::ArgvTests::test_argv_network_true_when_enabled | contract_dispatch.CodexCommandLine.test_argv_network_true_when_enabled |
+| test_dispatch.py::ArgvTests::test_argv_workspace_write_with_git_common_dir_and_effort | contract_dispatch.CodexCommandLine.test_argv_workspace_write_with_git_common_dir_and_effort |
+| test_dispatch.py::ArgvTests::test_argv_scout_is_read_only | contract_dispatch.CodexCommandLine.test_argv_scout_is_read_only |
+| test_dispatch.py::ArgvTests::test_argv_sets_blocking_env_through_shell_policy | contract_dispatch.CodexCommandLine.test_argv_sets_blocking_env_through_shell_policy |
+| test_dispatch.py::ArgvTests::test_evidence_worker_may_write_the_evidence_base_worktree_only | contract_dispatch.CodexCommandLine.test_evidence_worker_may_write_the_evidence_base_worktree_only |
+| test_dispatch.py::ArgvTests::test_evidence_base_worktree_must_be_registered_and_reached_through_no_symlink | contract_dispatch.CodexCommandLine.test_evidence_base_worktree_must_be_registered_and_reached_through_no_symlink |
+| test_dispatch.py::ArgvTests::test_resume_argv_matches_findings | contract_dispatch.CodexCommandLine.test_resume_argv_matches_findings |
+| test_dispatch.py::ResultTests::test_ready_reply_parsed_and_attempt_recorded | contract_dispatch.Results.test_ready_reply_parsed_and_attempt_recorded |
+| test_dispatch.py::ResultTests::test_reply_without_status_is_blocked_and_raw_kept | contract_dispatch.Results.test_reply_without_status_is_blocked_and_raw_kept |
+| test_dispatch.py::ResultTests::test_step_limit_stops_process_and_marks_spent | contract_dispatch.Results.test_step_limit_stops_process_and_marks_spent |
+| test_dispatch.py::ResultTests::test_time_limit_stops_process_and_marks_spent | contract_dispatch.Results.test_time_limit_stops_process_and_marks_spent |
+| test_dispatch.py::ResultTests::test_usage_limit_is_blocked_by_usage_limit | contract_dispatch.Results.test_usage_limit_is_blocked_by_usage_limit |
+| test_dispatch.py::ResultTests::test_killed_worker_usage_from_session_or_unknown | contract_dispatch.Usage.test_killed_worker_usage_from_session_or_unknown |
+| test_dispatch.py::ResultTests::test_missing_codex_binary_is_blocked_environment | contract_dispatch.Results.test_missing_codex_binary_is_blocked_environment |
+| test_dispatch.py::ResultTests::test_paths_with_spaces | contract_dispatch.Results.test_paths_with_spaces |
+| test_dispatch.py::OwnershipTests::test_runner_survives_foreground_death_and_records_result | contract_dispatch.RunnerLifecycle.test_runner_survives_foreground_death_and_records_result |
+| test_dispatch.py::OwnershipTests::test_second_dispatch_attaches_to_live_runner | contract_dispatch.RunnerLifecycle.test_second_dispatch_attaches_to_live_runner |
+| test_dispatch.py::OwnershipTests::test_repeated_dispatch_returns_existing_result | contract_dispatch.RunnerLifecycle.test_repeated_dispatch_returns_existing_result |
+| test_dispatch.py::OwnershipTests::test_cli_prints_reply_and_session_or_still_running | contract_dispatch.RunnerLifecycle.test_cli_prints_reply_and_session_or_still_running |
+| test_dispatch.py::CancelTests::test_signal_only_after_pid_and_start_time_match | contract_dispatch.Cancellation.test_signal_only_after_pid_and_start_time_match |
+| test_dispatch.py::CancelTests::test_cancel_detached_worker_stops_every_process_and_writes_nothing_after | contract_dispatch.Cancellation.test_cancel_detached_worker_stops_every_process_and_writes_nothing_after |
+| test_dispatch.py::CancelTests::test_stale_heartbeat_on_live_runner_is_cancelled_not_replaced_alongside | contract_dispatch.Cancellation.test_stale_heartbeat_on_live_runner_is_cancelled_not_replaced_alongside |
+| test_dispatch.py::CancelTests::test_orphaned_codex_group_is_terminated_before_finalizing | contract_dispatch.ProcessControl.test_orphaned_codex_group_is_terminated_before_finalizing |
+| test_dispatch.py::EscapedDescendantTests::test_double_forked_child_is_stopped_before_finalizing | contract_dispatch.ProcessControl.test_double_forked_child_is_stopped_before_finalizing |
+| test_dispatch.py::FixRoundTests::test_run_id_passed_through_shell_policy | contract_dispatch.CodexCommandLine.test_run_id_passed_through_shell_policy |
+| test_dispatch.py::FixRoundTests::test_stream_usage_is_charged_when_session_missing | contract_dispatch.Usage.test_stream_usage_is_charged_when_session_missing |
+| test_dispatch.py::FixRoundTests::test_usage_limit_text_does_not_override_clean_ready_reply | contract_dispatch.Results.test_usage_limit_text_does_not_override_clean_ready_reply |
+| test_dispatch.py::FixRoundTests::test_runner_exception_is_blocked_environment | internal: Rust unit test (dispatch) |
+| test_dispatch.py::FixRoundTests::test_unknown_codex_start_time_still_enforced | internal: Rust unit test (dispatch) |
+| test_dispatch.py::FixRoundTests::test_runner_record_without_start_time_is_not_dead_while_lock_held | contract_dispatch.RunnerLifecycle.test_runner_record_without_start_time_is_not_dead_while_lock_held |
+| test_dispatch.py::FixRoundTests::test_launch_intent_recorded_before_codex_starts | contract_dispatch.RunnerLifecycle.test_launch_intent_recorded_before_codex_starts |
+| test_dispatch.py::FixRoundTests::test_launch_rechecks_cancel_immediately_before_starting | internal: Rust unit test (dispatch) |
+| test_dispatch.py::FixRoundTests::test_cancel_requested_during_orphan_is_not_resurrected | contract_dispatch.Cancellation.test_cancel_requested_during_orphan_is_not_resurrected |
+| test_dispatch.py::FixRoundTests::test_ready_result_landing_during_replacement_cancel_is_kept | contract_dispatch.RunnerLifecycle.test_ready_result_landing_during_replacement_cancel_is_kept |
+| test_dispatch.py::FixRoundTests::test_heartbeat_refreshed_before_second_look_is_not_hung | contract_dispatch.RunnerLifecycle.test_heartbeat_refreshed_before_second_look_is_not_hung |
+| test_dispatch.py::FixRoundTests::test_concurrent_dispatches_start_one_runner | contract_dispatch.RunnerLifecycle.test_concurrent_dispatches_start_one_runner |
+| test_dispatch.py::FixRoundTests::test_second_runner_refuses_while_first_holds_lock | contract_dispatch.RunnerLifecycle.test_second_runner_refuses_while_first_holds_lock |
+| test_dispatch.py::RunnerCommitTests::test_runner_commits_codex_work_on_card_branch | contract_dispatch.RunnerCommits.test_runner_commits_codex_work_on_card_branch |
+| test_dispatch.py::RunnerCommitTests::test_runner_commits_partial_work_when_spent | contract_dispatch.RunnerCommits.test_runner_commits_partial_work_when_spent |
+| test_dispatch.py::RunnerCommitTests::test_commit_intent_restart_does_not_double_commit | contract_dispatch.RunnerCommits.test_commit_intent_restart_after_the_commit_does_not_commit_again; contract_dispatch.RunnerCommits.test_commit_intent_restart_before_the_commit_still_commits |
+| test_dispatch.py::RunnerCommitTests::test_runner_commits_a_new_file_in_a_subdirectory_workspace | dropped with in-place mode |
+| test_dispatch.py::RunnerCommitTests::test_untracked_to_take_fences_the_run_folder_from_the_checkout_top | dropped with in-place mode |
+| test_dispatch.py::RunnerCommitTests::test_untracked_to_take_keeps_only_paths_inside_a_subdirectory_workspace | dropped with in-place mode |
+| test_dispatch.py::RunnerCommitTests::test_untracked_to_take_fails_closed_when_the_checkout_top_is_unknown | internal: Rust unit test (dispatch) |
+| test_dispatch.py::RunnerCommitTests::test_runner_commit_leaves_untracked_files_outside_a_subdirectory_workspace | dropped with in-place mode |
+| test_dispatch.py::RunnerCommitTests::test_a_fifo_left_at_the_report_never_hangs_the_commit | contract_dispatch.RunnerCommits.test_a_fifo_left_at_the_report_never_hangs_the_commit |
+| test_dispatch.py::RunnerCommitTests::test_runner_commits_an_edit_hidden_behind_an_index_flag | contract_dispatch.RunnerCommits.test_runner_commits_an_edit_hidden_behind_an_index_flag |
+| test_dispatch.py::RunnerCommitTests::test_failed_commit_is_blocked_environment_with_reason | contract_dispatch.RunnerCommits.test_failed_commit_is_blocked_environment_with_reason |
+| test_dispatch.py::RunnerCommitTests::test_unlocatable_git_path_is_an_error_not_an_operation | internal: Rust unit test (dispatch) |
+| test_dispatch.py::RunnerCommitTests::test_commit_respects_the_cancel_deadline | contract_dispatch.RunnerCommits.test_commit_respects_the_cancel_deadline |
+| test_dispatch.py::RunnerCommitTests::test_externally_killed_codex_is_possibly_incomplete_and_partial_work_committed | contract_dispatch.RunnerCommits.test_externally_killed_codex_is_possibly_incomplete_and_partial_work_committed |
+| test_dispatch.py::RunnerCommitTests::test_exit_without_final_turn_completed_is_possibly_incomplete | contract_dispatch.RunnerCommits.test_exit_without_final_turn_completed_is_possibly_incomplete |
+| test_dispatch.py::RunnerCommitTests::test_complete_run_is_not_possibly_incomplete | contract_dispatch.RunnerCommits.test_complete_run_is_not_possibly_incomplete |
+| test_dispatch.py::RunnerCommitTests::test_wrong_branch_is_not_committed | contract_dispatch.RunnerCommits.test_wrong_branch_is_not_committed |
+| test_dispatch.py::RunnerCommitTests::test_operation_in_progress_is_not_committed | contract_dispatch.RunnerCommits.test_operation_in_progress_is_not_committed |
+| test_dispatch.py::RunnerCommitTests::test_check_dispatch_is_not_committed | contract_dispatch.RunnerCommits.test_check_dispatch_is_not_committed |
+| test_dispatch.py::RunnerCommitTests::test_cli_passes_kind_and_branch | contract_dispatch.RunnerCommits.test_cli_passes_kind_and_branch |

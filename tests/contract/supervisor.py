@@ -52,7 +52,8 @@ import time
 from pathlib import Path
 
 from gitfixture import make_repo, run_git, write
-from harness import FAKES, Result, hermetic_env, read_json, run_argv, run_cli, same_process, temp_root
+from harness import (FAKES, Result, hermetic_env, read_json, read_jsonl, run_argv, run_cli, same_process,
+                     started_by, temp_root)
 from rundir import read_records, run_paths
 
 IMPLEMENTER_KINDS = ("implement", "fix", "answer", "continue", "final_fix")
@@ -412,8 +413,11 @@ class FakeSupervisor:
     # -- cleanup --------------------------------------------------------------
 
     def kill_leftovers(self) -> None:
-        """Kill the proxies this world started, and every runner and Codex process a runner.json
-        records that is still the process it names; wait (briefly) for them to be gone."""
+        """Kill the proxies this world started, then every process a worker folder records that
+        is still the process it names (recorded_processes): runners first, so none starts another
+        Codex, then the rest. Then the fake Codex's tool children and escaped writers its log names
+        (a runner may not have recorded them yet), each only if it started no later than the log
+        line naming it. Wait (briefly) for them all to be gone."""
         for p in self.proxies:
             if p.poll() is None:
                 p.kill()
@@ -422,15 +426,45 @@ class FakeSupervisor:
         if self.run_dir is None:
             return
         killed = []
-        for runner in self.run_dir.glob("workers/*/runner.json"):
-            with contextlib.suppress(ValueError, OSError):
-                data = json.loads(runner.read_text(encoding="utf-8"))
-                for who in ("runner", "codex"):
-                    rec = data.get(who) or {}
-                    if same_process(rec.get("pid"), rec.get("start")):
-                        with contextlib.suppress(ProcessLookupError, PermissionError):
-                            os.kill(rec["pid"], signal.SIGKILL)
-                            killed.append(rec)
+
+        def kill(rec: dict) -> None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(rec["pid"], signal.SIGKILL)
+                killed.append(rec)
+
+        for runners_only in (True, False):
+            for rec in recorded_processes(self.run_dir, runners_only=runners_only):
+                if same_process(rec.get("pid"), rec.get("start")):
+                    kill(rec)
+        log = Path(self.env["FAKE_CODEX_LOG"])
+        for line in (read_jsonl(log) if log.exists() else []):
+            pid = line.get("child_pid") or line.get("escaped_pid")
+            start = started_by(pid, line["time"]) if pid else None
+            if start is not None:
+                kill({"pid": pid, "start": start})
         deadline = time.monotonic() + 5
         while any(same_process(r["pid"], r["start"]) for r in killed) and time.monotonic() < deadline:
             time.sleep(0.02)
+
+
+def recorded_processes(run_dir: Path, *, runners_only: bool = False) -> list[dict]:
+    """The {pid, start} records in the run's worker folders and their superseded generations:
+    the runner (runner.json, or spawn.json before it), and unless `runners_only` Codex, its
+    recorded descendants (procs.json) and what a result says was stopped (result.json). A
+    record is a process only while harness.same_process(pid, start) holds."""
+    def read(path: Path) -> dict:
+        with contextlib.suppress(ValueError, OSError):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        return {}
+
+    out = []
+    for folder in [*run_dir.glob("workers/*"), *run_dir.glob("workers/*/superseded/*")]:
+        runner = read(folder / "runner.json")
+        out += [runner.get("runner"), read(folder / "spawn.json")]
+        if not runners_only:
+            out.append(runner.get("codex"))
+            out += read(folder / "procs.json").get("descendants") or []
+            out += read(folder / "result.json").get("stopped") or []
+    return [r for r in out if isinstance(r, dict) and r.get("pid")]

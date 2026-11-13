@@ -271,3 +271,20 @@ def same_process(pid: int, start: str | None) -> bool:
     if not pid or not start:
         return False
     return _start_time(int(pid)) == start
+
+
+def _start_wall(start: str) -> float:
+    """A start time as seconds since the epoch (on Linux to the second of the boot time)."""
+    if start.startswith("ticks:"):
+        btime = next(int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines()
+                     if line.startswith("btime "))
+        return btime + int(start[len("ticks:"):]) / os.sysconf("SC_CLK_TCK")
+    return float(start)
+
+
+def started_by(pid: int, when: float) -> str | None:
+    """The start time of `pid` when it is alive and started no later than `when` (time.time()),
+    so it is the process a record written at `when` named, not a later one reusing the pid;
+    else None."""
+    start = _start_time(int(pid)) if pid else None
+    return start if start is not None and _start_wall(start) <= when else None
