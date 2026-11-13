@@ -144,10 +144,18 @@ class RunDir:
         self._append(self.paths.charges, lambda _last: rec)
 
     def rate_limit(self, percent, ts="2026-01-02T03:04:05.000Z", name="rollout-2026-01-02-abc.jsonl"):
-        d = self.sessions / "2026" / "01" / "02"
-        d.mkdir(parents=True, exist_ok=True)
-        line = {"timestamp": ts, "type": "event_msg", "payload": {"type": "token_count", "info": None,
-                "rate_limits": {"primary": {"used_percent": percent, "window_minutes": 10080,
-                                            "resets_at": 1767830400}, "secondary": None}}}
-        with open(d / name, "a", encoding="utf-8") as f:
-            f.write(json.dumps(line) + "\n")
+        write_rate_limit(self.sessions, percent, ts=ts, name=name)
+
+
+def write_rate_limit(sessions: Path, percent, ts="2026-01-02T03:04:05.000Z",
+                     name="rollout-2026-01-02-abc.jsonl") -> Path:
+    """Append a Codex rate-limit record (a weekly window at `percent`) to the rollout file `name`
+    under `sessions`/2026/01/02; returns the file."""
+    d = sessions / "2026" / "01" / "02"
+    d.mkdir(parents=True, exist_ok=True)
+    line = {"timestamp": ts, "type": "event_msg", "payload": {"type": "token_count", "info": None,
+            "rate_limits": {"primary": {"used_percent": percent, "window_minutes": 10080,
+                                        "resets_at": 1767830400}, "secondary": None}}}
+    with open(d / name, "a", encoding="utf-8") as f:
+        f.write(json.dumps(line) + "\n")
+    return d / name
