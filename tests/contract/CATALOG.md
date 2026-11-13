@@ -480,3 +480,84 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_engine_recovery.py::Untested::test_worker_crash_before_commit_escalates | contract_recovery.Untested.test_worker_crash_before_commit_escalates |
 | test_engine_recovery.py::Untested::test_worker_crash_after_commit_keeps_the_commit | contract_recovery.Untested.test_worker_crash_after_commit_keeps_the_commit |
 | test_engine_recovery.py::Untested::test_crash_before_result_record_writes_nothing | contract_recovery.Untested.test_crash_before_result_record_writes_nothing |
+| test_security.py::H1ForgedCodexBinary::test_runner_never_runs_a_binary_named_in_request_json | contract_security.H1ForgedCodexBinary.test_runner_never_runs_a_binary_named_in_request_json |
+| test_security.py::H1ForgedCodexBinary::test_test_override_is_honoured_only_under_leadhand_testing | contract_security.H1ForgedCodexBinary.test_test_override_is_honoured_only_under_leadhand_testing |
+| test_security.py::H1ForgedCodexBinary::test_request_json_carries_no_executable | contract_security.H1ForgedCodexBinary.test_request_json_carries_no_executable |
+| test_security.py::H2ConfinedDispatch::test_cwd_in_another_repository_is_refused | contract_security.H2ConfinedDispatch.test_cwd_in_another_repository_is_refused |
+| test_security.py::H2ConfinedDispatch::test_run_dir_other_than_the_sessions_is_refused | contract_security.H2ConfinedDispatch.test_run_dir_other_than_the_sessions_is_refused |
+| test_security.py::H2ConfinedDispatch::test_without_the_session_variable_a_dir_without_run_json_is_refused | contract_security.H2ConfinedDispatch.test_without_the_session_variable_a_dir_without_run_json_is_refused |
+| test_security.py::H2ConfinedDispatch::test_without_the_session_variable_a_run_owned_by_a_live_supervisor_is_refused | contract_security.H2ConfinedDispatch.test_without_the_session_variable_a_run_owned_by_a_live_supervisor_is_refused |
+| test_security.py::H2ConfinedDispatch::test_an_empty_session_variable_is_refused_not_read_as_unset | contract_security.H2ConfinedDispatch.test_an_empty_session_variable_is_refused_not_read_as_unset |
+| test_security.py::H2ConfinedDispatch::test_run_dir_inside_its_own_workspace_is_refused | contract_security.H2ConfinedDispatch.test_run_dir_inside_its_own_workspace_is_refused |
+| test_security.py::H2ConfinedDispatch::test_brief_or_report_outside_the_workspace_scratch_dir_is_refused | contract_security.H2ConfinedDispatch.test_brief_or_report_outside_the_workspace_scratch_dir_is_refused |
+| test_security.py::H2ConfinedDispatch::test_the_sessions_run_in_its_workspace_is_accepted | contract_security.H2ConfinedDispatch.test_the_sessions_run_in_its_workspace_is_accepted |
+| test_security.py::H2ConfinedDispatch::test_the_runs_evidence_base_worktree_is_accepted_as_cwd | contract_security.H2ConfinedDispatch.test_the_runs_evidence_base_worktree_is_accepted_as_cwd |
+| test_security.py::M1ConfinedStop::test_stop_dispatch_refuses_a_forged_folder_outside_the_run | contract_security.M1ConfinedStop.test_stop_dispatch_refuses_a_forged_folder_outside_the_run |
+| test_security.py::M1ConfinedStop::test_stop_dispatch_refuses_a_dispatch_id_that_leaves_the_workers_folder | contract_security.M1ConfinedStop.test_stop_dispatch_refuses_a_dispatch_id_that_leaves_the_workers_folder |
+| test_security.py::M1ConfinedStop::test_stop_dispatch_refuses_a_worker_folder_that_is_a_symlink_out_of_the_run | contract_security.M1ConfinedStop.test_stop_dispatch_refuses_a_worker_folder_that_is_a_symlink_out_of_the_run |
+| test_security.py::M1ConfinedStop::test_stop_dispatch_refuses_a_request_for_another_repository | contract_security.M1ConfinedStop.test_stop_dispatch_refuses_a_request_for_another_repository |
+| test_security.py::M1ConfinedStop::test_runner_commit_refuses_a_request_for_another_repository | contract_security.M1ConfinedStop.test_runner_commit_refuses_a_request_for_another_repository |
+| test_security.py::M1ConfinedStop::test_runner_refuses_a_folder_outside_the_run | contract_security.M1ConfinedStop.test_runner_refuses_a_folder_outside_the_run |
+| test_security.py::M1ConfinedStop::test_runner_refuses_a_request_for_another_repository | contract_security.M1ConfinedStop.test_runner_refuses_a_request_for_another_repository |
+| test_security.py::H3FilterDrivers::test_the_global_filter_fetches_for_plain_git | contract_security.H3FilterDrivers.test_checkouts_resets_and_stashes_fetch_nothing |
+| test_security.py::H3FilterDrivers::test_checkout_reset_and_stash_fetch_nothing | contract_security.H3FilterDrivers.test_checkouts_resets_and_stashes_fetch_nothing |
+| test_security.py::H3FilterDrivers::test_runner_git_calls_fetch_nothing | contract_security.H3FilterDrivers.test_runner_commits_lfs_files_as_pointers_and_fetches_nothing |
+| test_security.py::H3FilterDrivers::test_every_call_carries_the_environment | contract_security.H3FilterDrivers.test_checkouts_resets_and_stashes_fetch_nothing; contract_security.H3FilterDrivers.test_runner_commits_lfs_files_as_pointers_and_fetches_nothing |
+| test_security.py::H3FilterDrivers::test_checked_out_lfs_content_does_not_read_as_modified | contract_security.H3FilterDrivers.test_checked_out_lfs_content_does_not_read_as_modified |
+| test_security.py::H3FilterDrivers::test_runner_commits_lfs_files_as_pointers | contract_security.H3FilterDrivers.test_runner_commits_lfs_files_as_pointers_and_fetches_nothing |
+| test_security.py::M3SymlinkedBaseWorktree::test_evidence_reset_refuses_a_symlinked_base_worktree | contract_security.M3SymlinkedBaseWorktree.test_evidence_reset_refuses_a_symlinked_base_worktree |
+| test_security.py::M3SymlinkedBaseWorktree::test_evidence_reset_refuses_a_symlinked_worktrees_folder | contract_security.M3SymlinkedBaseWorktree.test_evidence_reset_refuses_a_symlinked_worktrees_folder |
+| test_security.py::M3SymlinkedBaseWorktree::test_prepare_workspace_refuses_a_symlinked_worktree | contract_security.M3SymlinkedBaseWorktree.test_start_refuses_a_symlinked_worktree |
+| test_security.py::L1ReplyFile::test_another_path_is_refused | contract_security.L1ReplyFile.test_another_path_is_refused |
+| test_security.py::L1ReplyFile::test_the_reply_file_as_a_symlink_is_refused | contract_security.L1ReplyFile.test_the_reply_file_as_a_symlink_is_refused |
+| test_security.py::L1ReplyFile::test_a_symlinked_scratch_folder_is_refused | contract_security.L1ReplyFile.test_a_symlinked_scratch_folder_is_refused |
+| test_security.py::L1ReplyFile::test_a_report_behind_a_symlinked_scratch_folder_is_never_copied | contract_security.L1ReplyFile.test_a_report_behind_a_symlinked_scratch_folder_is_never_copied |
+| test_security.py::L2SymlinkedScratch::test_a_symlinked_dispatch_folder_is_refused | contract_security.L2SymlinkedScratch.test_a_symlinked_dispatch_folder_is_refused; contract_worktree_safety.ScratchFolders.test_symlinked_scratch_folder_refused_without_writing |
+| test_security.py::L2SymlinkedScratch::test_a_symlinked_card_folder_is_refused | contract_security.L2SymlinkedScratch.test_a_symlinked_card_folder_is_refused |
+| test_security.py::L2SymlinkedScratch::test_a_file_in_place_of_the_dispatch_folder_is_refused | contract_security.L2SymlinkedScratch.test_a_file_in_place_of_the_dispatch_folder_is_refused |
+| test_security.py::L6ToolsInsideTheWorkspace::test_run_refuses_a_cli_inside_the_workspace | contract_security.L6ToolsInsideTheWorkspace.test_run_refuses_a_cli_inside_the_workspace |
+| test_security.py::L6ToolsInsideTheWorkspace::test_run_refuses_a_plugin_dir_inside_the_workspace | contract_security.L6ToolsInsideTheWorkspace.test_run_refuses_a_plugin_dir_inside_the_workspace |
+| test_security.py::L6ToolsInsideTheWorkspace::test_run_accepts_a_plugin_dir_outside_the_workspace | contract_security.L6ToolsInsideTheWorkspace.test_run_accepts_a_plugin_dir_outside_the_workspace |
+| test_security.py::L6StartInPlace::test_start_refuses_an_in_place_run_of_the_repository_holding_the_cli | dropped with in-place mode |
+| test_engine_in_place.py::InPlace::test_operators_untracked_files_survive_and_are_never_committed | contract_worktree_safety.OperatorCheckout.test_operator_checkout_untouched_by_a_complete_run |
+| test_engine_in_place.py::InPlace::test_undecodable_untracked_filename_survives_start | dropped with in-place mode |
+| test_engine_in_place.py::InPlace::test_json_output_escapes_undecodable_names | contract_worktree_safety.WorktreeRewrites.test_json_output_escapes_undecodable_names |
+| test_engine_in_place.py::InPlace::test_run_started_in_a_subdirectory_preserves_a_parked_cards_untracked_file | dropped with in-place mode |
+| test_engine_in_place.py::InPlace::test_run_started_in_a_subdirectory_leaves_untracked_files_outside_it_alone | dropped with in-place mode |
+| test_engine_in_place.py::InPlace::test_docs_dir_elsewhere_in_the_checkout_of_a_subdirectory_run_is_refused | dropped with in-place mode |
+| test_engine_in_place.py::InPlace::test_ignored_file_protection_is_for_in_place_runs_only | contract_worktree_safety.WorktreeRewrites.test_an_ignored_file_a_worker_left_does_not_block_a_card_cut |
+| test_engine_in_place.py::Exclusive::test_second_in_place_run_is_refused_while_the_first_is_unfinished | dropped with in-place mode |
+| test_engine_in_place.py::Exclusive::test_in_place_start_is_refused_while_a_run_in_another_runs_folder_is_supervised | dropped with in-place mode |
+| test_engine_in_place.py::Exclusive::test_in_place_start_from_a_subdirectory_is_refused_while_the_checkout_is_supervised | dropped with in-place mode |
+| test_engine_in_place.py::Exclusive::test_in_place_start_from_a_subdirectory_is_refused_while_a_run_is_unfinished | dropped with in-place mode |
+| test_engine_in_place.py::Exclusive::test_a_checkout_that_cannot_be_flocked_refuses_an_in_place_start_clearly | dropped with in-place mode |
+| test_engine_in_place.py::Exclusive::test_start_returns_the_unfinished_run_while_its_own_supervisor_holds_the_checkout | dropped with in-place mode |
+| test_engine_in_place.py::Exclusive::test_worktree_runs_are_not_held_back_by_an_in_place_run | dropped with in-place mode |
+| test_gitops.py::GitopsTests::test_prepare_workspace_without_worktree_uses_checkout | dropped with in-place mode |
+| test_gitops.py::GitopsTests::test_cut_card_branch_refuses_an_existing_branch_the_run_did_not_record | contract_worktree_safety.UnrecordedCardBranch.test_unrecorded_card_branch_adopted_only_at_run_tip |
+| test_gitops.py::GitopsTests::test_fast_forward_moves_a_run_branch_checked_out_in_the_workspace | dropped with in-place mode |
+| test_gitops.py::GitopsTests::test_prepare_workspace_without_worktree_refuses_uncommitted_changes | dropped with in-place mode |
+| test_gitops.py::GitopsTests::test_default_base_after_a_run_without_worktree | dropped with in-place mode |
+| test_gitops.py::SubdirectoryWorkspaceTests::test_stage_work_takes_a_new_file_in_the_subdirectory | dropped with in-place mode |
+| test_gitops.py::SubdirectoryWorkspaceTests::test_stage_work_leaves_out_a_gitlink_in_the_subdirectory | dropped with in-place mode |
+| test_gitops.py::SubdirectoryWorkspaceTests::test_preserve_keeps_and_removes_untracked_files_named_from_the_top | dropped with in-place mode |
+| test_gitops.py::SubdirectoryWorkspaceTests::test_preserve_leaves_untracked_files_outside_the_workspace_alone | dropped with in-place mode |
+| test_gitops.py::SubdirectoryWorkspaceTests::test_stage_work_never_takes_a_new_file_outside_the_workspace | dropped with in-place mode |
+| test_gitops.py::SubdirectoryWorkspaceTests::test_cleanliness_probes_see_the_whole_checkout_whatever_diff_relative_says | dropped with in-place mode |
+| test_gitops.py::SubdirectoryWorkspaceTests::test_patches_keep_the_standard_prefixes_whatever_the_users_diff_settings | contract_worktree_safety.WorktreeRewrites.test_check_diff_patch_keeps_the_standard_prefixes_whatever_the_repo_diff_settings |
+| test_gitops.py::SubdirectoryWorkspaceTests::test_preserve_never_removes_the_workspace_folder_itself | dropped with in-place mode |
+| test_gitops.py::OperatorFilesInPlaceTests::test_start_refuses_a_base_that_would_overwrite_an_ignored_file | dropped with in-place mode |
+| test_gitops.py::OperatorFilesInPlaceTests::test_switching_to_a_card_branch_never_overwrites_an_ignored_file | dropped with in-place mode |
+| test_gitops.py::OperatorFilesInPlaceTests::test_fast_forward_never_overwrites_an_ignored_file | dropped with in-place mode |
+| test_gitops.py::OperatorFilesInPlaceTests::test_rebase_never_overwrites_an_ignored_file | dropped with in-place mode |
+| test_gitops.py::OperatorFilesInPlaceTests::test_rebase_never_overwrites_an_ignored_file_an_intermediate_commit_adds | dropped with in-place mode |
+| test_gitops.py::OperatorFilesInPlaceTests::test_rebase_never_replaces_an_ignored_file_with_a_folder | dropped with in-place mode |
+| test_gitops.py::OperatorFilesInPlaceTests::test_start_refuses_a_folder_over_an_ignored_file_before_changing_anything | dropped with in-place mode |
+| test_gitops.py::OperatorFilesInPlaceTests::test_a_folder_of_tracked_files_a_rebase_turns_into_a_file_is_not_in_the_way | dropped with in-place mode |
+| test_gitops.py::OperatorFilesInPlaceTests::test_rebase_never_replaces_a_folder_holding_an_ignored_file_with_a_file | dropped with in-place mode |
+| test_gitops.py::OperatorFilesInPlaceTests::test_a_fold_equal_name_that_is_another_file_is_still_in_the_way | dropped with in-place mode |
+| test_gitops.py::OperatorFilesInPlaceTests::test_a_case_only_rename_is_not_in_the_way_on_a_case_insensitive_file_system | dropped with in-place mode |
+| test_gitops.py::OperatorFilesInPlaceTests::test_a_worktree_run_may_overwrite_an_ignored_file_it_holds | contract_worktree_safety.WorktreeRewrites.test_an_ignored_file_a_worker_left_does_not_block_a_card_cut |
+| test_gitops.py::OperatorFilesInPlaceTests::test_a_conflicted_merge_is_refused_as_uncommitted_changes | dropped with in-place mode |
+| test_gitops.py::OperatorFilesInPlaceTests::test_a_sparse_checkout_is_refused_in_place_with_short_advice | contract_worktree_safety.SparseCheckouts.test_sparse_checkout_refused_by_check_start_and_run |
+| test_gitops.py::OperatorFilesInPlaceTests::test_start_refuses_hidden_index_entries_in_place | dropped with in-place mode |
