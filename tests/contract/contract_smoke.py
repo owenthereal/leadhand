@@ -1,11 +1,18 @@
-"""The fake supervisor end to end: a two-card run, and the cleanup that leaves no runner behind.
+"""The fake supervisor end to end: a two-card run, the cleanup that leaves no runner behind, and a
+crash drive whose group kill takes down every process the drive started.
 
 Smoke is converted from test_engine_cards.HappyPath.test_happy_path_two_cards_accepted_in_order.
 """
 import json
+import os
+import signal
+import subprocess
 import time
+import traceback
 import unittest
+from unittest import mock
 
+import harness
 from gitfixture import run_git
 from harness import same_process
 from supervisor import FakeSupervisor, card
@@ -91,6 +98,60 @@ class Cleanup(unittest.TestCase):
         survivors = [(who, rec[who]) for rec in records for who in ("runner", "codex")
                      if rec.get(who) and same_process(rec[who].get("pid"), rec[who].get("start"))]
         self.assertEqual(survivors, [])
+
+
+class CrashDrive(unittest.TestCase):
+    def test_runner_crash_takes_down_everything_the_drive_started(self):
+        # The drive runs in a forked child that is its own process group, as a supervisor session
+        # is. The runner's crash point kills that group: the dispatch line in flight must die with
+        # it, as FakeWorld's in-process engine and proxies did. Codex ignores SIGINT, so a dispatch
+        # line left alive would sit in its cancel of the orphaned Codex for up to 30 s.
+        w = FakeSupervisor(self, [card(1)], installed=("claude", "codex"))
+        w.start()
+        w.script(1, "implement", {"sleep": 120})
+        started = w.tmp / "started processes.jsonl"
+        errors = w.tmp / "drive error.txt"
+
+        class Logged(subprocess.Popen):
+            def __init__(self, argv, *args, **kwargs):
+                super().__init__(argv, *args, **kwargs)
+                with open(started, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"pid": self.pid, "start": harness._start_time(self.pid),
+                                        "argv": [str(a) for a in argv]}) + "\n")
+
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                os.setpgid(0, 0)
+                w.env.update({"LEADHAND_CRASH_AT": "after_worker_launch", "LEADHAND_CRASH_KILL_PGID": str(os.getpid()),
+                              "FAKE_CODEX_IGNORE_SIGINT": "1"})
+                with mock.patch.object(subprocess, "Popen", Logged):
+                    w.run()
+                code = 0
+            except BaseException:
+                errors.write_text(traceback.format_exc(), encoding="utf-8")
+            finally:
+                os._exit(code)
+        deadline = time.monotonic() + 120
+        while not os.waitpid(pid, os.WNOHANG)[0]:
+            if time.monotonic() > deadline:
+                os.killpg(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                self.fail("the crash drive hung")
+            time.sleep(0.02)
+        procs = harness.read_jsonl(started)
+        try:
+            self.assertFalse(errors.exists(), errors.read_text(encoding="utf-8") if errors.exists() else "")
+            self.assertTrue(any(p["argv"][1:2] == ["dispatch"] for p in procs), procs)
+            end = time.monotonic() + 5
+            while any(same_process(p["pid"], p["start"]) for p in procs) and time.monotonic() < end:
+                time.sleep(0.05)
+            self.assertEqual([p["argv"] for p in procs if same_process(p["pid"], p["start"])], [])
+        finally:
+            for p in procs:
+                if same_process(p["pid"], p["start"]):
+                    os.kill(p["pid"], signal.SIGKILL)
 
 
 if __name__ == "__main__":

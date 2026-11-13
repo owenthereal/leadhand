@@ -93,24 +93,32 @@ class Result:
 
 def run_cli(*args, env: dict, cwd: Path, stdin: str | None = None, timeout: float = 120.0) -> Result:
     """Run BIN with `args`. A run past `timeout` seconds kills the binary's whole process group
-    and fails the test with the command named."""
+    (only the binary, in a crash drive: see run_argv) and fails the test with the command named."""
     return run_argv([str(BIN), *(str(a) for a in args)], env=env, cwd=cwd, stdin=stdin, timeout=timeout)
 
 
 def run_argv(argv: list[str], *, env: dict, cwd: Path, stdin: str | None = None,
              timeout: float = 120.0) -> Result:
-    """Run a full command line, such as a dispatch line the binary printed, as run_cli runs BIN."""
+    """Run a full command line, such as a dispatch line the binary printed, as run_cli runs BIN.
+
+    The command gets its own process group, so a timeout kills the children that hold the
+    pipes too. In a crash drive (`env` names LEADHAND_CRASH_KILL_PGID) it stays in the caller's
+    group instead, so a crash point's group kill takes it down with the drive."""
+    own_group = "LEADHAND_CRASH_KILL_PGID" not in env
     proc = subprocess.Popen(
         argv, cwd=cwd, env=env, text=True, encoding="utf-8", errors="surrogateescape",
         stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        process_group=0,    # so a timeout can kill the children that hold the pipes too
+        process_group=0 if own_group else None,
     )
     try:
         out, err = proc.communicate(stdin, timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            if own_group:
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
         except ProcessLookupError:
             pass
         try:
@@ -119,7 +127,8 @@ def run_argv(argv: list[str], *, env: dict, cwd: Path, stdin: str | None = None,
             proc.kill()
             proc.wait()
             out, err = "", "(not read: a process outside the binary's group held the pipes)"
-        raise AssertionError(f"leadhand timed out after {timeout:g} s; its process group was killed\n"
+        killed = "its process group was" if own_group else "it was"
+        raise AssertionError(f"leadhand timed out after {timeout:g} s; {killed} killed\n"
                              f"{Result(argv, proc.returncode, out, err)}") from None
     return Result(argv, proc.returncode, out, err)
 
