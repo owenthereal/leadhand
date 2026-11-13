@@ -562,7 +562,7 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_gitops.py::OperatorFilesInPlaceTests::test_a_sparse_checkout_is_refused_in_place_with_short_advice | contract_worktree_safety.SparseCheckouts.test_sparse_checkout_refused_by_check_start_and_run |
 | test_gitops.py::OperatorFilesInPlaceTests::test_start_refuses_hidden_index_entries_in_place | dropped with in-place mode |
 | test_git_safety.py::EngineGitCalls::test_engine_git_calls_run_no_fsmonitor_or_hook | contract_security.GitSafety.test_leadhand_git_calls_run_no_fsmonitor_or_hook |
-| test_git_safety.py::EngineGitCalls::test_safe_options_are_passed_on_every_call | contract_security.GitSafety.test_leadhand_git_calls_run_no_fsmonitor_or_hook |
+| test_git_safety.py::EngineGitCalls::test_safe_options_are_passed_on_every_call | contract_security.GitSafety.test_leadhand_git_calls_run_no_fsmonitor_or_hook; contract_worktree_safety.SavedState.test_a_nested_repository_at_a_gitlink_is_not_a_violation |
 | test_git_safety.py::RunnerGitlinks::test_runner_never_commits_a_gitlink | contract_security.GitSafety.test_runner_never_commits_a_gitlink |
 | test_gitops.py::GitopsTests::test_default_base_uses_origin_default_branch | internal: Rust unit test (git) |
 | test_gitops.py::GitopsTests::test_default_base_without_origin_uses_local_default | internal: Rust unit test (git) |
@@ -622,7 +622,7 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_state.py::AppendTests::test_concurrent_appends_from_threads | internal: Rust unit test (state) |
 | test_state.py::AppendTests::test_concurrent_appends_from_two_processes_keep_whole_lines_and_unique_seq | contract_usage.Concurrency.test_concurrent_supervisor_and_runner_charges_keep_exact_totals |
 | test_state.py::WriteJsonAtomicTests::test_undecodable_filenames_round_trip_through_json_and_jsonl | contract_worktree_safety.WorktreeRewrites.test_json_output_escapes_undecodable_names |
-| test_state.py::WriteJsonAtomicTests::test_write_json_atomic_leaves_no_temp_files | internal: Rust unit test (state) |
+| test_state.py::WriteJsonAtomicTests::test_write_json_atomic_leaves_no_temp_files | contract_cards.Start.test_a_whole_run_leaves_no_temporary_files |
 | test_state.py::WriteJsonAtomicTests::test_write_json_atomic_error_keeps_old_content_and_no_temp | internal: Rust unit test (state) |
 | test_state.py::WriteJsonAtomicTests::test_write_json_atomic_replace_failure_cleans_up | internal: Rust unit test (state) |
 | test_state.py::WriteJsonAtomicTests::test_write_json_atomic_fsyncs | internal: Rust unit test (state) |

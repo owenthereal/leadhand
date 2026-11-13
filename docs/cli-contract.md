@@ -324,8 +324,9 @@ run ends again (a resumed blocked run):
     -c diff.relative=false -c diff.noprefix=false -c diff.mnemonicPrefix=false
     -c diff.srcPrefix=a/ -c diff.dstPrefix=b/`.
 
-  So no repository hook, fsmonitor command or LFS smudge runs (I6, H3). The runner never
-  commits a gitlink (R45).
+  So no repository hook, fsmonitor command or LFS smudge runs (I6, H3), and a nested repository
+  checked out at a gitlink path is never a change leadhand sees. The runner never commits a
+  gitlink (R45).
 
 ## 8. Run state
 

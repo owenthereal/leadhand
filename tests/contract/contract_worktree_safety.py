@@ -25,7 +25,7 @@ from pathlib import Path
 from contract_cards import BY_RISK, CODEX_CARD, codex_world, commit_on, relaunch_env
 from contract_finish import base_wt, drive_until_refused, gate_names, marker
 from contract_integration import NOTE, parked_world, unpark
-from gitfixture import IDENTITY, commit, current_branch, run_git, write
+from gitfixture import IDENTITY, commit, current_branch, make_repo, run_git, write
 from harness import read_json
 from supervisor import FakeSupervisor, card
 
@@ -788,6 +788,42 @@ class SavedState(unittest.TestCase):
         self.assertEqual((ws / spaced).read_text(encoding="utf-8"), "a\n")
         tip = w.events("accepted")[0]["sha"]
         self.assertEqual(run_git(w.repo, "show", f"{tip}:{accented}"), "n")
+
+    def test_a_nested_repository_at_a_gitlink_is_not_a_violation(self):
+        # Leadhand's Git calls ignore submodules (diff.ignoreSubmodules=all, test_git_safety.py):
+        # a reviewer who checks out a nested repository at a gitlink path, at another commit than
+        # the gitlink records, changes nothing leadhand checks. Plain Git sees the gitlink as a
+        # tracked change, so a binary that drops the setting finds a violation here.
+        w = FakeSupervisor(self, [card(1)])
+        nested = make_repo(w.tmp, name="nested repo")
+        recorded = run_git(nested, "rev-parse", "HEAD")
+        run_git(w.repo, "update-index", "--add", "--cacheinfo", f"160000,{recorded},src/sub")
+        run_git(w.repo, "commit", "--quiet", "-m", "a submodule pointer")
+        w.base = run_git(w.repo, "rev-parse", "HEAD")
+        w.write_deck([card(1)])
+        moved = commit(nested, {"README.md": "moved\n"}, "moved")
+        seen = {}
+
+        def populate(world, ws, a):
+            write(ws, {"src/sub/.git": f"gitdir: {run_git(nested, 'rev-parse', '--absolute-git-dir')}\n",
+                       "src/sub/README.md": "moved\n"})
+            seen["sub"] = run_git(ws / "src" / "sub", "rev-parse", "HEAD")
+            seen["plain"] = run_git(ws, "diff", "--name-only", "HEAD")
+
+        w.start()
+        w.script(1, "review", {"tamper": populate})
+        self.assertEqual(w.run()[-1]["action"], "done")
+        # The trap is armed: the nested repository is at another commit, and plain Git sees it.
+        self.assertEqual(seen["sub"], moved)
+        self.assertNotEqual(moved, recorded)
+        self.assertEqual(seen["plain"], "src/sub")
+        self.assertEqual(w.events("violation"), [])
+        self.assertEqual(w.dispatch_ids(), ["c1-a1-implement-1", "c1-a1-review-1"])
+        run_id = w.meta()["run_id"]
+        self.assertEqual(run_git(w.repo, "for-each-ref", "--format=%(refname)",
+                                 f"refs/leadhand/{run_id}/violations/"), "")
+        (accepted,) = w.events("accepted")
+        self.assertEqual(run_git(w.repo, "rev-parse", f"{accepted['sha']}:src/sub"), recorded)
 
     def test_a_stat_only_touch_and_untracked_output_are_not_a_violation(self):
         def tamper(world, ws, a):

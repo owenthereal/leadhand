@@ -495,6 +495,23 @@ class Start(EngineCase):
             self.assertRegex(e["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$")
             self.assertIsInstance(e["kind"], str)
 
+    def test_a_whole_run_leaves_no_temporary_files(self):
+        # Every JSON file and report is written through a temporary file in the same folder
+        # (`.<name>.<random>`, `.tmp` for JSON) and renamed: none survives in the run directory,
+        # its card folders or a Codex worker folder (test_state.py). Read from the filesystem.
+        w = codex_world(self, [card(1, route=CODEX_CARD), card(2)], gates=True)
+        w.session("supervisor-1")
+        w.start()
+        w.script(1, "implement", {"commit": False})
+        self.assertEqual(w.run()[-1]["action"], "done")
+        self.assertTrue(w.paths.report.is_file())
+        workers = sorted((w.run_dir / "workers").iterdir())
+        self.assertTrue(workers)
+        self.assertTrue(all((wd / "result.json").is_file() for wd in workers), workers)
+        left = [str(p.relative_to(w.run_dir)) for p in w.run_dir.rglob("*")
+                if p.name.endswith(".tmp") or p.name.startswith(".")]
+        self.assertEqual(left, [])
+
     def test_start_returns_existing_unfinished_run_unless_new(self):
         w = FakeSupervisor(self, [card(1)])
         first = w.start()
