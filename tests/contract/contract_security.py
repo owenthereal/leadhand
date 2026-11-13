@@ -159,6 +159,7 @@ class H1ForgedCodexBinary(unittest.TestCase):
         self.assertEqual(len(s.starts()), 1, r)
 
     def test_test_override_is_honoured_only_under_leadhand_testing(self):
+        """Covers limit L4 (test hooks need LEADHAND_TESTING=1)."""
         # Observed through the program that runs: an override that leaves a mark, then runs the
         # fake, against the fake found on PATH.
         s = Anchored(self)
@@ -451,6 +452,7 @@ class H3FilterDrivers(unittest.TestCase):
         self.assertEqual(set(calls), {"SMUDGE skip=1"})
 
     def test_checkouts_resets_and_stashes_fetch_nothing(self):
+        """Covers R50."""
         # Card 1's worker commits a pointer to an object nobody has and an .lfsconfig naming its
         # URL; card 2's worker deletes that file and leaves the deletion uncommitted, so before
         # its review leadhand saves the leftovers (stash create) and resets the workspace, which
@@ -723,6 +725,7 @@ class L2SymlinkedScratch(unittest.TestCase):
         self.assertEqual([e for e in w.events("dispatch_requested") if e["dispatch_kind"] == "review"], [])
 
     def test_a_symlinked_dispatch_folder_is_refused(self):
+        """Covers bug class 5 (files workers can write)."""
         w, outside = self.plant("dispatch folder")
         self.assert_refused(w, outside, str(Path(".leadhand") / "1" / "c1-a1-review-1"))
 
@@ -765,6 +768,32 @@ class L6ToolsInsideTheWorkspace(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# M2: a filter driver in the repository's Git configuration still runs in leadhand's Git calls
+
+class M2ConfigDefinedCommands(unittest.TestCase):
+    def test_a_repository_config_filter_driver_runs_in_leadhands_checkout(self):
+        """Covers limit M2 (config-defined commands): leadhand pins hooks, fsmonitor and
+        git-lfs, but a filter driver in the repository's own Git configuration (other than
+        git-lfs) still runs in its Git calls. Seen from the driver's own log: `start` checks
+        out the run's worktree, and the smudge command runs there."""
+        w = FakeSupervisor(self, [card(1)])
+        log = w.tmp / "filter log"
+        driver = w.tmp / "probe filter"
+        driver.write_text(f'#!/bin/sh\necho "$1 $(pwd)" >> "{log}"\nexec cat\n', encoding="utf-8")
+        driver.chmod(0o755)
+        commit(w.repo, {".gitattributes": "*.dat filter=probe\n", "data.dat": "payload\n"}, "a filtered file")
+        w.base = run_git(w.repo, "rev-parse", "HEAD")
+        w.write_deck([card(1)])
+        for kind in ("smudge", "clean"):
+            run_git(w.repo, "config", f"filter.probe.{kind}", f"'{driver}' {kind}")
+        self.assertFalse(log.exists())
+        w.start()
+        ws = w.workspace()
+        self.assertIn(f"smudge {ws.resolve()}", log.read_text(encoding="utf-8").splitlines())
+        self.assertEqual((ws / "data.dat").read_text(encoding="utf-8"), "payload\n")
+
+
+# --------------------------------------------------------------------------
 # I6, I7 (R45): leadhand's Git calls run no hook or fsmonitor, and the runner commits no gitlink
 
 HOOKS = ("post-checkout", "pre-commit", "post-commit", "reference-transaction")
@@ -788,6 +817,7 @@ class GitSafety(unittest.TestCase):
     binary's environment."""
 
     def test_leadhand_git_calls_run_no_fsmonitor_or_hook(self):
+        """Covers bug class 3 (user Git config) and R45."""
         w = codex_world(self, [card(1), card(2)], gates=True)
         marker = w.tmp / "MARKER"
         evil = marker_script(w.tmp / "evil.sh", marker)

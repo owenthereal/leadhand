@@ -307,7 +307,8 @@ class LaunchCase(unittest.TestCase):
 class Argv(LaunchCase):
     def test_argv_order_and_auto_mode(self):
         """Without --plugin-dir: the settings overlay, the supervisor agent, the route's model
-        and effort, auto mode, then the first message."""
+        and effort, auto mode, then the first message.
+        Covers P1."""
         r = self.w.run()
         self.assertEqual(r.code, 0, r)
         argv = self.w.argv()
@@ -333,6 +334,7 @@ class Argv(LaunchCase):
         self.assertTrue(self.first_message_ok(argv[-1], self.w.run_dir), argv[-1])
 
     def test_run_passes_supervisor_model_effort_and_cli_settings(self):
+        """Covers P1 and P5 (the settings overlay's CLI exclusion)."""
         plugin = self.w.tmp / "plugin dir"
         r = self.w.run("--plugin-dir", plugin)
         self.assertEqual(r.code, 0, r)
@@ -375,6 +377,7 @@ class Argv(LaunchCase):
         self.assertIn("excludedCommands", r.stderr)
 
     def test_cli_path_with_spaces_warns_sandbox_exclusion_may_not_match(self):
+        """Covers R28."""
         # The CLI's own path, set through the testing hook as the Python test patched CLI_PATH.
         r = self.w.run(LEADHAND_TEST_CLI="/opt/lead hand/scripts/leadhand")
         self.assertEqual(r.code, 0, r)
@@ -402,6 +405,7 @@ class Child(LaunchCase):
         self.assertIn(f"Run the leadhand deck in {self.w.run_dir}.", start["argv"][-1])
 
     def test_env_has_run_id_dir_and_cli(self):
+        """Covers P3 (LEADHAND_RUN_ID reaches the supervisor's session)."""
         r = self.w.run()
         self.assertEqual(r.code, 0, r)
         env = self.w.starts()[0]["env"]
@@ -410,6 +414,7 @@ class Child(LaunchCase):
         self.assertTrue(env["LEADHAND_CLI"] and harness.names_bin(env["LEADHAND_CLI"]), env)
 
     def test_run_accepts_deck_md_path(self):
+        """Covers R24."""
         r = self.w.run(target=self.w.paths.deck)
         self.assertEqual(r.code, 0, r)
         self.assertEqual(self.w.starts()[0]["env"]["LEADHAND_RUN_DIR"], str(self.w.run_dir))
@@ -478,6 +483,7 @@ class SelfPathHook(LaunchCase):
     ROUTER = "/x/router"
 
     def test_self_path_override_is_honoured_only_under_leadhand_testing(self):
+        """Covers limit L4 (test hooks need LEADHAND_TESTING=1)."""
         deck = str(self.w.paths.deck)
         for testing, honoured in (("1", True), ("0", False)):
             with self.subTest(testing=testing):
@@ -567,6 +573,7 @@ class Ownership(LaunchCase):
         self.w.wait_gone(sup)
 
     def test_recorded_live_supervisor_blocks_takeover(self):
+        """Covers limit L3: a relaunch is refused while the recorded supervisor lives."""
         self.w.paths.lock.write_text("", encoding="utf-8")       # stale: nobody holds the flock
         live = self.w.popen(["sleep", "60"], env=self.w.env)
         start = wait_for(lambda: started_by(live.pid, time.time()), "the live process")
@@ -612,6 +619,7 @@ class Ownership(LaunchCase):
         self.assertEqual([e["kind"] for e in self.w.events()], ["run_started"])
 
     def test_holder_records_launcher_and_supervisor(self):
+        """Covers R7: the recorded start time is the process table's, read without `ps`."""
         launcher = self.w.launcher()
         sup = self.w.wait_supervisor(proc=launcher)
         h = self.w.holder()
@@ -679,7 +687,8 @@ class KeepAwake(LaunchCase):
     def test_keep_awake_runs_beside_claude_which_stays_the_direct_child(self):
         """macOS: `caffeinate -i -w <supervisor pid>`; Linux: `systemd-inhibit --what=idle
         --why='leadhand run' tail --pid=<supervisor pid> -f /dev/null`. Either is a child of
-        the launcher beside the supervisor, and is gone when the launch returns."""
+        the launcher beside the supervisor, and is gone when the launch returns.
+        Covers R27."""
         mine = "caffeinate" if sys.platform == "darwin" else "systemd-inhibit"
         for name in ("caffeinate", "systemd-inhibit"):
             self.w.tool(name, LOGGING_TOOL)
@@ -791,6 +800,7 @@ class InheritedLock(LaunchCase):
             os.set_blocking(fd, True)
 
     def test_relaunch_succeeds_while_a_cli_child_of_the_killed_supervisor_runs(self):
+        """Covers limit L3 (the inherited run lock) and R41(a)."""
         run_dir, did = self.started_dispatch()
         exported = self.w.tmp / "lock fd env"
         fifo = self.w.tmp / "reply fifo"
@@ -831,6 +841,7 @@ class InheritedLock(LaunchCase):
         self.w.wait_gone(child)
 
     def test_cli_closes_inherited_run_lock_fd(self):
+        """Covers limit L3 and R41(a)."""
         p = self.holding(self.w.paths.lock, run_dir=self.w.run_dir)
         self.assertTrue(lockable(self.w.paths.lock), "the command kept the inherited run.lock descriptor")
         self.assertIsNone(p.poll())

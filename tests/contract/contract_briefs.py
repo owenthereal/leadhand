@@ -263,6 +263,7 @@ class Briefs(unittest.TestCase):
         self.assertIn(f"- Implementer's report: {reports / 'c1-a1-fix-1' / 'report.md'}", rereview)
 
     def test_integrate_permits_rebase_onto_run_tip(self):
+        """Covers R15: integrate is the one permitted rewrite."""
         # Card 1 asks a question and is parked; card 2 lands a conflicting change; the unparked
         # card's rebase conflicts, so an integrate attempt is requested.
         w = BriefWorld(self, [card(1), card(2)])
@@ -339,6 +340,7 @@ class Briefs(unittest.TestCase):
     # -- where briefs live ---------------------------------------------------------------
 
     def test_brief_and_report_paths_are_inside_workspace_scratch(self):
+        """Covers C6."""
         w = gates_world(self)
         ws = w.workspace()
         for did, (a, _) in w.briefs.items():
@@ -350,6 +352,7 @@ class Briefs(unittest.TestCase):
         self.assertIn("c1-a1-implement-1", w.briefs)
 
     def test_scratch_dir_is_ignored_by_git(self):
+        """Covers C1."""
         w = gates_world(self)
         ws = w.workspace()
         for did in ("c1-a1-implement-1", "c2-a1-implement-1", "run-final_review-1", "run-verify-1"):

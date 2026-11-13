@@ -91,6 +91,8 @@ class WorkerEnvironment(unittest.TestCase):
         self.assertEqual(r.stdout.splitlines()[-1:], [""])
 
     def test_existing_git_config_env_entries_preserved(self):
+        """Covers limit M5: the parent's GIT_CONFIG_KEY_n/VALUE_n entries reach Codex's environment and its
+        command line."""
         _, env, policy = self.worker_env(lambda tmp: {
             "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "user.name", "GIT_CONFIG_VALUE_0": "Kept Name",
             "GIT_CONFIG_KEY_1": "core.abbrev", "GIT_CONFIG_VALUE_1": "12"})
@@ -104,6 +106,7 @@ class WorkerEnvironment(unittest.TestCase):
                                         capture_output=True, text=True, timeout=10).stdout.strip(), "12")
 
     def test_existing_git_config_parameters_kept_and_askpass_cleared(self):
+        """Covers R23."""
         _, env, policy = self.worker_env(lambda tmp: {"GIT_CONFIG_PARAMETERS": "'user.email=kept@example.invalid'"})
         self.assertEqual(policy["GIT_CONFIG_PARAMETERS"], env["GIT_CONFIG_PARAMETERS"])
         self.assertEqual(subprocess.run(["git", "config", "user.email"], cwd=self.repo, env=env,

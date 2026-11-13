@@ -334,6 +334,7 @@ class Leftovers(unittest.TestCase):
 
 class BaseWorktreeIdentity(unittest.TestCase):
     def test_foreign_worktree_at_base_path_is_never_reset(self):
+        """Covers bug class 4 (ownership by identity) and R60."""
         # A worktree this run did not add sits where the evidence base worktree goes, on the
         # operator's branch with a commit of its own and work of every kind. The evidence gate
         # is refused, again on every `next`, and nothing in that worktree changes.
@@ -405,6 +406,7 @@ class UnrecordedCardBranch(unittest.TestCase):
 
 class WorktreeRewrites(unittest.TestCase):
     def test_an_ignored_file_a_worker_left_does_not_block_a_card_cut(self):
+        """Covers R61."""
         # In a worktree run an ignored file in the run's worktree is a worker's or a build's,
         # never the operator's, so cutting a card branch may overwrite it (an in-place run
         # refused to). Card 1 tracks local.env (ignored by .gitignore) and is accepted; card 2
@@ -469,6 +471,7 @@ class WorktreeRewrites(unittest.TestCase):
         self.assertEqual((ws / CARD1_FILE).read_text(encoding="utf-8"), "c1-a1-implement-1\n")
 
     def test_check_diff_patch_keeps_the_standard_prefixes_whatever_the_repo_diff_settings(self):
+        """Covers bug class 3 (user Git config)."""
         # The operator's diff settings in the repository's configuration, which the run's
         # worktree shares, never change the patch a test-only fix's diff check reads.
         w = FakeSupervisor(self, [card(1)])
@@ -491,6 +494,7 @@ class WorktreeRewrites(unittest.TestCase):
         self.assertIn("+assert more\n", patch)
 
     def test_json_output_escapes_undecodable_names(self):
+        """Covers bug class 2 (path frames)."""
         # Spec contract item 13: an undecodable byte 0xXX of a name Git lists appears in the JSON
         # the CLI prints as \udcXX, in ASCII JSON. The fix commits a test file whose name is not
         # UTF-8 (odd_name), so the diff check's `paths` carries it. The diff check's note,
@@ -554,6 +558,7 @@ class WorktreeRewrites(unittest.TestCase):
 
 class OperatorCheckout(unittest.TestCase):
     def test_operator_checkout_untouched_by_a_complete_run(self):
+        """Covers bug class 1 (the operator's own checkout)."""
         # A gated three-card run (Codex implementers, the second leaving its work for the
         # runner to stage and commit) never touches the operator's checkout: its HEAD, its
         # index (tags included: an assume-unchanged entry stays one), `status --porcelain

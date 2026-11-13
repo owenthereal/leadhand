@@ -567,6 +567,7 @@ class Start(EngineCase):
         self.assertIn(f"existing run: {second}", w.cli("start", w.deck_path, "--repo", clone).ok().stdout)
 
     def test_start_never_reuses_another_runs_worktree(self):
+        """Covers R26 (as refined later: another run's worktree is never reused)."""
         # docs_dir changed between two same-day runs of the same deck: the second run's
         # directory has the same name, so its default worktree path is the first run's.
         w = FakeSupervisor(self, [card(1)], gates=True)
@@ -634,6 +635,7 @@ class Start(EngineCase):
 
 class Records(EngineCase):
     def test_reply_without_status_blocks_and_keeps_raw(self):
+        """Covers P7."""
         w = FakeSupervisor(self, [card(1)])
         w.start()
         raw = "I changed some things.\nIt went fine, mostly.\n"
@@ -649,6 +651,7 @@ class Records(EngineCase):
         self.assertEqual((retry["action"], retry["dispatch_id"]), ("dispatch", "c1-a1-implement-2"))
 
     def test_turn_limit_reply_is_spent(self):
+        """Covers P7."""
         w = FakeSupervisor(self, [card(1)])
         w.start()
         w.script(1, "implement", {"report": False,
@@ -1368,6 +1371,7 @@ class Paths(EngineCase):
 
 class ClockOffsetHook(EngineCase):
     def test_clock_offset_is_honoured_only_under_leadhand_testing(self):
+        """Covers limit L4 (test hooks need LEADHAND_TESTING=1)."""
         # Observed through the deadline `record started` gives a worker (the CLI's clock plus the
         # dispatch's budget): one fresh run per case, the same card, so the same budget.
         def deadline_lead(**env) -> float:
@@ -1386,6 +1390,35 @@ class ClockOffsetHook(EngineCase):
         ignored = deadline_lead(LEADHAND_TEST_CLOCK_OFFSET="3600", LEADHAND_TESTING="0")
         self.assertAlmostEqual(shifted - plain, 3600, delta=60)
         self.assertAlmostEqual(ignored, plain, delta=60)
+
+
+# --------------------------------------------------------------------------
+# The card-loop-only test mode (LEADHAND_TEST_CARD_LOOP_ONLY)
+
+class CardLoopOnlyHook(EngineCase):
+    def test_card_loop_only_mode_ends_the_run_after_its_cards(self):
+        """Covers R34: with LEADHAND_TEST_CARD_LOOP_ONLY=1 (honoured under LEADHAND_TESTING) the
+        engine stops once the cards are done: `done` with no outcome and no report, and no
+        end-of-run gate. Without it the same deck goes on to the final review."""
+        loop = FakeSupervisor(self, [card(1)])
+        self.assertEqual(loop.env.get("LEADHAND_TEST_CARD_LOOP_ONLY"), "1")
+        loop.start()
+        done = loop.run()[-1]
+        self.assertEqual((done["action"], done["outcome"], done["report"]), ("done", None, None), done)
+        self.assertEqual(done["cards"], [{"card": 1, "state": "accepted", "reason": ""}], done)
+        self.assertEqual(loop.events("outcome"), [])
+        self.assertEqual(loop.run_dispatch_ids(), [])
+        self.assertEqual([e for e in loop.events("dispatch_requested") if e.get("card") is None], [])
+
+        gated = FakeSupervisor(self, [card(1)], gates=True)
+        self.assertNotIn("LEADHAND_TEST_CARD_LOOP_ONLY", gated.env)
+        gated.start()
+        for _ in range(20):
+            a = gated.next()
+            if a["action"] == "dispatch" and a["card"] is None:
+                break
+            gated.act(a)
+        self.assertEqual((a["action"], a["kind"]), ("dispatch", "final_review"), a)
 
 
 if __name__ == "__main__":

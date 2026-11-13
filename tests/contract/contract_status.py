@@ -74,6 +74,33 @@ class Status(unittest.TestCase):
         self.assertTrue(any(l.startswith("Card 5") or l.startswith("5 ") or " 5 " in l for l in lines[2:]))
         self.assertIn("Usage", lines[-1])
 
+    def test_accepted_card_stays_accepted_after_a_late_park(self):
+        """Covers R12: `accepted` is terminal. Once the fast-forward is recorded the card is in,
+        whatever park or unpark comes after it."""
+        w = RunDir(self, cards=1)
+        w.ev("card_cut", card=1, branch="leadhand/demo-2/c1", base="b")
+        w.ev("accept_started", card=1, target="a" * 40)
+        w.ev("parked", card=1, reason="operator")
+        w.ev("accepted", card=1, sha="a" * 40)
+        w.ev("unparked", card=1, note="late")
+        lines = status(w)
+        self.assertEqual(lines[0], "Running · Waiting for the supervisor · 1 of 1 accepted", lines)
+        self.assertTrue(lines[1].startswith("Card 1: Card number 1 · accepted"), lines)
+        self.assertFalse([line for line in lines if "parked" in line], lines)
+
+    def test_park_reason_control_characters_reach_status_unfiltered(self):
+        """Covers limit L7 (terminal escapes): worker text reaches `status` with no
+        control-character filtering, so a park reason's escape sequence and bell are printed as
+        they are, in the attention line and the card line."""
+        reason = "\x1b[31mred\x1b[0m and a bell\x07"
+        w = RunDir(self, cards=1)
+        w.ev("card_cut", card=1, branch="leadhand/demo-2/c1", base="b")
+        w.ev("parked", card=1, reason=reason)
+        lines = status(w)
+        self.assertEqual(lines[0], "Needs your decision on card 1", lines)
+        self.assertTrue(is_unpark_line(lines[1], 1, w.root, reason), lines)
+        self.assertEqual(lines[2], f"Card 1: Card number 1 · parked · {reason}", lines)
+
     def test_ended_run_states(self):
         w = RunDir(self, cards=1)
         w.accept(1)

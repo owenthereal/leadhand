@@ -257,6 +257,8 @@ class Unpark(EngineCase):
         self.assertTrue(on_branch(w, RUN, "src/card1/c1-a1-implement-2.txt"))
 
     def test_unpark_cli_appends_unparked_and_refuses_a_card_not_parked(self):
+        """Covers limit M6 (run forgery): `unpark` has no caller check; any process that can run the CLI can
+        unpark a card of the run."""
         w = FakeSupervisor(self, [card(1)])
         w.start()
         w.next()
@@ -439,6 +441,7 @@ class Violations(EngineCase):
         self.assertFalse(on_branch(w, RUN, "build/out.txt"))
 
     def test_reviewer_committing_on_run_branch_and_returning_to_card_tip_is_violation(self):
+        """Covers R14."""
         def tamper(world, ws, a):
             back = current_branch(ws)
             run_git(ws, "checkout", "--quiet", RUN)
@@ -549,6 +552,7 @@ class Violations(EngineCase):
 
 class OneCardInFlight(EngineCase):
     def test_unpark_while_another_card_is_in_flight_waits(self):
+        """Covers R31 (one card in flight)."""
         # Review repro: unparking card 1 while card 2's review is requested must not interleave.
         w = FakeSupervisor(self, [card(1), card(2)])
         w.start()
@@ -597,6 +601,7 @@ class OneCardInFlight(EngineCase):
 
 class FixRound1(EngineCase):
     def test_repeated_check_violations_park_the_card(self):
+        """Covers R31 (the violation cap)."""
         def tamper(world, ws, a):
             write(ws, {"README.md": f"rewritten by {a['dispatch_id']}\n"})
 
@@ -786,6 +791,7 @@ class FixRound2(EngineCase):
         self.assertEqual(self.assert_run_tip_is_accepted(w, 1), rebased["tip"])
 
     def test_unpark_after_violation_cap_reruns_the_check(self):
+        """Covers R32."""
         def tamper(world, ws, a):
             write(ws, {"README.md": f"rewritten by {a['dispatch_id']}\n"})
 

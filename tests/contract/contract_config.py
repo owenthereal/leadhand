@@ -44,6 +44,7 @@ class ConfigTestCase(unittest.TestCase):
 
 class Config(ConfigTestCase):
     def test_default_preset_matches_spec(self):
+        """Covers C4."""
         w = self.world()
         self.assertEqual(self.route(w, "implementer", "--installed", "claude,codex"),
                          ("codex gpt-6.1-terra high", ["vendor codex: prefer"]))

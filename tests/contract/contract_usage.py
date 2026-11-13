@@ -194,6 +194,7 @@ class ClaudeTranscripts(unittest.TestCase):
     """How a worker's transcript is read: once per message ID, the record with the most output."""
 
     def test_claude_usage_dedupes_by_message_id(self):
+        """Covers P13."""
         w = claude_run(self)
         [c] = charge_worker(w, (FIXTURES / "claude-subagent-duplicates.jsonl").read_text(encoding="utf-8"))
         self.assertEqual(tokens(c), (130, 1500, 250, 300, 130))
@@ -282,6 +283,7 @@ class ClaudeCharges(unittest.TestCase):
         self.assertEqual(attempt["usage"], c["usage"])
 
     def test_charge_tops_up_message_charged_mid_stream(self):
+        """Covers R17."""
         w = claude_run(self)
         c1, c2, c3 = charge_worker(w, text(claude_line("m1", 5, inp=100, cached=1000, w5=50)),
                                    text(claude_line("m1", 40, inp=100, cached=1000, w5=50),
@@ -589,6 +591,7 @@ class CodexCharges(unittest.TestCase):
         self.assertEqual(summed([c1, c2, c3])[0], 250)
 
     def test_codex_stream_fallback_charged_when_session_missing(self):
+        """Covers R22."""
         w = World(self)
         c = codex_charge(w, "d1", "99999999-9999-4999-8999-999999999999", turn_completed(100, 30, 25, 8))
         self.assertEqual(c["source"], "codex-stream")
@@ -644,6 +647,7 @@ class CodexRollout(unittest.TestCase):
     the token_usage_records sum to 39938."""
 
     def test_rollout_charges_every_response_not_the_token_count_total(self):
+        """Covers P12."""
         w = World(self)
         place_rollout(w, THREAD, fixture_lines(ROLLOUT))
         c = codex_charge(w, "d1", THREAD, STREAM_TURN)

@@ -106,6 +106,7 @@ class Route(RouteTestCase):
         self.assertIn("profile thorough: +1", reasons)
 
     def test_pin_wins_for_first_two_attempts(self):
+        """Covers R11: a pinned xhigh stays xhigh at attempt 2; a pinned max is kept, never created."""
         pinned = self.deck(pin="claude opus xhigh")
         key, reasons = self.r(deck=pinned)
         self.assertEqual(key, ("claude", "opus", "xhigh"))

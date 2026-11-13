@@ -680,6 +680,7 @@ class Crashes(unittest.TestCase):
 
 class FixRound2(unittest.TestCase):
     def test_spent_final_fix_is_not_rechecked_after_a_card_accept_crash(self):
+        """Covers R37."""
         w = FakeSupervisor(self, [card(1), card(2)], gates=True)
         w.start()
         w.script(1, "implement", {"status": "QUESTION"})
@@ -755,6 +756,7 @@ class FixRound2(unittest.TestCase):
         self.assertNotIn("cache.o", seen["files"])
 
     def test_voided_final_fix_reruns_from_the_run_head(self):
+        """Covers R36."""
         w = FakeSupervisor(self, [card(1)], gates=True)
         w.start()
         w.script(None, "final_review", {"verdict": "defects"})

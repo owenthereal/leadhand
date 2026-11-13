@@ -265,6 +265,7 @@ class Reconcile(unittest.TestCase):
         self.assertEqual(w.dispatch_ids(), ["c1-a1-implement-1", "c1-a1-continue-1", "c1-a1-review-1"])
 
     def test_nothing_on_the_branch_requests_the_same_attempt_again(self):
+        """Covers P9: a Claude worker without a recorded result counts as interrupted."""
         w = FakeSupervisor(self, [card(1)])
         w.session("supervisor-1")
         w.start()
@@ -987,6 +988,7 @@ class RunnerHelpers(unittest.TestCase):
         return p
 
     def test_stop_strays_stops_what_a_dead_runner_left_and_leaves_a_live_runner_alone(self):
+        """Covers P14."""
         w = codex_world(self, [card(1, route=CODEX_CARD)])
         w.session("supervisor-1")
         w.start()
@@ -1229,6 +1231,7 @@ class EveryCrashPoint(unittest.TestCase):
             shutil.rmtree(w.tmp, ignore_errors=True)
 
     def test_restart_from_every_crash_point_reaches_same_final_state(self):
+        """Covers bug class 7 (crash windows)."""
         ref = self.stable_world()
         log = ref.tmp / "crash points.txt"
         ref.env["LEADHAND_CRASH_LOG"] = str(log)
@@ -1368,6 +1371,7 @@ class ResumeAfterBlocked(unittest.TestCase):
 
 class RunCollisions(unittest.TestCase):
     def test_start_returns_a_blocked_run_as_existing(self):
+        """Covers R25."""
         w = FakeSupervisor(self, card_list())
         first = w.start()
         w.script(1, "implement", {"status": "BLOCKED", "blocked_by": "usage limit"})
@@ -1377,6 +1381,7 @@ class RunCollisions(unittest.TestCase):
         self.assertIn(f"existing run: {first}", r.stdout)
 
     def test_new_run_suffixes_a_branch_owned_by_another_run(self):
+        """Covers R26 (as refined later: another run's branch is suffixed, never reused)."""
         w = FakeSupervisor(self, card_list())
         first = w.start()
         first_meta = read_json(first / "run.json")
@@ -1580,6 +1585,7 @@ class Untested(unittest.TestCase):
 
 class CrashProtocol(unittest.TestCase):
     def test_a_crash_point_exits_97_only_when_testing_and_named(self):
+        """Covers limit L4 (test hooks need LEADHAND_TESTING=1)."""
         # `record result` passes before_result_record. It exits 97 there, recording nothing, only
         # under LEADHAND_TESTING=1 with LEADHAND_CRASH_AT naming that point.
         cases = (({"LEADHAND_TESTING": "1", "LEADHAND_CRASH_AT": "before_result_record"}, 97),

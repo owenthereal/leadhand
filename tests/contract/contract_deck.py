@@ -8,8 +8,8 @@ import unittest
 
 from pathlib import Path
 
-from gitfixture import commit, make_repo
-from harness import ROOT, hermetic_env, run_cli, temp_root
+from gitfixture import commit, make_repo, run_git
+from harness import ROOT, hermetic_env, read_json, run_cli, temp_root
 from supervisor import FakeSupervisor, card
 
 FIXTURE = ROOT / "tests" / "fixtures" / "deck-basic.md"
@@ -113,6 +113,7 @@ class Deck(DeckTestCase):
         self.assertIn("pinned: codex gpt-6.1-sol xhigh", lines[1:], r)
 
     def test_unknown_key_bullet_warns(self):
+        """Covers R10."""
         text = deck_text([(1, "implementer", "no", "none")]) + "\n- Dependson: 2\n- Files: src/a.py\n"
         p = self.write(text)
         base = len(text.splitlines()) - 1
@@ -181,6 +182,23 @@ class Deck(DeckTestCase):
         self.assertTrue(any(l == "error" and "base commit" in m for l, m in self.messages(self.write(bad), repo)))
         gone = good.replace("Allowed paths: src/", "Allowed paths: nope/")
         self.assertTrue(any(l == "warning" and "nope/" in m for l, m in self.messages(self.write(gone), repo)))
+
+    def test_compact_header_line_parses(self):
+        """Covers C5: the spec's deck example puts `Base:` and `Branch:` on one line; a known
+        header key after two or more spaces starts a new field. `check` finds no error and
+        `start` takes the base and the run branch from that line."""
+        repo, sha = self.make_repo()
+        text = deck_text([(1, "implementer", "no", "none")]).replace(
+            "Base: main @ abc1234\nBranch: b\n", f"Base: main @ {sha}  Branch: leadhand/compact\n")
+        deck = self.write(text)
+        r = self.check(deck, repo)
+        self.assertEqual(r.code, 0, r)
+        self.assertEqual([m for level, m in problems(r) if level == "error"], [], r)
+        r = run_cli("start", deck, "--repo", repo, env=self.env, cwd=self.tmp).ok()
+        run_dir = Path(next(line for line in r.stdout.splitlines() if line.startswith("run: "))[len("run: "):])
+        meta = read_json(run_dir / "run.json")
+        self.assertEqual((meta["base_ref"], meta["base_sha"], meta["branch"]), ("main", sha, "leadhand/compact"))
+        self.assertEqual(run_git(repo, "rev-parse", "refs/heads/leadhand/compact"), sha)
 
     def test_check_cli_exits_1_on_error(self):
         repo, sha = self.make_repo()

@@ -263,6 +263,7 @@ class CodexCommandLine(unittest.TestCase):
         return w.records("start")[-1]["argv"]
 
     def test_argv_passes_network_false_explicitly(self):
+        """Covers P6."""
         w = World(self)
         w.scenario("ready")
         argv = self.argv_of(w)
@@ -362,6 +363,7 @@ class CodexCommandLine(unittest.TestCase):
         self.assertEqual(w.records("start"), [])         # Codex never started
 
     def test_resume_argv_matches_findings(self):
+        """Covers P11."""
         w = World(self)
         w.scenario("ready")
         w.dispatch("d1").ok()
@@ -423,6 +425,7 @@ class Results(unittest.TestCase):
         self.assertEqual(w.attempts()[0]["status"], "BLOCKED")
 
     def test_step_limit_stops_process_and_marks_spent(self):
+        """Covers P6 (steps are counted on item.completed)."""
         w = World(self)
         w.set_limits("implementer", steps=3)
         w.scenario("many-steps")
@@ -532,6 +535,7 @@ class RunnerLifecycle(unittest.TestCase):
     the exit codes (0 with the reply; 1 with `error: `; 3 for a second runner)."""
 
     def test_runner_survives_foreground_death_and_records_result(self):
+        """Covers P10."""
         w = World(self)
         w.scenario("ready", delay=2)
         fg = w.popen()
@@ -579,6 +583,7 @@ class RunnerLifecycle(unittest.TestCase):
         self.assertEqual(len(w.records("start")), 1)
 
     def test_foreground_wait_ends_with_exit_75_and_the_still_running_line(self):
+        """Covers R20."""
         # Waits the real 540 s FOREGROUND_WAIT: no test hook shortens it (ruling S1-R12).
         w = World(self)
         w.scenario("ready", delay=600)          # Codex outlasts the foreground wait
@@ -711,6 +716,7 @@ class Cancellation(unittest.TestCase):
     """`stop-dispatch`, a cancel request, and a hung runner's replacement."""
 
     def test_signal_only_after_pid_and_start_time_match(self):
+        """Covers bug class 4 (ownership by identity: pid and start time)."""
         w = World(self)
         decoy = w.decoy()
         wrong = {"pid": decoy.pid, "pgid": decoy.pid, "start": harness._start_time(decoy.pid) + "-not"}
@@ -735,6 +741,7 @@ class Cancellation(unittest.TestCase):
         self.assertIsNone(decoy.poll())
 
     def test_cancel_detached_worker_stops_every_process_and_writes_nothing_after(self):
+        """Covers bug class 6 (process lifetime) and P10."""
         w = World(self)
         w.scenario("slow")
         codex = w.start_detached()
@@ -819,6 +826,7 @@ class ProcessControl(unittest.TestCase):
         self.assertEqual(len(w.attempts()), 1)
 
     def test_double_forked_child_is_stopped_before_finalizing(self):
+        """Covers R51 and limit M4."""
         # Codex review round 1 (M4): a process that leaves Codex's tree (double fork, new session)
         # just before Codex exits is found by the dispatch tag in its environment and stopped
         # before the result is written.
@@ -1072,6 +1080,7 @@ class RunnerCommits(unittest.TestCase):
         self.assertFalse(w.attempts()[0]["possibly_incomplete"])
 
     def test_wrong_branch_is_not_committed(self):
+        """Covers R40."""
         w = self.w
         req = self.commit_request()
         w.git("checkout", "--quiet", "-b", "somewhere-else")
