@@ -15,6 +15,8 @@ diff-check` with the flags the run skill uses (a result through the dispatch's `
   or on for another implementer kind such as answer).
 
 A step's `tamper(world, ws, action)` runs inside the worker before its report is written.
+A Claude worker's step may give `transcript`: the text its transcript gets in place of the one
+usage record a worker appends by default (None: the worker writes no transcript at all).
 
 Steps are scripted per (card, kind), as in FakeWorld: run-level dispatches have card None, and
 (None, "fix_review") is the review of a fix wave. By default the run is the card loop only
@@ -285,7 +287,13 @@ class FakeSupervisor:
         if step.get("report", True):
             report.parent.mkdir(parents=True, exist_ok=True)
             report.write_text(text, encoding="utf-8")
-        self._append_message(self.subagent_transcript(worker), "claude-sonnet-4")
+        if "transcript" not in step:
+            self._append_message(self.subagent_transcript(worker), "claude-sonnet-4")
+        elif step["transcript"] is not None:
+            path = self.subagent_transcript(worker)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(step["transcript"])
         return step.get("reply") or f"{text.splitlines()[0]}\nReport: {report}"
 
     def work_label(self, a: dict) -> str:

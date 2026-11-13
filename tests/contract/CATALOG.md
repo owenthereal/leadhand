@@ -160,3 +160,57 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_dispatch.py::RunnerCommitTests::test_operation_in_progress_is_not_committed | contract_dispatch.RunnerCommits.test_operation_in_progress_is_not_committed |
 | test_dispatch.py::RunnerCommitTests::test_check_dispatch_is_not_committed | contract_dispatch.RunnerCommits.test_check_dispatch_is_not_committed |
 | test_dispatch.py::RunnerCommitTests::test_cli_passes_kind_and_branch | contract_dispatch.RunnerCommits.test_cli_passes_kind_and_branch |
+| test_worker_env.py::WorkerEnvTests::test_worker_env_removes_tokens_and_sets_empty_gh_config | contract_worker_env.WorkerEnvironment.test_worker_env_removes_tokens_and_sets_empty_gh_config |
+| test_worker_env.py::WorkerEnvTests::test_existing_git_config_env_entries_preserved | contract_worker_env.WorkerEnvironment.test_existing_git_config_env_entries_preserved |
+| test_worker_env.py::WorkerEnvTests::test_ssh_push_fails_for_ssh_scp_and_explicit_pushurl | contract_worker_env.WorkerEnvironment.test_ssh_push_fails_for_ssh_scp_and_explicit_pushurl |
+| test_worker_env.py::WorkerEnvTests::test_https_push_without_credentials_fails_without_prompting | contract_worker_env.WorkerEnvironment.test_https_push_without_credentials_fails_without_prompting |
+| test_worker_env.py::WorkerEnvTests::test_configured_askpass_is_not_run | contract_worker_env.WorkerEnvironment.test_configured_askpass_is_not_run; contract_worker_env.WorkerEnvironment.test_existing_git_config_parameters_kept_and_askpass_cleared |
+| test_worker_env.py::WorkerEnvTests::test_gh_reports_no_login_with_parent_token | contract_worker_env.WorkerEnvironment.test_gh_reports_no_login_with_parent_token |
+| test_worker_env.py::WorkerEnvTests::test_local_path_push_still_allowed | contract_worker_env.WorkerEnvironment.test_local_path_push_still_allowed |
+| test_usage.py::ArithmeticTests::test_add_sums_fields_and_known_is_conjunction | internal: Rust unit test (usage) |
+| test_usage.py::ArithmeticTests::test_subtract_is_field_wise_and_floored_at_zero | internal: Rust unit test (usage) |
+| test_usage.py::ArithmeticTests::test_estimate_cost_opus_matches_recorded_session | contract_usage.Pricing.test_estimate_cost_opus_matches_recorded_session |
+| test_usage.py::ArithmeticTests::test_estimate_cost_unpriced_model_is_none | contract_usage.Pricing.test_estimate_cost_unpriced_model_is_none; contract_usage.CodexCharges.test_codex_cumulative_takes_last_token_count_and_maps_fields |
+| test_usage.py::LocatorTests::test_claude_transcript_locators | contract_usage.Locators.test_claude_transcript_locators; contract_usage.Locators.test_wildcard_worker_id_finds_no_transcript |
+| test_usage.py::LocatorTests::test_missing_projects_dir_is_none | contract_usage.Locators.test_missing_projects_dir_is_none |
+| test_usage.py::ClaudeUsageTests::test_claude_usage_dedupes_by_message_id | contract_usage.ClaudeTranscripts.test_claude_usage_dedupes_by_message_id |
+| test_usage.py::ClaudeUsageTests::test_claude_usage_skips_excluded_ids | contract_usage.ClaudeTranscripts.test_claude_usage_skips_messages_already_charged |
+| test_usage.py::ClaudeUsageTests::test_claude_usage_ignores_partial_and_garbage_lines | contract_usage.ClaudeTranscripts.test_claude_usage_ignores_partial_and_garbage_lines |
+| test_usage.py::ChargeClaudeTests::test_charge_claude_resumed_worker_counts_each_message_once | contract_usage.ClaudeCharges.test_charge_claude_resumed_worker_counts_each_message_once |
+| test_usage.py::ChargeClaudeTests::test_charge_record_is_durable_and_round_trips | contract_usage.ClaudeCharges.test_charge_record_is_durable_and_round_trips |
+| test_usage.py::ChargeClaudeTests::test_charge_tops_up_message_charged_mid_stream | contract_usage.ClaudeCharges.test_charge_tops_up_message_charged_mid_stream |
+| test_usage.py::ChargeClaudeTests::test_charge_none_path_is_unknown_and_relative_path_is_rejected | contract_usage.ClaudeCharges.test_charge_missing_file_is_unknown_and_moves_no_checkpoint; contract_usage.CodexCharges.test_charge_none_thread_is_unknown |
+| test_usage.py::ChargeClaudeTests::test_repeated_charge_id_is_harmless | contract_usage.ClaudeCharges.test_repeated_charge_id_is_harmless; contract_usage.CodexCharges.test_runner_crash_after_charge_keeps_the_charge |
+| test_usage.py::ChargeClaudeTests::test_charge_missing_file_is_unknown_and_moves_no_checkpoint | contract_usage.ClaudeCharges.test_charge_missing_file_is_unknown_and_moves_no_checkpoint; contract_usage.CodexCharges.test_codex_cumulative_unknown_when_missing_or_without_token_count |
+| test_usage.py::ChargeClaudeTests::test_totals_group_by_role_dispatch_and_source | contract_usage.ClaudeCharges.test_totals_group_by_role_dispatch_and_source |
+| test_usage.py::CodexTests::test_codex_cumulative_takes_last_token_count_and_maps_fields | contract_usage.CodexCharges.test_codex_cumulative_takes_last_token_count_and_maps_fields |
+| test_usage.py::CodexTests::test_codex_cumulative_unknown_when_missing_or_without_token_count | contract_usage.CodexCharges.test_codex_cumulative_unknown_when_missing_or_without_token_count |
+| test_usage.py::CodexTests::test_charge_codex_cumulative_deltas | contract_usage.CodexCharges.test_charge_codex_cumulative_deltas |
+| test_usage.py::CodexTests::test_codex_stream_fallback_charged_when_session_missing | contract_usage.CodexCharges.test_codex_stream_fallback_charged_when_session_missing |
+| test_usage.py::CodexTests::test_codex_stream_usage_sums_turn_completed | contract_usage.CodexCharges.test_codex_stream_usage_sums_turn_completed |
+| test_usage.py::CodexRolloutFixtureTests::test_rollout_charges_every_response_not_the_token_count_total | contract_usage.CodexRollout.test_rollout_charges_every_response_not_the_token_count_total |
+| test_usage.py::CodexRolloutFixtureTests::test_rollout_charged_twice_charges_nothing_new | contract_usage.CodexRollout.test_rollout_charged_twice_charges_nothing_new |
+| test_usage.py::CodexRolloutFixtureTests::test_rollout_truncated_before_resume_charges_only_the_killed_turn | contract_usage.CodexRollout.test_rollout_truncated_before_resume_charges_only_the_killed_turn |
+| test_usage.py::CodexRolloutFixtureTests::test_rollout_repeated_response_id_counts_once | contract_usage.CodexRollout.test_rollout_repeated_response_id_counts_once |
+| test_usage.py::CodexRolloutFixtureTests::test_rollout_thread_total_mismatch_is_recorded_not_fatal | contract_usage.CodexRollout.test_rollout_thread_total_mismatch_is_recorded_not_fatal |
+| test_usage.py::CodexRolloutFixtureTests::test_possibly_incomplete_flag_is_recorded_on_the_charge | contract_usage.CodexRollout.test_possibly_incomplete_flag_is_recorded_on_the_charge |
+| test_usage.py::CodexRolloutFixtureTests::test_rollout_without_any_usable_record_is_unknown | contract_usage.CodexRollout.test_rollout_without_any_usable_record_is_unknown |
+| test_usage.py::CodexRolloutFixtureTests::test_token_count_is_only_a_fallback_for_a_rollout_without_records | contract_usage.CodexRollout.test_token_count_is_only_a_fallback_for_a_rollout_without_records |
+| test_usage.py::CodexStreamFixtureTests::test_stream_usage_sums_turn_completed | contract_usage.CodexStream.test_stream_usage_sums_turn_completed |
+| test_usage.py::CodexStreamFixtureTests::test_stream_cache_write_tokens_are_kept_as_five_minute_writes | contract_usage.CodexStream.test_stream_cache_write_tokens_are_kept_as_five_minute_writes |
+| test_usage.py::ClaudeFixtureTests::test_stopped_transcript_charges_its_one_message_once | contract_usage.ClaudeTranscripts.test_stopped_transcript_charges_its_one_message_once |
+| test_usage.py::ClaudeFixtureTests::test_resumed_transcript_charges_each_message_once | contract_usage.ClaudeTranscripts.test_resumed_transcript_charges_each_message_once |
+| test_usage.py::ClaudeFixtureTests::test_resumed_file_growth_is_charged_once | contract_usage.ClaudeTranscripts.test_resumed_file_growth_is_charged_once |
+| test_usage.py::CrashAndConcurrencyTests::test_crash_after_charge_before_attempt_keeps_exact_total | contract_usage.ClaudeCharges.test_crash_after_charge_before_attempt_keeps_exact_total |
+| test_usage.py::CrashAndConcurrencyTests::test_concurrent_supervisor_and_runner_charges_keep_exact_totals | contract_usage.Concurrency.test_concurrent_supervisor_and_runner_charges_keep_exact_totals |
+| test_usage_models.py::PerModel::test_mixed_batch_is_priced_per_model | contract_usage.Pricing.test_mixed_batch_is_priced_per_model |
+| test_usage_models.py::PerModel::test_single_model_and_empty_synthetic_records_stay_single | contract_usage.Pricing.test_single_model_and_empty_synthetic_records_stay_single |
+| test_usage_models.py::PerModel::test_unpriced_part_makes_the_estimate_unknown | contract_usage.Pricing.test_unpriced_part_makes_the_estimate_unknown |
+| test_usage_models.py::PerModel::test_charge_keeps_the_per_model_parts | contract_usage.Pricing.test_charge_keeps_the_per_model_parts |
+| test_procs.py::ProcsTests::test_own_process_info | internal: Rust unit test (procs) |
+| test_procs.py::ProcsTests::test_start_time_is_stable_and_differs_between_processes | internal: Rust unit test (procs) |
+| test_procs.py::ProcsTests::test_child_in_new_session_has_own_group_and_is_a_descendant | internal: Rust unit test (procs) |
+| test_procs.py::ProcsTests::test_same_process_checks_start_time_and_zombies | internal: Rust unit test (procs) |
+| test_procs.py::ProcsTests::test_ps_fallback_parses_lstart_with_spaces | internal: Rust unit test (procs) |
+| test_procs.py::ProcsTests::test_tagged_processes_finds_a_process_by_an_environment_entry | internal: Rust unit test (procs) |
+| test_procs.py::ProcsTests::test_missing_pid | internal: Rust unit test (procs) |
