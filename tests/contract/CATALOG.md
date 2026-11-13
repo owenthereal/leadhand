@@ -121,7 +121,7 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_dispatch.py::OwnershipTests::test_runner_survives_foreground_death_and_records_result | contract_dispatch.RunnerLifecycle.test_runner_survives_foreground_death_and_records_result |
 | test_dispatch.py::OwnershipTests::test_second_dispatch_attaches_to_live_runner | contract_dispatch.RunnerLifecycle.test_second_dispatch_attaches_to_live_runner |
 | test_dispatch.py::OwnershipTests::test_repeated_dispatch_returns_existing_result | contract_dispatch.RunnerLifecycle.test_repeated_dispatch_returns_existing_result |
-| test_dispatch.py::OwnershipTests::test_cli_prints_reply_and_session_or_still_running | contract_dispatch.RunnerLifecycle.test_cli_prints_reply_and_session_or_still_running |
+| test_dispatch.py::OwnershipTests::test_cli_prints_reply_and_session_or_still_running | contract_dispatch.RunnerLifecycle.test_cli_prints_reply_and_session_or_still_running; contract_dispatch.RunnerLifecycle.test_foreground_wait_ends_with_exit_75_and_the_still_running_line |
 | test_dispatch.py::CancelTests::test_signal_only_after_pid_and_start_time_match | contract_dispatch.Cancellation.test_signal_only_after_pid_and_start_time_match |
 | test_dispatch.py::CancelTests::test_cancel_detached_worker_stops_every_process_and_writes_nothing_after | contract_dispatch.Cancellation.test_cancel_detached_worker_stops_every_process_and_writes_nothing_after |
 | test_dispatch.py::CancelTests::test_stale_heartbeat_on_live_runner_is_cancelled_not_replaced_alongside | contract_dispatch.Cancellation.test_stale_heartbeat_on_live_runner_is_cancelled_not_replaced_alongside |

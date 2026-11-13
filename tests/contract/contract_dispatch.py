@@ -178,8 +178,8 @@ class World:
 
     # -- commands -------------------------------------------------------------
 
-    def dispatch(self, did="d1", **request) -> harness.Result:
-        return run_cli(*self.args(did, **request), env=self.env, cwd=self.tmp)
+    def dispatch(self, did="d1", *, timeout: float = 120.0, **request) -> harness.Result:
+        return run_cli(*self.args(did, **request), env=self.env, cwd=self.tmp, timeout=timeout)
 
     def popen(self, did="d1", **request) -> subprocess.Popen:
         """The `dispatch` line in the background, in its own process group; cleanup kills it."""
@@ -557,8 +557,8 @@ class RunnerLifecycle(unittest.TestCase):
         self.assertEqual(len(w.attempts()), 1)
 
     def test_cli_prints_reply_and_session_or_still_running(self):
-        # The first call is left before its runner finishes. (Its exit 75 and `still running` line
-        # come only after the foreground's 540 s wait, which a black-box test cannot shorten.)
+        # The first call is left before its runner finishes. (Its exit 75 and `still running` line,
+        # after the foreground's 540 s wait, are test_foreground_wait_ends_with_exit_75_….)
         w = World(self)
         w.scenario("ready", delay=1)
         w.start_detached()
@@ -566,6 +566,19 @@ class RunnerLifecycle(unittest.TestCase):
         lines = r.stdout.splitlines()
         self.assertEqual(lines[0], "Status: READY")
         self.assertEqual(lines[-1], f"session: {DEFAULT_THREAD}")
+        self.assertEqual(len(w.records("start")), 1)
+
+    def test_foreground_wait_ends_with_exit_75_and_the_still_running_line(self):
+        # Waits the real 540 s FOREGROUND_WAIT: no test hook shortens it (ruling S1-R12).
+        w = World(self)
+        w.scenario("ready", delay=600)          # Codex outlasts the foreground wait
+        r = w.dispatch(timeout=700)
+        self.assertEqual(r.code, 75, r)
+        self.assertEqual(r.stdout.splitlines(), ["still running: run the same command again (dispatch d1)"])
+        self.assertFalse((w.wd() / "result.json").exists())
+        runner = w.runner_json()
+        self.assertTrue(alive(runner["runner"]))
+        self.assertTrue(alive(runner["codex"]))
         self.assertEqual(len(w.records("start")), 1)
 
     def test_concurrent_dispatches_start_one_runner(self):
