@@ -531,8 +531,9 @@ class WorktreeRewrites(unittest.TestCase):
         # (odd_name) leaves the run's worktree with that file missing, so the check before the
         # review finds a violation. Its `paths` is written to events.jsonl as \udcff in an
         # ASCII line, and a later reader (`status`) reads it back. Whether the worktree can then
-        # be restored depends on the file system (APFS refuses the name), so that `next`'s
-        # outcome is not asserted.
+        # be restored depends on the file system (APFS refuses the name; ext4 accepts it and a
+        # second violation line, stage restored, follows), so that `next`'s outcome is not
+        # asserted and the found line is selected by its stage.
         w = FakeSupervisor(self, [card(1)])
         w.start()
         w.script(1, "implement", {"tamper": odd_name})
@@ -544,7 +545,8 @@ class WorktreeRewrites(unittest.TestCase):
         self.assertIn(ODD_NAME, run_git_bytes(w.repo, "ls-tree", "-r", "--name-only", "-z", f"refs/heads/{CARD1}"))
         run_git(w.repo, "rev-parse", "--verify", "--quiet", v["ref"])
         raw = (w.run_dir / "events.jsonl").read_text(encoding="utf-8")
-        (line,) = [line for line in raw.splitlines() if '"kind":"violation"' in line]
+        (line,) = [line for line in raw.splitlines()
+                   if '"kind":"violation"' in line and json.loads(line).get("stage") == "found"]
         self.assertTrue(line.isascii(), line)
         self.assertIn('"paths":["tests/notes-\\udcff.txt"]', line)
         st = w.cli("status", w.run_dir)

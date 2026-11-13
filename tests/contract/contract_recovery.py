@@ -1140,7 +1140,7 @@ def crash_child(w: StableSupervisor, point: str, skip: int, counter: Path, info:
     except OSError:
         pass                                     # the child already did (or is gone)
     with open(info, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"drive_pgid": pid}) + "\n")
+        f.write(json.dumps({"drive_pgid": pid, "drive_start": harness._start_time(pid)}) + "\n")
     end = time.monotonic() + 180
     while True:
         done, status_ = os.waitpid(pid, os.WNOHANG)
@@ -1161,10 +1161,12 @@ def crash_child(w: StableSupervisor, point: str, skip: int, counter: Path, info:
 
 def kill_world(info: Path) -> None:
     """Clean up after a crash-matrix worker killed at its deadline: the drive's group, every
-    process its run records, the fake Codex's tool children, then its temporary root."""
+    process its run records, the fake Codex's tool children, then its temporary root. The
+    group is killed only while its leader is still the drive recorded: it was usually reaped
+    long before, and its pid may since name an unrelated group."""
     records = read_jsonl(info) if info.exists() else []
     merged = {k: v for rec in records for k, v in rec.items()}
-    if merged.get("drive_pgid"):
+    if same_process(merged.get("drive_pgid"), merged.get("drive_start")):
         try:
             os.killpg(merged["drive_pgid"], signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
