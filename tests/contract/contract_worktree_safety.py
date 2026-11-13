@@ -17,6 +17,7 @@ a lowercase tag, skip-worktree `S`), `core.sparseCheckout`, the files under a fo
 pointed elsewhere, and the operator's own checkout. The binary's events are asserted beside
 that, never as the only evidence.
 """
+import json
 import os
 import subprocess
 import unittest
@@ -33,6 +34,22 @@ RUN = "leadhand/demo"
 CARD1 = "leadhand/demo--card-1"
 CARD1_FILE = "src/card1/c1-a1-implement-1.txt"
 SPARSE_REFUSAL = "sparse checkouts are not supported"
+
+
+ODD_NAME = b"tests/notes-\xff.txt"          # not UTF-8
+
+
+def odd_name(world, ws, a):
+    """A worker's tamper: commit ODD_NAME through Git's index alone (the file system here may
+    refuse such a name), so the file is in the commit but not in the worktree."""
+    notes = world.tmp / "notes blob.txt"
+    notes.write_text("notes\n", encoding="utf-8")
+    env = dict(os.environ)
+    blob = subprocess.run(["git", "hash-object", "-w", str(notes)], cwd=ws, env=env, check=True,
+                          capture_output=True, timeout=60).stdout.strip()
+    for argv in ([b"git", b"update-index", b"--add", b"--cacheinfo", b"100644," + blob + b"," + ODD_NAME],
+                 [b"git", *(x.encode() for x in IDENTITY), b"commit", b"--quiet", b"-m", b"odd name"]):
+        subprocess.run(argv, cwd=ws, env=env, check=True, capture_output=True, timeout=60)
 
 
 def found(w: FakeSupervisor, by: str = "check") -> list[dict]:
@@ -476,20 +493,9 @@ class WorktreeRewrites(unittest.TestCase):
     def test_json_output_escapes_undecodable_names(self):
         # Spec contract item 13: an undecodable byte 0xXX of a name Git lists appears in the JSON
         # the CLI prints as \udcXX, in ASCII JSON. The fix commits a test file whose name is not
-        # UTF-8 (through Git's index alone: the file system here may refuse such a name), so the
-        # diff check's `paths` carries it.
-        name = b"tests/notes-\xff.txt"
-
-        def odd_name(world, ws, a):
-            notes = world.tmp / "notes blob.txt"
-            notes.write_text("notes\n", encoding="utf-8")
-            env = dict(os.environ)
-            blob = subprocess.run(["git", "hash-object", "-w", str(notes)], cwd=ws, env=env, check=True,
-                                  capture_output=True, timeout=60).stdout.strip()
-            for argv in ([b"git", b"update-index", b"--add", b"--cacheinfo", b"100644," + blob + b"," + name],
-                         [b"git", *(x.encode() for x in IDENTITY), b"commit", b"--quiet", b"-m", b"odd name"]):
-                subprocess.run(argv, cwd=ws, env=env, check=True, capture_output=True, timeout=60)
-
+        # UTF-8 (odd_name), so the diff check's `paths` carries it. The diff check's note,
+        # non-ASCII text, goes the other way: `record` prints it, and writes it to events.jsonl,
+        # as ASCII JSON escapes that parse back to the same text.
         w = FakeSupervisor(self, [card(1)])
         w.start()
         w.script(1, "review", {"verdict": "defects", "findings": ["[medium] tests/test_widget.py — weak — assert more"]})
@@ -503,8 +509,44 @@ class WorktreeRewrites(unittest.TestCase):
         self.assertEqual((a["action"], a["dispatch_id"]), ("check_diff", "c1-a1-fix-1"))
         self.assertTrue(r.stdout.isascii(), r)
         self.assertIn('"tests/notes-\\udcff.txt"', r.stdout)
-        self.assertEqual(sorted(a["paths"]), sorted([name.decode("utf-8", "surrogateescape"), "tests/test_widget.py"]))
-        self.assertIn(name, run_git_bytes(w.repo, "ls-tree", "-r", "--name-only", "-z", f"refs/heads/{CARD1}"))
+        self.assertEqual(sorted(a["paths"]), sorted([ODD_NAME.decode("utf-8", "surrogateescape"),
+                                                     "tests/test_widget.py"]))
+        self.assertIn(ODD_NAME, run_git_bytes(w.repo, "ls-tree", "-r", "--name-only", "-z", f"refs/heads/{CARD1}"))
+
+        note = "café — the test-only fix looks right"
+        r = w.cli("record", w.run_dir, "diff-check", "--card", "1", "--ok", "yes", "--note", note).ok()
+        self.assertTrue(r.stdout.isascii(), r)
+        self.assertEqual((r.json()["kind"], r.json()["note"]), ("diff_checked", note), r)
+        raw = (w.run_dir / "events.jsonl").read_text(encoding="utf-8")
+        (line,) = [line for line in raw.splitlines() if '"kind":"diff_checked"' in line]
+        self.assertTrue(line.isascii(), line)
+        self.assertEqual(json.loads(line)["note"], note)
+
+    def test_events_jsonl_keeps_undecodable_names_as_escapes(self):
+        # Spec contract item 13, on disk: an implementer that commits a name that is not UTF-8
+        # (odd_name) leaves the run's worktree with that file missing, so the check before the
+        # review finds a violation. Its `paths` is written to events.jsonl as \udcff in an
+        # ASCII line, and a later reader (`status`) reads it back. Whether the worktree can then
+        # be restored depends on the file system (APFS refuses the name), so that `next`'s
+        # outcome is not asserted.
+        w = FakeSupervisor(self, [card(1)])
+        w.start()
+        w.script(1, "implement", {"tamper": odd_name})
+        w.act(w.next())
+        w.cli("next", w.run_dir)                 # the check before the review
+        (v,) = found(w, by="implementer")
+        self.assertEqual(v["paths"], [ODD_NAME.decode("utf-8", "surrogateescape")])
+        self.assertEqual(v["why"], "before review c1-a1-review-1")
+        self.assertIn(ODD_NAME, run_git_bytes(w.repo, "ls-tree", "-r", "--name-only", "-z", f"refs/heads/{CARD1}"))
+        run_git(w.repo, "rev-parse", "--verify", "--quiet", v["ref"])
+        raw = (w.run_dir / "events.jsonl").read_text(encoding="utf-8")
+        (line,) = [line for line in raw.splitlines() if '"kind":"violation"' in line]
+        self.assertTrue(line.isascii(), line)
+        self.assertIn('"paths":["tests/notes-\\udcff.txt"]', line)
+        st = w.cli("status", w.run_dir)
+        self.assertEqual(st.code, 0, st)
+        self.assertIn(f"Violation by a implementer worker (dispatch unknown): its changes were preserved at "
+                      f"{v['ref']} — next: inspect {v['ref']}", st.stdout.splitlines(), st)
 
 
 # --------------------------------------------------------------------------

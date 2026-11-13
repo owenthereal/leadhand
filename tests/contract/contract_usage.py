@@ -813,6 +813,12 @@ class Concurrency(unittest.TestCase):
         raw = w.run_dir.joinpath("charges.jsonl").read_text(encoding="utf-8")
         self.assertTrue(raw.endswith("\n"))
         self.assertEqual(len(raw.splitlines()), len(read_jsonl(w.run_dir / "charges.jsonl")))
+        # and so does events.jsonl, its seqs 1..N in file order: one counter, under the lock
+        raw = w.run_dir.joinpath("events.jsonl").read_text(encoding="utf-8")
+        self.assertTrue(raw.endswith("\n"))
+        seqs = [e["seq"] for e in read_jsonl(w.run_dir / "events.jsonl")]
+        self.assertEqual(len(raw.splitlines()), len(seqs))
+        self.assertEqual(seqs, list(range(1, len(seqs) + 1)))
 
 
 if __name__ == "__main__":

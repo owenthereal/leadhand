@@ -6,14 +6,19 @@ Converted from tests/test_status.py. Run directories are built with RunDir; the 
 files come from FakeSupervisor runs, since only `next` and `record` write them. `status` with
 no argument is reference-only (deliberate change 3).
 """
+import fcntl
 import os
 import shlex
 import shutil
+import signal
+import subprocess
 import threading
 import traceback
 import unittest
 
-from harness import hermetic_env, is_bin_command, read_json, reference_only, run_cli, temp_root
+from contract_dispatch import holds
+from harness import (BIN, Result, hermetic_env, is_bin_command, read_json, read_jsonl, reference_only, run_cli,
+                     temp_root)
 from rundir import RunDir, write_rate_limit
 from supervisor import FakeSupervisor, card
 
@@ -324,6 +329,81 @@ class StatusDuringRun(unittest.TestCase):
         # at least one per engine step before it.
         self.assertGreaterEqual(running_polls, len(actions) - 1)
         self.assertGreaterEqual(len(actions), 9, actions)
+
+
+class StateLock(unittest.TestCase):
+    """Contract item 12: <run>/state.lock is an exclusive flock(2) that another process contends
+    on. While the test holds it, as another leadhand process would, the writers (`next`,
+    `record started`) and the reader (`status`) wait and write nothing; once it is released
+    they finish."""
+
+    def setUp(self):
+        self.w = FakeSupervisor(self, [card(1)])
+        self.run_dir = self.w.start()
+        self.events = self.run_dir / "events.jsonl"
+
+    def hold(self, path):
+        """Take an exclusive flock on `path`; returns `release`, which the cleanup also calls."""
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        held = [fd]
+
+        def release():
+            if held:
+                os.close(held.pop())
+        self.addCleanup(release)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return release
+
+    def background(self, *args) -> subprocess.Popen:
+        """The binary in the background in its own process group; the cleanup kills the group."""
+        p = subprocess.Popen([str(BIN), *map(str, args)], cwd=self.w.tmp, env=self.w.env, text=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             process_group=0)
+
+        def kill():
+            if p.poll() is None:
+                os.killpg(p.pid, signal.SIGKILL)
+            p.communicate(timeout=10)
+        self.addCleanup(kill)
+        return p
+
+    @staticmethod
+    def finish(p: subprocess.Popen) -> Result:
+        out, err = p.communicate(timeout=60)
+        return Result([str(a) for a in p.args], p.returncode, out, err)
+
+    def wait_while_held(self, *args) -> list[Result]:
+        """Hold state.lock, start `args` (one command each) and `status`, check they neither exit
+        nor append for a second, release, and return how they finished."""
+        before = self.events.read_bytes()
+        release = self.hold(self.run_dir / "state.lock")
+        procs = [self.background(*a) for a in (*args, ("status", self.run_dir))]
+        holds(lambda: all(p.poll() is None for p in procs) and self.events.read_bytes() == before, 1.0,
+              "the commands wait while another process holds state.lock")
+        release()
+        return [self.finish(p) for p in procs]
+
+    def test_writers_and_readers_wait_while_another_process_holds_state_lock(self):
+        nxt, st = self.wait_while_held(("next", self.run_dir))
+        a = nxt.ok().json()
+        self.assertEqual(a["action"], "dispatch", a)
+        self.assertEqual(st.code, 0, st)
+        self.assertTrue(st.stdout.startswith("Running · "), st)
+        kinds = [e["kind"] for e in read_jsonl(self.events)]
+        self.assertIn("card_cut", kinds)
+
+        rec, st = self.wait_while_held(("record", self.run_dir, "started", "--dispatch", a["dispatch_id"],
+                                        "--worker", "agent0001"))
+        self.assertEqual(rec.ok().json()["kind"], "worker_started", rec)
+        self.assertEqual(st.code, 0, st)
+        self.assertEqual(read_jsonl(self.events)[-1]["kind"], "worker_started")
+
+    def test_state_lock_is_not_the_run_lock(self):
+        """Holding run.lock, as a live launcher does, holds up neither a writer nor a reader."""
+        self.hold(self.run_dir / "run.lock")
+        a = run_cli("next", self.run_dir, env=self.w.env, cwd=self.w.tmp, timeout=60).ok().json()
+        self.assertEqual(a["action"], "dispatch", a)
+        run_cli("status", self.run_dir, env=self.w.env, cwd=self.w.tmp, timeout=60).ok()
 
 
 if __name__ == "__main__":

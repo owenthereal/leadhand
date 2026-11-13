@@ -603,7 +603,7 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_state.py::RunPathsTests::test_new_run_dir_rejects_path_in_slug | internal: Rust unit test (state) |
 | test_state.py::LockTests::test_state_lock_is_reentrant_within_a_process | internal: Rust unit test (state) |
 | test_state.py::LockTests::test_state_lock_released_after_exception | internal: Rust unit test (state) |
-| test_state.py::LockTests::test_state_lock_is_not_the_run_lock | internal: Rust unit test (state) |
+| test_state.py::LockTests::test_state_lock_is_not_the_run_lock | contract_status.StateLock.test_state_lock_is_not_the_run_lock |
 | test_state.py::AppendTests::test_append_event_assigns_seq_and_fsyncs | contract_cards.Start.test_every_event_line_carries_seq_ts_and_kind |
 | test_state.py::AppendTests::test_append_attempt_and_read_attempts | internal: Rust unit test (state) |
 | test_state.py::AppendTests::test_read_missing_files_are_empty | internal: Rust unit test (state) |
@@ -611,7 +611,7 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_state.py::AppendTests::test_read_events_ignores_complete_json_without_newline | contract_status.Status.test_complete_json_without_a_newline_is_ignored |
 | test_state.py::AppendTests::test_read_attempts_ignores_partial_trailing_line | contract_recovery.Reconcile.test_appends_repair_a_torn_last_line_in_any_record_file |
 | test_state.py::AppendTests::test_read_events_raises_on_corrupt_complete_line | contract_status.Status.test_corrupt_event_line_is_an_attention_line_not_a_failure; contract_finish.Start.test_start_skips_an_old_run_whose_event_log_is_unreadable |
-| test_state.py::AppendTests::test_read_holds_state_lock_so_tail_repair_cannot_tear_it | internal: Rust unit test (state) |
+| test_state.py::AppendTests::test_read_holds_state_lock_so_tail_repair_cannot_tear_it | contract_status.StateLock.test_writers_and_readers_wait_while_another_process_holds_state_lock |
 | test_state.py::AppendTests::test_read_of_missing_run_dir_is_empty | internal: Rust unit test (state) |
 | test_state.py::AppendTests::test_append_after_truncated_final_record_stays_valid | contract_recovery.Reconcile.test_restart_after_truncated_final_event_then_append |
 | test_state.py::AppendTests::test_append_when_whole_file_is_one_partial_line | contract_recovery.Reconcile.test_appends_repair_a_torn_last_line_in_any_record_file |
@@ -621,7 +621,7 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_state.py::AppendTests::test_reserved_field_names_rejected | internal: Rust unit test (state) |
 | test_state.py::AppendTests::test_concurrent_appends_from_threads | internal: Rust unit test (state) |
 | test_state.py::AppendTests::test_concurrent_appends_from_two_processes_keep_whole_lines_and_unique_seq | contract_usage.Concurrency.test_concurrent_supervisor_and_runner_charges_keep_exact_totals |
-| test_state.py::WriteJsonAtomicTests::test_undecodable_filenames_round_trip_through_json_and_jsonl | contract_worktree_safety.WorktreeRewrites.test_json_output_escapes_undecodable_names |
+| test_state.py::WriteJsonAtomicTests::test_undecodable_filenames_round_trip_through_json_and_jsonl | contract_worktree_safety.WorktreeRewrites.test_json_output_escapes_undecodable_names; contract_worktree_safety.WorktreeRewrites.test_events_jsonl_keeps_undecodable_names_as_escapes |
 | test_state.py::WriteJsonAtomicTests::test_write_json_atomic_leaves_no_temp_files | contract_cards.Start.test_a_whole_run_leaves_no_temporary_files |
 | test_state.py::WriteJsonAtomicTests::test_write_json_atomic_error_keeps_old_content_and_no_temp | internal: Rust unit test (state) |
 | test_state.py::WriteJsonAtomicTests::test_write_json_atomic_replace_failure_cleans_up | internal: Rust unit test (state) |
