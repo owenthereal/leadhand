@@ -94,7 +94,12 @@ class Result:
 def run_cli(*args, env: dict, cwd: Path, stdin: str | None = None, timeout: float = 120.0) -> Result:
     """Run BIN with `args`. A run past `timeout` seconds kills the binary's whole process group
     and fails the test with the command named."""
-    argv = [str(BIN), *(str(a) for a in args)]
+    return run_argv([str(BIN), *(str(a) for a in args)], env=env, cwd=cwd, stdin=stdin, timeout=timeout)
+
+
+def run_argv(argv: list[str], *, env: dict, cwd: Path, stdin: str | None = None,
+             timeout: float = 120.0) -> Result:
+    """Run a full command line, such as a dispatch line the binary printed, as run_cli runs BIN."""
     proc = subprocess.Popen(
         argv, cwd=cwd, env=env, text=True, encoding="utf-8", errors="surrogateescape",
         stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
