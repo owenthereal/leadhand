@@ -170,6 +170,13 @@ class SupervisorFiles(unittest.TestCase):
         self.assertIn("the action's `report`", done)
         self.assertNotIn("report.md", done)
 
+    def test_run_skill_steers_with_plain_commands(self):
+        # Converted from test_recovery.PauseCancel.test_run_skill_steers_with_plain_commands.
+        _, body = split(SKILL)
+        steering = body[body.index("## Steering"):]
+        self.assertIn("to pause, run `<cli> pause <run_dir>`; to cancel, `<cli> cancel <run_dir>`", steering)
+        self.assertIn("`<cli> unpark <run_dir> --card N --note '…'`", steering)
+
     def test_run_skill_records_started_before_waiting(self):
         _, body = split(SKILL)
         for heading in ("### `dispatch` without `resume`", "### `dispatch` with `resume`"):

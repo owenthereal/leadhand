@@ -423,36 +423,44 @@ class FakeSupervisor:
     def kill_leftovers(self) -> None:
         """Kill the proxies this world started, then every process a worker folder records that
         is still the process it names (recorded_processes): runners first, so none starts another
-        Codex, then the rest. Then the fake Codex's tool children and escaped writers its log names
-        (a runner may not have recorded them yet), each only if it started no later than the log
-        line naming it. Wait (briefly) for them all to be gone."""
+        Codex, then the rest. Then the fake Codex processes, tool children and escaped writers its
+        log names (a runner may not have recorded them yet), each only if it started no later than
+        the log line naming it. Wait (briefly) for them all to be gone."""
         for p in self.proxies:
             if p.poll() is None:
                 p.kill()
             with contextlib.suppress(Exception):
                 p.communicate(timeout=10)
-        if self.run_dir is None:
-            return
-        killed = []
+        if self.run_dir is not None:
+            kill_run_leftovers(self.run_dir, Path(self.env["FAKE_CODEX_LOG"]))
 
-        def kill(rec: dict) -> None:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(rec["pid"], signal.SIGKILL)
-                killed.append(rec)
 
-        for runners_only in (True, False):
-            for rec in recorded_processes(self.run_dir, runners_only=runners_only):
-                if same_process(rec.get("pid"), rec.get("start")):
-                    kill(rec)
-        log = Path(self.env["FAKE_CODEX_LOG"])
-        for line in (read_jsonl(log) if log.exists() else []):
-            pid = line.get("child_pid") or line.get("escaped_pid")
-            start = started_by(pid, line["time"]) if pid else None
-            if start is not None:
-                kill({"pid": pid, "start": start})
-        deadline = time.monotonic() + 5
-        while any(same_process(r["pid"], r["start"]) for r in killed) and time.monotonic() < deadline:
-            time.sleep(0.02)
+def kill_run_leftovers(run_dir: Path, codex_log: Path) -> None:
+    """kill_leftovers without a world: every live process run_dir's worker folders record
+    (runners first), then the Codex processes, tool children and escaped writers `codex_log`
+    names. For a run whose world is gone with its process, such as a crash-matrix worker killed
+    at its deadline."""
+    killed = []
+
+    def kill(rec: dict) -> None:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(rec["pid"], signal.SIGKILL)
+            killed.append(rec)
+
+    for runners_only in (True, False):
+        for rec in recorded_processes(run_dir, runners_only=runners_only):
+            if same_process(rec.get("pid"), rec.get("start")):
+                kill(rec)
+    for line in (read_jsonl(codex_log) if codex_log.exists() else []):
+        pid = line.get("child_pid") or line.get("escaped_pid")
+        if line.get("event") == "start":
+            pid = line["pid"]
+        start = started_by(pid, line["time"]) if pid else None
+        if start is not None:
+            kill({"pid": pid, "start": start})
+    deadline = time.monotonic() + 5
+    while any(same_process(r["pid"], r["start"]) for r in killed) and time.monotonic() < deadline:
+        time.sleep(0.02)
 
 
 def recorded_processes(run_dir: Path, *, runners_only: bool = False) -> list[dict]:
