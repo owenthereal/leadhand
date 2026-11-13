@@ -80,6 +80,12 @@ def alive(rec: dict) -> bool:
     return same_process(rec.get("pid"), rec.get("start"))
 
 
+def logged_alive(rec: dict) -> bool:
+    """Whether the process a fake Codex log record names (`child_pid` or `escaped_pid`) is still
+    alive: judged from the log line's own time, never from anything the binary wrote."""
+    return harness.started_by(rec.get("child_pid") or rec.get("escaped_pid"), rec["time"]) is not None
+
+
 def implementer_prompt(brief: Path, report: Path) -> str:
     """The prompt a Codex implementer gets: the implementer agent's body without its front
     matter, the no-commit rule, then its files."""
@@ -438,8 +444,9 @@ class Results(unittest.TestCase):
         saved = w.result()
         self.assertEqual((saved["status"], saved["exit_reason"]), ("SPENT", "time_limit"))
         self.assertFalse(alive(w.runner_json()["codex"]))
-        child = w.records("child")[0]["child_pid"]
-        self.assertFalse(alive(w.stopped()[child]))     # its identity, as the runner recorded it
+        child = w.records("child")[0]
+        self.assertIn(child["child_pid"], w.stopped())
+        self.assertFalse(logged_alive(child))
 
     def test_usage_limit_is_blocked_by_usage_limit(self):
         w = World(self)
@@ -728,7 +735,7 @@ class Cancellation(unittest.TestCase):
         w = World(self)
         w.scenario("slow")
         codex = w.start_detached()
-        child = wait_for(lambda: w.records("child"), "the tool child")[0]["child_pid"]
+        child = wait_for(lambda: w.records("child"), "the tool child")[0]
         progress = w.ws / "progress.log"
         wait_for(lambda: progress.exists() and progress.stat().st_size > 0, "progress.log")
         r = w.stop().ok()
@@ -736,7 +743,8 @@ class Cancellation(unittest.TestCase):
         saved = w.result()
         self.assertEqual((saved["status"], saved["exit_reason"]), ("SPENT", "cancelled"))
         self.assertFalse(alive(codex))
-        self.assertFalse(alive(w.stopped()[child]))
+        self.assertIn(child["child_pid"], w.stopped())
+        self.assertFalse(logged_alive(child))
         before = progress.stat()
         holds(lambda: (lambda s: (s.st_size, s.st_mtime_ns) == (before.st_size, before.st_mtime_ns))(progress.stat()),
               1.5, "nothing writes progress.log after the cancel")
@@ -791,7 +799,8 @@ class ProcessControl(unittest.TestCase):
         w = World(self)
         w.scenario("slow", orphan_child=1)
         codex = w.start_detached()
-        child = wait_for(lambda: w.records("child"), "the tool child")[0]["child_pid"]
+        child_rec = wait_for(lambda: w.records("child"), "the tool child")[0]
+        child = child_rec["child_pid"]
         wait_for(lambda: any(d["pid"] == child for d in (w.read("d1", "procs.json") or {}).get("descendants", [])),
                  "procs.json to list the tool child")
         runner = w.runner_json()["runner"]
@@ -803,7 +812,7 @@ class ProcessControl(unittest.TestCase):
         self.assertEqual((saved["status"], saved["exit_reason"]), ("SPENT", "cancelled"))
         self.assertFalse(alive(codex))
         self.assertIn(child, [p["pid"] for p in saved["stopped"]])
-        self.assertFalse(alive(w.stopped()[child]))
+        self.assertFalse(logged_alive(child_rec))
         self.assertEqual(len(w.attempts()), 1)
 
     def test_double_forked_child_is_stopped_before_finalizing(self):
@@ -816,9 +825,8 @@ class ProcessControl(unittest.TestCase):
         (rec,) = w.records("escaped")
         pid = rec["escaped_pid"]
         self.assertEqual(w.result()["status"], "READY")
-        stopped = w.stopped()
-        self.assertIn(pid, stopped)
-        self.assertFalse(alive(stopped[pid]), "the escaped writer outlived the dispatch")
+        self.assertIn(pid, w.stopped())
+        self.assertFalse(logged_alive(rec), "the escaped writer outlived the dispatch")
         log = w.ws / "escaped.log"
         size = log.stat().st_size
         holds(lambda: log.stat().st_size == size, 0.5, "the escaped writer writes nothing after finalize")
