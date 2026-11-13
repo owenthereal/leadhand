@@ -259,3 +259,81 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_launch.py::CheckoutClaimTests::test_worktree_launch_is_not_held_back_by_a_claimed_checkout | contract_launch.Ownership.test_another_runs_live_supervisor_does_not_hold_back_a_launch |
 | test_launch.py::CheckoutClaimTests::test_a_cli_child_of_a_killed_supervisor_does_not_keep_the_checkout_claimed | dropped with in-place mode |
 | test_launch.py::CheckoutClaimTests::test_cli_leaves_an_unrelated_fd_named_as_the_checkout_claim_open | dropped with in-place mode |
+| test_engine_cards.py::HappyPath::test_happy_path_two_cards_accepted_in_order | contract_smoke.Smoke.test_two_cards_accepted_in_order |
+| test_engine_cards.py::HappyPath::test_requested_dispatch_is_repeated_until_started | contract_cards.HappyPath.test_requested_dispatch_is_repeated_until_started |
+| test_engine_cards.py::HappyPath::test_started_dispatch_returns_wait_then_stop_worker_after_deadline | contract_cards.HappyPath.test_started_dispatch_returns_wait_then_stop_worker_after_deadline |
+| test_engine_cards.py::HappyPath::test_duplicate_result_is_harmless | contract_cards.HappyPath.test_duplicate_result_is_harmless |
+| test_engine_cards.py::Loop::test_repeated_answers_and_reviews_get_distinct_ids | contract_cards.Loop.test_repeated_answers_and_reviews_get_distinct_ids |
+| test_engine_cards.py::Loop::test_by_risk_review_skips_low_risk_card | contract_cards.Loop.test_by_risk_review_skips_low_risk_card |
+| test_engine_cards.py::Loop::test_defects_get_one_fix_round_then_rereview_on_production_change | contract_cards.Loop.test_defects_get_one_fix_round_then_rereview_on_production_change |
+| test_engine_cards.py::Loop::test_clean_verdict_with_medium_finding_counts_as_defects | contract_cards.Loop.test_clean_verdict_with_medium_finding_counts_as_defects |
+| test_engine_cards.py::Loop::test_clean_rereview_noting_fixed_findings_stays_clean | contract_cards.Loop.test_clean_rereview_noting_fixed_findings_stays_clean |
+| test_engine_cards.py::Loop::test_clean_verdict_cross_check_reads_only_findings_lines | contract_cards.Loop.test_clean_verdict_cross_check_reads_only_findings_lines |
+| test_engine_cards.py::Loop::test_clean_verdict_cross_check_counts_bullet_findings_lines | contract_cards.Loop.test_clean_verdict_cross_check_counts_bullet_findings_lines |
+| test_engine_cards.py::Loop::test_test_only_fix_returns_check_diff | contract_cards.Loop.test_test_only_fix_returns_check_diff |
+| test_engine_cards.py::Loop::test_defects_after_fix_round_escalate_with_fresh_worker | contract_cards.Loop.test_defects_after_fix_round_escalate_with_fresh_worker |
+| test_engine_cards.py::Loop::test_spent_escalates_and_exhausted_ladder_parks | contract_cards.Loop.test_spent_escalates_and_exhausted_ladder_parks |
+| test_engine_cards.py::Loop::test_usage_limit_ends_blocked_without_switching_vendor | contract_cards.Loop.test_usage_limit_ends_blocked_without_switching_vendor |
+| test_engine_cards.py::Loop::test_other_blocked_retries_once_then_ends_blocked_environment | contract_cards.Loop.test_other_blocked_retries_once_then_ends_blocked_environment |
+| test_engine_cards.py::Loop::test_question_ruling_resumes_worker | contract_cards.Loop.test_question_ruling_resumes_worker |
+| test_engine_cards.py::Loop::test_parked_card_skips_dependents_and_continues_independent | contract_cards.Loop.test_parked_card_skips_dependents_and_continues_independent |
+| test_engine_cards.py::Start::test_start_returns_existing_unfinished_run_unless_new | contract_cards.Start.test_start_returns_existing_unfinished_run_unless_new |
+| test_engine_cards.py::Start::test_start_never_reuses_an_unfinished_run_of_another_clone | contract_cards.Start.test_start_never_reuses_an_unfinished_run_of_another_clone |
+| test_engine_cards.py::Start::test_start_never_reuses_another_runs_worktree | contract_cards.Start.test_start_never_reuses_another_runs_worktree |
+| test_engine_cards.py::Start::test_start_refuses_unsupported_settings_and_scout_cards | contract_cards.Start.test_start_refuses_unsupported_settings_and_scout_cards |
+| test_engine_cards.py::Start::test_check_and_start_refuse_step_limits_claude_workers_cannot_honour | contract_cards.Start.test_check_and_start_refuse_step_limits_claude_workers_cannot_honour |
+| test_engine_cards.py::Start::test_deck_changed_since_start_refuses | contract_cards.Start.test_deck_changed_since_start_refuses |
+| test_engine_cards.py::Records::test_reply_without_status_blocks_and_keeps_raw | contract_cards.Records.test_reply_without_status_blocks_and_keeps_raw |
+| test_engine_cards.py::Records::test_turn_limit_reply_is_spent | contract_cards.Records.test_turn_limit_reply_is_spent |
+| test_engine_cards.py::Records::test_invalid_record_transition_raises | contract_cards.Records.test_invalid_record_transition_raises |
+| test_engine_cards.py::Records::test_timer_returns_at_deadline | contract_cards.Records.test_timer_returns_at_deadline |
+| test_engine_cards.py::Records::test_cli_records_reply_from_stdin | contract_cards.Records.test_cli_records_reply_from_stdin |
+| test_engine_cards.py::Codex::test_codex_route_dispatches_proxy_with_null_agent_model | contract_cards.Codex.test_codex_route_dispatches_proxy_with_null_agent_model |
+| test_engine_cards.py::Codex::test_stop_worker_for_codex_cancels_runner_and_records_before_returning | contract_cards.Codex.test_stop_worker_for_codex_cancels_runner_and_records_before_returning |
+| test_engine_cards.py::Crashes::test_crash_after_fast_forward_before_accepted_reconciles | contract_cards.Crashes.test_crash_after_fast_forward_before_accepted_reconciles |
+| test_engine_cards.py::Crashes::test_crash_after_result_files_before_event_reconciles | contract_cards.Crashes.test_crash_after_result_files_before_event_reconciles |
+| test_engine_cards.py::Crashes::test_crash_after_charge_before_attempt_retry_keeps_one_charge | contract_cards.Crashes.test_crash_after_charge_before_attempt_retry_keeps_one_charge |
+| test_engine_cards.py::Supervisor::test_supervisor_usage_charged_once_across_calls | contract_cards.Supervisor.test_supervisor_usage_charged_once_across_calls |
+| test_engine_by_risk.py::ByRisk::test_ready_at_the_attempt_start_tip_goes_to_review | contract_cards.ByRisk.test_ready_at_the_attempt_start_tip_goes_to_review |
+| test_engine_by_risk.py::ByRisk::test_low_risk_ready_with_commits_is_still_accepted_without_review | contract_cards.ByRisk.test_low_risk_ready_with_commits_is_still_accepted_without_review |
+| test_engine_decisions.py::DecisionNeeded::test_question_parked_on_a_decision_ends_blocked_and_unpark_continues | contract_cards.DecisionNeeded.test_question_parked_on_a_decision_ends_blocked_and_unpark_continues |
+| test_engine_decisions.py::DecisionNeeded::test_card_waiting_on_a_decision_card_still_ends_blocked | contract_cards.DecisionNeeded.test_card_waiting_on_a_decision_card_still_ends_blocked |
+| test_engine_decisions.py::DecisionNeeded::test_violation_cap_park_ends_blocked_for_a_decision | contract_cards.DecisionNeeded.test_violation_cap_park_ends_blocked_for_a_decision |
+| test_engine_decisions.py::DecisionNeeded::test_park_that_is_not_a_decision_still_ends_incomplete | contract_cards.DecisionNeeded.test_park_that_is_not_a_decision_still_ends_incomplete |
+| test_engine_decisions.py::DecisionNeeded::test_unpark_refuses_on_a_run_it_cannot_reopen_and_hides_the_hint | contract_cards.DecisionNeeded.test_unpark_refuses_on_a_run_it_cannot_reopen_and_hides_the_hint |
+| test_engine_reply_file.py::ReplyFile::test_dispatch_action_carries_a_git_ignored_reply_file_in_the_scratch_dir | contract_cards.ReplyFile.test_dispatch_action_carries_a_git_ignored_reply_file_in_the_scratch_dir |
+| test_engine_reply_file.py::ReplyFile::test_wait_names_the_same_reply_file | contract_cards.ReplyFile.test_wait_names_the_same_reply_file |
+| test_engine_reply_file.py::ReplyFile::test_cli_records_reply_from_a_file_with_spaces_in_its_path | contract_cards.ReplyFile.test_cli_records_reply_from_a_file_with_spaces_in_its_path |
+| test_engine_reply_file.py::ReplyFile::test_reply_and_reply_file_are_exclusive | contract_cards.ReplyFile.test_reply_and_reply_file_are_exclusive |
+| test_engine_reply_file.py::ReplyFile::test_missing_reply_file_falls_back_to_the_report_head_with_a_note | contract_cards.ReplyFile.test_missing_reply_file_falls_back_to_the_report_head_with_a_note |
+| test_engine_reply_file.py::ReplyFile::test_new_request_removes_a_stale_reply_file | dropped with in-place mode |
+| test_engine_codex_result.py::CodexResultFromRunner::test_early_still_running_reply_waits_and_starts_no_second_implementer | contract_cards.CodexResultFromRunner.test_early_still_running_reply_waits_and_starts_no_second_implementer |
+| test_engine_codex_result.py::CodexResultFromRunner::test_invented_verdict_without_a_worker_is_not_accepted | contract_cards.CodexResultFromRunner.test_invented_verdict_without_a_worker_is_not_accepted |
+| test_engine_codex_result.py::CodexResultFromRunner::test_skipping_a_codex_card_stops_its_runner | contract_cards.CodexResultFromRunner.test_skipping_a_codex_card_stops_its_runner |
+| test_engine_codex_e2e.py::NonCommittingCodex::test_two_card_run_with_gates_completes_with_the_runners_commits | contract_cards.NonCommittingCodex.test_two_card_run_with_gates_completes_with_the_runners_commits |
+| test_engine_run_branch.py::ImplementerGuard::test_implementer_commit_on_the_run_branch_is_a_violation | contract_cards.ImplementerGuard.test_implementer_commit_on_the_run_branch_is_a_violation |
+| test_engine_run_branch.py::RunHeadCheck::test_run_branch_moved_between_dispatches_fails_the_run | contract_cards.RunHeadCheck.test_run_branch_moved_between_dispatches_fails_the_run |
+| test_engine_run_branch.py::RunHeadCheck::test_outcome_checks_the_run_head_after_a_cancel | contract_cards.RunHeadCheck.test_outcome_checks_the_run_head_after_a_cancel |
+| test_engine_untracked.py::EngineSide::test_parked_cards_untracked_file_does_not_land_via_the_next_codex_card | contract_cards.EngineSide.test_parked_cards_untracked_file_does_not_land_via_the_next_codex_card |
+| test_engine_untracked.py::EngineSide::test_cancel_partial_commit_leaves_untracked_files_that_were_there_before | contract_cards.EngineSide.test_cancel_partial_commit_leaves_untracked_files_that_were_there_before |
+| test_engine_untracked.py::RunnerSide::test_runner_commits_only_tracked_changes_and_files_created_during_the_dispatch | contract_cards.RunnerSide.test_runner_commits_only_tracked_changes_and_files_created_during_the_dispatch |
+| test_briefs.py::BriefTests::test_implement_brief_contains_contract_fields_verbatim | contract_briefs.Briefs.test_implement_brief_contains_contract_fields_verbatim |
+| test_briefs.py::BriefTests::test_test_first_defaults_to_when_cheap | contract_briefs.Briefs.test_test_first_defaults_to_when_cheap |
+| test_briefs.py::BriefTests::test_every_brief_kind_has_a_template | contract_briefs.Briefs.test_every_brief_kind_fills_its_values; contract_briefs.Briefs.test_integrate_permits_rebase_onto_run_tip; contract_briefs.Briefs.test_continue_brief_carries_on_from_the_branch |
+| test_briefs.py::BriefTests::test_kind_specific_content | contract_briefs.Briefs.test_kind_specific_content; contract_briefs.Briefs.test_continue_brief_carries_on_from_the_branch |
+| test_briefs.py::BriefTests::test_card_briefs_require_card_base_and_branch | contract_briefs.Briefs.test_card_briefs_render_card_base_and_branch |
+| test_briefs.py::BriefTests::test_review_needs_implementer_report_unless_test_first_off | contract_briefs.Briefs.test_review_names_the_implementer_report |
+| test_briefs.py::BriefTests::test_integrate_permits_rebase_onto_run_tip | contract_briefs.Briefs.test_integrate_permits_rebase_onto_run_tip |
+| test_briefs.py::BriefTests::test_final_briefs_list_scope | contract_briefs.Briefs.test_final_briefs_list_scope |
+| test_briefs.py::BriefTests::test_evidence_requires_cards | internal: Rust unit test (briefs) |
+| test_briefs.py::BriefTests::test_answer_quotes_every_ruling_line | contract_briefs.Briefs.test_answer_quotes_every_ruling_line |
+| test_briefs.py::BriefTests::test_verify_says_skip_for_empty_commands | internal: Rust unit test (briefs) |
+| test_briefs.py::BriefTests::test_missing_extra_and_unknown_kind_raise | internal: Rust unit test (briefs) |
+| test_briefs.py::BriefTests::test_brief_and_report_paths_are_inside_workspace_scratch | contract_briefs.Briefs.test_brief_and_report_paths_are_inside_workspace_scratch |
+| test_briefs.py::BriefTests::test_scratch_dir_is_ignored_by_git | contract_briefs.Briefs.test_scratch_dir_is_ignored_by_git |
+| test_briefs.py::BriefTests::test_agent_for_maps_every_role_and_vendor | contract_briefs.Briefs.test_agent_for_maps_every_role_and_vendor; contract_cards.Codex.test_codex_route_dispatches_proxy_with_null_agent_model; contract_cards.CodexResultFromRunner.test_invented_verdict_without_a_worker_is_not_accepted |
+| test_briefs.py::BriefTests::test_claude_dispatch_message_names_paths | contract_briefs.Briefs.test_claude_dispatch_message_names_paths |
+| test_briefs.py::BriefTests::test_codex_dispatch_message_is_one_quoted_command | contract_briefs.Briefs.test_codex_dispatch_message_is_one_quoted_command |
+| test_briefs.py::BriefTests::test_worker_prompt_for_codex_workers | contract_briefs.Briefs.test_worker_prompt_for_codex_workers |
+| test_briefs.py::BriefTests::test_codex_implementer_prompt_forbids_commits_and_claude_agents_do_not | contract_briefs.Briefs.test_codex_implementer_prompt_forbids_commits_and_claude_agents_do_not |
+| test_briefs.py::BriefTests::test_parse_report_head_variants | contract_briefs.Briefs.test_parse_report_head_variants |
