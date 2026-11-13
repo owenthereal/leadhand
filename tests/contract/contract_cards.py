@@ -1354,12 +1354,9 @@ class Paths(EngineCase):
 
         # The printed dispatch line runs, from the unrelated directory, through the spaced path.
         recorded(w, "started", "--dispatch", a["dispatch_id"], "--worker", "agent-proxy")
-        line, env = w.proxy_argv_env(a, {})
+        line, _ = w.proxy_argv_env(a, {})
         self.assertEqual(line, argv)
-        for _ in range(20):
-            out = harness.run_argv(line, env=env, cwd=elsewhere, timeout=180)
-            if out.code != 75:
-                break
+        out = w.proxy(a, {}, cwd=elsewhere)
         self.assertEqual(out.code, 0, out)
         self.assertEqual(out.stdout.splitlines()[0], "Status: READY", out)
         self.assertEqual(read_json(run_dir / "workers" / a["dispatch_id"] / "result.json")["status"], "READY")

@@ -86,8 +86,12 @@ class Cleanup(unittest.TestCase):
                 if all(same_process(r.get("pid"), r.get("start")) for r in live):
                     break
                 if proxy.poll() is not None:
+                    try:
+                        output = proxy.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:   # a descendant still holds the pipes
+                        output = "(not read: a descendant held the pipes)"
                     self.fail(f"the dispatch line exited ({proxy.returncode}) before its runner and Codex "
-                              f"were both running:\n{proxy.communicate()}")
+                              f"were both running:\n{output}")
                 if time.monotonic() > deadline:
                     self.fail(f"no live runner and Codex in {runner_json} after 30 s: {data}")
                 time.sleep(0.05)

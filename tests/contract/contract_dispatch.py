@@ -57,7 +57,10 @@ def wait_for(cond, what: str, timeout: float = 30.0, proc: subprocess.Popen | No
         if value:
             return value
         if proc is not None and proc.poll() is not None:
-            out, err = proc.communicate()
+            try:
+                out, err = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:   # a descendant still holds the pipes
+                out, err = "(not read: a descendant held the pipes)", ""
             raise AssertionError(f"the command exited ({proc.returncode}) while waiting for {what}\n"
                                  f"argv: {proc.args}\nstdout:\n{out}\nstderr:\n{err}")
         if time.monotonic() > deadline:

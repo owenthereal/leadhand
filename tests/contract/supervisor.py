@@ -346,13 +346,28 @@ class FakeSupervisor:
                    FAKE_CODEX_THREAD=f"0f0f0f0f-0000-4000-8000-{next(self._ids):012d}")
         return argv, env
 
-    def run_proxy(self, a: dict, step: dict) -> str:
-        """What the leadhand:codex proxy does: run the command, again while it is still running."""
+    def proxy(self, a: dict, step: dict, *, cwd: Path | None = None, timeout: float = 180.0,
+              attempts: int = 20) -> Result:
+        """What the leadhand:codex proxy does: run the command, again while it is still running
+        (exit 75), from `cwd` (default the world's tmp). Bounded: all the runs together get
+        `timeout` seconds, and at most `attempts` runs; past either, a run still exiting 75
+        fails the test with the last result."""
         argv, env = self.proxy_argv_env(a, step)
-        while True:
-            r = run_argv(argv, env=env, cwd=self.tmp, timeout=180)
+        deadline = time.monotonic() + timeout
+        for _ in range(attempts):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            r = run_argv(argv, env=env, cwd=cwd or self.tmp, timeout=left)
             if r.code != 75:
-                return r.stdout + r.stderr
+                return r
+        raise AssertionError(f"the dispatch line was still running (exit 75) after {attempts} runs or "
+                             f"{timeout:g} s\n{r}")
+
+    def run_proxy(self, a: dict, step: dict, *, cwd: Path | None = None) -> str:
+        """`proxy`, returning what the proxy hands back: the command's stdout and stderr."""
+        r = self.proxy(a, step, cwd=cwd)
+        return r.stdout + r.stderr
 
     def start_proxy(self, a: dict, step: dict) -> subprocess.Popen:
         argv, env = self.proxy_argv_env(a, step)

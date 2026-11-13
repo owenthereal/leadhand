@@ -745,8 +745,7 @@ class InheritedLock(LaunchCase):
                               "--reply", "-"], env=env, pass_fds=(fd,), stdin=subprocess.PIPE)
         finally:
             os.close(fd)
-        p.stdin.write(self.BIG.encode())
-        p.stdin.flush()
+        self.write_big(p.stdin.fileno(), p, "the command to read its reply from stdin")
         self.assertIsNone(p.poll(), "the command exited before its stdin was closed")
         return p
 
@@ -767,12 +766,29 @@ class InheritedLock(LaunchCase):
                     return None
                 raise
         fd = wait_for(opened, "the CLI child to open its stdin", proc=proc)
-        os.set_blocking(fd, True)
         writer = os.fdopen(fd, "wb")
         self.addCleanup(writer.close)
-        writer.write(self.BIG.encode())
-        writer.flush()
+        self.write_big(fd, proc, "the CLI child to read its reply from the FIFO")
         return writer
+
+    def write_big(self, fd: int, proc: subprocess.Popen, what: str) -> None:
+        """Write BIG to `fd` in non-blocking chunks, polled as wait_for(proc=proc) polls: a reader
+        that stays alive but stops reading fails the test after WAIT seconds instead of blocking it.
+        `fd` is left blocking again."""
+        os.set_blocking(fd, False)
+        rest = memoryview(self.BIG.encode())
+
+        def written():
+            nonlocal rest
+            try:
+                rest = rest[os.write(fd, rest[:1 << 16]):]
+            except BlockingIOError:
+                pass
+            return not rest
+        try:
+            wait_for(written, what, proc=proc)
+        finally:
+            os.set_blocking(fd, True)
 
     def test_relaunch_succeeds_while_a_cli_child_of_the_killed_supervisor_runs(self):
         run_dir, did = self.started_dispatch()
