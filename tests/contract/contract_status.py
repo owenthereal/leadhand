@@ -13,7 +13,7 @@ import threading
 import traceback
 import unittest
 
-from harness import BIN, hermetic_env, read_json, reference_only, run_cli, temp_root
+from harness import hermetic_env, is_bin_command, read_json, reference_only, run_cli, temp_root
 from rundir import RunDir, write_rate_limit
 from supervisor import FakeSupervisor, card
 
@@ -32,9 +32,10 @@ def usage_line(lines: list[str]) -> str:
     return next(line for line in lines if line.startswith("Usage: "))
 
 
-def unpark_line(n: int, root, reason: str) -> str:
-    return (f"Card {n} parked: {reason} — next: {shlex.quote(str(BIN))} unpark "
-            f"{shlex.quote(str(root))} --card {n} --note '…'")
+def is_unpark_line(line: str, n: int, root, reason: str) -> bool:
+    """The parked card's attention line, its next step naming the binary (by file: S1-R11)."""
+    return is_bin_command(line, f"Card {n} parked: {reason} — next: ",
+                          f" unpark {shlex.quote(str(root))} --card {n} --note '…'")
 
 
 class Status(unittest.TestCase):
@@ -64,7 +65,7 @@ class Status(unittest.TestCase):
         lines = status(w)
         self.assertIn(" ", str(w.root))
         self.assertEqual(lines[0], "Needs your decision on card 5; independent work continues")
-        self.assertEqual(lines[1], unpark_line(5, w.root, "needs a design decision"))
+        self.assertTrue(is_unpark_line(lines[1], 5, w.root, "needs a design decision"), lines)
         self.assertTrue(any(l.startswith("Card 5") or l.startswith("5 ") or " 5 " in l for l in lines[2:]))
         self.assertIn("Usage", lines[-1])
 

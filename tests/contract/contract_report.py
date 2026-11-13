@@ -7,7 +7,7 @@ read from the report.md that `report` writes.
 import shlex
 import unittest
 
-from harness import BIN, run_cli
+from harness import is_bin_command, run_cli
 from rundir import RunDir
 
 SECTIONS = ["## Needs your attention", "## Result", "## Evidence", "## Unresolved", "## Cards", "## Rulings",
@@ -127,9 +127,11 @@ class FixRound(unittest.TestCase):
         w = RunDir(self, cards=1)
         w.ev("card_cut", card=1, branch="b", base="b")
         w.ev("parked", card=1, reason="why")
-        expected = (f"- Card 1 parked: why — next: {shlex.quote(str(BIN))} unpark "
-                    f"{shlex.quote(str(w.root))} --card 1 --note '…'")
-        self.assertIn(expected, section(report(w), "Needs your attention", "Result").splitlines())
+        lines = section(report(w), "Needs your attention", "Result").splitlines()
+        # the next step names the binary; it is compared by file, not spelling (S1-R11)
+        self.assertTrue(any(is_bin_command(l, "- Card 1 parked: why — next: ",
+                                           f" unpark {shlex.quote(str(w.root))} --card 1 --note '…'")
+                            for l in lines), lines)
 
     def test_evidence_shows_last_result_per_gate_and_marks_stale(self):
         w = RunDir(self, cards=2)

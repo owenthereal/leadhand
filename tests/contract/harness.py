@@ -170,6 +170,32 @@ def hermetic_env(test: unittest.TestCase, tmp: Path, *, installed=("claude",), c
 
 
 # --------------------------------------------------------------------------
+# The binary's own path (ruling S1-R11)
+#
+# Where the binary prints or passes a path for itself (an unpark hint, the launch line, a
+# dispatch line's argv[0], LEADHAND_CLI), parity is the file it names, not its spelling.
+
+def names_bin(path_text: str) -> bool:
+    """True when `path_text` names the binary under test: the same file as BIN once both are resolved."""
+    return os.path.realpath(path_text) == os.path.realpath(BIN)
+
+
+def is_bin_command(text: str, before: str, after: str) -> bool:
+    """True when `text` is exactly `before`, then one shell word naming BIN (names_bin), then
+    exactly `after`."""
+    if not (text.startswith(before) and text.endswith(after) and len(text) >= len(before) + len(after)):
+        return False
+    word = text[len(before):len(text) - len(after)]
+    if not word or word != word.strip():
+        return False
+    try:
+        words = shlex.split(word)
+    except ValueError:
+        return False
+    return len(words) == 1 and names_bin(words[0])
+
+
+# --------------------------------------------------------------------------
 # Reading what the binary wrote
 
 def read_jsonl(path: Path) -> list[dict]:

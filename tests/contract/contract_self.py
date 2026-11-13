@@ -3,6 +3,7 @@ the suite's isolation from the Python package, and the tags. Static: these never
 LEADHAND_BIN (fake binaries stand in for it)."""
 import os
 import re
+import shlex
 import time
 import unittest
 from pathlib import Path
@@ -82,6 +83,38 @@ class HarnessReports(unittest.TestCase):
         while harness._start_time(sleeper) is not None and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertIsNone(harness._start_time(sleeper), f"sleeper {sleeper} outlived the timeout")
+
+
+class SelfPath(unittest.TestCase):
+    """S1-R11: a path the binary prints for itself is compared by resolved file, not spelling."""
+
+    def setUp(self):
+        tmp = temp_root(self, "lh self ")
+        self.real = fake_binary(tmp, "exit 0\n")
+        (tmp / "link dir").symlink_to(tmp)
+        self.linked = tmp / "link dir" / self.real.name     # another spelling of the same file
+        self.other = tmp / "other leadhand"
+        self.other.write_text("#!/bin/sh\n", encoding="utf-8")
+        patch = mock.patch.object(harness, "BIN", self.real)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_names_bin_accepts_any_spelling_of_bin_and_rejects_another_file(self):
+        self.assertNotEqual(str(self.linked), str(self.real))
+        self.assertTrue(harness.names_bin(str(self.real)))
+        self.assertTrue(harness.names_bin(str(self.linked)))
+        self.assertFalse(harness.names_bin(str(self.other)))
+
+    def test_bin_command_checks_the_rest_of_the_line_exactly(self):
+        before, after = "next: ", " unpark '/a run' --card 1"
+        line = lambda path: before + shlex.quote(str(path)) + after
+        self.assertTrue(harness.is_bin_command(line(self.linked), before, after))
+        self.assertFalse(harness.is_bin_command(line(self.other), before, after))
+        self.assertFalse(harness.is_bin_command(line(self.real) + " x", before, after))
+        self.assertFalse(harness.is_bin_command("Next: " + shlex.quote(str(self.real)) + after, before, after))
+        self.assertFalse(harness.is_bin_command(before + " " + shlex.quote(str(self.real)) + after, before, after))
+        # an unquoted path with a space is two shell words, not one
+        self.assertFalse(harness.is_bin_command(before + str(self.real) + after, before, after))
 
 
 class HermeticEnv(unittest.TestCase):
