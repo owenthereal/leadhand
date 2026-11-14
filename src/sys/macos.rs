@@ -5,9 +5,11 @@
 //!   `kp_proc.p_starttime` as `"<sec>.<usec:06>"`.
 //! - `KERN_PROCARGS2` gives a process's initial argv and environment.
 //!
-//! The one `unsafe` block is the `sysctl(3)` call; everything it returns is parsed from bytes.
+//! The `unsafe` blocks are the `sysctl(3)` call, whose output is parsed from bytes, and the
+//! `proc_pidinfo` thread count `close_inherited_fd` relies on.
 
 use std::io;
+use std::mem::{self, MaybeUninit};
 use std::ptr;
 
 use libc::{CTL_KERN, KERN_ARGMAX, KERN_PROC, KERN_PROC_ALL, KERN_PROC_PID, KERN_PROCARGS2, c_int};
@@ -173,6 +175,32 @@ fn environment(raw: &[u8]) -> Option<Vec<&[u8]>> {
     )
 }
 
+/// The number of threads in this process, from `proc_pidinfo(PROC_PIDTASKINFO)`
+/// (<libproc.h>); `None` when it cannot be read.
+pub(super) fn thread_count() -> Option<usize> {
+    let mut info = MaybeUninit::<libc::proc_taskinfo>::zeroed();
+    let size = c_int::try_from(mem::size_of::<libc::proc_taskinfo>()).ok()?;
+    // SAFETY: `info` is a writable, properly aligned `proc_taskinfo`, borrowed for the call,
+    // and `size` is its exact size: the kernel writes at most `size` bytes into it and
+    // returns how many it wrote. Nothing is retained after the call.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            std::process::id().try_into().ok()?,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast::<libc::c_void>(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: `info` was zeroed and then filled whole by the kernel (`written == size`);
+    // every field is an integer, for which any bit pattern is valid.
+    let info = unsafe { info.assume_init() };
+    usize::try_from(info.pti_threadnum).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +260,22 @@ mod tests {
                 uid: 501
             }
         );
+    }
+
+    #[test]
+    fn thread_count_counts_this_process() {
+        let before = thread_count().expect("readable");
+        assert!(before >= 1);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _ = rx.recv();
+        });
+        started_rx.recv().unwrap();
+        assert!(thread_count().unwrap() > 1);
+        drop(tx);
+        t.join().unwrap();
     }
 
     #[test]

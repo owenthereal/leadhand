@@ -310,7 +310,7 @@ pub fn main() -> ExitCode {
     let lock = std::env::var_os("LEADHAND_RUN_DIR")
         .filter(|dir| !dir.is_empty())
         .map(|dir| PathBuf::from(dir).join("run.lock"));
-    crate::sys::close_inherited_fd("LEADHAND_LOCK_FD", lock.as_deref());
+    crate::sys::close_inherited_fd(lock.as_deref());
     let (command, name) = match parse(std::env::args_os()) {
         Ok(parsed) => parsed,
         Err(e) => {

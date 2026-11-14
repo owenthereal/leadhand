@@ -1,4 +1,5 @@
-//! Linux: the process table from `/proc`, read as `procs.py` reads it. No `unsafe` here.
+//! Linux: the process table from `/proc`, read as `procs.py` reads it, and this process's
+//! thread count. No `unsafe` here.
 //!
 //! The start time is field 22 of `/proc/<pid>/stat` (clock ticks since boot), written
 //! `"ticks:<n>"` as the Python writes it; the owner is the owner of `/proc/<pid>`, as
@@ -57,6 +58,18 @@ pub(super) fn env_has(pid: i32, entry: &[u8]) -> Option<bool> {
     Some(raw.split(|&b| b == 0).any(|e| e == entry))
 }
 
+/// The number of threads in this process, from the `Threads:` line of `/proc/self/status`;
+/// `None` when it cannot be read.
+pub(super) fn thread_count() -> Option<usize> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,6 +108,21 @@ mod tests {
     fn short_or_malformed_stat_is_none() {
         assert_eq!(parse_stat(7, b"7 (sleep) S 1 7", 0), None);
         assert_eq!(parse_stat(7, b"no parenthesis", 0), None);
+    }
+
+    #[test]
+    fn thread_count_counts_this_process() {
+        assert!(thread_count().expect("readable") >= 1);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _ = rx.recv();
+        });
+        started_rx.recv().unwrap();
+        assert!(thread_count().unwrap() > 1);
+        drop(tx);
+        t.join().unwrap();
     }
 
     #[test]

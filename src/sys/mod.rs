@@ -5,7 +5,7 @@
 //! - the process table: `sysctl` on macOS (`macos.rs`), `/proc` on Linux (`linux.rs`, no
 //!   `unsafe`); never `ps`;
 //! - closing the run-lock descriptor a command inherited (`close_inherited_fd`), after the
-//!   device-and-inode check `launch._close_if_same` makes;
+//!   device-and-inode check `launch._close_if_same` makes, and the thread count it relies on;
 //! - the steps a child takes before `exec`: `setsid` (`detach_session`) and keeping one
 //!   descriptor open across `exec` (`pass_fd_to_child`).
 //!
@@ -13,10 +13,11 @@
 
 use std::ffi::OsStr;
 use std::io;
-use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustix::io::{Errno, FdFlags, fcntl_getfd, fcntl_setfd};
 
@@ -71,40 +72,52 @@ pub fn env_has(pid: i32, entry: &[u8]) -> Option<bool> {
     }
 }
 
-/// Drops the descriptor a supervisor's Bash command inherited, as `launch.close_inherited_lock`
-/// does for `LEADHAND_LOCK_FD` (R41a). The variable `var` is removed from the environment
-/// either way, so children do not try again. Then, with `same_file_as` given (the run's
-/// `run.lock`), the descriptor `var` named is closed only when it is open and is the same file
-/// (device and inode) as that path: never any other descriptor, never 0–2, and never an unlock
-/// (closing one reference leaves the supervisor's lock in place). A value that is not an
-/// integer is ignored.
-///
-/// Call it first thing in `main`, while the process has one thread and has opened nothing:
-/// both the environment change and taking the descriptor rely on that.
-pub fn close_inherited_fd(var: &str, same_file_as: Option<&Path>) {
-    let Some(raw) = std::env::var_os(var) else {
+/// The variable a launcher sets to the run-lock descriptor it passes `claude` (R41a).
+pub(crate) const LOCK_FD_VAR: &str = "LEADHAND_LOCK_FD";
+
+/// Whether `close_inherited_fd` has run in this process.
+static CLOSE_INHERITED_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Drops the run-lock descriptor a supervisor's Bash command inherited, as
+/// `launch.close_inherited_lock` does (R41a). `main` calls it first; it acts at most once per
+/// process, and every later call does nothing.
+/// - `LEADHAND_LOCK_FD` is removed from the environment, so children do not try again: but
+///   only when the process has one thread (counted at run time), because removing a variable
+///   is unsound while another thread may read the environment. With more threads, or a count
+///   that cannot be read, the variable stays and only the close below happens.
+/// - With `same_file_as` given (the run's `run.lock`), the descriptor the variable names is
+///   closed only when it is open and is the same file (device and inode) as that path: never
+///   any other descriptor, never 0–2, and never an unlock (closing one reference leaves the
+///   supervisor's lock in place). A value that is not an integer is ignored.
+pub(crate) fn close_inherited_fd(same_file_as: Option<&Path>) {
+    if CLOSE_INHERITED_DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let Some(raw) = std::env::var_os(LOCK_FD_VAR) else {
         return;
     };
-    // SAFETY: `remove_var` is unsound only while another thread reads or writes the
-    // environment. The documented caller is `main`, before anything else runs: one thread,
-    // and no code that touches the environment behind std's lock. (The unit test calls it
-    // in a child process running that one test.)
-    unsafe { std::env::remove_var(var) };
+    if platform::thread_count() == Some(1) {
+        // SAFETY: `remove_var` is unsound only while another thread may read or write the
+        // environment. The process has exactly one thread, this one, counted just now; no
+        // other can start before the call returns, since only this thread could start it.
+        unsafe { std::env::remove_var(LOCK_FD_VAR) };
+    }
     let (Some(path), Some(fd)) = (same_file_as, descriptor(&raw)) else {
         return;
     };
-    // SAFETY: `fd` is > 2 (never -1) and is borrowed for this one `fstat` call. No object in
-    // this process owns it (nothing has been opened yet, see above), so the borrow aliases no
-    // owner, and with one thread nothing can close it during the call. If it is not open,
-    // `fstat` fails with EBADF and nothing else happens.
+    // SAFETY: `fd` is > 2 (never -1) and is borrowed for this one `fstat` call. This function
+    // runs at most once, and its one caller is the start of `main`, before anything in the
+    // process opens a descriptor: no object owns `fd`, so the borrow aliases no owner and
+    // nothing closes it during the call. If it is not open, `fstat` fails with EBADF and
+    // nothing else happens.
     let held = rustix::fs::fstat(unsafe { BorrowedFd::borrow_raw(fd) });
     let (Ok(held), Ok(want)) = (held, rustix::fs::stat(path)) else {
         return;
     };
     if (held.st_dev, held.st_ino) == (want.st_dev, want.st_ino) {
         // SAFETY: `fstat` just showed `fd` open, and it is the inherited descriptor, which
-        // no object in this process owns: taking ownership once and dropping it closes it
-        // exactly once, and nothing uses the number afterwards.
+        // no object in this process owns (as above): taking ownership once and dropping it
+        // closes it exactly once, and nothing uses the number afterwards.
         drop(unsafe { OwnedFd::from_raw_fd(fd) });
     }
 }
@@ -134,29 +147,41 @@ pub fn detach_session(cmd: &mut Command) {
 
 /// Keeps descriptor `fd` open across the child's `exec` by clearing `FD_CLOEXEC` in the child
 /// only: Rust opens every file close-on-exec, so this one child, and no other, inherits it
-/// (`subprocess.Popen(pass_fds=…)`). A descriptor that is not open fails the spawn (EBADF).
-pub fn pass_fd_to_child(cmd: &mut Command, fd: RawFd) {
+/// (`subprocess.Popen(pass_fds=…)`).
+///
+/// The descriptor is borrowed here, so it is open when the step is registered, and its
+/// identity (device and inode) is recorded. In the child the step first checks that the same
+/// number is still that file; if the caller closed it before spawning (the number then names
+/// nothing, or a descriptor opened since, such as std's own exec-error pipe), the spawn fails
+/// with EBADF instead of clearing the flag on the wrong descriptor.
+pub fn pass_fd_to_child(cmd: &mut Command, fd: BorrowedFd<'_>) {
+    let raw = fd.as_raw_fd();
+    let identity = rustix::fs::fstat(fd).ok().map(|st| (st.st_dev, st.st_ino));
     let keep_open = move || -> io::Result<()> {
-        if fd < 0 {
+        // SAFETY: in the forked child, which runs no other code, `raw` (a descriptor number
+        // that was open when the step was registered, so never -1) is borrowed for these
+        // `fstat` and `fcntl` calls only; nothing can close it meanwhile. If it is no longer
+        // open, they fail with EBADF.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
+        let now = rustix::fs::fstat(borrowed)?;
+        if identity != Some((now.st_dev, now.st_ino)) {
             return Err(Errno::BADF.into());
         }
-        // SAFETY: in the forked child, which runs no other code, `fd` (not -1) is borrowed
-        // for two `fcntl` calls. If the parent did not have it open, they fail with EBADF.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         let flags = fcntl_getfd(borrowed)?;
         fcntl_setfd(borrowed, flags.difference(FdFlags::CLOEXEC))?;
         Ok(())
     };
     // SAFETY: the closure runs in the forked child before `exec`, where only
-    // async-signal-safe work is allowed. It makes two `fcntl(2)` system calls on one
-    // descriptor, allocates nothing, takes no lock, and builds any error from the raw errno.
+    // async-signal-safe work is allowed. It makes one `fstat(2)` and two `fcntl(2)` system
+    // calls on one descriptor, allocates nothing, takes no lock, and builds any error from
+    // the raw errno.
     unsafe { cmd.pre_exec(keep_open) };
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use std::fs::File;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsFd, AsRawFd};
     use std::path::PathBuf;
     use std::process::{Child, Stdio};
 
@@ -215,10 +240,10 @@ pub(crate) mod tests {
     }
 
     /// Whether `fd` is open in a `test -e /dev/fd/<fd>` child, passed to it or not.
-    fn open_in_child(fd: RawFd, pass: bool) -> bool {
+    fn open_in_child(fd: BorrowedFd, pass: bool) -> bool {
         let mut cmd = Command::new("test");
         cmd.arg("-e")
-            .arg(format!("/dev/fd/{fd}"))
+            .arg(format!("/dev/fd/{}", fd.as_raw_fd()))
             .stdin(Stdio::null());
         if pass {
             pass_fd_to_child(&mut cmd, fd);
@@ -231,9 +256,9 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let passed = File::create(dir.path().join("passed")).unwrap();
         let kept = File::create(dir.path().join("kept")).unwrap();
-        assert!(open_in_child(passed.as_raw_fd(), true));
+        assert!(open_in_child(passed.as_fd(), true));
         assert!(
-            !open_in_child(kept.as_raw_fd(), false),
+            !open_in_child(kept.as_fd(), false),
             "close-on-exec by default"
         );
         // The flag is cleared in the child only.
@@ -243,26 +268,53 @@ pub(crate) mod tests {
                 .contains(FdFlags::CLOEXEC)
         );
 
-        // A descriptor that is not open fails the spawn instead of being ignored.
+        // The number is checked to be the same file in the child: when it names another
+        // file by then, the spawn fails instead of clearing the flag on the wrong descriptor.
+        let mut swapped: OwnedFd = File::create(dir.path().join("swapped")).unwrap().into();
         let mut cmd = Command::new("true");
-        pass_fd_to_child(&mut cmd, -1);
-        assert!(cmd.status().is_err());
+        pass_fd_to_child(&mut cmd, swapped.as_fd());
+        rustix::io::dup2(&kept, &mut swapped).unwrap();
+        fcntl_setfd(&swapped, FdFlags::CLOEXEC).unwrap();
+        assert!(cmd.status().is_err(), "another file under the number");
+        // Closed before the spawn: the number names nothing, or something opened since.
+        let gone = File::create(dir.path().join("gone")).unwrap();
+        let mut cmd = Command::new("true");
+        pass_fd_to_child(&mut cmd, gone.as_fd());
+        drop(gone);
+        assert!(cmd.status().is_err(), "a closed descriptor");
     }
 
     const CLOSE_CHILD: &str = "LEADHAND_SYS_TEST_CLOSE_CHILD";
     const CLOSE_LOCK: &str = "LEADHAND_SYS_TEST_LOCK";
+    const CLOSE_AGAIN: &str = "LEADHAND_SYS_TEST_AGAIN";
 
-    /// Not a test of its own: the child process `close_in_child` starts (this test binary,
-    /// running this test alone). One `close_inherited_fd` call, as `main` makes it, then a
-    /// report of the variable and of each listed descriptor. Does nothing in an ordinary run.
+    /// Not a test of its own: the child process `run_close_child` starts (this test binary,
+    /// running this test alone). It makes one `close_inherited_fd` call as `main` makes it
+    /// (then a second one, with another lock path, if asked), and reports whether
+    /// `LEADHAND_LOCK_FD` is still set and which listed descriptors are open. Does nothing in
+    /// an ordinary run.
+    ///
+    /// libtest runs every test on a thread of its own, so this process always has more than
+    /// one thread, and `close_inherited_fd` always keeps the variable here. A parked thread is
+    /// started as well, so that stays true however libtest runs it. Only a single-threaded
+    /// process (`main`) removes the variable.
     #[test]
     fn close_inherited_fd_child() {
         let Some(fds) = std::env::var_os(CLOSE_CHILD) else {
             return;
         };
+        std::thread::spawn(|| {
+            loop {
+                std::thread::park();
+            }
+        });
+        assert!(platform::thread_count().unwrap() > 1);
         let lock = std::env::var_os(CLOSE_LOCK).map(PathBuf::from);
-        close_inherited_fd("LEADHAND_LOCK_FD", lock.as_deref());
-        let var = std::env::var_os("LEADHAND_LOCK_FD").is_some();
+        close_inherited_fd(lock.as_deref());
+        if let Some(again) = std::env::var_os(CLOSE_AGAIN) {
+            close_inherited_fd(Some(Path::new(&again)));
+        }
+        let var = std::env::var_os(LOCK_FD_VAR).is_some();
         let open: Vec<String> = fds
             .to_str()
             .unwrap()
@@ -272,10 +324,28 @@ pub(crate) mod tests {
         println!("report var={var} {}", open.join(" "));
     }
 
-    /// Runs `close_inherited_fd_child` with `LEADHAND_LOCK_FD=value`, the lock path `lock`
-    /// and the descriptors `fds` inherited; returns its report.
-    fn close_in_child(value: &str, lock: Option<&Path>, fds: &[RawFd]) -> String {
-        let listed: Vec<String> = fds.iter().map(RawFd::to_string).collect();
+    /// One run of `close_inherited_fd_child`.
+    #[derive(Default)]
+    struct CloseCase<'a> {
+        /// `LEADHAND_LOCK_FD`'s value; unset when `None`.
+        value: Option<&'a str>,
+        /// The lock path `main` would pass.
+        lock: Option<&'a Path>,
+        /// Descriptors the child inherits and reports on; 0-2 are reported, not passed.
+        fds: &'a [BorrowedFd<'a>],
+        /// Call again, with this lock path.
+        again: Option<&'a Path>,
+        /// Another variable set in the child.
+        extra: Option<(&'a str, &'a str)>,
+    }
+
+    /// Runs `close_inherited_fd_child` for `case`; returns its report.
+    fn run_close_child(case: CloseCase) -> String {
+        let listed: Vec<String> = case
+            .fds
+            .iter()
+            .map(|fd| fd.as_raw_fd().to_string())
+            .collect();
         let mut cmd = Command::new(std::env::current_exe().unwrap());
         cmd.args([
             "sys::tests::close_inherited_fd_child",
@@ -284,15 +354,25 @@ pub(crate) mod tests {
             "--test-threads=1",
         ])
         .env(CLOSE_CHILD, listed.join(","))
-        .env("LEADHAND_LOCK_FD", value)
+        .env_remove(LOCK_FD_VAR)
+        .env_remove(CLOSE_LOCK)
+        .env_remove(CLOSE_AGAIN)
         .stdin(Stdio::null());
-        match lock {
-            Some(path) => cmd.env(CLOSE_LOCK, path),
-            None => cmd.env_remove(CLOSE_LOCK),
-        };
-        for &fd in fds {
-            if fd > 2 {
-                pass_fd_to_child(&mut cmd, fd);
+        if let Some(value) = case.value {
+            cmd.env(LOCK_FD_VAR, value);
+        }
+        if let Some(path) = case.lock {
+            cmd.env(CLOSE_LOCK, path);
+        }
+        if let Some(path) = case.again {
+            cmd.env(CLOSE_AGAIN, path);
+        }
+        if let Some((name, value)) = case.extra {
+            cmd.env(name, value);
+        }
+        for fd in case.fds {
+            if fd.as_raw_fd() > 2 {
+                pass_fd_to_child(&mut cmd, fd.as_fd());
             }
         }
         let out = cmd.output().unwrap();
@@ -309,6 +389,17 @@ pub(crate) mod tests {
         report.lines().next().unwrap().to_owned()
     }
 
+    /// `run_close_child` with `LEADHAND_LOCK_FD=value`, the lock path `lock` and the
+    /// descriptors `fds`, nothing else.
+    fn close_in_child(value: &str, lock: Option<&Path>, fds: &[BorrowedFd]) -> String {
+        run_close_child(CloseCase {
+            value: Some(value),
+            lock,
+            fds,
+            ..CloseCase::default()
+        })
+    }
+
     #[test]
     fn close_inherited_fd_closes_only_the_same_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -316,47 +407,106 @@ pub(crate) mod tests {
         let lock = File::create(&lock_path).unwrap();
         let other = File::create(dir.path().join("other")).unwrap();
         let (l, o) = (lock.as_raw_fd(), other.as_raw_fd());
+        let fds = [lock.as_fd(), other.as_fd()];
 
         // Another file under the variable stays open.
         assert_eq!(
-            close_in_child(&o.to_string(), Some(&lock_path), &[l, o]),
-            format!("var=false {l}=true {o}=true")
+            close_in_child(&o.to_string(), Some(&lock_path), &fds),
+            format!("var=true {l}=true {o}=true")
         );
         // The same file (device and inode) is closed, and nothing else.
         assert_eq!(
-            close_in_child(&l.to_string(), Some(&lock_path), &[l, o]),
-            format!("var=false {l}=false {o}=true")
+            close_in_child(&l.to_string(), Some(&lock_path), &fds),
+            format!("var=true {l}=false {o}=true")
         );
         // A hard link to run.lock is the same file.
         let link = dir.path().join("link.lock");
         std::fs::hard_link(&lock_path, &link).unwrap();
         assert_eq!(
-            close_in_child(&l.to_string(), Some(&link), &[l, o]),
-            format!("var=false {l}=false {o}=true")
+            close_in_child(&l.to_string(), Some(&link), &fds),
+            format!("var=true {l}=false {o}=true")
         );
-        // Without a run directory, nothing is closed; the variable goes either way.
+        // Without a run directory, nothing is closed.
         assert_eq!(
-            close_in_child(&l.to_string(), None, &[l, o]),
-            format!("var=false {l}=true {o}=true")
+            close_in_child(&l.to_string(), None, &fds),
+            format!("var=true {l}=true {o}=true")
         );
         // A missing run.lock closes nothing.
         assert_eq!(
-            close_in_child(&l.to_string(), Some(&dir.path().join("missing")), &[l, o]),
-            format!("var=false {l}=true {o}=true")
+            close_in_child(&l.to_string(), Some(&dir.path().join("missing")), &fds),
+            format!("var=true {l}=true {o}=true")
         );
         // Not a number, or a standard descriptor: ignored.
         for value in ["", "x", "2", "-1", "99999999999"] {
             assert_eq!(
-                close_in_child(value, Some(&lock_path), &[2, l, o]),
-                format!("var=false 2=true {l}=true {o}=true"),
+                close_in_child(
+                    value,
+                    Some(&lock_path),
+                    &[std::io::stderr().as_fd(), lock.as_fd(), other.as_fd()]
+                ),
+                format!("var=true 2=true {l}=true {o}=true"),
                 "value {value:?}"
             );
         }
         // Surrounding whitespace is allowed, as Python's int() allows it.
         assert_eq!(
-            close_in_child(&format!(" {l}\n"), Some(&lock_path), &[l, o]),
-            format!("var=false {l}=false {o}=true")
+            close_in_child(&format!(" {l}\n"), Some(&lock_path), &fds),
+            format!("var=true {l}=false {o}=true")
         );
+    }
+
+    #[test]
+    fn close_inherited_fd_acts_at_most_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("run.lock");
+        let lock = File::create(&lock_path).unwrap();
+        let other_path = dir.path().join("other");
+        let other = File::create(&other_path).unwrap();
+        let (l, o) = (lock.as_raw_fd(), other.as_raw_fd());
+        // The variable stays (more than one thread), so a second call could still act on it:
+        // the first call (another file) closes nothing, and the second (run.lock) does
+        // nothing at all.
+        let report = run_close_child(CloseCase {
+            value: Some(&l.to_string()),
+            lock: Some(&other_path),
+            fds: &[lock.as_fd(), other.as_fd()],
+            again: Some(&lock_path),
+            extra: None,
+        });
+        assert_eq!(report, format!("var=true {l}=true {o}=true"));
+    }
+
+    #[test]
+    fn close_inherited_fd_with_threads_still_closes_but_keeps_the_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("run.lock");
+        let lock = File::create(&lock_path).unwrap();
+        let other = File::create(dir.path().join("other")).unwrap();
+        let (l, o) = (lock.as_raw_fd(), other.as_raw_fd());
+        let report = run_close_child(CloseCase {
+            value: Some(&l.to_string()),
+            lock: Some(&lock_path),
+            fds: &[lock.as_fd(), other.as_fd()],
+            ..CloseCase::default()
+        });
+        assert_eq!(report, format!("var=true {l}=false {o}=true"));
+    }
+
+    #[test]
+    fn close_inherited_fd_reads_only_its_own_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("run.lock");
+        let lock = File::create(&lock_path).unwrap();
+        let l = lock.as_raw_fd();
+        // Python's in-place checkout claim variable, naming run.lock: not Rust's to close.
+        let report = run_close_child(CloseCase {
+            value: None,
+            lock: Some(&lock_path),
+            fds: &[lock.as_fd()],
+            extra: Some(("LEADHAND_CHECKOUT_FD", &l.to_string())),
+            ..CloseCase::default()
+        });
+        assert_eq!(report, format!("var=false {l}=true"));
     }
 
     #[test]
