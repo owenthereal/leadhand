@@ -48,8 +48,9 @@ const PRESETS: [(&str, &str); 2] = [
     ("claude-only", include_str!("../presets/claude-only.toml")),
 ];
 
-/// The Claude worker agents' bodies, for their `maxTurns` (`briefs.agent_max_turns`).
-const AGENTS: [(&str, &str); 4] = [
+/// The Claude worker agents' files, for their `maxTurns` (`briefs.agent_max_turns`) and
+/// their bodies (`briefs::worker_prompt`).
+pub(crate) const AGENTS: [(&str, &str); 4] = [
     ("implementer", include_str!("../agents/implementer.md")),
     ("reviewer", include_str!("../agents/reviewer.md")),
     ("verifier", include_str!("../agents/verifier.md")),
@@ -57,7 +58,7 @@ const AGENTS: [(&str, &str); 4] = [
 ];
 
 /// The Claude agent each role's worker runs as (`briefs.ROLE_AGENT`).
-const ROLE_AGENT: [(&str, &str); 7] = [
+pub(crate) const ROLE_AGENT: [(&str, &str); 7] = [
     ("implementer", "implementer"),
     ("implementer_hard", "implementer"),
     ("reviewer", "reviewer"),

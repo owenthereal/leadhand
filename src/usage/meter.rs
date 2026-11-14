@@ -179,15 +179,62 @@ pub fn lenient<'de, D: Deserializer<'de>, T: Lenient>(d: D) -> Result<T, D::Erro
 /// `Deserialize` through `Lenient`.
 macro_rules! deserialize_leniently {
     ($($t:ty),*) => {$(
-        impl<'de> Deserialize<'de> for $t {
-            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-                lenient(d)
+        impl<'de> serde::Deserialize<'de> for $t {
+            fn deserialize<D: serde::Deserializer<'de>>(
+                d: D,
+            ) -> std::result::Result<Self, D::Error> {
+                $crate::usage::meter::lenient(d)
             }
         }
     )*};
 }
 
-deserialize_leniently!(Window, Number, Stamp);
+pub(crate) use deserialize_leniently;
+
+deserialize_leniently!(Window, Number, Stamp, Count);
+
+/// A token count as `usage._int` reads it: a JSON number (not a `bool`), truncated and
+/// floored at 0; any other value is 0. A count beyond `u64` saturates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Count(pub u64);
+
+impl Lenient for Count {
+    fn int(v: i64) -> Self {
+        Count(u64::try_from(v).unwrap_or(0))
+    }
+    fn uint(v: u64) -> Self {
+        Count(v)
+    }
+    fn float(v: f64) -> Self {
+        // `as` truncates toward zero and saturates; NaN is 0.
+        Count(if v > 0.0 { v as u64 } else { 0 })
+    }
+}
+
+/// A JSON string as `json.loads` gives it, lone surrogates included (the field is read raw,
+/// unvalidated, and only a string is decoded), else `None`: a field Python reads with
+/// `isinstance(x, str)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VendorStr(pub Option<PyStr>);
+
+impl<'de> Deserialize<'de> for VendorStr {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = Box::<serde_json::value::RawValue>::deserialize(d)?;
+        if !raw.get().starts_with('"') {
+            return Ok(VendorStr(None));
+        }
+        serde_json::from_str::<PyStr>(raw.get())
+            .map(|s| VendorStr(Some(s)))
+            .map_err(de::Error::custom)
+    }
+}
+
+impl VendorStr {
+    /// Whether the value is the string `s`.
+    pub(crate) fn is(&self, s: &str) -> bool {
+        self.0.as_ref().is_some_and(|v| v.as_wtf8() == s.as_bytes())
+    }
+}
 
 /// A rollout line with a rate-limit record: only the fields the meter reads.
 #[derive(Deserialize)]

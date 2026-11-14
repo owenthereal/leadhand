@@ -1,15 +1,31 @@
 //! Usage accounting (`usage.py`): the token counts a charge carries, their sums, totals per
 //! group and the estimated cost; `charges.jsonl` read typed; and the Codex meter (`meter`).
-//! Charging itself (the transcript, rollout and stream readers, checkpoints, `subtract`) is
-//! Task 8's.
+//!
+//! - `claude`: Claude transcripts, located, and read once per message ID;
+//! - `codex`: Codex rollouts (once per `response_id`) and `--json` streams;
+//! - `charges`: charging what is new exactly once, from the checkpoint earlier charges reached.
 //!
 //! A `Usage` mixing models keeps each model's tokens in `by_model` (with `model` `None`), so
 //! a total is priced per model; the key `""` stands for records without a model.
 
+pub mod charges;
+pub mod claude;
+pub mod codex;
 pub mod meter;
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
+pub use charges::{
+    CODEX_STREAM_SOURCE, ChargeSource, Checkpoint, Cumulative, Mismatch, Source, charge,
+    charged_checkpoint,
+};
+pub use claude::{
+    claude_session_transcript, claude_subagent_transcript, claude_usage, new_claude_usage,
+};
+pub use codex::{codex_cumulative, codex_session_file, codex_stream_usage};
 pub use meter::{METER_SCAN_FILES, Meter, codex_meter};
 
 use serde::{Deserialize, Serialize};
@@ -51,14 +67,27 @@ impl Tokens {
         *self != Tokens::default()
     }
 
+    /// Field-wise sum, saturating: a vendor's count can be as large as `u64` holds.
     fn plus(&self, o: &Tokens) -> Tokens {
         Tokens {
-            input: self.input + o.input,
-            cached: self.cached + o.cached,
-            cache_write_5m: self.cache_write_5m + o.cache_write_5m,
-            cache_write_1h: self.cache_write_1h + o.cache_write_1h,
-            output: self.output + o.output,
-            reasoning: self.reasoning + o.reasoning,
+            input: self.input.saturating_add(o.input),
+            cached: self.cached.saturating_add(o.cached),
+            cache_write_5m: self.cache_write_5m.saturating_add(o.cache_write_5m),
+            cache_write_1h: self.cache_write_1h.saturating_add(o.cache_write_1h),
+            output: self.output.saturating_add(o.output),
+            reasoning: self.reasoning.saturating_add(o.reasoning),
+        }
+    }
+
+    /// Field-wise difference, floored at 0.
+    fn minus(&self, o: &Tokens) -> Tokens {
+        Tokens {
+            input: self.input.saturating_sub(o.input),
+            cached: self.cached.saturating_sub(o.cached),
+            cache_write_5m: self.cache_write_5m.saturating_sub(o.cache_write_5m),
+            cache_write_1h: self.cache_write_1h.saturating_sub(o.cache_write_1h),
+            output: self.output.saturating_sub(o.output),
+            reasoning: self.reasoning.saturating_sub(o.reasoning),
         }
     }
 }
@@ -188,6 +217,17 @@ pub fn add(a: &Usage, b: &Usage) -> Usage {
     }
 }
 
+/// Field-wise `a - b`, floored at 0 (`usage.subtract`): keeps `a`'s `known` and `model`, and
+/// no `by_model`.
+pub fn subtract(a: &Usage, b: &Usage) -> Usage {
+    Usage {
+        tokens: a.tokens.minus(&b.tokens),
+        known: a.known,
+        model: a.model.clone(),
+        by_model: None,
+    }
+}
+
 /// `"opus"` for `claude-opus-*`, and so on, by substring of the lowercased model; `None` for
 /// any other model (all of Codex's) (`usage.price_family`).
 pub fn price_family(model: Option<&PyStr>) -> Option<&'static str> {
@@ -230,10 +270,11 @@ fn price(t: &Tokens, model: Option<&PyStr>, prices: &[(String, Prices)]) -> Opti
     )
 }
 
-/// One charge (`charges.jsonl`, contract item 4), with the fields `status` and `report` read;
-/// Task 8 adds `checkpoint` and `mismatch` when it writes charges. The fields the Python's
-/// `_charge_from_record` requires are required here.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+/// One charge (`charges.jsonl`, contract item 4), in the Python's field order
+/// (`usage._charge_to_record`). The fields the Python's `_charge_from_record` requires are
+/// required here; a missing or `null` checkpoint is an empty one. `possibly_incomplete` is
+/// written only when set, `mismatch` only when there is one.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Charge {
     pub charge_id: PyStr,
     pub source: String,
@@ -241,9 +282,13 @@ pub struct Charge {
     pub dispatch_id: String,
     pub role: String,
     pub usage: Usage,
+    #[serde(default, deserialize_with = "charges::null_as_default")]
+    pub checkpoint: Checkpoint,
     pub ts: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub possibly_incomplete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mismatch: Option<Mismatch>,
 }
 
 /// Every charge in the run's log, typed (`usage.read_charges`).
@@ -281,6 +326,114 @@ pub fn totals(charges: &[Charge], by: Group) -> PyMap<Usage> {
 /// How many charges have unknown usage (`usage.unknown_count`).
 pub fn unknown_count(charges: &[Charge]) -> usize {
     charges.iter().filter(|c| !c.usage.known).count()
+}
+
+/// `usage._safe_id`: an ID that can be part of a file name (not empty, no `/`, no NUL).
+pub(crate) fn safe_id(id: &PyStr) -> bool {
+    let b = id.as_wtf8();
+    !b.is_empty() && !b.contains(&b'/') && !b.contains(&0)
+}
+
+/// What a locator's pattern ends with, after its `*` folders.
+pub(crate) enum Locate<'a> {
+    /// These literal components, matched when the path exists (`os.path.lexists`).
+    Path(&'a [&'a OsStr]),
+    /// Any entry whose name, decoded as `surrogateescape` decodes it, ends with these WTF-8
+    /// bytes (`*<suffix>`).
+    Suffix(&'a [u8]),
+}
+
+/// The newest match of `<base>/*/…/*/<last>`, with `wild` `*` folders, as `glob.glob` and
+/// `usage._newest` find it: `*` matches no hidden name (one starting with `.`) and, before the
+/// last component, only folders (followed through links). The newest is the greatest
+/// (`st_mtime`, 0 when it cannot be read; then the path's text). The path is spelled as
+/// `pathlib` spells it.
+pub(crate) fn newest(base: &Path, wild: usize, last: Locate) -> Option<PathBuf> {
+    let visible = |name: &OsStr| !name.as_bytes().starts_with(b".");
+    let mut dirs = vec![crate::pytext::pure_path(base.as_os_str())];
+    for _ in 0..wild {
+        let mut next = Vec::new();
+        for dir in &dirs {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = dir.join(entry.file_name());
+                if visible(&entry.file_name()) && path.is_dir() {
+                    next.push(path);
+                }
+            }
+        }
+        dirs = next;
+    }
+    let mut found = Vec::new();
+    for dir in dirs {
+        match last {
+            Locate::Path(parts) => {
+                let path = parts.iter().fold(dir, |p, part| p.join(part));
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    found.push(path);
+                }
+            }
+            Locate::Suffix(suffix) => {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if visible(&name) && PyStr::from_os(&name).as_wtf8().ends_with(suffix) {
+                        found.push(dir.join(name));
+                    }
+                }
+            }
+        }
+    }
+    found
+        .into_iter()
+        .map(|path| {
+            let path = crate::pytext::pure_path(path.as_os_str());
+            let mtime = std::fs::metadata(&path)
+                .map_or(0.0, |m| m.mtime() as f64 + m.mtime_nsec() as f64 * 1e-9);
+            (mtime, PyStr::from_os(path.as_os_str()), path)
+        })
+        .max_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+        .map(|(_, _, path)| path)
+}
+
+/// The parsed lines of a vendor file (`usage._json_lines`): the text decoded as UTF-8 with
+/// replacement and split at universal newlines (`\n`, `\r\n`, `\r`, as Python's text mode
+/// reads it; a final line without one counts too). A line holding none of `needles` (when
+/// there are any) is skipped unparsed; the rest are stripped as `str.strip` strips them and
+/// parsed, and a line that does not parse (a partial write, foreign noise) is skipped. `T`
+/// reads leniently (`meter::Lenient`): only the fields it uses, a field of another type
+/// being no value.
+pub(crate) fn json_lines<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    needles: &[&str],
+) -> std::io::Result<Vec<T>> {
+    let bytes = std::fs::read(path)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut out = Vec::new();
+    let mut rest: &str = &text;
+    while !rest.is_empty() {
+        let (line, next) = match rest.find(['\n', '\r']) {
+            Some(at) if rest[at..].starts_with("\r\n") => (&rest[..at], &rest[at + 2..]),
+            Some(at) => (&rest[..at], &rest[at + 1..]),
+            None => (rest, ""),
+        };
+        rest = next;
+        if !needles.is_empty() && !needles.iter().any(|n| line.contains(n)) {
+            continue;
+        }
+        let line = crate::pytext::py_strip(line);
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(record) = serde_json::from_str(line) {
+            out.push(record);
+        }
+    }
+    Ok(out)
 }
 
 /// `$CODEX_HOME/sessions`, else `~/.codex/sessions` (`usage.default_sessions_dir`).
@@ -367,6 +520,45 @@ mod tests {
         assert!(s.known);
         assert!(!add(&a, &Usage::unknown()).known);
         assert!(!add(&Usage::unknown(), &a).known);
+    }
+
+    // CATALOG: test_usage.py::ArithmeticTests::test_subtract_is_field_wise_and_floored_at_zero
+    #[test]
+    fn subtract_is_field_wise_and_floored_at_zero() {
+        let a = Usage {
+            tokens: Tokens {
+                input: 5,
+                cached: 1,
+                output: 100,
+                ..Tokens::default()
+            },
+            model: Some("m".into()),
+            ..Usage::default()
+        };
+        let b = Usage {
+            tokens: Tokens {
+                input: 3,
+                cached: 9,
+                output: 40,
+                ..Tokens::default()
+            },
+            known: false,
+            ..Usage::default()
+        };
+        let d = subtract(&a, &b);
+        assert_eq!(
+            (d.tokens.input, d.tokens.cached, d.tokens.output),
+            (2, 0, 60)
+        );
+        // a's `known` and model are kept; a per-model split is not.
+        assert!(d.known);
+        assert_eq!(d.model, Some(PyStr::from("m")));
+        let mixed = add(
+            &usage(tokens(1, 1), Some("x")),
+            &usage(tokens(1, 1), Some("y")),
+        );
+        assert!(mixed.by_model.is_some());
+        assert_eq!(subtract(&mixed, &Usage::default()).by_model, None);
     }
 
     #[test]
@@ -475,8 +667,10 @@ mod tests {
             dispatch_id: "d1".into(),
             role: role.into(),
             usage: u,
+            checkpoint: Checkpoint::default(),
             ts: "t".into(),
             possibly_incomplete: false,
+            mismatch: None,
         };
         let charges = [
             charge("supervisor", usage(tokens(1, 1), None)),

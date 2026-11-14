@@ -4,15 +4,18 @@
 //! - `paths`: the run directory's file names (`RunPaths`);
 //! - `events`: one typed struct per event kind, decoded tag-first (`read_events`);
 //! - `fold`: each card's state (`fold_cards`);
-//! - `outcome`: how a run ends (`decide_outcome`, `allowed_next_step`).
+//! - `outcome`: how a run ends (`decide_outcome`, `allowed_next_step`);
+//! - `write`: appending events and attempts, and the two-phase steps that host the crash
+//!   points.
 //!
-//! Here too: the typed views of `run.json` and of `attempts.jsonl` that `status` and `report`
-//! read, and the timestamp every record carries.
+//! Here too: the typed views of `run.json` and of `attempts.jsonl`, and the timestamp every
+//! record carries.
 
 pub mod events;
 pub mod fold;
 pub mod outcome;
 pub mod paths;
+pub mod write;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,6 +28,7 @@ pub use outcome::{
     decide_outcome,
 };
 pub use paths::{RunPaths, run_paths};
+pub use write::{append_attempt, append_event, read_attempts, two_phase};
 
 use crate::error::{Error, Result};
 use crate::wire::{self, PyStr};
@@ -60,20 +64,44 @@ pub fn read_run_meta(paths: &RunPaths) -> Result<RunMeta> {
     serde_json::from_str(&text).map_err(|e| Error::msg(format!("run.json: {e}")))
 }
 
-/// One attempt record (`attempts.jsonl`), with the fields `status` and `report` read. Task 8
-/// adds the rest of the record when it writes them.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+/// One attempt record (`attempts.jsonl`, contract item 4), as the engine writes it for a
+/// Claude worker (`engine._store_result`) and the runner for a Codex one
+/// (`dispatch._finish`), in their shared field order. The fields only one of them writes
+/// (`agent` and `recorded_by`; `usage_source`, `generation` and `possibly_incomplete`) are
+/// left out when `None`; the rest are always written, `null` when `None`. Read leniently as
+/// to presence: every field may be missing.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AttemptRecord {
     pub dispatch: Option<String>,
+    pub run: Option<String>,
     pub card: Option<CardRef>,
     pub attempt: Option<i64>,
     pub role: Option<String>,
     pub vendor: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
-    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub worker_id: Option<PyStr>,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub steps: Option<i64>,
+    pub charge_ids: Vec<PyStr>,
+    pub usage: Option<crate::usage::Usage>,
     pub usage_known: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_source: Option<String>,
+    pub cost_estimate: Option<f64>,
+    pub exit_reason: Option<String>,
+    pub status: Option<String>,
+    pub blocked_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recorded_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub possibly_incomplete: Option<bool>,
 }
 
 /// The time now, UTC, as every record carries it: `YYYY-MM-DDTHH:MM:SS.mmmZ`

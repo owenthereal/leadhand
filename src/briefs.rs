@@ -1,0 +1,421 @@
+//! Worker briefs (`briefs.py`): where a dispatch's scratch folder is, the prompt a Codex
+//! worker gets, and the head of a worker's report.
+//!
+//! A brief is a Markdown file in the attempt's scratch folder inside the workspace
+//! (`<ws>/.leadhand/<card or "run">/<dispatch_id>/brief.md`); the worker writes its report
+//! beside it. The worker contract and the role rules are the agent files under `agents/`,
+//! compiled in; Codex workers get the same text through `worker_prompt`.
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use crate::config::{AGENTS, ROLE_AGENT, VENDORS};
+use crate::error::{Error, Result};
+use crate::pytext::{pure_path, py_isspace, py_repr, py_splitlines, py_strip};
+
+/// The scratch folder's name in the workspace (`briefs.SCRATCH`).
+pub const SCRATCH: &str = ".leadhand";
+/// The agent a Codex worker's proxy runs as (`briefs.CODEX_AGENT`).
+pub const CODEX_AGENT: &str = "leadhand:codex";
+/// A report head's status values (`briefs.STATUS_VALUES`).
+pub const STATUS_VALUES: [&str; 4] = ["READY", "QUESTION", "BLOCKED", "SPENT"];
+/// What `Blocked by:` may name (`briefs.BLOCKED_REASONS`).
+pub const BLOCKED_REASONS: [&str; 2] = ["environment", "usage limit"];
+
+/// Codex's workspace-write sandbox keeps the Git directory read-only (ruling R39), so a
+/// Codex implementer never commits; the runner commits its work afterwards
+/// (`briefs.CODEX_NO_COMMIT`).
+pub const CODEX_NO_COMMIT: &str = "## Commits (Codex workers)\n\n\
+    This overrides the contract's rule to commit on the card branch. Do not run git commit,\n\
+    git add, or any command that writes under .git; leave your changes in the working tree\n\
+    and list the changed files in your report. leadhand commits them on your branch after\n\
+    you finish.";
+
+/// The agent a role's worker runs as on `vendor` (`briefs.agent_for`).
+pub fn agent_for(role: &str, vendor: &str) -> Result<&'static str> {
+    if !VENDORS.contains(&vendor) {
+        return Err(Error::msg(format!("unknown vendor {}", py_repr(vendor))));
+    }
+    let Some((_, agent)) = ROLE_AGENT.iter().find(|(r, _)| *r == role) else {
+        return Err(Error::msg(format!(
+            "no worker agent for role {}",
+            py_repr(role)
+        )));
+    };
+    if vendor == "codex" {
+        return Ok(CODEX_AGENT);
+    }
+    Ok(match *agent {
+        "implementer" => "leadhand:implementer",
+        "reviewer" => "leadhand:reviewer",
+        "verifier" => "leadhand:verifier",
+        _ => "leadhand:scout",
+    })
+}
+
+/// `<ws>/.leadhand/<card or "run">/<dispatch_id>`, spelled as `pathlib` spells it
+/// (`briefs.scratch_dir`); a dispatch ID that is empty, `.`, `..` or holds a `/` is an error.
+pub fn scratch_dir(ws: &Path, card: Option<i64>, dispatch_id: &str) -> Result<PathBuf> {
+    if dispatch_id.is_empty() || dispatch_id.contains('/') || matches!(dispatch_id, "." | "..") {
+        return Err(Error::msg(format!(
+            "bad dispatch id {}",
+            py_repr(dispatch_id)
+        )));
+    }
+    let ws = pure_path(ws.as_os_str());
+    let scratch = if ws == Path::new(".") {
+        PathBuf::from(SCRATCH)
+    } else {
+        ws.join(SCRATCH)
+    };
+    let folder = card.map_or_else(|| "run".to_string(), |n| n.to_string());
+    Ok(scratch.join(folder).join(dispatch_id))
+}
+
+/// The instructions a Codex worker gets (`briefs.worker_prompt`): the role's Claude agent
+/// body (the contract and the role's rules), for implementers the no-commit rule, then the
+/// brief and report paths, spelled as `pathlib` spells them. The paths are kept as their
+/// bytes, so the prompt is OS text: it goes to Codex as an argument or on its stdin.
+pub fn worker_prompt(role: &str, brief: &Path, report: &Path) -> Result<OsString> {
+    let agent = agent_for(role, "claude")?;
+    let name = agent.trim_start_matches("leadhand:");
+    let file = AGENTS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map_or("", |(_, text)| *text);
+    let body = match file
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+    {
+        Some((_, body)) => body,
+        None => file,
+    };
+    let mut body = py_strip(body).to_string();
+    if agent == "leadhand:implementer" {
+        body.push_str("\n\n");
+        body.push_str(CODEX_NO_COMMIT);
+    }
+    let mut prompt = OsString::from(format!("{body}\n\n## Your files\n\n- Brief: "));
+    prompt.push(pure_path(brief.as_os_str()));
+    prompt.push("\n- Report file: ");
+    prompt.push(pure_path(report.as_os_str()));
+    prompt.push("\n\nRead the brief now, do the work, write the report, then reply.\n");
+    Ok(prompt)
+}
+
+/// What a report head is when it cannot be parsed (`briefs._UNPARSED`).
+const UNPARSED: (&str, &str, &str) = ("Status", "BLOCKED", "");
+
+/// `(key, value, blocked_by)` from a report's or reply's head (`briefs.parse_report_head`):
+/// the first non-blank line, Markdown emphasis and quote marks aside, must be `Status:`,
+/// `Verdict:` or `Result:` and one of its values, in any case; a `BLOCKED` status takes its
+/// reason from a `Blocked by:` line among the next four. Anything else is
+/// `("Status", "BLOCKED", "")`.
+///
+/// The Python matches with `re.IGNORECASE` over Unicode, so `ſ` matches `s`, `ı` and `İ`
+/// match `i`, and the Kelvin sign matches `k`; this matches the same lines. Where its
+/// `capitalize()` then makes a key it has no values for (`reſult`, `verdİct`), the Python
+/// raises `KeyError`; here that head is unparsed.
+pub fn parse_report_head(text: &str) -> (&'static str, &'static str, &'static str) {
+    let lines: Vec<String> = py_splitlines(text)
+        .into_iter()
+        .map(clean)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let Some((key, word)) = lines.first().and_then(|first| head(first)) else {
+        return UNPARSED;
+    };
+    let allowed: &[&'static str] = match key {
+        "Status" => &STATUS_VALUES,
+        "Verdict" => &["clean", "defects"],
+        _ => &["pass", "fail"],
+    };
+    let word = folded_lower(word);
+    let Some(value) = allowed
+        .iter()
+        .find(|v| Some(v.to_ascii_lowercase()) == word)
+    else {
+        return UNPARSED;
+    };
+    let mut blocked_by = "";
+    if key == "Status" && *value == "BLOCKED" {
+        for line in lines.iter().skip(1).take(4) {
+            if let Some(reason) = blocked_reason(line) {
+                let reason = reason.to_lowercase();
+                blocked_by = BLOCKED_REASONS
+                    .into_iter()
+                    .find(|r| reason.starts_with(r))
+                    .unwrap_or("");
+                break;
+            }
+        }
+    }
+    (key, value, blocked_by)
+}
+
+/// `briefs._clean`: emphasis marks removed, stripped, leading `#` and `>` removed, stripped.
+fn clean(line: &str) -> String {
+    let unmarked: String = line
+        .chars()
+        .filter(|c| !matches!(c, '*' | '_' | '`'))
+        .collect();
+    py_strip(py_strip(&unmarked).trim_start_matches(['#', '>'])).to_string()
+}
+
+/// Whether `c` matches the lowercase ASCII letter `p` under Python's Unicode `IGNORECASE`.
+fn folds_to(c: char, p: char) -> bool {
+    c.to_ascii_lowercase() == p && c.is_ascii()
+        || matches!((p, c), ('s', 'ſ') | ('i', 'İ' | 'ı') | ('k', '\u{212a}'))
+}
+
+/// `line` after the case-folded `word`, and whether the matched text was all ASCII but for
+/// a leading `ſ` (whether Python's `capitalize()` gives back the word's own key).
+fn after_folded<'a>(line: &'a str, word: &str) -> Option<(&'a str, bool)> {
+    let mut rest = line;
+    let mut keyed = true;
+    for (i, p) in word.chars().enumerate() {
+        let c = rest.chars().next()?;
+        if !folds_to(c, p) {
+            return None;
+        }
+        keyed &= c.is_ascii() || (i == 0 && c == 'ſ');
+        rest = &rest[c.len_utf8()..];
+    }
+    Some((rest, keyed))
+}
+
+/// `_HEAD`: `(status|verdict|result)\s*:\s*([A-Za-z]+)\s*$`, case-folded; the key as the
+/// Python names it, and the value word.
+fn head(line: &str) -> Option<(&'static str, &str)> {
+    for (word, key) in [
+        ("status", "Status"),
+        ("verdict", "Verdict"),
+        ("result", "Result"),
+    ] {
+        let Some((rest, keyed)) = after_folded(line, word) else {
+            continue;
+        };
+        let rest = rest.trim_start_matches(py_isspace).strip_prefix(':')?;
+        let rest = rest.trim_start_matches(py_isspace);
+        let letters = rest
+            .find(|c: char| !is_head_letter(c))
+            .unwrap_or(rest.len());
+        let (value, tail) = rest.split_at(letters);
+        if value.is_empty() || !tail.chars().all(py_isspace) {
+            return None;
+        }
+        // A key `capitalize()` does not give back raises KeyError in the Python.
+        return keyed.then_some((key, value));
+    }
+    None
+}
+
+/// `[A-Za-z]` under Unicode `IGNORECASE`.
+fn is_head_letter(c: char) -> bool {
+    c.is_ascii_alphabetic() || matches!(c, 'İ' | 'ı' | 'ſ' | '\u{212a}')
+}
+
+/// `word.lower()` when it is ASCII once lowered (the Kelvin sign lowers to `k`); `None` when
+/// it is not, so it equals no value.
+fn folded_lower(word: &str) -> Option<String> {
+    word.chars()
+        .map(|c| match c {
+            '\u{212a}' => Some('k'),
+            c if c.is_ascii() => Some(c.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `_BLOCKED_BY`: `blocked by\s*:\s*(.+?)\s*$`, case-folded; the reason.
+fn blocked_reason(line: &str) -> Option<&str> {
+    let (rest, _) = after_folded(line, "blocked")?;
+    let rest = rest.strip_prefix(' ')?;
+    let (rest, _) = after_folded(rest, "by")?;
+    let rest = rest.trim_start_matches(py_isspace).strip_prefix(':')?;
+    let reason = py_strip(rest);
+    (!reason.is_empty()).then_some(reason)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    use super::*;
+    use crate::wire::tests::python;
+
+    #[test]
+    fn worker_prompt_matches_python() {
+        let paths: [(&[u8], &[u8]); 4] = [
+            (
+                b"/ws/.leadhand/1/c1-a1-implement-1/brief.md",
+                b"/ws/.leadhand/1/c1-a1-implement-1/report.md",
+            ),
+            // A non-UTF-8 byte, kept as it is.
+            (
+                b"/ws/caf\xff/.leadhand/run/d/brief.md",
+                b"/ws/caf\xff/.leadhand/run/d/report.md",
+            ),
+            // Non-ASCII text, and a space.
+            (
+                b"/ws/caf\xc3\xa9 \xe2\x98\x95/brief.md",
+                b"/ws/caf\xc3\xa9 \xe2\x98\x95/report.md",
+            ),
+            // Spelled as pathlib spells it.
+            (b"rel//./ws/brief.md", b"./rel/report.md/"),
+        ];
+        let code = "import os, sys\nfrom pathlib import Path\nfrom leadhand import briefs\n\
+                    roles, rest = sys.argv[1].split(','), sys.argv[2:]\n\
+                    out = [os.fsencode(briefs.worker_prompt(role, Path(b), Path(r)))\n\
+                    \x20      for role in roles for b, r in zip(rest[::2], rest[1::2])]\n\
+                    sys.stdout.buffer.write(b'\\0'.join(out))\n";
+        let roles: Vec<&str> = ROLE_AGENT.iter().map(|(role, _)| *role).collect();
+        let joined = roles.join(",");
+        let mut args: Vec<&OsStr> = vec![OsStr::new(&joined)];
+        for (b, r) in &paths {
+            args.push(OsStr::from_bytes(b));
+            args.push(OsStr::from_bytes(r));
+        }
+        let theirs = python(code, &args);
+        let mut ours: Vec<Vec<u8>> = Vec::new();
+        for role in &roles {
+            for (b, r) in &paths {
+                let prompt = worker_prompt(
+                    role,
+                    Path::new(OsStr::from_bytes(b)),
+                    Path::new(OsStr::from_bytes(r)),
+                );
+                ours.push(prompt.unwrap().into_vec());
+            }
+        }
+        assert_eq!(ours.join(&b"\0"[..]), theirs);
+        assert_eq!(ours.len(), 7 * 4);
+        // The implementer's prompt carries the no-commit rule; the reviewer's does not.
+        let has = |p: &[u8], s: &[u8]| p.windows(s.len()).any(|w| w == s);
+        assert!(has(&ours[0], CODEX_NO_COMMIT.as_bytes()));
+        assert!(!has(&ours[2 * 4], CODEX_NO_COMMIT.as_bytes()));
+        // The non-UTF-8 byte is in the prompt as itself.
+        assert!(has(
+            &ours[1],
+            b"\n- Brief: /ws/caf\xff/.leadhand/run/d/brief.md\n"
+        ));
+        let err = worker_prompt("supervisor", Path::new("/b"), Path::new("/r")).unwrap_err();
+        assert_eq!(err.message, "no worker agent for role 'supervisor'");
+    }
+
+    #[test]
+    fn agent_for_maps_every_role_and_vendor() {
+        for (role, agent) in ROLE_AGENT {
+            assert_eq!(
+                agent_for(role, "claude").unwrap(),
+                format!("leadhand:{agent}")
+            );
+            assert_eq!(agent_for(role, "codex").unwrap(), CODEX_AGENT);
+        }
+        assert_eq!(
+            agent_for("implementer", "gemini").unwrap_err().message,
+            "unknown vendor 'gemini'"
+        );
+        assert_eq!(
+            agent_for("proxy", "claude").unwrap_err().message,
+            "no worker agent for role 'proxy'"
+        );
+    }
+
+    #[test]
+    fn scratch_dir_matches_python() {
+        let cases: [(&str, Option<i64>, &str); 4] = [
+            ("/ws", Some(1), "c1-a1-implement-1"),
+            ("/ws/", None, "run-a1-final_review-1"),
+            ("ws//a/.", Some(-2), "x"),
+            (".", None, "d"),
+        ];
+        let code = "import sys\nfrom leadhand import briefs\n\
+                    a = sys.argv[1:]\n\
+                    for ws, card, did in zip(a[::3], a[1::3], a[2::3]):\n\
+                    \x20   print(briefs.scratch_dir(ws, None if card == '-' else int(card), did))\n";
+        let mut args: Vec<OsString> = Vec::new();
+        for (ws, card, did) in cases {
+            args.push(ws.into());
+            args.push(card.map_or("-".to_string(), |c| c.to_string()).into());
+            args.push(did.into());
+        }
+        let args: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
+        let theirs = String::from_utf8(python(code, &args)).unwrap();
+        let ours: String = cases
+            .iter()
+            .map(|(ws, card, did)| {
+                format!(
+                    "{}\n",
+                    scratch_dir(Path::new(ws), *card, did).unwrap().display()
+                )
+            })
+            .collect();
+        assert_eq!(ours, theirs);
+        for bad in ["", ".", "..", "a/b"] {
+            let err = scratch_dir(Path::new("/ws"), Some(1), bad).unwrap_err();
+            assert_eq!(err.message, format!("bad dispatch id {}", py_repr(bad)));
+        }
+    }
+
+    #[test]
+    fn parse_report_head_matches_python() {
+        let cases = [
+            "Status: READY",
+            "  **Status**: ready  ",
+            "\n\n_Status_ :  `Blocked`\nBlocked by: environment (no network)",
+            "Status: BLOCKED\nBlocked by: Usage limit reached",
+            "Status: BLOCKED\nBlocked by:\nBlocked by: usage limit",
+            "Status: BLOCKED\n\n\n\n\nBlocked by: environment",
+            "Status: BLOCKED\na\nb\nc\nd\nBlocked by: environment",
+            "Status: BLOCKED\nblocked  by : environment",
+            "Status: BLOCKED\nBlocked by: something else",
+            "Status: BLOCKED\nBloc\u{212a}ed by: environment",
+            "Status: QUESTION\nBlocked by: environment",
+            "# Verdict: clean",
+            "> Result: FAIL",
+            "# > Verdict : Clean",
+            "Verdict: dirty",
+            "Result: pass extra",
+            "Status: SPENT\r\nmore",
+            "\u{17f}tatus: READY",
+            "Status: B\u{212a}OCKED",
+            "Status: BLO\u{212a}ED",
+            "Status: \u{17f}pent",
+            "Status\u{a0}:\u{2003}READY\u{3000}",
+            "Statusx: READY",
+            "Status READY",
+            "",
+            "   \n\t",
+            "**",
+            "status:ready\u{2028}Blocked by: environment",
+        ];
+        let code = "import json, sys\nfrom leadhand import briefs\n\
+                    print(json.dumps([list(briefs.parse_report_head(t)) for t in json.loads(sys.argv[1])]))\n";
+        let arg = serde_json::to_string(&cases).unwrap();
+        let theirs: Vec<Vec<String>> =
+            serde_json::from_slice(&python(code, &[OsStr::new(&arg)])).unwrap();
+        for (text, want) in cases.iter().zip(theirs) {
+            let (k, v, b) = parse_report_head(text);
+            assert_eq!([k, v, b], [&want[0], &want[1], &want[2]], "{text:?}");
+        }
+    }
+
+    #[test]
+    fn parse_report_head_where_python_raises() {
+        // `capitalize()` turns these keys into names `HEAD_VALUES` does not have, and the
+        // Python raises KeyError; Rust takes them as unparsed.
+        for text in [
+            "re\u{17f}ult: pass",
+            "verd\u{130}ct: clean",
+            "verd\u{131}ct: clean",
+        ] {
+            assert_eq!(
+                parse_report_head(text),
+                ("Status", "BLOCKED", ""),
+                "{text:?}"
+            );
+        }
+    }
+}

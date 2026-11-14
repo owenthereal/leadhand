@@ -2,6 +2,7 @@
 //! leadhand: carries an approved deck through implementation and review with bounded workers.
 //! The binary (`src/main.rs`) is `cli::main`.
 
+pub mod briefs;
 pub mod cli;
 pub mod config;
 pub mod deck;

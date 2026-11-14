@@ -162,7 +162,7 @@ mod tests {
     use serde::{Deserialize, Serialize, Serializer};
 
     use super::*;
-    use crate::Error;
+    use crate::state::{Event, append_event, events, run_paths};
 
     fn run_dir() -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -176,38 +176,15 @@ mod tests {
         seq: u64,
     }
 
-    #[derive(Serialize)]
-    struct Ruling<'a> {
-        seq: u64,
-        ts: &'a str,
-        kind: &'a str,
-        who: &'a str,
-        i: u32,
-    }
-
-    /// Appends a `ruling` event numbered from the last one, as `append_event` will (S2-R11).
+    /// Appends a `ruling` event through `state::append_event`, which numbers it from the last
+    /// one under the lock (S2-R11); its text names the writer and the line.
     fn append_ruling(run: &Path, who: &str, i: u32) -> u64 {
-        let mut seq = 0;
-        append_jsonl_with(run, &run.join("events.jsonl"), |last| {
-            seq = match last {
-                None => 1,
-                Some(raw) => {
-                    serde_json::from_str::<Seq>(raw.get())
-                        .map_err(|e| Error::msg(e.to_string()))?
-                        .seq
-                        + 1
-                }
-            };
-            Ok(Ruling {
-                seq,
-                ts: "2026-11-14T00:00:00.000Z",
-                kind: "ruling",
-                who,
-                i,
-            })
-        })
-        .unwrap();
-        seq
+        let ruling = events::Ruling {
+            text: Some(format!("{who} {i}").into()),
+            ..events::Ruling::default()
+        };
+        let (event, _) = append_event(&run_paths(run), Event::Ruling(ruling)).unwrap();
+        event.seq()
     }
 
     #[derive(Debug, PartialEq, Deserialize)]
@@ -322,11 +299,14 @@ mod tests {
         let lines: Vec<&[u8]> = raw.split(|&b| b == b'\n').collect();
         let lines = &lines[..lines.len() - 1];
         assert_eq!(lines.len(), 400);
+        // Python's lines name their writer and number in `who` and `i`; Rust's, in the
+        // ruling's text.
         #[derive(Deserialize)]
         struct Line {
             seq: u64,
-            who: String,
-            i: u32,
+            who: Option<String>,
+            i: Option<u32>,
+            text: Option<String>,
         }
         let parsed: Vec<Line> = lines
             .iter()
@@ -336,11 +316,22 @@ mod tests {
             parsed.iter().map(|e| e.seq).collect::<Vec<u64>>(),
             (1..=400).collect::<Vec<u64>>()
         );
+        let writer = |e: &Line| -> (String, u32) {
+            match (&e.who, e.i, &e.text) {
+                (Some(who), Some(i), None) => (who.clone(), i),
+                (None, None, Some(text)) => {
+                    let (who, i) = text.split_once(' ').unwrap();
+                    (who.to_string(), i.parse().unwrap())
+                }
+                _ => panic!("a line of neither writer (seq {})", e.seq),
+            }
+        };
         for who in ["python", "rust"] {
             let mine: Vec<u32> = parsed
                 .iter()
-                .filter(|e| e.who == who)
-                .map(|e| e.i)
+                .map(writer)
+                .filter(|(w, _)| w == who)
+                .map(|(_, i)| i)
                 .collect();
             assert_eq!(mine, (0..200).collect::<Vec<u32>>(), "{who}");
         }

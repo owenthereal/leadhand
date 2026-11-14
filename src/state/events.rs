@@ -180,6 +180,16 @@ macro_rules! event_kinds {
                     $(Event::$variant(e) => &e.ts,)*
                 }
             }
+
+            /// Sets its `seq` and `ts`: `append_event` assigns both under the state lock.
+            pub(crate) fn stamp(&mut self, seq: u64, ts: String) {
+                match self {
+                    $(Event::$variant(e) => {
+                        e.seq = seq;
+                        e.ts = ts;
+                    })*
+                }
+            }
         }
 
         impl Serialize for Event {
