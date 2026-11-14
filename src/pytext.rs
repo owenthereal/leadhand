@@ -263,26 +263,32 @@ const DEFAULT_PATH: &str = "/bin:/usr/bin";
 
 /// The executable file `name` on `PATH` (`shutil.which`), or `None`.
 pub fn which(name: &str) -> Option<PathBuf> {
-    which_in(std::env::var_os("PATH").as_deref(), name)
+    which_in(std::env::var_os("PATH").as_deref(), name, Path::new("."))
 }
 
-/// `which` with `path` as the value of `PATH` (`None`: unset).
-fn which_in(path: Option<&OsStr>, name: &str) -> Option<PathBuf> {
+/// `which` with `path` as the value of `PATH` (`None`: unset), a relative candidate (from an
+/// empty entry) looked for under `cwd`. The result is named as Python names it: an empty
+/// entry's candidate is the bare `name`.
+fn which_in(path: Option<&OsStr>, name: &str, cwd: &Path) -> Option<PathBuf> {
     search_dirs(path)
         .into_iter()
         .map(|dir| dir.join(name))
-        .find(|p| is_executable_file(p))
+        .find(|p| is_executable_file(&cwd.join(p)))
 }
 
-/// The directories `which` searches, in order. An unset `PATH` is the OS default; an empty
-/// one searches nothing. An empty entry is skipped: it is never the current directory
-/// (Python would look there; a program found that way could be anything a worker wrote).
+/// The directories `which` searches, in order (`shutil.which`, Python 3.12). An unset `PATH`
+/// is the OS default; an empty one searches nothing. An empty entry inside a non-empty `PATH`
+/// is the current directory, as Python and `execvp` read it (ruling S2-R28). Repeats are
+/// searched once.
 fn search_dirs(path: Option<&OsStr>) -> Vec<PathBuf> {
     let path = path.unwrap_or(OsStr::new(DEFAULT_PATH));
+    if path.is_empty() {
+        return Vec::new();
+    }
     let mut out: Vec<PathBuf> = Vec::new();
     for dir in path.as_bytes().split(|b| *b == b':') {
         let dir = PathBuf::from(OsStr::from_bytes(dir));
-        if !dir.as_os_str().is_empty() && !out.contains(&dir) {
+        if !out.contains(&dir) {
             out.push(dir);
         }
     }
@@ -461,25 +467,71 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn which_searches_path_but_never_the_current_directory() {
+    fn which_matches_python_for_empty_entries_and_an_empty_path() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        let tool = bin.join("fake-tool");
-        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (bin, cwd) = (root.join("bin"), root.join("cwd"));
+        for d in [&bin, &cwd] {
+            std::fs::create_dir(d).unwrap();
+        }
+        let exec = |p: &Path| {
+            std::fs::write(p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        exec(&bin.join("in-bin"));
+        exec(&cwd.join("in-cwd"));
         std::fs::write(bin.join("not-exec"), "x").unwrap();
-        let path = |s: &str| Some(OsString::from(s));
-        let in_bin = path(&format!("/nonexistent:{}", bin.display()));
-        assert_eq!(which_in(in_bin.as_deref(), "fake-tool"), Some(tool.clone()));
-        assert_eq!(which_in(in_bin.as_deref(), "not-exec"), None);
-        assert_eq!(which_in(in_bin.as_deref(), "bin"), None);
-        // An empty PATH searches nothing (Python's `which` returns None for it).
-        assert_eq!(search_dirs(Some(OsStr::new(""))), Vec::<PathBuf>::new());
-        // An empty entry is skipped, never the current directory; repeats are searched once.
+        let b = bin.display().to_string();
+        let cases: Vec<(String, &str)> = vec![
+            (format!("/nonexistent:{b}"), "in-bin"),
+            (b.clone(), "not-exec"),
+            (b.clone(), "in-cwd"),
+            // An empty entry inside a non-empty PATH is the current directory (S2-R28).
+            (format!("/nonexistent::{b}"), "in-cwd"),
+            (format!("{b}:"), "in-cwd"),
+            (":".into(), "in-cwd"),
+            (format!(":{b}"), "in-bin"),
+            // An empty PATH searches nothing, not even the current directory.
+            (String::new(), "in-cwd"),
+            (String::new(), "in-bin"),
+        ];
+        let script = "import json, shutil, sys\n\
+                      print(json.dumps([shutil.which(n, path=p) for p, n in json.load(sys.stdin)]))";
+        let mut child = std::process::Command::new("python3")
+            .args(["-B", "-c", script])
+            .current_dir(&cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            let input = serde_json::to_string(&cases).unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        let theirs: Vec<Option<String>> = serde_json::from_slice(&out.stdout).unwrap();
+        for ((path, name), want) in cases.iter().zip(theirs) {
+            let ours = which_in(Some(OsStr::new(path)), name, &cwd);
+            assert_eq!(
+                ours.map(|p| p.to_str().unwrap().to_string()),
+                want,
+                "PATH={path:?} {name}"
+            );
+        }
+        // Repeats are searched once; an empty entry is kept, in its place.
         assert_eq!(
             search_dirs(Some(OsStr::new(":/usr/bin::/bin:/usr/bin:"))),
-            [PathBuf::from("/usr/bin"), PathBuf::from("/bin")]
+            [
+                PathBuf::from(""),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin")
+            ]
         );
         // An unset PATH is the OS default (`os.confstr("CS_PATH")`).
         let theirs = python_map(
