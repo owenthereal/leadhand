@@ -1,8 +1,10 @@
-//! The run directory's file names (`state.RunPaths`, `state.run_paths`; contract item 4).
+//! The run directory's file names (`state.RunPaths`, `state.run_paths`; contract item 4), and a
+//! new run directory (`state.new_run_dir`).
 
 use std::path::{Path, PathBuf};
 
-use crate::pytext::pure_path;
+use crate::error::{Error, Result};
+use crate::pytext::{pure_path, py_repr};
 
 /// The files of one run directory, named as the Python names them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,9 +59,54 @@ pub fn run_paths(root: &Path) -> RunPaths {
     }
 }
 
+/// Creates and returns `<docs_dir>/runs/<today>-<slug>`, or the first free `-2`, `-3`, …
+/// (`state.new_run_dir`); `today` is the date as `YYYY-MM-DD`.
+///
+/// Each candidate is created with a plain `mkdir`, so two starts racing for one name cannot
+/// both get it.
+pub fn new_run_dir(docs_dir: &Path, slug: &str, today: &str) -> Result<PathBuf> {
+    if slug.is_empty() || slug.contains('/') || slug.starts_with('.') {
+        return Err(Error::msg(format!("invalid run slug: {}", py_repr(slug))));
+    }
+    let runs = docs_dir.join("runs");
+    std::fs::create_dir_all(&runs).map_err(|e| Error::io(&runs, e))?;
+    let base = format!("{today}-{slug}");
+    let mut n = 1;
+    loop {
+        let name = if n == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{n}")
+        };
+        let candidate = runs.join(name);
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(Error::io(&candidate, e)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // CATALOG: test_state.py::RunPathsTests::test_new_run_dir_rejects_path_in_slug
+    #[test]
+    fn new_run_dir_rejects_path_in_slug() {
+        let tmp = tempfile::tempdir().unwrap();
+        for bad in ["", "a/b", "..", ".hidden"] {
+            let e = new_run_dir(tmp.path(), bad, "2026-11-10").unwrap_err();
+            assert!(e.message.starts_with("invalid run slug: "), "{bad:?}: {e}");
+        }
+        assert!(!tmp.path().join("runs").exists());
+        // A good slug: the date and the slug, then the first free suffix.
+        let first = new_run_dir(tmp.path(), "demo", "2026-11-10").unwrap();
+        let second = new_run_dir(tmp.path(), "demo", "2026-11-10").unwrap();
+        assert_eq!(first, tmp.path().join("runs/2026-11-10-demo"));
+        assert_eq!(second, tmp.path().join("runs/2026-11-10-demo-2"));
+        assert!(first.is_dir() && second.is_dir());
+    }
 
     // CATALOG: test_state.py::RunPathsTests::test_run_paths_names
     #[test]

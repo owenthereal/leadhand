@@ -145,10 +145,15 @@ pub struct CodexSettings {
 /// $/MTok for one model family (`PRICE_KEYS`).
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct Prices {
+    #[serde(serialize_with = "crate::wire::allow_nan")]
     pub input: f64,
+    #[serde(serialize_with = "crate::wire::allow_nan")]
     pub output: f64,
+    #[serde(serialize_with = "crate::wire::allow_nan")]
     pub cache_read: f64,
+    #[serde(serialize_with = "crate::wire::allow_nan")]
     pub cache_write_5m: f64,
+    #[serde(serialize_with = "crate::wire::allow_nan")]
     pub cache_write_1h: f64,
 }
 
@@ -431,6 +436,7 @@ impl Serialize for ConfigSnapshot<'_> {
             test_first: &'a str,
             evidence: &'a str,
             card_review: &'a str,
+            #[serde(serialize_with = "crate::wire::allow_nan")]
             cost_limit_usd: f64,
             branch_prefix: &'a str,
         }
@@ -532,12 +538,97 @@ impl Serialize for RoleSpec {
 /// The configuration from a snapshot's JSON text, with the same validation as the TOML files
 /// (`config.config_from_dict`).
 pub fn config_from_snapshot(json: &str) -> Result<Config> {
-    let value: Val = serde_json::from_str(json)
-        .map_err(|e| cerr(format!("the configuration snapshot is not JSON: {e}")))?;
-    match value {
+    let not_json =
+        |e: &dyn fmt::Display| cerr(format!("the configuration snapshot is not JSON: {e}"));
+    let value: Val = serde_json::from_str(&mark_constants(json)).map_err(|e| not_json(&e))?;
+    match unmark(value).map_err(|e| not_json(&e))? {
         Val::Table(t) => build(&t),
         _ => Err(cerr("the configuration snapshot is not a table")),
     }
+}
+
+/// A string starting with this marks one of Python's JSON constants (`mark_constants`).
+const MARK: char = '\0';
+/// `MARK` as a JSON escape.
+const MARK_ESCAPE: &str = r"\u0000";
+/// The constants Python's `json.loads` reads as floats, and its `json.dump` writes for a
+/// non-finite one (`allow_nan=True`), as a price can be (TOML has `inf` and `nan`).
+const CONSTANTS: [(&str, f64); 3] = [
+    ("NaN", f64::NAN),
+    ("Infinity", f64::INFINITY),
+    ("-Infinity", f64::NEG_INFINITY),
+];
+
+/// `json` with each of `CONSTANTS` outside a string replaced by a string marking it, which
+/// `serde_json` (reading none of them) reads, and `unmark` turns back into its float. A marker
+/// is the constant after a NUL; a string of the text that starts with a NUL gets a second one,
+/// so no string is ever taken for a marker. Text with neither comes back unchanged.
+fn mark_constants(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    let mut rest = json;
+    while let Some(c) = rest.chars().next() {
+        if c == '"' {
+            let (string, tail) = rest.split_at(string_end(rest));
+            out.push('"');
+            if string[1..].starts_with(MARK_ESCAPE) {
+                out.push_str(MARK_ESCAPE);
+            }
+            out.push_str(&string[1..]);
+            rest = tail;
+        } else if let Some((word, _)) = CONSTANTS.iter().find(|(w, _)| rest.starts_with(w)) {
+            out.push_str(&format!("\"{MARK_ESCAPE}{word}\""));
+            rest = &rest[word.len()..];
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
+}
+
+/// The length of the JSON string `s` starts with, its closing quote included (all of `s`
+/// when it is not closed).
+fn string_end(s: &str) -> usize {
+    let mut chars = s.char_indices().skip(1);
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '"' => return i + 1,
+            _ => {}
+        }
+    }
+    s.len()
+}
+
+/// `value` with `mark_constants`' markers turned back into floats and its doubled NULs back
+/// into one. A marker in a key's place is an error, as the constant is there for Python.
+fn unmark(value: Val) -> std::result::Result<Val, String> {
+    Ok(match value {
+        Val::Str(s) => match s.strip_prefix(MARK) {
+            None => Val::Str(s),
+            Some(rest) if rest.starts_with(MARK) => Val::Str(rest.to_string()),
+            Some(rest) => match CONSTANTS.iter().find(|(w, _)| *w == rest) {
+                Some((_, x)) => Val::Float(*x),
+                None => return Err(format!("unexpected string {}", py_repr(&s))),
+            },
+        },
+        Val::Array(items) => Val::Array(items.into_iter().map(unmark).collect::<Result<_, _>>()?),
+        Val::Table(t) => Val::Table(
+            t.into_iter()
+                .map(|(k, v)| {
+                    let k = match k.strip_prefix(MARK) {
+                        None => k,
+                        Some(rest) if rest.starts_with(MARK) => rest.to_string(),
+                        Some(rest) => return Err(format!("{rest} where a key was expected")),
+                    };
+                    Ok((k, unmark(v)?))
+                })
+                .collect::<Result<_, _>>()?,
+        ),
+        other => other,
+    })
 }
 
 // --------------------------------------------------------------------------
@@ -1139,6 +1230,105 @@ mod tests {
         let live = f.load().unwrap();
         let json = crate::wire::to_pretty(&ConfigSnapshot(&live)).unwrap();
         assert_eq!(config_from_snapshot(&json).unwrap(), live);
+    }
+
+    #[test]
+    fn snapshot_with_non_finite_prices_is_the_pythons_both_ways() {
+        // TOML's inf and nan reach a price; Python's json.dump writes them as Infinity and NaN
+        // and json.loads reads them back. The snapshot is written as the Python writes it, and
+        // each implementation reads the other's.
+        let f = Files::new(
+            "docs_dir = \"/tmp/d\"\n[prices.x]\ninput = inf\noutput = -inf\ncache_read = nan\n\
+             cache_write_5m = 1.5\ncache_write_1h = 0\n",
+            "[notify]\ncommand = \"say NaN Infinity\"\n",
+        );
+        let live = f.load().unwrap();
+        let ours = crate::wire::to_pretty(&ConfigSnapshot(&live)).unwrap();
+        let code = "import json, sys\nfrom pathlib import Path\nfrom leadhand import config as cfg\n\
+                    c = cfg.load_config(Path(sys.argv[1]), user_file=Path(sys.argv[2]))\n\
+                    print(json.dumps(cfg.config_to_dict(c), indent=2, ensure_ascii=True))\n\
+                    back = cfg.config_from_dict(json.loads(sys.argv[3]))\n\
+                    print(back.prices['x'], file=sys.stderr)\n";
+        let out = std::process::Command::new("python3")
+            .args(["-B", "-c", code])
+            .arg(&f.repo)
+            .arg(&f.user)
+            .arg(&ours)
+            .env(
+                "PYTHONPATH",
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/lib"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let theirs = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(ours, theirs.trim_end());
+        assert!(ours.contains("\"input\": Infinity,"), "{ours}");
+        assert!(ours.contains("\"output\": -Infinity,"), "{ours}");
+        assert!(ours.contains("\"cache_read\": NaN,"), "{ours}");
+        // Python reads ours back with the same prices.
+        let back = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            back.contains("'input': inf, 'output': -inf, 'cache_read': nan"),
+            "{back}"
+        );
+        // And Rust reads the Python's.
+        let read = config_from_snapshot(&theirs).unwrap();
+        let (_, p) = read.prices.iter().find(|(k, _)| k == "x").unwrap();
+        assert_eq!(
+            (p.input, p.output, p.cache_write_5m),
+            (f64::INFINITY, f64::NEG_INFINITY, 1.5)
+        );
+        assert!(p.cache_read.is_nan());
+        assert_eq!(read.notify_command, "say NaN Infinity");
+    }
+
+    #[test]
+    fn snapshot_constants_are_read_only_where_python_reads_them() {
+        // Strings starting with a NUL are kept as they are; a constant where a key belongs,
+        // or one misspelt, is refused, as json.loads refuses it.
+        let marked = "{\"a\": [NaN, -Infinity, \"\\u0000NaN\", \"\\u0000\\u0000x\", \"NaN\"], \
+                      \"\\u0000k\": \"Infinity\"}";
+        let value = unmark(serde_json::from_str(&mark_constants(marked)).unwrap()).unwrap();
+        let Val::Table(t) = value else {
+            panic!("{value:?}")
+        };
+        let Val::Array(items) = &t[0].1 else {
+            panic!("{t:?}")
+        };
+        assert!(matches!(items[0], Val::Float(x) if x.is_nan()));
+        assert_eq!(
+            items[1..],
+            [
+                Val::Float(f64::NEG_INFINITY),
+                Val::Str("\0NaN".into()),
+                Val::Str("\0\0x".into()),
+                Val::Str("NaN".into()),
+            ]
+        );
+        assert_eq!(
+            (t[1].0.as_str(), &t[1].1),
+            ("\0k", &Val::Str("Infinity".into()))
+        );
+        for bad in [
+            "{NaN: 1}",
+            "{\"a\": nan}",
+            "{\"a\": -NaN}",
+            "{\"a\": Infinityx}",
+        ] {
+            let read = serde_json::from_str::<Val>(&mark_constants(bad))
+                .map_err(|e| e.to_string())
+                .and_then(unmark);
+            assert!(read.is_err(), "{bad}: {read:?}");
+        }
+        assert_eq!(
+            mark_constants("{\"a\": \"x\\\"NaN\"}"),
+            "{\"a\": \"x\\\"NaN\"}"
+        );
     }
 
     #[test]

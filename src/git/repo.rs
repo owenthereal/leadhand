@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use super::Git;
 use crate::error::Failure;
+use crate::pytext::real_path;
 
 /// The repository a directory belongs to: the main working tree of its Git common directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,7 +34,7 @@ pub fn repo_identity(any_dir: &Path) -> Result<RepoIdentity, Failure> {
         // The main working tree itself (or a bare repository, which Git refuses here).
         rev_parse_path(&git, &["--show-toplevel"])?
     } else {
-        main_worktree(&git)?
+        main_worktree(&git, &common_dir)?
     };
     Ok(RepoIdentity { top, common_dir })
 }
@@ -70,7 +71,7 @@ pub fn linked_worktree(any_dir: &Path) -> Result<Option<LinkedWorktree>, Failure
         top: rev_parse_path(&git, &["--show-toplevel"])?,
         git_dir,
         repo: RepoIdentity {
-            top: main_worktree(&git)?,
+            top: main_worktree(&git, &common_dir)?,
             common_dir,
         },
     }))
@@ -112,7 +113,11 @@ fn rev_parse_path(git: &Git, args: &[&str]) -> Result<PathBuf, Failure> {
 }
 
 /// The main working tree's top: the first entry of `git worktree list --porcelain -z`.
-fn main_worktree(git: &Git) -> Result<PathBuf, Failure> {
+///
+/// Fail-closed: for a linked worktree of a submodule or of a `--separate-git-dir` repository,
+/// Git can list the Git directory itself as the main working tree. A listed path inside
+/// `common_dir` is refused, so no worktree is ever made, and no config read, from there.
+fn main_worktree(git: &Git, common_dir: &Path) -> Result<PathBuf, Failure> {
     let out = run(
         git,
         &["worktree", "list", "--porcelain", "-z"].map(OsStr::new),
@@ -129,7 +134,23 @@ fn main_worktree(git: &Git) -> Result<PathBuf, Failure> {
             git,
             " belongs to a bare repository, which has no main working tree",
         )),
-        Some(path) if !path.is_empty() => Ok(PathBuf::from(OsStr::from_bytes(path))),
+        Some(path) if !path.is_empty() => {
+            let path = PathBuf::from(OsStr::from_bytes(path));
+            if real_path(&path).starts_with(real_path(common_dir)) {
+                return Err(Failure::of(&[
+                    git.cwd().as_os_str(),
+                    OsStr::new(": Git lists the main working tree as "),
+                    path.as_os_str(),
+                    OsStr::new(", inside the Git directory "),
+                    common_dir.as_os_str(),
+                    OsStr::new(
+                        " (a submodule or a --separate-git-dir repository), so which checkout \
+                         is the repository is unclear; run leadhand from the main working tree",
+                    ),
+                ]));
+            }
+            Ok(path)
+        }
         _ => Err(in_cwd(
             "git worktree list: no main working tree listed (in ",
             git,
@@ -365,6 +386,60 @@ mod tests {
         let e = repo_identity(&wt).unwrap_err();
         assert!(e.to_string().contains("bare repository"), "{e}");
         assert!(repo_identity(&bare).is_err());
+    }
+
+    #[test]
+    fn a_main_working_tree_listed_inside_the_git_directory_is_refused() {
+        // A --separate-git-dir repository: from its own working tree it is found as usual; from
+        // a linked worktree, Git lists the Git directory itself as the main working tree.
+        let f = Fixture::new();
+        let gitdir = f.root().join("separate gitdir");
+        let checkout = f.root().join("checkout");
+        f.git(
+            f.root(),
+            &[
+                "init",
+                "--quiet",
+                "--initial-branch",
+                "main",
+                "--separate-git-dir",
+                gitdir.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        f.commit(&checkout, &[("README.md", "hello\n")], "initial");
+        let id = repo_identity(&checkout).unwrap();
+        assert_eq!(id.top, real(&checkout));
+        assert_eq!(id.common_dir, real(&gitdir));
+        let linked = f.root().join("linked wt");
+        f.git(
+            &checkout,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "side",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let listed = f.git(&linked, &["worktree", "list", "--porcelain"]);
+        let main = listed
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("worktree ")
+            .unwrap();
+        assert!(
+            real(Path::new(main)).starts_with(real(&gitdir)),
+            "Git lists {main} first"
+        );
+        for e in [
+            repo_identity(&linked).unwrap_err(),
+            linked_worktree(&linked).unwrap_err(),
+        ] {
+            assert!(e.to_string().contains("inside the Git directory"), "{e}");
+        }
     }
 
     #[test]

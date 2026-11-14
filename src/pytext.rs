@@ -20,6 +20,37 @@ pub fn py_strip(s: &str) -> &str {
     s.trim_matches(py_isspace)
 }
 
+/// `str.strip()` of OS bytes decoded with `surrogateescape`, given back as bytes: an
+/// undecodable byte is never whitespace, and a character is whitespace as `py_isspace` says.
+/// A valid character at either end is found by its bytes alone, since the decoder never
+/// takes a lead byte into the sequence before it.
+pub fn py_strip_bytes(s: &[u8]) -> &[u8] {
+    let mut start = 0;
+    for chunk in s.utf8_chunks() {
+        let valid = chunk.valid();
+        let kept = valid.trim_start_matches(py_isspace);
+        start += valid.len() - kept.len();
+        if !kept.is_empty() || !chunk.invalid().is_empty() {
+            break;
+        }
+    }
+    let rest = &s[start..];
+    let mut end = rest.len();
+    loop {
+        // The last character, when the bytes end in a valid one.
+        let last = (1..=end.min(4)).find_map(|n| {
+            let mut chars = std::str::from_utf8(&rest[end - n..end]).ok()?.chars();
+            let c = chars.next()?;
+            chars.next().is_none().then_some((c, n))
+        });
+        match last {
+            Some((c, n)) if py_isspace(c) => end -= n,
+            _ => break,
+        }
+    }
+    &rest[..end]
+}
+
 /// `str.split()`.
 pub fn py_split(s: &str) -> impl Iterator<Item = &str> {
     s.split(py_isspace).filter(|w| !w.is_empty())
@@ -563,6 +594,28 @@ pub(crate) mod tests {
                 py_splitlines(text)
             ]);
             assert_eq!(ours, want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn strip_bytes_matches_python_surrogateescape_strip() {
+        let mut cases: Vec<Vec<u8>> = TEXTS.iter().map(|t| t.as_bytes().to_vec()).collect();
+        cases.extend([
+            b"\xff refs/x \n".to_vec(),
+            b" \xc2\xa0main\xff\xc2\xa0\n".to_vec(),
+            b"\xe2\xc2\x85x\xe2\x80\x85".to_vec(),
+            b"\xe2\x80\n".to_vec(),
+            b"\xc2".to_vec(),
+        ]);
+        // Each case as its bytes; Python decodes, strips and encodes back.
+        let inputs: Vec<serde_json::Value> = cases.iter().map(|c| serde_json::json!(c)).collect();
+        let theirs = python_map(
+            "list(bytes(x).decode('utf-8', 'surrogateescape').strip()\
+             .encode('utf-8', 'surrogateescape'))",
+            &inputs,
+        );
+        for (case, want) in cases.iter().zip(theirs) {
+            assert_eq!(serde_json::json!(py_strip_bytes(case)), want, "{case:?}");
         }
     }
 

@@ -110,6 +110,8 @@ pub enum Command {
         repo: OsString,
         #[arg(long, help = "start a new run even if one is unfinished")]
         new: bool,
+        #[arg(long, help = "print the result as one JSON object")]
+        json: bool,
     },
 
     #[command(about = "perform due steps and print the supervisor's next action")]
@@ -380,6 +382,12 @@ fn run(command: Command, name: &str, caller: &Result<Caller>) -> Result<ExitCode
             crate::status::command(run_dir.as_deref().filter(|d| !d.is_empty()), json)
         }
         Command::Report { run_dir, json } => crate::report::command(run_dir.as_deref(), json),
+        Command::Start {
+            deck,
+            repo,
+            new,
+            json,
+        } => crate::engine::start::command(&deck, &repo, new, json),
         Command::Dispatch(args) => crate::dispatch::cmd::dispatch_command(&args, caller),
         Command::StopDispatch { run_dir, dispatch } => {
             crate::dispatch::cmd::stop_command(&run_dir, &dispatch, caller)

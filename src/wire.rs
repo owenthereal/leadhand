@@ -508,6 +508,25 @@ pub fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
+/// The three non-finite floats, as the `i128` values `allow_nan` hands the serializer in their
+/// place: `serde_json` writes any non-finite `f64` as `null` before a formatter sees it, so
+/// they reach `PyFormatter::write_i128` as these, which no record holds as an integer.
+const NAN_MARK: i128 = i128::MIN;
+const INFINITY_MARK: i128 = i128::MIN + 1;
+const NEG_INFINITY_MARK: i128 = i128::MIN + 2;
+
+/// For an `f64` field written with `#[serde(serialize_with = "wire::allow_nan")]`: a finite
+/// value as any float, and `NaN`, `Infinity` and `-Infinity` as Python's `json.dump` writes
+/// them (`allow_nan=True`), which only the writers here can do.
+pub fn allow_nan<S: Serializer>(x: &f64, s: S) -> std::result::Result<S::Ok, S::Error> {
+    match *x {
+        x if x.is_nan() => s.serialize_i128(NAN_MARK),
+        f64::INFINITY => s.serialize_i128(INFINITY_MARK),
+        f64::NEG_INFINITY => s.serialize_i128(NEG_INFINITY_MARK),
+        x => s.serialize_f64(x),
+    }
+}
+
 /// The record's `kind`, read alone; no other field is validated.
 pub fn event_kind(line: &RawLine) -> Result<String> {
     #[derive(Deserialize)]
@@ -640,6 +659,17 @@ impl Formatter for PyFormatter {
     /// non-finite float as `null` without calling this.
     fn write_f64<W: ?Sized + io::Write>(&mut self, w: &mut W, value: f64) -> io::Result<()> {
         w.write_all(crate::pytext::py_float(value).as_bytes())
+    }
+
+    /// An integer, or one of the non-finite floats `allow_nan` marks, as Python writes it.
+    fn write_i128<W: ?Sized + io::Write>(&mut self, w: &mut W, value: i128) -> io::Result<()> {
+        let text = match value {
+            NAN_MARK => "NaN".to_string(),
+            INFINITY_MARK => "Infinity".to_string(),
+            NEG_INFINITY_MARK => "-Infinity".to_string(),
+            n => n.to_string(),
+        };
+        w.write_all(text.as_bytes())
     }
 
     /// The unescaped run of a string: everything but `"`, `\` and control characters, which

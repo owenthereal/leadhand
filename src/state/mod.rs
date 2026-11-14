@@ -1,7 +1,8 @@
 //! Run state (`state.py`): the run directory's files, the event log read into typed events,
 //! each card's state folded from them, and the run's outcome.
 //!
-//! - `paths`: the run directory's file names (`RunPaths`);
+//! - `paths`: the run directory's file names (`RunPaths`), and a new run directory
+//!   (`new_run_dir`);
 //! - `events`: one typed struct per event kind, decoded tag-first (`read_events`);
 //! - `fold`: each card's state (`fold_cards`);
 //! - `outcome`: how a run ends (`decide_outcome`, `allowed_next_step`);
@@ -27,7 +28,7 @@ pub use outcome::{
     BLOCKED_QUALIFIERS, Blocked, Outcome, OutcomeDecision, OutcomeInput, allowed_next_step,
     decide_outcome,
 };
-pub use paths::{RunPaths, run_paths};
+pub use paths::{RunPaths, new_run_dir, run_paths};
 pub use write::{append_attempt, append_event, read_attempts, two_phase};
 
 use crate::error::{Error, Result};

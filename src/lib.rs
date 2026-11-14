@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod deck;
 pub mod dispatch;
+pub mod engine;
 pub mod error;
 pub mod git;
 pub mod launch;

@@ -14,7 +14,8 @@
 //! - the launcher's SIGINT and SIGTERM forwarding handler (`forward_signals`, ruling S2-R40):
 //!   installed and restored with `sigaction(2)`, so the previous dispositions come back as the
 //!   Python restores its handlers; it sends with rustix's `kill_process` and keeps `errno` for
-//!   the code it interrupts.
+//!   the code it interrupts;
+//! - the local date a new run directory is named for (`local_date`, `localtime_r(3)`).
 //!
 //! The safe layer over the process table is `crate::procs`.
 
@@ -198,6 +199,38 @@ pub fn ignore_sighup() {
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
+}
+
+unsafe extern "C" {
+    /// POSIX `tzset(3)`, in the C library on macOS and Linux; the `libc` crate does not
+    /// declare it for every target.
+    fn tzset();
+}
+
+/// The local calendar date at `secs` seconds after the epoch, as `(year, month, day)`
+/// (Python's `date.fromtimestamp`, so `date.today()` at the current time): `localtime_r(3)`
+/// after `tzset(3)`, so `TZ` and the system's zone are read as the C library reads them.
+/// `None` when the C library cannot convert the time.
+pub fn local_date(secs: i64) -> Option<(i32, u32, u32)> {
+    let t = libc::time_t::try_from(secs).ok()?;
+    // SAFETY: `tzset` takes no arguments and only (re)reads `TZ` into the C library's zone
+    // state. Reading the environment races only with a concurrent `setenv`/`unsetenv`, and
+    // leadhand changes its own environment only in `close_inherited_fd`, at the start of
+    // `main` with one thread.
+    unsafe { tzset() };
+    // SAFETY: `tm` is a zeroed, valid `struct tm` owned by this frame, and `localtime_r`
+    // writes only into it (the reentrant form: no shared static buffer). `t` is a live local
+    // read through a shared pointer. On failure it returns null and `tm` is not used.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return None;
+        }
+        tm
+    };
+    let month = u32::try_from(tm.tm_mon + 1).ok()?;
+    let day = u32::try_from(tm.tm_mday).ok()?;
+    Some((tm.tm_year.checked_add(1900)?, month, day))
 }
 
 /// Marks every descriptor above 2 close-on-exec, so that none this process inherited without
@@ -864,6 +897,72 @@ pub(crate) mod tests {
                 term = libc::SIGTERM
             )
         );
+    }
+
+    #[test]
+    fn local_date_is_pythons_local_date() {
+        // The current time, and times around year and day ends, in this process's zone and in
+        // two fixed ones, as Python's date.fromtimestamp gives them.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let times = [
+            now,
+            0,
+            951_782_400,
+            1_767_225_599,
+            1_767_225_600,
+            1_794_268_800,
+        ];
+        let code = "import sys, time\nfrom datetime import date\n\
+                    print(' '.join(date.fromtimestamp(int(t)).isoformat() for t in sys.argv[1:]))";
+        let args: Vec<String> = times.iter().map(i64::to_string).collect();
+        let theirs = Command::new("python3")
+            .args(["-B", "-c", code])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(theirs.status.success());
+        let ours: Vec<String> = times
+            .iter()
+            .map(|t| {
+                let (y, m, d) = local_date(*t).unwrap();
+                format!("{y:04}-{m:02}-{d:02}")
+            })
+            .collect();
+        assert_eq!(
+            ours.join(" "),
+            String::from_utf8(theirs.stdout).unwrap().trim_end()
+        );
+        // In a child with TZ set, so this process's own zone is left alone: Tokyo is a day
+        // ahead of UTC at 20:00 UTC, Honolulu a day behind at 05:00 UTC.
+        for (tz, t, want) in [
+            ("Asia/Tokyo", 1_767_211_200, "2026-01-01"),
+            ("Pacific/Honolulu", 1_767_243_600, "2025-12-31"),
+            ("UTC", 1_767_225_599, "2025-12-31"),
+        ] {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "sys::tests::local_date_in_child", "--nocapture"])
+                .env("TZ", tz)
+                .env("LEADHAND_LOCAL_DATE_AT", t.to_string())
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                text.contains(&format!("local date: {want}\n")),
+                "{tz}: {text}"
+            );
+        }
+    }
+
+    /// Prints the local date at `$LEADHAND_LOCAL_DATE_AT`; run by the test above in a child.
+    #[test]
+    fn local_date_in_child() {
+        if let Some(t) = std::env::var_os("LEADHAND_LOCAL_DATE_AT") {
+            let (y, m, d) = local_date(t.to_str().unwrap().parse().unwrap()).unwrap();
+            println!("local date: {y:04}-{m:02}-{d:02}");
+        }
     }
 
     #[test]

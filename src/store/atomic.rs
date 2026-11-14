@@ -7,7 +7,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -26,11 +26,25 @@ pub fn write_json_atomic<T: Serialize + ?Sized>(path: &Path, value: &T) -> Resul
 /// Replaces `path` with `data` the same way: a file such as `report.md`
 /// (`report.write_report`).
 pub fn write_file_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    write_file(path, data, None)
+}
+
+/// As `write_file_atomic`, the file given the permission bits `mode` before it replaces
+/// `path`, as `gitops.ensure_excluded` keeps the mode of `info/exclude`.
+pub fn write_file_atomic_mode(path: &Path, data: &[u8], mode: u32) -> Result<()> {
+    write_file(path, data, Some(mode))
+}
+
+fn write_file(path: &Path, data: &[u8], mode: Option<u32>) -> Result<()> {
     let dir = parent(path);
     let (tmp, file) = create_temp(dir, path)?;
     let replaced = (|| {
         (&file).write_all(data).map_err(|e| Error::io(&tmp, e))?;
         fsync(&file, &tmp)?;
+        if let Some(mode) = mode {
+            file.set_permissions(fs::Permissions::from_mode(mode))
+                .map_err(|e| Error::io(&tmp, e))?;
+        }
         drop(file);
         fs::rename(&tmp, path).map_err(|e| Error::io(path, e))
     })();
@@ -129,6 +143,21 @@ mod tests {
         assert!(err.message.contains(&*target.to_string_lossy()), "{err}");
         assert_eq!(names(tmp.path()), ["status.json"]);
         assert_eq!(names(&target), ["keep"]);
+    }
+
+    #[test]
+    fn write_file_atomic_mode_sets_the_mode_and_leaves_no_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("exclude");
+        fs::write(&target, b"old\n").unwrap();
+        write_file_atomic_mode(&target, b"new\n", 0o640).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new\n");
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&target), 0o640);
+        assert_eq!(names(tmp.path()), ["exclude"]);
+        // Without a mode, the file keeps the temporary file's 0600, as `mkstemp` makes it.
+        write_file_atomic(&target, b"x\n").unwrap();
+        assert_eq!(mode(&target), 0o600);
     }
 
     #[test]

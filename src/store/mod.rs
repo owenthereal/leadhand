@@ -22,7 +22,7 @@ mod atomic;
 mod jsonl;
 mod lock;
 
-pub use atomic::{write_file_atomic, write_json_atomic};
+pub use atomic::{write_file_atomic, write_file_atomic_mode, write_json_atomic};
 pub use jsonl::{append_jsonl, append_jsonl_with, read_jsonl};
 pub use lock::{StateLock, state_lock, try_state_lock};
 
