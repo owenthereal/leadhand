@@ -1,63 +1,58 @@
 //! The dispatch runner's shell (`dispatch.run_runner` and what it calls): the runner's life
-//! in its worker folder, the threads that feed the pure core (`runner.rs`), the process
-//! tracker that carries out its snapshots and signals, and finalizing.
+//! in its worker folder, and the threads and I/O that feed the pure core (`runner.rs`). The
+//! processes are the tracker's (`tracker.rs`), the result `finalize.rs`'s.
 //!
 //! Codex's stdout is `stream.jsonl` itself, as the Python's `Popen(stdout=file)` makes it, so
 //! everything Codex writes is on disk even while the runner is stopped, and after it dies;
 //! the stream thread follows the file. Three threads feed the core one channel: the stream's
-//! lines, Codex's exit (SIGCHLD) and the runner's signals (SIGTERM, SIGHUP); a receive with a
-//! timeout supplies the ticks. The shell owns Codex's `Child` and polls it before every event
-//! (`try_wait`, the Python's `proc.poll()`), so an exit that came first is seen first, ahead
-//! of a cancel or a limit seen in the same look.
+//! lines, Codex's exit (SIGCHLD) and the runner's SIGTERM; a receive with a timeout supplies
+//! the ticks. Before every event the shell looks as the Python's loop looks, in its order:
+//! Codex's exit (`try_wait`, the Python's `proc.poll()`), then a cancel (SIGTERM or the
+//! `cancel` file, `cancelled()`); so an exit that came first is seen first.
+//!
+//! At its start the runner sets SIGHUP to ignored and keeps every inherited descriptor from
+//! its children, as the Python's `SIG_IGN` and `Popen(close_fds=True)` do.
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, FileTimes, OpenOptions};
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::fs::{self, File};
+use std::io::{ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use rustix::fs::FlockOperation;
 use rustix::process::{getpgrp, getpid};
-use serde::de::IgnoredAny;
-use serde::{Serialize, Serializer};
-use serde_json::value::RawValue;
-use signal_hook::consts::{SIGCHLD, SIGHUP, SIGTERM};
+use serde::Serialize;
+use signal_hook::consts::{SIGCHLD, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use super::caller::py_name;
+use super::finalize::{Commits, NoCommit, finalize};
 use super::request::StoppedProc;
 use super::runner::{
-    Action, CANCEL_FINISH_MARGIN, Event, Finish, HEARTBEAT_EVERY, Ladder, Liveness, POLL,
-    RUNNER_LOCK_RETRY, Runner, Sig, StopReason, StreamSummary, StreamView, classify,
-    possibly_incomplete, return_code,
+    Action, CANCEL_FINISH_MARGIN, Event, Finish, POLL, RUNNER_LOCK_RETRY, Runner, StopReason,
+    StreamView, return_code,
 };
+use super::tracker::{Tracker, carry_out};
 use super::{
-    BlockedBy, CANCEL, COMMIT_KINDS, DispatchRequest, DispatchResult, Env, ExitReason,
-    FINALIZE_LOCK, GH_DIR, HEARTBEAT, LAST, PROCS, RAW, RESULT, RUNNER, RUNNER_LOCK, STDERR,
-    STOPPING, STREAM, SUPERSEDED, Status, TAG_VAR, UNTRACKED, codex_argv_parts, codex_overrides,
-    evidence_dirs, load_result, read_json_object, read_request, worker_env,
+    CANCEL, DispatchRequest, Env, GH_DIR, HEARTBEAT, LAST, RUNNER, RUNNER_LOCK, STDERR, STOPPING,
+    STREAM, SUPERSEDED, UNTRACKED, codex_argv_parts, codex_overrides, evidence_dirs, load_result,
+    open_lock_file, read_from, read_json_object, read_request, run_id_of, touch, wall_now,
+    worker_env, write_text,
 };
 use crate::briefs::worker_prompt;
 use crate::error::{Error, Failure, Result};
 use crate::git::{Git, git_common_dir, split_nul};
-use crate::procs::{self, ProcId, ProcInfo};
-use crate::pytext::py_strip;
-use crate::state::{AttemptRecord, CardRef, append_attempt, read_attempts, run_paths, utc_now};
-use crate::store::{state_lock, write_json_atomic};
+use crate::state::utc_now;
+use crate::store::write_json_atomic;
 use crate::sys::detach_session;
 use crate::testing::crash_point;
-use crate::usage::{
-    CODEX_STREAM_SOURCE, ChargeSource, Usage, charge, default_sessions_dir, estimate_cost,
-};
-use crate::wire::{PyMap, PyStr};
+use crate::wire::PyStr;
 
 // --------------------------------------------------------------------------
 // The records the runner writes (contract item 5)
@@ -85,38 +80,6 @@ pub struct Launching {
     pub aborted: bool,
 }
 
-/// `procs.json`: the recorded processes still alive, by pid, and the last tag sweep's
-/// unreadable environments when there were any.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-struct ProcsFile {
-    descendants: Vec<StoppedProc>,
-    #[serde(skip_serializing_if = "Unreadable::is_empty")]
-    tag_unreadable: Unreadable,
-}
-
-/// The pids whose environment the last tag sweep could not read, or `unsupported` where the
-/// process table could not be read at all.
-#[derive(Clone, Debug, PartialEq)]
-enum Unreadable {
-    Pids(Vec<i32>),
-    Unsupported,
-}
-
-impl Unreadable {
-    fn is_empty(&self) -> bool {
-        matches!(self, Unreadable::Pids(pids) if pids.is_empty())
-    }
-}
-
-impl Serialize for Unreadable {
-    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        match self {
-            Unreadable::Pids(pids) => pids.serialize(s),
-            Unreadable::Unsupported => s.serialize_str("unsupported"),
-        }
-    }
-}
-
 /// `stopping.json`: the runner's acknowledgement.
 #[derive(Serialize)]
 struct Stopping<'a> {
@@ -135,77 +98,6 @@ struct UntrackedRecord {
 }
 
 // --------------------------------------------------------------------------
-// Committing the worker's work
-
-/// What committing the worker's work came to (`_commit_work`'s outcome).
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct CommitOutcome {
-    /// The commit made for the worker.
-    pub committed: Option<String>,
-    /// Whether the worker left changes.
-    pub changes: bool,
-    pub commit_skipped: Option<PyStr>,
-    pub commit_error: Option<PyStr>,
-    pub gitlinks_skipped: Option<Vec<PyStr>>,
-}
-
-/// The runner's commit of a commit kind's work (R39), supplied by the caller: called only for
-/// a launched dispatch whose kind is one of `COMMIT_KINDS` with a branch. `deadline` bounds
-/// every Git call, for a cancel.
-pub trait Commits {
-    fn commit_work(
-        &self,
-        wd: &Path,
-        req: &DispatchRequest,
-        deadline: Option<Instant>,
-    ) -> CommitOutcome;
-}
-
-/// No commit: a commit kind's work is reported as uncommitted changes, so its result can never
-/// pass for finished work.
-pub struct NoCommit;
-
-impl Commits for NoCommit {
-    fn commit_work(&self, _: &Path, _: &DispatchRequest, _: Option<Instant>) -> CommitOutcome {
-        CommitOutcome {
-            changes: true,
-            commit_error: Some("the runner's commits are not available in this build".into()),
-            ..CommitOutcome::default()
-        }
-    }
-}
-
-/// `commit_failed`: why a dispatch's changes were left uncommitted, or `None`. A result whose
-/// worker left changes the runner could not commit must not pass for finished work.
-pub fn commit_failed(commit: &CommitOutcome) -> Option<PyStr> {
-    if commit.committed.as_deref().is_some_and(|c| !c.is_empty()) || !commit.changes {
-        return None;
-    }
-    let given = |text: &Option<PyStr>| text.clone().filter(|t| !t.is_empty());
-    given(&commit.commit_error).or_else(|| given(&commit.commit_skipped))
-}
-
-/// `_commit_work`'s first rule, then the caller's commit.
-fn commit_work(
-    wd: &Path,
-    req: &DispatchRequest,
-    deadline: Option<Instant>,
-    commits: &dyn Commits,
-) -> CommitOutcome {
-    let kind = req.kind.as_deref().filter(|k| !k.is_empty());
-    let commits_kind = kind.is_some_and(|k| COMMIT_KINDS.contains(&k));
-    if !commits_kind || req.branch.as_ref().is_none_or(PyStr::is_empty) {
-        return CommitOutcome {
-            commit_skipped: Some(
-                format!("{} dispatch does not commit", kind.unwrap_or("this")).into(),
-            ),
-            ..CommitOutcome::default()
-        };
-    }
-    commits.commit_work(wd, req, deadline)
-}
-
-// --------------------------------------------------------------------------
 // The runner
 
 /// The detached runner's body (`run_runner`): launch Codex, watch it, stop it at a limit or a
@@ -218,11 +110,15 @@ pub fn run_runner(worker_dir: &Path) -> Result<u8> {
 /// `run_runner`, committing a commit kind's work with `commits`.
 pub fn run_runner_with(worker_dir: &Path, commits: &dyn Commits) -> Result<u8> {
     let wd = worker_dir;
-    // First of all, as the Python: SIGTERM is a cancel request, and SIGHUP is caught and does
-    // nothing (it is not `SIG_IGN`, so Codex does not inherit it ignored).
+    // First of all, as the Python: SIGHUP is ignored, so Codex and its tools inherit it
+    // ignored (S2-R37); nothing this process inherited reaches them (`close_fds=True`,
+    // S2-R38); SIGTERM is a cancel request.
+    crate::sys::ignore_sighup();
+    crate::sys::keep_inherited_fds_from_children()
+        .map_err(|e| Error::msg(format!("cannot list this process's descriptors: {e}")))?;
     let term = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGTERM, Arc::clone(&term)).map_err(signal_error)?;
-    let signals = Signals::new([SIGTERM, SIGHUP]).map_err(signal_error)?;
+    let signals = Signals::new([SIGTERM]).map_err(signal_error)?;
     let exits = Signals::new([SIGCHLD]).map_err(signal_error)?;
     let Some(lock) = take_runner_lock(wd)? else {
         eprintln!("leadhand: another runner owns {}", wd.display());
@@ -299,7 +195,7 @@ pub fn run_runner_with(worker_dir: &Path, commits: &dyn Commits) -> Result<u8> {
         });
     }
     let mut tracker = Tracker::new(wd, record.codex.clone(), Some(child), Some(tag));
-    let (finish, fault) = watch(wd, &req, &mut tracker, signals, exits)?;
+    let (finish, fault) = watch(wd, &req, &mut tracker, &term, signals, exits)?;
     // `proc.wait()`: Codex is reaped once everything is gone.
     let codex_exit = finish
         .codex_exit
@@ -350,18 +246,6 @@ fn take_runner_lock(wd: &Path) -> Result<Option<File>> {
     }
 }
 
-/// A lock file, opened as the Python opens it (`O_RDWR | O_CREAT | O_CLOEXEC`, `0644`).
-fn open_lock_file(path: &Path) -> Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o644)
-        .open(path)
-        .map_err(|e| Error::io(path, e))
-}
-
 /// This process's record: pid, group and start time (the start `None` when the process table
 /// cannot be read).
 fn own_record() -> StoppedProc {
@@ -380,13 +264,6 @@ fn own_record() -> StoppedProc {
     }
 }
 
-/// `time.time()`.
-fn wall_now() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64())
-}
-
 /// This runner's generation: one more than the generations already superseded.
 fn generation_of(wd: &Path) -> Result<u32> {
     let dir = wd.join(SUPERSEDED);
@@ -395,74 +272,6 @@ fn generation_of(wd: &Path) -> Result<u32> {
     }
     let entries = fs::read_dir(&dir).map_err(|e| Error::io(&dir, e))?.count();
     Ok(u32::try_from(entries).map_or(u32::MAX, |n| n.saturating_add(1)))
-}
-
-/// `_run_id`: `run.json`'s `run_id`, else the run directory's name. A run ID that is not a
-/// string, or not text, is an error (an anchored run's is always a non-empty string).
-fn run_id_of(run_dir: &Path) -> Result<String> {
-    let meta = read_json_object(&run_paths(run_dir).run_json)?.unwrap_or_default();
-    match meta.get(&PyStr::from("run_id")).filter(|raw| truthy(raw)) {
-        Some(raw) => {
-            let text = serde_json::from_str::<PyStr>(raw.get()).map_err(|_| {
-                Error::msg(format!("run.json's run_id {} is not a string", raw.get()))
-            })?;
-            String::from_utf8(text.as_wtf8().to_vec())
-                .map_err(|_| Error::msg(format!("run.json's run_id {} is not text", text.repr())))
-        }
-        None => py_name(run_dir).into_string().map_err(|name| {
-            Error::msg(format!(
-                "the run directory's name {} is not text",
-                PyStr::from_os(&name).repr()
-            ))
-        }),
-    }
-}
-
-/// Whether a JSON value is true as Python's `bool` reads the value `json.loads` gives.
-fn truthy(raw: &RawValue) -> bool {
-    let text = raw.get().trim();
-    match text.as_bytes().first() {
-        Some(b'n' | b'f') | None => false,
-        Some(b't') => true,
-        Some(b'"') => text != "\"\"",
-        Some(b'[') => serde_json::from_str::<Vec<IgnoredAny>>(text).is_ok_and(|v| !v.is_empty()),
-        Some(b'{') => serde_json::from_str::<PyMap<IgnoredAny>>(text).is_ok_and(|m| !m.is_empty()),
-        Some(_) => serde_json::from_str::<f64>(text).is_ok_and(|n| n != 0.0),
-    }
-}
-
-/// `_touch`: creates the file if needed, and sets its times to now.
-fn touch(path: &Path) -> Result<()> {
-    let file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)
-        .map_err(|e| Error::io(path, e))?;
-    let now = SystemTime::now();
-    file.set_times(FileTimes::new().set_accessed(now).set_modified(now))
-        .map_err(|e| Error::io(path, e))
-}
-
-/// `Path.write_text(text, encoding="utf-8")`: the file is replaced first, then written; text
-/// holding a lone surrogate fails there, leaving it empty, as Python's strict encoder does.
-fn write_text(path: &Path, text: &PyStr) -> Result<()> {
-    let mut file = File::create(path).map_err(|e| Error::io(path, e))?;
-    file.write_all(text.encode_utf8()?.as_bytes())
-        .map_err(|e| Error::io(path, e))
-}
-
-/// `Path.read_text(encoding="utf-8", errors="replace")`: undecodable bytes replaced, line ends
-/// translated to `\n`; `None` when the file is missing.
-fn read_text(path: &Path) -> Result<Option<PyStr>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error::io(path, e)),
-    };
-    let text = String::from_utf8_lossy(&bytes)
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
-    Ok(Some(PyStr::from(text)))
 }
 
 /// What launching Codex needs, prepared before the launch.
@@ -676,6 +485,7 @@ fn watch(
     wd: &Path,
     req: &DispatchRequest,
     tracker: &mut Tracker,
+    term: &AtomicBool,
     signals: Signals,
     exits: Signals,
 ) -> Result<(Finish, Option<Error>)> {
@@ -690,9 +500,9 @@ fn watch(
     let mut shell = Shell {
         wd,
         tracker,
+        term,
         fault: None,
         finish: None,
-        exit_seen: false,
     };
     let watched = shell.run(Runner::new(req, Instant::now()), &rx);
     done.store(true, Ordering::SeqCst);
@@ -735,20 +545,6 @@ fn follow_stream(path: PathBuf, tx: Sender<Input>, done: Arc<AtomicBool>) -> Joi
     })
 }
 
-/// The bytes of `path` from `offset` on; none when the file is missing.
-fn read_from(path: &Path, offset: u64) -> Result<Vec<u8>> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(Error::io(path, e)),
-    };
-    let mut data = Vec::new();
-    file.seek(SeekFrom::Start(offset))
-        .and_then(|_| file.read_to_end(&mut data))
-        .map_err(|e| Error::io(path, e))?;
-    Ok(data)
-}
-
 /// A signal thread: each signal caught, until its handle is closed.
 fn forward_signals(mut signals: Signals, tx: Sender<Input>) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -769,9 +565,10 @@ fn forward_signals(mut signals: Signals, tx: Sender<Input>) -> JoinHandle<()> {
 struct Shell<'a> {
     wd: &'a Path,
     tracker: &'a mut Tracker,
+    /// SIGTERM's flag (`term.is_set()`).
+    term: &'a AtomicBool,
     fault: Option<Error>,
     finish: Option<Finish>,
-    exit_seen: bool,
 }
 
 impl Shell<'_> {
@@ -784,13 +581,8 @@ impl Shell<'_> {
             }
             let wait = core.next_wakeup(Instant::now());
             next = match rx.recv_timeout(wait) {
-                Ok(Input::Line(view)) => Event::Line(view),
-                Ok(Input::Signal(sig)) => Event::Signal(sig),
-                Ok(Input::Child) | Err(RecvTimeoutError::Timeout) => Event::Tick,
-                Ok(Input::Fault(e)) => {
-                    self.fault.get_or_insert(e);
-                    Event::Fault
-                }
+                Ok(input) => self.event_of(&core, input),
+                Err(RecvTimeoutError::Timeout) => Event::Tick,
                 Err(RecvTimeoutError::Disconnected) => {
                     thread::sleep(wait.min(POLL));
                     Event::Tick
@@ -799,660 +591,85 @@ impl Shell<'_> {
         }
     }
 
-    /// One event, after the Python's `proc.poll()` and its look for a cancel request; then
-    /// every action it leads to, the answers to snapshots and checks fed straight back.
+    /// The event a thread's input is. A stream that cannot be read stops Codex ("error"), and
+    /// fails the runner once the result is written, only while Codex is watched: the Python
+    /// reads the stream only in its watch loop, never while stopping.
+    fn event_of(&mut self, core: &Runner, input: Input) -> Event {
+        match input {
+            Input::Line(view) => Event::Line(view),
+            Input::Signal(sig) => Event::Signal(sig),
+            Input::Child => Event::Tick,
+            Input::Fault(e) if core.watching() => {
+                self.fault.get_or_insert(e);
+                Event::Fault
+            }
+            Input::Fault(_) => Event::Tick,
+        }
+    }
+
+    /// One event, after the Python's loop's first two looks, in its order: `proc.poll()`
+    /// (Codex's exit), then `cancelled()` (SIGTERM's flag, or the `cancel` file). Then every
+    /// action it leads to, carried out with the tracker.
     fn feed(&mut self, core: &mut Runner, ev: Event) -> Result<()> {
-        let mut events: VecDeque<Event> = self.exit().into_iter().collect();
-        if core.watching() && self.wd.join(CANCEL).exists() {
+        let mut events: VecDeque<Event> = self
+            .tracker
+            .newly_exited()
+            .map(Event::Exited)
+            .into_iter()
+            .collect();
+        if core.watching() && (self.term.load(Ordering::SeqCst) || self.wd.join(CANCEL).exists()) {
             events.push_back(Event::CancelRequested);
         }
         events.push_back(ev);
         while let Some(ev) = events.pop_front() {
-            let mut actions: VecDeque<Action> = core.step(ev, Instant::now()).into();
-            while let Some(action) = actions.pop_front() {
+            let actions = core.step(ev, Instant::now());
+            let (wd, finish) = (self.wd, &mut self.finish);
+            let mut beat_failed = None;
+            carry_out(&mut *self.tracker, core, actions, &mut |action| {
                 match action {
                     Action::TouchHeartbeat => {
-                        // Watching, a heartbeat that cannot be touched stops Codex ("error");
-                        // stopping, it is let be, as the Python's `wait_gone` lets it be.
-                        if let Err(e) = touch(&self.wd.join(HEARTBEAT))
-                            && core.watching()
-                        {
-                            self.fault.get_or_insert(e);
-                            events.push_back(Event::Fault);
+                        if let Err(e) = touch(&wd.join(HEARTBEAT)) {
+                            beat_failed.get_or_insert(e);
                         }
                     }
-                    Action::Snapshot { tagged } => {
-                        self.tracker.snapshot(tagged);
-                        for answer in self.answer() {
-                            actions.extend(core.step(answer, Instant::now()));
-                        }
-                    }
-                    Action::CheckAlive => {
-                        for answer in self.answer() {
-                            actions.extend(core.step(answer, Instant::now()));
-                        }
-                    }
-                    Action::SignalGroups(sig) => self.tracker.signal(sig),
                     Action::Acknowledge(reason) => {
                         let ack = Stopping {
                             reason: reason.map_or("finished", StopReason::as_str),
                             at: utc_now(),
                         };
-                        write_json_atomic(&self.wd.join(STOPPING), &ack)?;
+                        write_json_atomic(&wd.join(STOPPING), &ack)?;
                     }
-                    Action::ChargeAndFinish(finish) => self.finish = Some(finish),
+                    Action::ChargeAndFinish(done) => *finish = Some(done),
+                    // The tracker's own actions.
+                    Action::Snapshot { .. } | Action::CheckAlive(_) | Action::SignalGroups(_) => {}
                 }
+                Ok(())
+            })?;
+            // Watching, a heartbeat that cannot be touched stops Codex ("error"); stopping, it
+            // is let be, as the Python's `wait_gone` lets it be.
+            if let Some(e) = beat_failed
+                && core.watching()
+            {
+                self.fault.get_or_insert(e);
+                events.push_back(Event::Fault);
             }
         }
         Ok(())
     }
-
-    /// Codex's exit, the first time it is seen.
-    fn exit(&mut self) -> Option<Event> {
-        let status = self.tracker.exited()?;
-        if std::mem::replace(&mut self.exit_seen, true) {
-            return None;
-        }
-        Some(Event::Exited(status))
-    }
-
-    /// The answer to a snapshot or a check: Codex's exit first, when this is where it is
-    /// first seen.
-    fn answer(&mut self) -> Vec<Event> {
-        let procs = self.tracker.liveness();
-        let mut out: Vec<Event> = self.exit().into_iter().collect();
-        out.push(Event::Procs(procs));
-        out
-    }
-}
-
-// --------------------------------------------------------------------------
-// Processes: recording, signalling, confirming (`_Tracker`)
-
-/// Codex and its recorded descendants (`_Tracker`): each recorded as (pid, pgid, start), a
-/// process counting as the one recorded only while its pid still has that start time. With a
-/// dispatch tag, a snapshot can also sweep up every process of this user carrying it, so a
-/// process that left Codex's tree before a snapshot saw it is stopped too (M4).
-pub struct Tracker {
-    wd: PathBuf,
-    codex: Option<StoppedProc>,
-    child: Option<Child>,
-    exit: Option<ExitStatus>,
-    tag: Option<String>,
-    /// The recorded processes not yet seen gone, in the order first recorded.
-    live: Vec<StoppedProc>,
-    /// Every process ever recorded, in that order.
-    seen: Vec<StoppedProc>,
-    saved: Option<ProcsFile>,
-    unreadable: Unreadable,
-}
-
-impl Tracker {
-    /// A tracker for Codex (`codex`, our own unreaped child when `child` is given), with the
-    /// dispatch tag the sweep looks for.
-    pub fn new(
-        wd: &Path,
-        codex: Option<StoppedProc>,
-        child: Option<Child>,
-        tag: Option<String>,
-    ) -> Tracker {
-        Tracker {
-            wd: wd.to_path_buf(),
-            codex,
-            child,
-            exit: None,
-            tag,
-            live: Vec::new(),
-            seen: Vec::new(),
-            saved: None,
-            unreadable: Unreadable::Pids(Vec::new()),
-        }
-    }
-
-    /// Codex's exit status, once our child has exited (it is reaped then).
-    pub fn exited(&mut self) -> Option<ExitStatus> {
-        if self.exit.is_none()
-            && let Some(child) = &mut self.child
-        {
-            // An error polling our own child leaves it counted as running: never as gone.
-            self.exit = child.try_wait().ok().flatten();
-        }
-        self.exit
-    }
-
-    /// Codex's exit status, waiting for it (`proc.wait()`).
-    pub fn wait(&mut self) -> Option<ExitStatus> {
-        if self.exit.is_none()
-            && let Some(child) = &mut self.child
-        {
-            self.exit = child.wait().ok();
-        }
-        self.exit
-    }
-
-    pub fn codex_alive(&mut self) -> bool {
-        if self.child.is_some() {
-            // Our own unreaped child: its pid (and group) cannot be reused until we reap it,
-            // so it is identified even when its start time could not be read.
-            return self.exited().is_none();
-        }
-        self.codex
-            .as_ref()
-            .is_some_and(|c| procs::same_process(Some(c.pid), c.start.as_deref()))
-    }
-
-    /// The identity a target is signalled under: a recorded process's own record; Codex,
-    /// while it is our unreaped child, as the process table shows its pid now.
-    fn identity(&mut self, target: &StoppedProc, is_codex: bool) -> Option<ProcId> {
-        if is_codex && self.child.is_some() {
-            return if self.codex_alive() {
-                procs::identify(target.pid)
-            } else {
-                None
-            };
-        }
-        target.start.clone().map(|start| ProcId {
-            pid: target.pid,
-            start,
-        })
-    }
-
-    fn add(&mut self, rec: StoppedProc) {
-        let same = |p: &StoppedProc| p.pid == rec.pid && p.start == rec.start;
-        if !self.live.iter().any(same) {
-            self.live.push(rec.clone());
-        }
-        if !self.seen.iter().any(same) {
-            self.seen.push(rec);
-        }
-    }
-
-    /// `find_tagged`: every live process carrying the dispatch tag. Processes whose
-    /// environment cannot be read (or a platform where none can) are noted in `procs.json`.
-    fn find_tagged(&mut self) {
-        let Some(tag) = &self.tag else {
-            return;
-        };
-        match procs::tagged(&format!("{TAG_VAR}={tag}")) {
-            None => self.unreadable = Unreadable::Unsupported,
-            Some((found, unreadable)) => {
-                self.unreadable = Unreadable::Pids(unreadable);
-                for p in &found {
-                    self.add(record_of(p));
-                }
-            }
-        }
-    }
-
-    /// Records Codex's live descendants, and with `tagged` every live process carrying the
-    /// tag; drops the recorded processes that are gone; writes `procs.json` when it changed.
-    pub fn snapshot(&mut self, tagged: bool) {
-        if self.codex_alive()
-            && let Some(pid) = self.codex.as_ref().map(|c| c.pid)
-        {
-            for p in procs::descendants(pid) {
-                self.add(record_of(&p));
-            }
-        }
-        if tagged {
-            self.find_tagged();
-        }
-        self.live
-            .retain(|r| procs::same_process(Some(r.pid), r.start.as_deref()));
-        let mut descendants = self.live.clone();
-        descendants.sort_by_key(|p| p.pid);
-        let current = ProcsFile {
-            descendants,
-            tag_unreadable: self.unreadable.clone(),
-        };
-        if self.saved.as_ref() != Some(&current) {
-            // As the Python: a snapshot that cannot be written is not a failure.
-            let _ = write_json_atomic(&self.wd.join(PROCS), &current);
-            self.saved = Some(current);
-        }
-    }
-
-    pub fn liveness(&mut self) -> Liveness {
-        let codex = self.codex_alive();
-        let any = codex
-            || self
-                .live
-                .iter()
-                .any(|r| procs::same_process(Some(r.pid), r.start.as_deref()));
-        Liveness { codex, any }
-    }
-
-    /// What is still alive: Codex, then the recorded processes.
-    pub fn alive(&mut self) -> Vec<StoppedProc> {
-        let mut out: Vec<StoppedProc> = Vec::new();
-        if self.codex_alive() {
-            out.extend(self.codex.clone());
-        }
-        out.extend(
-            self.live
-                .iter()
-                .filter(|r| procs::same_process(Some(r.pid), r.start.as_deref()))
-                .cloned(),
-        );
-        out
-    }
-
-    /// One rung's signal (`_Tracker.signal`): first to each group whose leader is a target
-    /// still with its identity, then to each other target, itself, with its identity. Codex
-    /// alone for SIGINT; Codex and every recorded process otherwise.
-    pub fn signal(&mut self, sig: Sig) {
-        let mut targets: Vec<(StoppedProc, bool)> = Vec::new();
-        if self.codex_alive()
-            && let Some(codex) = &self.codex
-        {
-            targets.push((codex.clone(), true));
-        }
-        if !sig.codex_only() {
-            targets.extend(self.live.iter().cloned().map(|r| (r, false)));
-        }
-        let signal = sig.signal();
-        let mut groups: Vec<i32> = Vec::new();
-        for (target, is_codex) in &targets {
-            if target.pid == target.pgid
-                && !groups.contains(&target.pgid)
-                && let Some(id) = self.identity(target, *is_codex)
-                && procs::signal_group_if_same(&id, target.pgid, signal)
-            {
-                groups.push(target.pgid);
-            }
-        }
-        for (target, is_codex) in &targets {
-            if !groups.contains(&target.pgid)
-                && let Some(id) = self.identity(target, *is_codex)
-            {
-                procs::signal_if_same(&id, signal);
-            }
-        }
-    }
-
-    /// Codex and every process ever recorded, by pid: `result.json`'s `stopped`.
-    pub fn stopped(&self) -> Vec<StoppedProc> {
-        let mut out: Vec<StoppedProc> = self.codex.iter().chain(&self.seen).cloned().collect();
-        out.sort_by_key(|p| p.pid);
-        out
-    }
-}
-
-fn record_of(p: &ProcInfo) -> StoppedProc {
-    StoppedProc {
-        pid: p.pid,
-        pgid: p.pgid,
-        start: Some(p.start.clone()),
-    }
-}
-
-/// The stop ladder, run to its end (`_Tracker.stop`): what is still alive, empty once
-/// everything is confirmed gone. With a deadline it gives up there; without one it sends
-/// SIGKILL again until everything is gone.
-pub fn stop(tracker: &mut Tracker, deadline: Option<Instant>) -> Vec<StoppedProc> {
-    let mut ladder = Ladder::new(deadline);
-    let mut actions: VecDeque<Action> = ladder.start(Instant::now()).into();
-    loop {
-        while let Some(action) = actions.pop_front() {
-            match action {
-                Action::Snapshot { tagged } => {
-                    tracker.snapshot(tagged);
-                    let procs = Event::Procs(tracker.liveness());
-                    actions.extend(ladder.step(&procs, Instant::now()));
-                }
-                Action::CheckAlive => {
-                    let procs = Event::Procs(tracker.liveness());
-                    actions.extend(ladder.step(&procs, Instant::now()));
-                }
-                Action::SignalGroups(sig) => tracker.signal(sig),
-                _ => {}
-            }
-        }
-        match ladder.done() {
-            Some(true) => return Vec::new(),
-            Some(false) => return tracker.alive(),
-            None => {}
-        }
-        thread::sleep(ladder.next_wakeup(Instant::now()));
-        actions.extend(ladder.step(&Event::Tick, Instant::now()));
-    }
-}
-
-// --------------------------------------------------------------------------
-// Finalizing: classify, commit, charge, record the attempt, write result.json
-
-/// The heartbeat, touched every second while a block runs (`_beating`): committing and
-/// charging can take a while, and a stale heartbeat reads as hung.
-struct Beating {
-    stop: Option<Sender<()>>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Beating {
-    fn start(beat: &Path) -> Beating {
-        let _ = touch(beat);
-        let (tx, rx) = mpsc::channel::<()>();
-        let beat = beat.to_path_buf();
-        let thread = thread::spawn(move || {
-            while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(HEARTBEAT_EVERY) {
-                let _ = touch(&beat);
-            }
-        });
-        Beating {
-            stop: Some(tx),
-            thread: Some(thread),
-        }
-    }
-}
-
-impl Drop for Beating {
-    fn drop(&mut self) {
-        drop(self.stop.take());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// What `runner.json` says about the generation, for finalizing.
-struct RunnerFacts {
-    generation: u32,
-    /// Two-phase launch: an intent without a recorded Codex may still have started one.
-    launched: bool,
-}
-
-/// `runner.json` as `_finalize_body` reads it: `generation` (1 when missing or false),
-/// `codex`, and `launching` with its `aborted`, each as Python's truth tests read them.
-fn runner_facts(wd: &Path) -> Result<RunnerFacts> {
-    let runner = read_json_object(&wd.join(RUNNER))?.unwrap_or_default();
-    let field = |key: &str| runner.get(&PyStr::from(key)).filter(|raw| truthy(raw));
-    let generation = match field("generation") {
-        None => 1,
-        Some(raw) => match raw.get().trim() {
-            "true" => 1,
-            text => serde_json::from_str::<u32>(text).map_err(|_| {
-                Error::msg(format!(
-                    "runner.json: generation {text} is not a generation"
-                ))
-            })?,
-        },
-    };
-    let launched = field("codex").is_some()
-        || match field("launching") {
-            None => false,
-            Some(raw) => {
-                let launching: PyMap<Box<RawValue>> = serde_json::from_str(raw.get())
-                    .map_err(|_| Error::msg("runner.json: launching is not an object"))?;
-                !launching
-                    .get(&PyStr::from("aborted"))
-                    .is_some_and(|a| truthy(a))
-            }
-        };
-    Ok(RunnerFacts {
-        generation,
-        launched,
-    })
-}
-
-/// The cancel request's token, when it is a string.
-fn cancel_token(wd: &Path) -> Result<Option<String>> {
-    let cancel = read_json_object(&wd.join(CANCEL))?.unwrap_or_default();
-    Ok(cancel
-        .get(&PyStr::from("token"))
-        .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok()))
-}
-
-/// `_charge_usage`: (usage, charge IDs, source). The session file first, then the stream,
-/// else unknown; nothing when Codex never ran.
-fn charge_usage(
-    wd: &Path,
-    req: &DispatchRequest,
-    thread: Option<&str>,
-    launched: bool,
-    generation: u32,
-    incomplete: bool,
-) -> Result<(Usage, Vec<PyStr>, &'static str)> {
-    if !launched {
-        return Ok((Usage::default(), Vec::new(), "none"));
-    }
-    let paths = run_paths(&req.run_dir);
-    let suffix = if generation > 1 {
-        format!(":g{generation}")
-    } else {
-        String::new()
-    };
-    let did = &req.dispatch_id;
-    let (charge_id, key) = match thread.filter(|t| !t.is_empty()) {
-        Some(t) => (format!("{did}:codex:{t}{suffix}"), t.to_string()),
-        None => (
-            format!("{did}:codex:unknown{suffix}"),
-            format!("dispatch:{did}"),
-        ),
-    };
-    let charge_id = PyStr::from(charge_id);
-    let thread = thread.map(PyStr::from);
-    let source = ChargeSource::Codex {
-        thread: thread.as_ref(),
-        sessions_dir: &default_sessions_dir(),
-        stream: Some(&wd.join(STREAM)),
-    };
-    let c = charge(
-        &paths,
-        &charge_id,
-        &PyStr::from(key),
-        did,
-        &req.role,
-        source,
-        incomplete,
-    )?;
-    if !c.usage.known {
-        return Ok((Usage::unknown(), vec![charge_id], "unknown"));
-    }
-    let source = if c.source == CODEX_STREAM_SOURCE {
-        "stream"
-    } else {
-        "session"
-    };
-    Ok((c.usage, vec![charge_id], source))
-}
-
-/// Finalize a dispatch (`_finalize`): classify it, commit a commit kind's work, charge the
-/// usage, record the attempt and write `result.json`, under `finalize.lock`. A result already
-/// there is returned as it is. With `beat`, the heartbeat is touched every second meanwhile.
-///
-/// S2-R32: a reply head the Python's `parse_report_head` raises `KeyError` on is an error
-/// here, before anything is written, charged or recorded, as the Python's exception escapes.
-#[allow(clippy::too_many_arguments)]
-pub fn finalize(
-    wd: &Path,
-    req: &DispatchRequest,
-    finish: Finish,
-    stopped: &[StoppedProc],
-    started_at: Option<&str>,
-    deadline: Option<Instant>,
-    beat: Option<&Path>,
-    commits: &dyn Commits,
-) -> Result<DispatchResult> {
-    let _beating = beat.map(Beating::start);
-    let lock_path = wd.join(FINALIZE_LOCK);
-    let lock = open_lock_file(&lock_path)?;
-    rustix::fs::flock(&lock, FlockOperation::LockExclusive)
-        .map_err(|e| Error::io(&lock_path, e.into()))?;
-    if let Some(existing) = load_result(wd)? {
-        return Ok(existing);
-    }
-    let run_id = run_id_of(&req.run_dir)?;
-    let runner = runner_facts(wd)?;
-    let stream = StreamSummary::of(&read_from(&wd.join(STREAM), 0)?);
-    let mut reply = read_text(&wd.join(LAST))?.unwrap_or_default();
-    if py_strip(&reply.lossy()).is_empty() {
-        reply = stream.last_agent_message.clone().unwrap_or_default();
-    }
-    let stderr = read_text(&wd.join(STDERR))?.unwrap_or_default();
-    let classified = classify(
-        finish.stopped_for,
-        finish.codex_exit,
-        &reply.lossy(),
-        &stream.errors,
-        &stderr.lossy(),
-    )?;
-    let (mut status, mut blocked_by, mut exit_reason) = (
-        classified.status,
-        classified.blocked_by,
-        classified.exit_reason,
-    );
-    if !runner.launched && finish.stopped_for.is_none() {
-        // Codex could not be started at all.
-        blocked_by = BlockedBy::Environment;
-    }
-    if classified.keep_raw {
-        write_text(&wd.join(RAW), &reply)?;
-    }
-    let incomplete = possibly_incomplete(
-        runner.launched,
-        finish.stopped_for,
-        finish.codex_exit,
-        stream.turn_open,
-    );
-    let mut commit = if runner.launched {
-        commit_work(wd, req, deadline, commits)
-    } else {
-        CommitOutcome {
-            commit_skipped: Some("Codex never ran".into()),
-            ..CommitOutcome::default()
-        }
-    };
-    let mut worker = None;
-    if let Some(failed) = commit_failed(&commit) {
-        // The work is still in the tree but not on the branch: an environment problem.
-        let mut text = PyStr::from(
-            "Status: BLOCKED\nBlocked by: environment\nleadhand could not commit the worker's \
-             changes on ",
-        );
-        text.push(&req.branch.clone().unwrap_or_else(|| PyStr::from("None")));
-        text.push_str(": ");
-        text.push(&failed);
-        if !py_strip(&reply.lossy()).is_empty() {
-            text.push_str(&format!("\n\nWorker reply ({}):\n", exit_reason.as_str()));
-            text.push(&reply);
-        }
-        reply = text;
-        worker = Some((status, exit_reason));
-        (status, blocked_by, exit_reason) =
-            (Status::Blocked, BlockedBy::Environment, ExitReason::Error);
-    }
-    let (usage, charge_ids, source) = charge_usage(
-        wd,
-        req,
-        stream.thread_id.as_deref(),
-        runner.launched,
-        runner.generation,
-        incomplete,
-    )?;
-    crash_point("after_charge_before_attempt");
-    let ended_at = utc_now();
-    // Codex models are not priced: an empty table suffices.
-    let cost = if usage.known {
-        estimate_cost(&usage, Some(&req.model), &[])
-    } else {
-        None
-    };
-    let known = usage.known.then(|| usage.clone());
-    let attempt = AttemptRecord {
-        dispatch: Some(req.dispatch_id.clone()),
-        run: Some(run_id),
-        card: req.card.map(CardRef::Number),
-        attempt: Some(req.attempt),
-        role: Some(req.role.clone()),
-        vendor: Some("codex".into()),
-        model: Some(req.model.clone()),
-        effort: Some(req.effort.clone()),
-        agent: None,
-        worker_id: stream.thread_id.as_deref().map(PyStr::from),
-        started_at: Some(started_at.unwrap_or(&ended_at).to_string()),
-        ended_at: Some(ended_at.clone()),
-        steps: Some(i64::from(stream.steps)),
-        charge_ids: charge_ids.clone(),
-        usage: known.clone(),
-        usage_known: Some(usage.known),
-        usage_source: Some(source.to_string()),
-        cost_estimate: cost,
-        exit_reason: Some(exit_reason.as_str().to_string()),
-        status: Some(status.as_str().to_string()),
-        blocked_by: Some(blocked_by.as_str().to_string()),
-        recorded_by: None,
-        generation: Some(i64::from(runner.generation)),
-        possibly_incomplete: Some(incomplete),
-    };
-    let paths = run_paths(&req.run_dir);
-    {
-        let _state = state_lock(&paths.root)?;
-        let generation = i64::from(runner.generation);
-        let recorded = read_attempts(&paths)?.iter().any(|a| {
-            a.dispatch.as_deref() == Some(&req.dispatch_id)
-                && a.generation.unwrap_or(1) == generation
-        });
-        if !recorded {
-            append_attempt(&paths, &attempt)?;
-        }
-    }
-    let mut stopped = stopped.to_vec();
-    stopped.sort_by_key(|p| p.pid);
-    let cancel_token = match exit_reason {
-        ExitReason::Cancelled => cancel_token(wd)?,
-        _ => None,
-    };
-    let result = DispatchResult {
-        dispatch_id: req.dispatch_id.clone(),
-        status,
-        blocked_by,
-        session_id: stream.thread_id.clone(),
-        reply,
-        steps: stream.steps,
-        usage: known,
-        usage_known: usage.known,
-        usage_source: source.to_string(),
-        possibly_incomplete: incomplete,
-        exit_reason,
-        codex_exit: finish.codex_exit,
-        charge_ids,
-        generation: runner.generation,
-        stopped,
-        confirmed_at: wall_now(),
-        cancel_token,
-        started_at: started_at.map(str::to_string),
-        ended_at: Some(ended_at),
-        committed: commit.committed.take(),
-        changes: commit.changes,
-        commit_skipped: commit.commit_skipped.take(),
-        commit_error: commit.commit_error.take(),
-        gitlinks_skipped: commit.gitlinks_skipped.take(),
-        worker_status: worker.map(|(s, _)| s),
-        worker_exit_reason: worker.map(|(_, e)| e),
-    };
-    write_json_atomic(&wd.join(RESULT), &result)?;
-    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{OsStr, OsString};
-    use std::fs;
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::PathBuf;
-    use std::process::{Command, Output, Stdio};
-    use std::time::Duration;
+    use std::os::fd::BorrowedFd;
+    use std::process::Output;
 
     use serde::Deserialize;
 
     use super::*;
-    use crate::dispatch::{
-        BlockedBy, ExitReason, RESULT, RUNNER, RUNNER_LOCK, STDERR, STOPPING, STREAM, Status,
-        load_result,
-    };
+    use crate::dispatch::runner::Limits;
+    use crate::dispatch::{BlockedBy, DispatchResult, ExitReason, RESULT, Status, load_result};
     use crate::git::fixture::Fixture;
     use crate::state::{AttemptRecord, read_attempts, run_paths};
-    use crate::sys::detach_session;
     use crate::usage::{Charge, read_charges};
 
     #[cfg(feature = "testing")]
@@ -1609,6 +826,8 @@ mod tests {
         prompt: Option<PyStr>,
         #[serde(default)]
         how: Option<String>,
+        #[serde(default)]
+        escaped_pid: Option<i32>,
     }
 
     fn json_path(p: &Path) -> String {
@@ -1655,38 +874,61 @@ mod tests {
 
     /// The Rust runner on `wd`, as a child with `env` only.
     fn rust_runner(wd: &Path, env: &[(OsString, OsString)]) -> Output {
-        Command::new(std::env::current_exe().unwrap())
-            .args([
-                "dispatch::shell::tests::runner_child",
-                "--exact",
-                "--test-threads=1",
-                "--nocapture",
-            ])
-            .env_clear()
-            .envs(env.iter().cloned())
-            .env(CHILD_WD, wd)
-            .stdin(Stdio::null())
-            .output()
-            .unwrap()
+        rust_runner_with(wd, env, None)
+    }
+
+    /// `rust_runner`, the child also inheriting `fd` without close-on-exec, as a runner can
+    /// inherit a descriptor from whoever started it.
+    fn rust_runner_with(
+        wd: &Path,
+        env: &[(OsString, OsString)],
+        fd: Option<BorrowedFd<'_>>,
+    ) -> Output {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "dispatch::shell::tests::runner_child",
+            "--exact",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env_clear()
+        .envs(env.iter().cloned())
+        .env(CHILD_WD, wd)
+        .stdin(Stdio::null());
+        if let Some(fd) = fd {
+            crate::sys::pass_fd_to_child(&mut cmd, fd);
+        }
+        cmd.output().unwrap()
     }
 
     /// The Python reference runner on `wd`, with `env` only.
     fn python_runner(wd: &Path, env: &[(OsString, OsString)]) -> Output {
+        python_runner_with(wd, env, None)
+    }
+
+    /// `python_runner`, the child also inheriting `fd` without close-on-exec.
+    fn python_runner_with(
+        wd: &Path,
+        env: &[(OsString, OsString)],
+        fd: Option<BorrowedFd<'_>>,
+    ) -> Output {
         let code = "import sys\nfrom pathlib import Path\nfrom leadhand import dispatch\n\
                     sys.exit(dispatch.run_runner(Path(sys.argv[1])))\n";
-        Command::new(crate::pytext::which("python3").unwrap())
-            .args([
-                OsStr::new("-B"),
-                OsStr::new("-c"),
-                OsStr::new(code),
-                wd.as_os_str(),
-            ])
-            .env_clear()
-            .envs(env.iter().cloned())
-            .env("PYTHONPATH", manifest().join("scripts/lib"))
-            .stdin(Stdio::null())
-            .output()
-            .unwrap()
+        let mut cmd = Command::new(crate::pytext::which("python3").unwrap());
+        cmd.args([
+            OsStr::new("-B"),
+            OsStr::new("-c"),
+            OsStr::new(code),
+            wd.as_os_str(),
+        ])
+        .env_clear()
+        .envs(env.iter().cloned())
+        .env("PYTHONPATH", manifest().join("scripts/lib"))
+        .stdin(Stdio::null());
+        if let Some(fd) = fd {
+            crate::sys::pass_fd_to_child(&mut cmd, fd);
+        }
+        cmd.output().unwrap()
     }
 
     fn shown(out: &Output) -> String {
@@ -2059,72 +1301,177 @@ mod tests {
         assert!(w.records().is_empty());
     }
 
-    // CATALOG: test_dispatch.py::FixRoundTests::test_unknown_codex_start_time_still_enforced
+    /// A process recorded by identity: killed when the test ends if it is still that process.
+    #[cfg(feature = "testing")]
+    struct KillOnDrop(crate::procs::ProcId);
+
+    #[cfg(feature = "testing")]
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            crate::procs::signal_if_same(&self.0, rustix::process::Signal::KILL);
+        }
+    }
+
+    #[cfg(feature = "testing")]
     #[test]
-    fn unknown_codex_start_time_still_enforced() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut cmd = Command::new("sleep");
-        cmd.arg("30").stdin(Stdio::null());
-        detach_session(&mut cmd);
-        let child = cmd.spawn().unwrap();
-        let pid = i32::try_from(child.id()).unwrap();
-        let record = StoppedProc {
-            pid,
-            pgid: pid,
-            start: None,
-        };
-        let mut tracker = Tracker::new(tmp.path(), Some(record), Some(child), None);
-        assert!(tracker.codex_alive());
-        let left = stop(&mut tracker, Some(Instant::now() + Duration::from_secs(15)));
-        assert_eq!(left, []);
-        assert!(tracker.exited().is_some());
+    fn a_process_escaping_codexs_tree_is_stopped_before_finalizing() {
+        // M4: the fake's escaped writer double-forks into a new session, so it leaves Codex's
+        // tree, and writes on after Codex exits. Only the tag sweep after the exit finds it;
+        // it is stopped, and recorded, before the result is written.
+        let w = World::new();
+        w.write_request(&w.request());
+        let out = rust_runner(&w.wd, &w.env("ready-escaped-writer"));
+        let escaped = w
+            .records()
+            .into_iter()
+            .find(|r| r.event == "escaped")
+            .and_then(|r| r.escaped_pid);
+        let _guard = escaped.and_then(crate::procs::identify).map(KillOnDrop);
+        assert_eq!(out.status.code(), Some(0), "{}", shown(&out));
+        let r = w.result().unwrap();
+        assert_eq!(r.status, Status::Ready);
+        let pid = escaped.expect("the fake logged its escaped writer");
+        assert!(r.stopped.iter().any(|p| p.pid == pid), "{:?}", r.stopped);
+        assert_eq!(
+            crate::procs::identify(pid),
+            None,
+            "the escaped writer outlived the dispatch"
+        );
+    }
+
+    /// A stand-in for Codex that reports what it inherited into `$PROBE_OUT`: whether
+    /// descriptor `$PROBE_FD` is open, then whether it survives a SIGHUP it sends itself.
+    #[cfg(feature = "testing")]
+    const PROBE: &str = "#!/bin/sh\n\
+        if [ -e \"/dev/fd/$PROBE_FD\" ]; then echo 'fd open' > \"$PROBE_OUT\"; \
+        else echo 'fd closed' > \"$PROBE_OUT\"; fi\n\
+        kill -HUP $$\n\
+        echo 'survived SIGHUP' >> \"$PROBE_OUT\"\n";
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn codex_gets_sighup_ignored_and_no_inherited_descriptor() {
+        // S2-R37 and S2-R38, as the Python's runner gives them: SIGHUP's `SIG_IGN` is kept
+        // across exec, and `close_fds=True` keeps a descriptor the runner inherited out of
+        // Codex.
+        use std::os::fd::{AsFd, AsRawFd};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::ExitStatusExt;
+
+        let (ours, theirs) = twins(|_, _| {});
+        let probe = ours.root.join("probe codex");
+        fs::write(&probe, PROBE).unwrap();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+        let held = File::create(ours.root.join("held")).unwrap();
+        let fd = rustix::io::fcntl_dupfd_cloexec(&held, 60).unwrap();
+        let number = fd.as_raw_fd().to_string();
+        // The probe sees both when nothing hides them: run from here with the descriptor
+        // passed, and SIGHUP's default action, it reports the descriptor and dies of SIGHUP.
+        let control = ours.root.join("control.out");
+        let mut cmd = Command::new(&probe);
+        cmd.env("PROBE_FD", &number)
+            .env("PROBE_OUT", &control)
+            .stdin(Stdio::null());
+        crate::sys::pass_fd_to_child(&mut cmd, fd.as_fd());
+        let status = cmd.status().unwrap();
+        assert_eq!(status.signal(), Some(rustix::process::Signal::HUP.as_raw()));
+        assert_eq!(fs::read_to_string(&control).unwrap(), "fd open\n");
+        // Through either runner, given the same descriptor without close-on-exec: Codex has
+        // neither.
+        for (w, python) in [(&ours, false), (&theirs, true)] {
+            let out_file = w.root.join("probe.out");
+            let env: Vec<(OsString, OsString)> = w
+                .env("ready")
+                .into_iter()
+                .map(|(k, v)| {
+                    if k == "LEADHAND_TEST_CODEX_BIN" {
+                        (k, probe.clone().into())
+                    } else {
+                        (k, v)
+                    }
+                })
+                .chain([
+                    ("PROBE_FD".into(), number.clone().into()),
+                    ("PROBE_OUT".into(), out_file.clone().into()),
+                ])
+                .collect();
+            let out = if python {
+                python_runner_with(&w.wd, &env, Some(fd.as_fd()))
+            } else {
+                rust_runner_with(&w.wd, &env, Some(fd.as_fd()))
+            };
+            assert_eq!(out.status.code(), Some(0), "{}", shown(&out));
+            assert_eq!(
+                fs::read_to_string(&out_file).unwrap(),
+                "fd closed\nsurvived SIGHUP\n",
+                "python: {python}"
+            );
+        }
+    }
+
+    /// A shell watching no Codex, in a folder of its own: for the shell's own rules.
+    fn bare_shell<'a>(wd: &'a Path, tracker: &'a mut Tracker, term: &'a AtomicBool) -> Shell<'a> {
+        Shell {
+            wd,
+            tracker,
+            term,
+            fault: None,
+            finish: None,
+        }
     }
 
     #[test]
-    fn ladder_stops_a_tool_child_codex_left_in_its_own_group() {
-        // Codex starts a tool command in a process group of its own and leaves it behind at
-        // SIGINT: the snapshot recorded it, so SIGTERM to its group stops it.
+    fn a_stream_fault_counts_only_while_codex_is_watched() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut cmd = Command::new("python3");
-        cmd.args([
-            "-c",
-            "import subprocess, sys\n\
-             p = subprocess.Popen(['sleep', '30'], start_new_session=True, stdin=subprocess.DEVNULL)\n\
-             print(p.pid, flush=True)\n\
-             sys.stdin.read()\n",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-        detach_session(&mut cmd);
-        let mut child = cmd.spawn().unwrap();
-        let _stdin = child.stdin.take();
-        let mut line = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
-            &mut line,
-        )
-        .unwrap();
-        let tool: i32 = line.trim().parse().unwrap();
-        let pid = i32::try_from(child.id()).unwrap();
-        let start = crate::procs::identify(pid).map(|id| id.start);
-        let record = StoppedProc {
-            pid,
-            pgid: pid,
-            start,
+        let mut tracker = Tracker::new(tmp.path(), None, None, None);
+        let term = AtomicBool::new(false);
+        let mut shell = bare_shell(tmp.path(), &mut tracker, &term);
+        let t0 = Instant::now();
+        let limits = Limits {
+            steps: 50,
+            time: Duration::MAX,
         };
-        let mut tracker = Tracker::new(tmp.path(), Some(record), Some(child), None);
-        tracker.snapshot(false);
-        let procs = fs::read_to_string(tmp.path().join("procs.json")).unwrap();
-        assert!(procs.contains(&format!("\"pid\": {tool}")), "{procs}");
-        let started = Instant::now();
-        assert_eq!(stop(&mut tracker, None), []);
-        assert!(started.elapsed() < Duration::from_secs(12));
-        assert_eq!(crate::procs::identify(tool), None);
-        let stopped: Vec<i32> = tracker.stopped().iter().map(|p| p.pid).collect();
-        assert!(
-            stopped.contains(&pid) && stopped.contains(&tool),
-            "{stopped:?}"
-        );
+        let fault = || Input::Fault(Error::msg("the stream cannot be read"));
+        let watching = Runner::with_limits(limits, t0);
+        assert_eq!(shell.event_of(&watching, fault()), Event::Fault);
+        assert!(shell.fault.take().is_some());
+        // Stopping, the Python reads the stream no more: nothing to fail the runner with.
+        let mut stopping = Runner::with_limits(limits, t0);
+        let _ = stopping.step(Event::CancelRequested, t0);
+        assert!(!stopping.watching());
+        assert_eq!(shell.event_of(&stopping, fault()), Event::Tick);
+        assert!(shell.fault.is_none());
+    }
+
+    #[test]
+    fn sigterm_comes_before_a_step_limit_seen_in_the_same_look() {
+        // The Python's loop checks `cancelled()` (SIGTERM's flag, or the cancel file) before
+        // the steps: a step line read in the same look as a SIGTERM still stops for the
+        // cancel.
+        for (term, want) in [
+            (true, StopReason::Cancelled),
+            (false, StopReason::StepLimit),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut tracker = Tracker::new(tmp.path(), None, None, None);
+            let term = AtomicBool::new(term);
+            let mut shell = bare_shell(tmp.path(), &mut tracker, &term);
+            let limits = Limits {
+                steps: 1,
+                time: Duration::MAX,
+            };
+            let mut core = Runner::with_limits(limits, Instant::now());
+            let step = StreamView::parse(
+                br#"{"type": "item.completed", "item": {"type": "command_execution"}}"#,
+            )
+            .unwrap();
+            shell.feed(&mut core, Event::Line(step)).unwrap();
+            assert_eq!(shell.finish.map(|f| f.stopped_for), Some(Some(want)));
+            let ack = fs::read_to_string(tmp.path().join(STOPPING)).unwrap();
+            assert!(
+                ack.contains(&format!("\"reason\": \"{}\"", want.as_str())),
+                "{ack}"
+            );
+        }
     }
 }

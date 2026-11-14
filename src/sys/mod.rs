@@ -1,13 +1,15 @@
 #![allow(unsafe_code)]
 #![deny(clippy::undocumented_unsafe_blocks)]
-//! The only module with `unsafe` code (spec, decision 5). It holds three things, each unsafe
+//! The only module with `unsafe` code (spec, decision 5). It holds these things, each unsafe
 //! block with its safety argument and a test:
 //! - the process table: `sysctl` on macOS (`macos.rs`), `/proc` on Linux (`linux.rs`, no
 //!   `unsafe`); never `ps`;
 //! - closing the run-lock descriptor a command inherited (`close_inherited_fd`), after the
 //!   device-and-inode check `launch._close_if_same` makes, and the thread count it relies on;
 //! - the steps a child takes before `exec`: `setsid` (`detach_session`) and keeping one
-//!   descriptor open across `exec` (`pass_fd_to_child`).
+//!   descriptor open across `exec` (`pass_fd_to_child`);
+//! - the dispatch runner's start: SIGHUP ignored (`ignore_sighup`, ruling S2-R37), and every
+//!   inherited descriptor kept from its children (`keep_inherited_fds_from_children`, S2-R38).
 //!
 //! The safe layer over the process table is `crate::procs`.
 
@@ -178,10 +180,54 @@ pub fn pass_fd_to_child(cmd: &mut Command, fd: BorrowedFd<'_>) {
     unsafe { cmd.pre_exec(keep_open) };
 }
 
+/// Sets SIGHUP to ignored, as the Python's runner does (`signal.signal(SIGHUP, SIG_IGN)`).
+/// An ignored signal stays ignored across `exec`, so Codex and every tool it starts inherit
+/// it, as they do under the Python.
+pub fn ignore_sighup() {
+    // SAFETY: `signal(2)` with `SIG_IGN` installs no handler, so no code of ours ever runs on
+    // delivery: it only sets SIGHUP's disposition, for the whole process, which is what is
+    // meant. Nothing else in leadhand handles SIGHUP. The result is ignored: it fails only for
+    // a signal number that is not valid, and SIGHUP is.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+}
+
+/// Marks every descriptor above 2 close-on-exec, so that none this process inherited without
+/// the flag reaches a child it starts: Python's `Popen(close_fds=True)` keeps them out of
+/// Codex. The descriptors are listed from `/dev/fd` (macOS) or `/proc/self/fd` (Linux); the
+/// process keeps them open itself.
+pub fn keep_inherited_fds_from_children() -> io::Result<()> {
+    let listing = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let fds: Vec<RawFd> = std::fs::read_dir(listing)?
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|fd| *fd > 2)
+        .collect();
+    for fd in fds {
+        // SAFETY: `fcntl(2)` with `F_GETFD` and `F_SETFD` on a descriptor number only reads and
+        // sets that descriptor's close-on-exec flag, and touches no memory. The number need not
+        // still be open: the listing's own directory descriptor is closed by now, and a closed
+        // number fails with EBADF, which is skipped. Setting the flag on a descriptor this
+        // process opened itself changes nothing, since Rust opens every file close-on-exec.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::fs::File;
     use std::os::fd::{AsFd, AsRawFd};
+    use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
     use std::process::{Child, Stdio};
 
@@ -513,5 +559,94 @@ pub(crate) mod tests {
     fn env_has_is_none_for_a_missing_process() {
         assert_eq!(env_has(0, b"A=1"), None);
         assert_eq!(env_has((1 << 22) + 12345, b"A=1"), None);
+    }
+
+    /// The check `start_child` makes, when its variable names one: `sighup` or `descriptors`.
+    const START_CHILD: &str = "LEADHAND_TEST_SYS_START";
+
+    /// The runner's start steps change the whole process (a signal disposition, every
+    /// descriptor's flag), so they are checked in this test binary run again as a child. It
+    /// prints `verdict: …` and exits.
+    #[test]
+    fn start_child() {
+        let Some(what) = std::env::var_os(START_CHILD) else {
+            return;
+        };
+        let verdict = match what.to_str() {
+            Some("sighup") => {
+                // A child that sends itself SIGHUP, before and after.
+                let hup = || {
+                    Command::new("sh")
+                        .args(["-c", "kill -HUP $$; echo survived"])
+                        .stdin(Stdio::null())
+                        .output()
+                        .unwrap()
+                };
+                let before = hup();
+                ignore_sighup();
+                let after = hup();
+                format!(
+                    "{:?} {:?} {}",
+                    before.status.signal(),
+                    after.status.code(),
+                    String::from_utf8_lossy(&after.stdout).trim()
+                )
+            }
+            Some("descriptors") => {
+                // A descriptor this process has without close-on-exec, as one it inherited.
+                let path =
+                    std::env::temp_dir().join(format!("leadhand-start-{}", getpid().as_raw_pid()));
+                let file = File::create(&path).unwrap();
+                let fd = rustix::io::fcntl_dupfd_cloexec(&file, 60).unwrap();
+                fcntl_setfd(&fd, FdFlags::empty()).unwrap();
+                let before = open_in_child(fd.as_fd(), false);
+                keep_inherited_fds_from_children().unwrap();
+                let after = open_in_child(fd.as_fd(), false);
+                let flagged = fcntl_getfd(&fd).unwrap().contains(FdFlags::CLOEXEC);
+                let _ = std::fs::remove_file(&path);
+                format!("{before} {after} {flagged}")
+            }
+            _ => "unknown".into(),
+        };
+        println!("verdict: {verdict}");
+        std::process::exit(0);
+    }
+
+    /// `start_child`'s verdict on `what`.
+    fn start(what: &str) -> String {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "sys::tests::start_child",
+                "--exact",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(START_CHILD, what)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        // libtest prints the test's name first, on the same line.
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines()
+            .find_map(|l| l.split_once("verdict: ").map(|(_, v)| v))
+            .unwrap_or_else(|| panic!("no verdict: {text}{}", String::from_utf8_lossy(&out.stderr)))
+            .to_string()
+    }
+
+    #[test]
+    fn ignore_sighup_is_inherited_across_exec() {
+        // Before: the child dies of SIGHUP (here SIGHUP has its default action). After: it
+        // inherits SIGHUP ignored, survives its own, and goes on.
+        assert_eq!(
+            start("sighup"),
+            format!("Some({}) Some(0) survived", libc::SIGHUP)
+        );
+    }
+
+    #[test]
+    fn inherited_descriptors_are_kept_from_children() {
+        // Before: a child inherits the descriptor. After: it does not, and it is marked
+        // close-on-exec, still open here.
+        assert_eq!(start("descriptors"), "true false true");
     }
 }

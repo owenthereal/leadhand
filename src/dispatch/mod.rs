@@ -8,21 +8,30 @@
 //! - `caller`: the run anchor `dispatch`, `stop-dispatch` and `dispatch-runner` check
 //!   (security fixes H1, H2 and M1, `docs/compatibility.md`);
 //! - `runner`: the detached runner's pure core, a state machine (spec, decision 6);
-//! - `shell`: the runner's threads and I/O around it, its process tracker, and finalizing.
+//! - `shell`: the runner's life, and the threads and I/O around the core;
+//! - `tracker`: Codex and its recorded processes, which the stop ladder signals;
+//! - `finalize`: classifying, committing, charging, the attempt and `result.json`.
 
 pub mod argv;
 pub mod caller;
 pub mod env;
+pub mod finalize;
 pub mod request;
 pub mod runner;
 pub mod shell;
+pub mod tracker;
 
+use std::fs::{File, FileTimes, OpenOptions};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::de::IgnoredAny;
 use serde_json::value::RawValue;
 
 use crate::error::{Error, Result};
-use crate::wire::PyMap;
+use crate::wire::{PyMap, PyStr};
 
 pub use argv::{codex_argv, codex_argv_parts, toml_string};
 pub use caller::{
@@ -84,6 +93,110 @@ pub const UNTRACKED: &str = "untracked.json";
 /// last value, as `json.loads` does). Any other I/O error is an error.
 pub fn read_json_object(path: &Path) -> Result<Option<PyMap<Box<RawValue>>>> {
     Ok(read_json_text(path)?.and_then(|text| serde_json::from_str(&text).ok()))
+}
+
+// --------------------------------------------------------------------------
+// The worker folder's files, as the Python's runner reads and writes them
+
+/// `_touch`: creates the file if needed, and sets its times to now.
+pub(crate) fn touch(path: &Path) -> Result<()> {
+    let file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(|e| Error::io(path, e))?;
+    let now = SystemTime::now();
+    file.set_times(FileTimes::new().set_accessed(now).set_modified(now))
+        .map_err(|e| Error::io(path, e))
+}
+
+/// `time.time()`.
+pub(crate) fn wall_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// A lock file, opened as the Python opens it (`O_RDWR | O_CREAT | O_CLOEXEC`, `0644`).
+pub(crate) fn open_lock_file(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o644)
+        .open(path)
+        .map_err(|e| Error::io(path, e))
+}
+
+/// `Path.write_text(text, encoding="utf-8")`: the file is replaced first, then written; text
+/// holding a lone surrogate fails there, leaving it empty, as Python's strict encoder does.
+pub(crate) fn write_text(path: &Path, text: &PyStr) -> Result<()> {
+    let mut file = File::create(path).map_err(|e| Error::io(path, e))?;
+    file.write_all(text.encode_utf8()?.as_bytes())
+        .map_err(|e| Error::io(path, e))
+}
+
+/// `Path.read_text(encoding="utf-8", errors="replace")`: undecodable bytes replaced, line ends
+/// translated to `\n`; `None` when the file is missing.
+pub(crate) fn read_text(path: &Path) -> Result<Option<PyStr>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::io(path, e)),
+    };
+    let text = String::from_utf8_lossy(&bytes)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    Ok(Some(PyStr::from(text)))
+}
+
+/// The bytes of `path` from `offset` on; none when the file is missing.
+pub(crate) fn read_from(path: &Path, offset: u64) -> Result<Vec<u8>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::io(path, e)),
+    };
+    let mut data = Vec::new();
+    file.seek(SeekFrom::Start(offset))
+        .and_then(|_| file.read_to_end(&mut data))
+        .map_err(|e| Error::io(path, e))?;
+    Ok(data)
+}
+
+/// Whether a JSON value is true as Python's `bool` reads the value `json.loads` gives.
+pub(crate) fn truthy(raw: &RawValue) -> bool {
+    let text = raw.get().trim();
+    match text.as_bytes().first() {
+        Some(b'n' | b'f') | None => false,
+        Some(b't') => true,
+        Some(b'"') => text != "\"\"",
+        Some(b'[') => serde_json::from_str::<Vec<IgnoredAny>>(text).is_ok_and(|v| !v.is_empty()),
+        Some(b'{') => serde_json::from_str::<PyMap<IgnoredAny>>(text).is_ok_and(|m| !m.is_empty()),
+        Some(_) => serde_json::from_str::<f64>(text).is_ok_and(|n| n != 0.0),
+    }
+}
+
+/// `_run_id`: `run.json`'s `run_id`, else the run directory's name. A run ID that is not a
+/// string, or not text, is an error (an anchored run's is always a non-empty string).
+pub(crate) fn run_id_of(run_dir: &Path) -> Result<String> {
+    let meta = read_json_object(&crate::state::run_paths(run_dir).run_json)?.unwrap_or_default();
+    match meta.get(&PyStr::from("run_id")).filter(|raw| truthy(raw)) {
+        Some(raw) => {
+            let text = serde_json::from_str::<PyStr>(raw.get()).map_err(|_| {
+                Error::msg(format!("run.json's run_id {} is not a string", raw.get()))
+            })?;
+            String::from_utf8(text.as_wtf8().to_vec())
+                .map_err(|_| Error::msg(format!("run.json's run_id {} is not text", text.repr())))
+        }
+        None => caller::py_name(run_dir).into_string().map_err(|name| {
+            Error::msg(format!(
+                "the run directory's name {} is not text",
+                PyStr::from_os(&name).repr()
+            ))
+        }),
+    }
 }
 
 /// The text of a JSON object file, `None` where `read_json_object` is `None`: for a typed

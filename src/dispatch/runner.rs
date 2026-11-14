@@ -297,6 +297,12 @@ pub struct Liveness {
     pub any: bool,
 }
 
+/// One request for the recorded set's liveness, carried back by its answer: the ladder takes
+/// only the answer to the request it has outstanding, so a late or stray answer can never
+/// stand for a later look.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ask(u64);
+
 /// What the shell tells the core.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
@@ -304,12 +310,12 @@ pub enum Event {
     Line(StreamView),
     /// Codex exited (and was reaped).
     Exited(ExitStatus),
-    /// A signal the runner caught: SIGTERM is a cancel request; others are ignored (SIGHUP).
+    /// A signal the runner caught: SIGTERM is a cancel request; any other is ignored.
     Signal(i32),
-    /// The worker folder's `cancel` file is there.
+    /// A cancel request: the worker folder's `cancel` file is there, or SIGTERM came.
     CancelRequested,
-    /// The answer to `Snapshot` or `CheckAlive`.
-    Procs(Liveness),
+    /// The answer to the `Snapshot` or `CheckAlive` that asked `Ask`.
+    Procs(Ask, Liveness),
     /// The shell failed while Codex ran (a heartbeat it could not touch, a stream it could
     /// not read).
     Fault,
@@ -323,12 +329,14 @@ pub enum Action {
     TouchHeartbeat,
     /// Record Codex's live descendants (and, with `tagged`, every process carrying the
     /// dispatch tag), drop the recorded ones that are gone, and write `procs.json` if it
-    /// changed. Answered with `Event::Procs`.
+    /// changed. With an `ask`, answered with `Event::Procs`; a watching runner's own refresh
+    /// asks nothing.
     Snapshot {
         tagged: bool,
+        ask: Option<Ask>,
     },
     /// Answered with `Event::Procs`, the recorded set unchanged.
-    CheckAlive,
+    CheckAlive(Ask),
     /// Signal Codex's group, and with `Term` and `Kill` every recorded group (a recorded
     /// process that leads no recorded group, itself), each only while the recorded process
     /// still has its recorded identity.
@@ -448,14 +456,17 @@ impl Runner {
                     self.begin_stop(Some(StopReason::Error), now, &mut out);
                 }
             }
-            Event::Procs(_) | Event::Tick => {}
+            Event::Procs(..) | Event::Tick => {}
         }
         if self.watching() {
             if let Some(reason) = self.limit_reached(now) {
                 self.begin_stop(Some(reason), now, &mut out);
             } else if now.saturating_duration_since(self.last_snapshot) >= SNAPSHOT_EVERY {
                 self.last_snapshot = now;
-                out.push(Action::Snapshot { tagged: false });
+                out.push(Action::Snapshot {
+                    tagged: false,
+                    ask: None,
+                });
             }
             return out;
         }
@@ -539,10 +550,17 @@ impl Runner {
 /// does not, and sends SIGKILL until everything is gone). It asks for a snapshot with the tag
 /// sweep before each signal, and while it waits for the recorded processes to go, it checks
 /// them every `WAIT_POLL` and snapshots them every `WAIT_SNAPSHOT`, the first time at once.
+///
+/// It has at most one request out at a time, and takes only that request's answer: an answer
+/// to anything else (the watching runner's own refresh, an earlier look) is ignored.
 #[derive(Clone, Debug)]
 pub struct Ladder {
     deadline: Option<Instant>,
     state: LadderState,
+    /// The request whose answer the ladder waits for.
+    asked: Option<Ask>,
+    /// The next request's number.
+    asks: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -556,7 +574,6 @@ enum LadderState {
         until: Instant,
         last_snapshot: Instant,
         next_check: Instant,
-        asked: bool,
     },
     /// Over: everything is gone (`true`), or the deadline passed with something alive.
     Done(bool),
@@ -574,29 +591,55 @@ impl Ladder {
         Ladder {
             deadline,
             state: LadderState::Idle,
+            asked: None,
+            asks: 0,
         }
     }
 
     /// The first snapshot.
     pub fn start(&mut self, _now: Instant) -> Vec<Action> {
         self.state = LadderState::Probing(Probe::First);
-        vec![Action::Snapshot { tagged: true }]
+        vec![self.snapshot()]
     }
 
-    /// `Event::Procs` and `Event::Tick` drive it; anything else is ignored.
+    /// `Event::Procs` answering the outstanding request, and `Event::Tick`, drive it; anything
+    /// else is ignored.
     pub fn step(&mut self, ev: &Event, now: Instant) -> Vec<Action> {
-        match (ev, self.state.clone()) {
-            (Event::Procs(procs), LadderState::Probing(probe)) => self.probed(probe, *procs, now),
-            (
-                Event::Procs(procs),
-                LadderState::Waiting {
-                    sig,
-                    until,
-                    last_snapshot,
-                    asked: true,
-                    ..
-                },
-            ) => {
+        match ev {
+            Event::Procs(ask, procs) if self.asked == Some(*ask) => {
+                self.asked = None;
+                self.answered(*procs, now)
+            }
+            Event::Tick => self.tick(now),
+            _ => Vec::new(),
+        }
+    }
+
+    /// A snapshot with the tag sweep, asked for.
+    fn snapshot(&mut self) -> Action {
+        Action::Snapshot {
+            tagged: true,
+            ask: Some(self.ask()),
+        }
+    }
+
+    fn ask(&mut self) -> Ask {
+        let ask = Ask(self.asks);
+        self.asks += 1;
+        self.asked = Some(ask);
+        ask
+    }
+
+    /// The answer to the outstanding request.
+    fn answered(&mut self, procs: Liveness, now: Instant) -> Vec<Action> {
+        match self.state.clone() {
+            LadderState::Probing(probe) => self.probed(probe, procs, now),
+            LadderState::Waiting {
+                sig,
+                until,
+                last_snapshot,
+                ..
+            } => {
                 // `wait_gone`: gone first, then the deadline.
                 if !procs.any {
                     self.state = LadderState::Done(true);
@@ -609,48 +652,48 @@ impl Ladder {
                         until,
                         last_snapshot,
                         next_check: now + WAIT_POLL,
-                        asked: false,
                     };
                     Vec::new()
                 }
             }
-            (
-                Event::Tick,
-                LadderState::Waiting {
-                    sig,
-                    until,
-                    last_snapshot,
-                    next_check,
-                    asked: false,
-                },
-            ) if now >= next_check => {
-                let due = now.saturating_duration_since(last_snapshot) >= WAIT_SNAPSHOT;
-                self.state = LadderState::Waiting {
-                    sig,
-                    until,
-                    last_snapshot: if due { now } else { last_snapshot },
-                    next_check,
-                    asked: true,
-                };
-                vec![if due {
-                    Action::Snapshot { tagged: true }
-                } else {
-                    Action::CheckAlive
-                }]
-            }
-            _ => Vec::new(),
+            LadderState::Idle | LadderState::Done(_) => Vec::new(),
+        }
+    }
+
+    /// A wait's next look, when it is due and no answer is outstanding: a snapshot every
+    /// `WAIT_SNAPSHOT`, a check in between.
+    fn tick(&mut self, now: Instant) -> Vec<Action> {
+        let LadderState::Waiting {
+            sig,
+            until,
+            last_snapshot,
+            next_check,
+        } = self.state
+        else {
+            return Vec::new();
+        };
+        if self.asked.is_some() || now < next_check {
+            return Vec::new();
+        }
+        if now.saturating_duration_since(last_snapshot) >= WAIT_SNAPSHOT {
+            self.state = LadderState::Waiting {
+                sig,
+                until,
+                last_snapshot: now,
+                next_check,
+            };
+            vec![self.snapshot()]
+        } else {
+            vec![Action::CheckAlive(self.ask())]
         }
     }
 
     /// How long until the next check.
     pub fn next_wakeup(&self, now: Instant) -> Duration {
         match &self.state {
-            LadderState::Waiting {
-                next_check,
-                asked: false,
-                ..
-            } => next_check.saturating_duration_since(now),
-            LadderState::Probing(_) | LadderState::Waiting { .. } => Duration::ZERO,
+            _ if self.asked.is_some() => Duration::ZERO,
+            LadderState::Waiting { next_check, .. } => next_check.saturating_duration_since(now),
+            LadderState::Probing(_) => Duration::ZERO,
             LadderState::Idle | LadderState::Done(_) => Duration::MAX,
         }
     }
@@ -666,7 +709,7 @@ impl Ladder {
             Probe::First if procs.codex => self.signal(Sig::Int, now),
             Probe::First => {
                 self.state = LadderState::Probing(Probe::BeforeTerm);
-                vec![Action::Snapshot { tagged: true }]
+                vec![self.snapshot()]
             }
             Probe::BeforeTerm => self.signal(Sig::Term, now),
             Probe::BeforeKill => self.signal(Sig::Kill, now),
@@ -684,9 +727,8 @@ impl Ladder {
             until: now + span,
             last_snapshot: now,
             next_check: now,
-            asked: true,
         };
-        vec![Action::SignalGroups(sig), Action::Snapshot { tagged: true }]
+        vec![Action::SignalGroups(sig), self.snapshot()]
     }
 
     /// `left()`: a signal step, cut to what is left of the deadline.
@@ -710,7 +752,7 @@ impl Ladder {
             Sig::Kill => Probe::BeforeKill,
         };
         self.state = LadderState::Probing(next);
-        vec![Action::Snapshot { tagged: true }]
+        vec![self.snapshot()]
     }
 
     /// `Some(true)` once everything recorded is gone, `Some(false)` once the deadline passed
@@ -966,15 +1008,58 @@ mod tests {
         any: false,
     };
 
-    /// The shell's part in a test: each `Snapshot` and `CheckAlive` is answered at once with
-    /// `procs`; every action is recorded, the answers' too.
+    /// Any request's token, in a logged action: the logs compare actions without their tokens.
+    const ANY: Ask = Ask(u64::MAX);
+    /// A tagged snapshot that asks for an answer, as logged.
+    const SNAP: Action = Action::Snapshot {
+        tagged: true,
+        ask: Some(ANY),
+    };
+    /// A watching runner's own refresh, which asks nothing.
+    const WATCH: Action = Action::Snapshot {
+        tagged: false,
+        ask: None,
+    };
+    /// A liveness check, as logged.
+    const CHECK: Action = Action::CheckAlive(ANY);
+
+    /// The request an action makes, if it asks for an answer.
+    fn ask_of(a: &Action) -> Option<Ask> {
+        match a {
+            Action::Snapshot { ask, .. } => *ask,
+            Action::CheckAlive(ask) => Some(*ask),
+            _ => None,
+        }
+    }
+
+    /// `a` with its token replaced by `ANY`.
+    fn logged(a: Action) -> Action {
+        match a {
+            Action::Snapshot {
+                tagged,
+                ask: Some(_),
+            } => Action::Snapshot {
+                tagged,
+                ask: Some(ANY),
+            },
+            Action::CheckAlive(_) => CHECK,
+            other => other,
+        }
+    }
+
+    fn all_logged(actions: Vec<Action>) -> Vec<Action> {
+        actions.into_iter().map(logged).collect()
+    }
+
+    /// The shell's part in a test: each request is answered at once with `procs`, under its
+    /// own token; every action is recorded (tokens aside), the answers' too.
     fn act(r: &mut Runner, ev: Event, now: Instant, procs: Liveness, log: &mut Vec<Action>) {
         let mut todo = std::collections::VecDeque::from(r.step(ev, now));
         while let Some(a) = todo.pop_front() {
-            let answer = matches!(a, Action::Snapshot { .. } | Action::CheckAlive);
-            log.push(a);
-            if answer {
-                todo.extend(r.step(Event::Procs(procs), now));
+            let ask = ask_of(&a);
+            log.push(logged(a));
+            if let Some(ask) = ask {
+                todo.extend(r.step(Event::Procs(ask, procs), now));
             }
         }
     }
@@ -1054,9 +1139,9 @@ mod tests {
             log,
             [
                 Action::Acknowledge(Some(StopReason::StepLimit)),
-                Action::Snapshot { tagged: true },
+                SNAP,
                 Action::SignalGroups(Sig::Int),
-                Action::Snapshot { tagged: true },
+                SNAP,
             ]
         );
         // More steps change nothing.
@@ -1247,11 +1332,7 @@ mod tests {
         assert_eq!(signals(&log), [Sig::Int, Sig::Term, Sig::Kill, Sig::Kill]);
         for (i, a) in log.iter().enumerate() {
             if matches!(a, Action::SignalGroups(_)) {
-                assert_eq!(
-                    log[i - 1],
-                    Action::Snapshot { tagged: true },
-                    "action {i} of {log:?}"
-                );
+                assert_eq!(log[i - 1], SNAP, "action {i} of {log:?}");
             }
         }
         // While it waits, liveness is checked every WAIT_POLL and the set re-snapshotted
@@ -1262,29 +1343,16 @@ mod tests {
             .skip(1)
             .take(6)
             .collect();
-        assert_eq!(
-            first_wait,
-            [
-                &Action::Snapshot { tagged: true },
-                &Action::CheckAlive,
-                &Action::CheckAlive,
-                &Action::CheckAlive,
-                &Action::CheckAlive,
-                &Action::Snapshot { tagged: true },
-            ]
-        );
+        assert_eq!(first_wait, [&SNAP, &CHECK, &CHECK, &CHECK, &CHECK, &SNAP,]);
         // Watching, the snapshots have no tag sweep, every second.
         let mut r = runner(50, 60, t0);
         let mut log = Vec::new();
         act(&mut r, Event::Tick, t0 + ms(999), ALIVE, &mut log);
-        assert!(!log.contains(&Action::Snapshot { tagged: false }));
+        assert!(!log.contains(&WATCH));
         act(&mut r, Event::Tick, t0 + ms(1000), ALIVE, &mut log);
         act(&mut r, Event::Tick, t0 + ms(1500), ALIVE, &mut log);
         act(&mut r, Event::Tick, t0 + ms(2000), ALIVE, &mut log);
-        let snaps = log
-            .iter()
-            .filter(|a| **a == Action::Snapshot { tagged: false })
-            .count();
+        let snaps = log.iter().filter(|a| **a == WATCH).count();
         assert_eq!(snaps, 2);
     }
 
@@ -1306,7 +1374,7 @@ mod tests {
             log,
             [
                 Action::Acknowledge(None),
-                Action::Snapshot { tagged: true },
+                SNAP,
                 Action::ChargeAndFinish(Finish {
                     stopped_for: None,
                     codex_exit: Some(0),
@@ -1328,8 +1396,8 @@ mod tests {
             log[..4],
             [
                 Action::Acknowledge(None),
-                Action::Snapshot { tagged: true },
-                Action::Snapshot { tagged: true },
+                SNAP,
+                SNAP,
                 Action::SignalGroups(Sig::Term),
             ]
         );
@@ -1434,9 +1502,9 @@ mod tests {
                 log,
                 [
                     Action::Acknowledge(Some(StopReason::Cancelled)),
-                    Action::Snapshot { tagged: true },
+                    SNAP,
                     Action::SignalGroups(Sig::Int),
-                    Action::Snapshot { tagged: true },
+                    SNAP,
                 ],
                 "{cancel:?}"
             );
@@ -1542,10 +1610,10 @@ mod tests {
             |ladder: &mut Ladder, actions: Vec<Action>, now: Instant, log: &mut Vec<Action>| {
                 let mut todo = std::collections::VecDeque::from(actions);
                 while let Some(a) = todo.pop_front() {
-                    let answer = matches!(a, Action::Snapshot { .. } | Action::CheckAlive);
-                    log.push(a);
-                    if answer {
-                        todo.extend(ladder.step(&Event::Procs(ALIVE), now));
+                    let ask = ask_of(&a);
+                    log.push(logged(a));
+                    if let Some(ask) = ask {
+                        todo.extend(ladder.step(&Event::Procs(ask, ALIVE), now));
                     }
                 }
             };
@@ -1562,9 +1630,39 @@ mod tests {
         assert!(t >= t0 + ms(7000) && t < t0 + ms(7100), "{:?}", t - t0);
         // Nothing alive at the first look: done at once, nothing signalled.
         let mut ladder = Ladder::new(Some(t0 + ms(7000)));
-        assert_eq!(ladder.start(t0), [Action::Snapshot { tagged: true }]);
-        assert_eq!(ladder.step(&Event::Procs(GONE), t0), []);
+        let first = ladder.start(t0);
+        assert_eq!(all_logged(first.clone()), [SNAP]);
+        let ask = ask_of(&first[0]).unwrap();
+        assert_eq!(ladder.step(&Event::Procs(ask, GONE), t0), []);
         assert_eq!(ladder.done(), Some(true));
+    }
+
+    #[test]
+    fn ladder_takes_only_the_answer_to_its_own_request() {
+        // The review's case: Codex exits while the runner watches, so the ladder starts; a
+        // stale answer (to any other request) arrives before the ladder's own, and says nothing
+        // is alive. It must not end the ladder: the tagged snapshot decides, and here a tagged
+        // process is still alive, so it gets SIGTERM.
+        let t0 = Instant::now();
+        let mut r = runner(50, 60, t0);
+        let actions = r.step(Event::Exited(ExitStatus::from_raw(0)), t0);
+        assert_eq!(
+            all_logged(actions.clone()),
+            [Action::Acknowledge(None), SNAP]
+        );
+        let ask = ask_of(&actions[1]).unwrap();
+        for stale in [Ask(ask.0 + 1), Ask(ask.0.wrapping_sub(1)), ANY] {
+            assert_eq!(r.step(Event::Procs(stale, GONE), t0), [], "{stale:?}");
+        }
+        let probe = r.step(Event::Procs(ask, LEFT), t0);
+        assert_eq!(all_logged(probe.clone()), [SNAP]);
+        // An answer already taken is stale too.
+        assert_eq!(r.step(Event::Procs(ask, GONE), t0), []);
+        let before_term = ask_of(&probe[0]).unwrap();
+        let term = r.step(Event::Procs(before_term, LEFT), t0);
+        assert_eq!(all_logged(term), [Action::SignalGroups(Sig::Term), SNAP]);
+        // A tick while an answer is outstanding asks nothing more.
+        assert_eq!(r.step(Event::Tick, t0 + ms(100)), []);
     }
 
     // ----------------------------------------------------------------------
