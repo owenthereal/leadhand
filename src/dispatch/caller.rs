@@ -279,7 +279,7 @@ fn check_holder(real: &Path, shown_run: &Path, run_id: &PyStr) -> Result<()> {
 
 /// `str(value)` of a JSON value, for a message: text as it is, `True`/`False`, a number as
 /// Python prints it; anything else as its JSON text.
-fn py_str_of(raw: &RawValue) -> String {
+pub(crate) fn py_str_of(raw: &RawValue) -> String {
     let text = raw.get();
     if let Ok(s) = serde_json::from_str::<PyStr>(text) {
         return s.lossy().into_owned();

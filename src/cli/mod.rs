@@ -142,8 +142,8 @@ pub enum Command {
         after_help = "Example:\n  leadhand run ~/.leadhand/myapp/runs/2026-11-10-retry-uploads"
     )]
     Run {
-        #[arg(help = "the run directory or its deck.md")]
-        run_dir: OsString,
+        #[arg(help = RUN_HELP)]
+        run_dir: Option<OsString>,
         #[arg(long, help = "load the leadhand plugin from this directory")]
         plugin_dir: Option<OsString>,
         #[arg(long = "print", hide = true)]
@@ -155,10 +155,12 @@ pub enum Command {
         after_help = "Example:\n  leadhand launch-line ~/.leadhand/myapp/runs/2026-11-10-retry-uploads"
     )]
     LaunchLine {
-        #[arg(help = "the run directory or its deck.md")]
-        run_dir: OsString,
+        #[arg(help = RUN_HELP)]
+        run_dir: Option<OsString>,
         #[arg(long, help = "load the leadhand plugin from this directory")]
         plugin_dir: Option<OsString>,
+        #[arg(long, help = "print the line as one JSON object")]
+        json: bool,
     },
 
     #[command(
@@ -385,6 +387,16 @@ fn run(command: Command, name: &str, caller: &Result<Caller>) -> Result<ExitCode
         Command::DispatchRunner { worker_dir } => {
             crate::dispatch::cmd::runner_command(&worker_dir, caller)
         }
+        Command::Run {
+            run_dir,
+            plugin_dir,
+            print_mode,
+        } => crate::launch::run_command(run_dir.as_deref(), plugin_dir.as_deref(), print_mode),
+        Command::LaunchLine {
+            run_dir,
+            plugin_dir,
+            json,
+        } => crate::launch::launch_line_command(run_dir.as_deref(), plugin_dir.as_deref(), json),
         _ => Err(Error::msg(format!("not ported yet: {name}"))),
     }
 }

@@ -9,6 +9,7 @@ pub mod deck;
 pub mod dispatch;
 pub mod error;
 pub mod git;
+pub mod launch;
 pub mod procs;
 pub mod pytext;
 pub mod report;

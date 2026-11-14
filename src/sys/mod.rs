@@ -9,7 +9,9 @@
 //! - the steps a child takes before `exec`: `setsid` (`detach_session`) and keeping one
 //!   descriptor open across `exec` (`pass_fd_to_child`);
 //! - the dispatch runner's start: SIGHUP ignored (`ignore_sighup`, ruling S2-R37), and every
-//!   inherited descriptor kept from its children (`keep_inherited_fds_from_children`, S2-R38).
+//!   inherited descriptor kept from its children (`keep_inherited_fds_from_children`, S2-R38);
+//! - the launcher's SIGINT and SIGTERM handler, which forwards them to its child
+//!   (`forward_signals`), and the `errno` it keeps.
 //!
 //! The safe layer over the process table is `crate::procs`.
 
@@ -19,9 +21,11 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
+use libc::c_int;
 use rustix::io::{Errno, FdFlags, fcntl_getfd, fcntl_setfd};
+use rustix::process::Signal;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -221,6 +225,161 @@ pub fn keep_inherited_fds_from_children() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+// --------------------------------------------------------------------------
+// The launcher's signal forwarding
+
+/// Where a forwarded signal goes (`launch._supervise`'s `forward`): 0 before the child is
+/// named (the signal is kept as pending), its pid while it runs, -1 once it has exited (the
+/// signal is dropped: once reaped, the pid may be another process's).
+static FORWARD_TO: AtomicI32 = AtomicI32::new(0);
+/// The signals that arrived before the child was named, in order (at most `MAX_PENDING`).
+const MAX_PENDING: usize = 8;
+static PENDING: [AtomicI32; MAX_PENDING] = [const { AtomicI32::new(0) }; MAX_PENDING];
+static PENDING_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// How many signals the handler has handled, whatever it did with them; and how many of them
+/// it sent the child.
+static HANDLED: AtomicUsize = AtomicUsize::new(0);
+static FORWARDED: AtomicUsize = AtomicUsize::new(0);
+/// Whether a `Forwarding` is installed: there is one handler per process.
+static FORWARDING: AtomicBool = AtomicBool::new(false);
+
+/// The handler `forward_signals` installs. It runs in signal context, so it only reads and
+/// writes atomics and makes one `kill(2)` call, all async-signal-safe; `errno` is kept for
+/// the code it interrupted.
+extern "C" fn forward(sig: c_int) {
+    let saved = errno::get();
+    match FORWARD_TO.load(Ordering::SeqCst) {
+        0 => {
+            let at = PENDING_COUNT.fetch_add(1, Ordering::SeqCst);
+            if let Some(slot) = PENDING.get(at) {
+                slot.store(sig, Ordering::SeqCst);
+            }
+        }
+        pid if pid > 0 => {
+            // SAFETY: `kill(2)` takes two integers and touches no memory. `pid` is the child,
+            // which is not reaped until `child_exited` has set `FORWARD_TO` to -1 (the caller
+            // waits with `WNOWAIT` first), so it cannot be another process's pid. A failure
+            // (the child is a zombie) is ignored, as the Python ignores ProcessLookupError.
+            unsafe { libc::kill(pid, sig) };
+            FORWARDED.fetch_add(1, Ordering::SeqCst);
+        }
+        _ => {}
+    }
+    HANDLED.fetch_add(1, Ordering::SeqCst);
+    errno::set(saved);
+}
+
+/// `errno`, read and restored around the handler's `kill`.
+mod errno {
+    #[cfg(target_os = "linux")]
+    use libc::__errno_location as location;
+    #[cfg(target_os = "macos")]
+    use libc::__error as location;
+
+    pub(super) fn get() -> libc::c_int {
+        // SAFETY: `location()` returns this thread's own `errno` slot, valid for the life of
+        // the thread; reading an `int` from it is what reading `errno` means.
+        unsafe { *location() }
+    }
+
+    pub(super) fn set(value: libc::c_int) {
+        // SAFETY: as in `get`: the pointer is this thread's own `errno`, writable.
+        unsafe { *location() = value };
+    }
+}
+
+/// SIGINT and SIGTERM (or whichever `signals`) forwarded to the launcher's child, as
+/// `launch._supervise` forwards them: kept as pending until `forward_to` names the child,
+/// then sent to it, and dropped once `child_exited` says it has exited. Dropping this
+/// restores the dispositions it replaced, as the Python restores its previous handlers.
+pub struct Forwarding {
+    previous: Vec<(Signal, libc::sigaction)>,
+}
+
+/// Installs the forwarding handler for `signals`. An error when one is installed already
+/// (there is one handler per process) or `sigaction(2)` fails; nothing stays installed then.
+pub fn forward_signals(signals: &[Signal]) -> io::Result<Forwarding> {
+    if FORWARDING.swap(true, Ordering::SeqCst) {
+        return Err(io::Error::other("signal forwarding is installed already"));
+    }
+    FORWARD_TO.store(0, Ordering::SeqCst);
+    PENDING_COUNT.store(0, Ordering::SeqCst);
+    for slot in &PENDING {
+        slot.store(0, Ordering::SeqCst);
+    }
+    let mut installed = Forwarding {
+        previous: Vec::new(),
+    };
+    for &sig in signals {
+        // SAFETY: an all-zero `sigaction` is a valid value of the plain C struct (no handler,
+        // an empty mask, no flags); the fields that matter are set below.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = forward as extern "C" fn(c_int) as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        // SAFETY: as above, for the struct that receives the previous action.
+        let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: `action.sa_mask` is a valid `sigset_t` owned here; `sigemptyset` only
+        // writes it. Then `sigaction(2)` reads `action` and writes `old`, both live locals.
+        // The handler it installs (`forward`) is async-signal-safe (see there).
+        let failed = unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(sig.as_raw(), &action, &mut old) != 0
+        };
+        if failed {
+            let err = io::Error::last_os_error();
+            drop(installed);
+            return Err(err);
+        }
+        installed.previous.push((sig, old));
+    }
+    Ok(installed)
+}
+
+impl Forwarding {
+    /// The signals that arrived before the child was named, in order.
+    pub fn pending(&self) -> Vec<Signal> {
+        let count = PENDING_COUNT.load(Ordering::SeqCst).min(MAX_PENDING);
+        PENDING[..count]
+            .iter()
+            .filter_map(|slot| Signal::from_named_raw(slot.load(Ordering::SeqCst)))
+            .collect()
+    }
+
+    /// Names the child: every signal from now on is sent to `pid`. Returns the signals that
+    /// arrived before, for the caller to send it (`for signum in pending: forward(signum)`).
+    pub fn forward_to(&self, pid: i32) -> Vec<Signal> {
+        FORWARD_TO.store(pid, Ordering::SeqCst);
+        self.pending()
+    }
+
+    /// The child has exited and is about to be reaped: signals from now on are dropped
+    /// (`if child.returncode is not None: return`).
+    pub fn child_exited(&self) {
+        FORWARD_TO.store(-1, Ordering::SeqCst);
+    }
+
+    /// How many signals the handler has handled so far, and how many of them it sent the
+    /// child (the signals `forward_to` returns are the caller's to send, and not counted).
+    pub fn counts(&self) -> (usize, usize) {
+        (
+            HANDLED.load(Ordering::SeqCst),
+            FORWARDED.load(Ordering::SeqCst),
+        )
+    }
+}
+
+impl Drop for Forwarding {
+    fn drop(&mut self) {
+        for (sig, old) in self.previous.drain(..).rev() {
+            // SAFETY: `old` is the action `sigaction(2)` returned for `sig`, restored as it
+            // was; the pointer for the replaced action is null, which the call allows.
+            unsafe { libc::sigaction(sig.as_raw(), &old, std::ptr::null_mut()) };
+        }
+        FORWARD_TO.store(0, Ordering::SeqCst);
+        FORWARDING.store(false, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -606,6 +765,7 @@ pub(crate) mod tests {
                 let _ = std::fs::remove_file(&path);
                 format!("{before} {after} {flagged}")
             }
+            Some("forwarding") => forwarding_verdict(),
             _ => "unknown".into(),
         };
         println!("verdict: {verdict}");
@@ -640,6 +800,63 @@ pub(crate) mod tests {
         assert_eq!(
             start("sighup"),
             format!("Some({}) Some(0) survived", libc::SIGHUP)
+        );
+    }
+
+    /// The launcher's forwarding, in a child test process (a signal to the whole process):
+    /// whether a second install is refused, the signals pending before a child is named and
+    /// those `forward_to` returns, how the named child ended, whether a child named after
+    /// `child_exited` was spared, the handler's counts, and whether SIGTERM's default
+    /// disposition came back.
+    fn forwarding_verdict() -> String {
+        let fwd = forward_signals(&[Signal::INT, Signal::TERM]).unwrap();
+        let twice = forward_signals(&[Signal::TERM]).is_err();
+        let raise = |sig: Signal| {
+            let (before, _) = fwd.counts();
+            rustix::process::kill_process(getpid(), sig).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while fwd.counts().0 == before && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let raw = |sigs: Vec<Signal>| sigs.iter().map(|s| s.as_raw()).collect::<Vec<_>>();
+        // Before a child: kept, and the process lives on.
+        raise(Signal::INT);
+        let pending = raw(fwd.pending());
+        let mut kid = sleeper(false);
+        let to_send = raw(fwd.forward_to(kid.pid()));
+        raise(Signal::TERM);
+        let ended = kid.0.wait().unwrap().signal();
+        // A child that has exited (as far as the handler knows) gets nothing.
+        let mut spared = sleeper(false);
+        fwd.forward_to(spared.pid());
+        fwd.child_exited();
+        raise(Signal::TERM);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let alive = spared.0.try_wait().unwrap().is_none();
+        let (handled, forwarded) = fwd.counts();
+        drop(fwd);
+        // SAFETY: an all-zero `sigaction` is a valid value of the C struct; `sigaction(2)`
+        // with a null new action only writes the current one into `now`, a live local.
+        let restored = unsafe {
+            let mut now: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGTERM, std::ptr::null(), &mut now);
+            now.sa_sigaction == libc::SIG_DFL
+        };
+        format!(
+            "{twice} {pending:?} {to_send:?} {ended:?} {alive} {handled} {forwarded} {restored}"
+        )
+    }
+
+    #[test]
+    fn signals_are_forwarded_to_the_child_only_while_it_runs() {
+        assert_eq!(
+            start("forwarding"),
+            format!(
+                "true [{int}] [{int}] Some({term}) true 3 1 true",
+                int = libc::SIGINT,
+                term = libc::SIGTERM
+            )
         );
     }
 
