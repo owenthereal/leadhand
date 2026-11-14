@@ -142,13 +142,31 @@ mod tests {
         true
     }
 
-    /// A unique `LEADHAND_TEST_TAG=…` entry.
+    /// A unique `LEADHAND_TEST_TAG=…` entry: the pid, a process-wide counter (two tests in
+    /// parallel can read the same clock time) and the time.
     fn unique_tag() -> String {
+        static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        format!("LEADHAND_TEST_TAG=t-{}-{nanos}", me())
+        format!("LEADHAND_TEST_TAG=t-{}-{n}-{nanos}", me())
+    }
+
+    #[test]
+    fn unique_tags_never_repeat() {
+        let tags: Vec<String> = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| s.spawn(|| (0..2500).map(|_| unique_tag()).collect::<Vec<_>>()))
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().unwrap())
+                .collect()
+        });
+        let distinct: std::collections::HashSet<&String> = tags.iter().collect();
+        assert_eq!(distinct.len(), tags.len());
     }
 
     /// A Python child in a new session that starts `sleep 30` in another new session, prints

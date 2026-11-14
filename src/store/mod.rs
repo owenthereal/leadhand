@@ -24,7 +24,7 @@ mod lock;
 
 pub use atomic::{write_file_atomic, write_json_atomic};
 pub use jsonl::{append_jsonl, append_jsonl_with, read_jsonl};
-pub use lock::{StateLock, state_lock};
+pub use lock::{StateLock, state_lock, try_state_lock};
 
 /// `fsync(2)` (not macOS's `F_FULLFSYNC`), as Python's `os.fsync`; `path` names the file in
 /// an error.

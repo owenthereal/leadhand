@@ -18,7 +18,7 @@ use std::thread::{self, ThreadId};
 use rustix::fs::{FlockOperation, flock};
 use rustix::io::Errno;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Failure, Result};
 
 /// The file name of the state lock inside a run directory.
 pub(crate) const STATE_LOCK: &str = "state.lock";
@@ -61,9 +61,15 @@ pub struct StateLock {
 
 /// Takes the state lock of `run_dir`, waiting for any other holder.
 pub fn state_lock(run_dir: &Path) -> Result<StateLock> {
+    try_state_lock(run_dir).map_err(Error::from)
+}
+
+/// As `state_lock`, with the failure's text kept lossless, for a reader that reports it as
+/// data (`status`'s attention lines).
+pub fn try_state_lock(run_dir: &Path) -> std::result::Result<StateLock, Failure> {
     let path = run_dir.join(STATE_LOCK);
     let key = fs::canonicalize(run_dir)
-        .map_err(|e| Error::io(&path, e))?
+        .map_err(|e| Failure::io(&path, e))?
         .join(STATE_LOCK);
     let held = held_for(key);
     let me = thread::current().id();
@@ -104,7 +110,7 @@ pub fn state_lock(run_dir: &Path) -> Result<StateLock> {
 }
 
 /// Opens `path` (created `0644`) and takes an exclusive `flock` on it, waiting.
-fn take_flock(path: &Path) -> Result<File> {
+fn take_flock(path: &Path) -> std::result::Result<File, Failure> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -112,12 +118,12 @@ fn take_flock(path: &Path) -> Result<File> {
         .truncate(false)
         .mode(0o644)
         .open(path)
-        .map_err(|e| Error::io(path, e))?;
+        .map_err(|e| Failure::io(path, e))?;
     loop {
         match flock(&file, FlockOperation::LockExclusive) {
             Ok(()) => return Ok(file),
             Err(Errno::INTR) => continue,
-            Err(e) => return Err(Error::io(path, e.into())),
+            Err(e) => return Err(Failure::io(path, e.into())),
         }
     }
 }

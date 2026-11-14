@@ -13,9 +13,9 @@ use crate::pytext::{pure_path, py_fixed};
 use crate::runsel;
 use crate::state::events;
 use crate::state::{AttemptRecord, CardRef, CardStage, Event, run_paths};
-use crate::status::{self, Meter, Snapshot, Status, UsageRow};
+use crate::status::{self, Snapshot, Status, UsageRow};
 use crate::store;
-use crate::usage;
+use crate::usage::{self, Meter};
 use crate::wire::{self, PyMap, PyStr};
 
 const IMPLEMENTER_KINDS: [&str; 6] = [

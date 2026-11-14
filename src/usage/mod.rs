@@ -1,11 +1,16 @@
 //! Usage accounting (`usage.py`): the token counts a charge carries, their sums, totals per
-//! group and the estimated cost; and `charges.jsonl` read typed. Charging itself (the
-//! transcript, rollout and stream readers, checkpoints, `subtract`) is Task 8's.
+//! group and the estimated cost; `charges.jsonl` read typed; and the Codex meter (`meter`).
+//! Charging itself (the transcript, rollout and stream readers, checkpoints, `subtract`) is
+//! Task 8's.
 //!
 //! A `Usage` mixing models keeps each model's tokens in `by_model` (with `model` `None`), so
 //! a total is priced per model; the key `""` stands for records without a model.
 
+pub mod meter;
+
 use std::path::Path;
+
+pub use meter::{METER_SCAN_FILES, Meter, codex_meter};
 
 use serde::{Deserialize, Serialize};
 

@@ -10,11 +10,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -22,7 +20,7 @@ use crate::cli::human;
 use crate::config;
 use crate::deck;
 use crate::error::{Error, Failure, Result};
-use crate::pytext::{pure_path, py_fixed, py_float, py_splitlines};
+use crate::pytext::{pure_path, py_fixed};
 use crate::runsel;
 use crate::state::events::{self, given};
 use crate::state::{
@@ -31,13 +29,11 @@ use crate::state::{
 };
 use crate::store;
 use crate::testing;
-use crate::usage::{self, Charge};
+use crate::usage::{self, Charge, Meter, codex_meter};
 use crate::wire::{self, PyMap, PyStr, RawLine};
 
 /// The Codex meter reading taken when a run's first status is written: the run's "before".
 pub const METER_START: &str = "meter-start.json";
-/// The newest rollout files the Codex meter reads.
-pub const METER_SCAN_FILES: usize = 20;
 
 const IMPLEMENTER_VERBS: [(&str, &str); 6] = [
     ("implement", "Implementing"),
@@ -93,10 +89,10 @@ fn whole_lines(
     }
     let could_not = |why: PyStr| cat(&format!("{label} could not be read: "), &why);
     let raw = {
-        let _lock = match store::state_lock(&paths.root) {
+        let _lock = match store::try_state_lock(&paths.root) {
             Ok(lock) => lock,
-            Err(e) => {
-                problems.push(could_not(PyStr::from(e.message)));
+            Err(failure) => {
+                problems.push(could_not(failure.text));
                 return Vec::new();
             }
         };
@@ -235,8 +231,8 @@ impl Snapshot {
 
 /// The run directory `run_dir`, read (`status.load`).
 pub fn load(run_dir: &Path) -> Snapshot {
-    let root = run_dir.to_path_buf();
-    let paths = run_paths(&root);
+    let paths = run_paths(run_dir);
+    let root = paths.root.clone();
     let mut problems = Vec::new();
     let meta = read_run_meta(&paths).unwrap_or_else(|_| {
         problems.push("run.json is missing or unreadable".into());
@@ -287,283 +283,6 @@ pub fn load(run_dir: &Path) -> Snapshot {
 
 // --------------------------------------------------------------------------
 // The Codex meter
-
-/// A Codex rate-limit reading: the used percent and when it was observed (`null` both when
-/// there is none).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Meter {
-    pub percent: Option<f64>,
-    pub observed_at: Option<PyStr>,
-}
-
-/// The latest rate-limit record in the newest Codex rollout files under `sessions_dir`,
-/// preferring the weekly window (`status.codex_meter`); none when there is none.
-pub fn codex_meter(sessions_dir: &Path) -> Meter {
-    let mut files = Vec::new();
-    rollouts(sessions_dir, &mut files);
-    let mut dated = Vec::with_capacity(files.len());
-    for file in files {
-        // A matched name that cannot be stat'ed (a dangling link) ends the scan, as the
-        // Python's sort raises.
-        let Ok(meta) = std::fs::metadata(&file) else {
-            return Meter::default();
-        };
-        dated.push((meta.mtime() as f64 + meta.mtime_nsec() as f64 * 1e-9, file));
-    }
-    // Newest first; equal times keep their order, as Python's stable sort does.
-    dated.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let mut best: Option<(PyStr, f64)> = None;
-    for (_, file) in dated.iter().take(METER_SCAN_FILES) {
-        let Ok(bytes) = std::fs::read(file) else {
-            continue;
-        };
-        let text = String::from_utf8_lossy(&bytes);
-        for line in py_splitlines(&text) {
-            if !line.contains("rate_limits") {
-                continue;
-            }
-            let Ok(rec) = serde_json::from_str::<RateRecord>(line) else {
-                continue;
-            };
-            let limits = rec.payload.rate_limits;
-            let windows: Vec<&Window> = [&limits.primary, &limits.secondary]
-                .into_iter()
-                .filter(|w| w.used_percent.is_some())
-                .collect();
-            let weekly = windows.iter().find(|w| w.window_minutes == Some(10080.0));
-            let Some(window) = weekly.or(windows.first()) else {
-                continue;
-            };
-            let stamp = rec.timestamp.0;
-            if best.as_ref().is_none_or(|(at, _)| stamp >= *at) {
-                best = Some((stamp, window.used_percent.unwrap_or_default()));
-            }
-        }
-        if best.is_some() {
-            break;
-        }
-    }
-    match best {
-        Some((stamp, percent)) => Meter {
-            percent: Some(percent),
-            observed_at: Some(stamp).filter(|s| !s.is_empty()),
-        },
-        None => Meter::default(),
-    }
-}
-
-/// Every entry under `dir`, at any depth, named `rollout-*.jsonl` (`Path.glob`, which
-/// matches hidden names and does not follow linked directories).
-fn rollouts(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut subdirs = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let bytes = name.as_bytes();
-        if bytes.len() >= "rollout-.jsonl".len()
-            && bytes.starts_with(b"rollout-")
-            && bytes.ends_with(b".jsonl")
-        {
-            out.push(entry.path());
-        }
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            subdirs.push(entry.path());
-        }
-    }
-    for sub in subdirs {
-        rollouts(&sub, out);
-    }
-}
-
-/// A rollout line with a rate-limit record: only the fields the meter reads.
-#[derive(Deserialize)]
-struct RateRecord {
-    payload: RatePayload,
-    #[serde(default)]
-    timestamp: Stamp,
-}
-
-#[derive(Deserialize)]
-struct RatePayload {
-    rate_limits: RateLimits,
-}
-
-#[derive(Deserialize)]
-struct RateLimits {
-    #[serde(default)]
-    primary: Window,
-    #[serde(default)]
-    secondary: Window,
-}
-
-/// A rate-limit window: `used_percent` set only when the window is an object whose
-/// `used_percent` is a number (Python's `isinstance(w, dict)` and `(int, float)`, `bool`
-/// included).
-#[derive(Default)]
-struct Window {
-    used_percent: Option<f64>,
-    window_minutes: Option<f64>,
-}
-
-impl<'de> Deserialize<'de> for Window {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Window;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("any JSON value")
-            }
-            fn visit_map<A: MapAccess<'de>>(
-                self,
-                mut m: A,
-            ) -> std::result::Result<Window, A::Error> {
-                let mut w = Window::default();
-                while let Some(key) = m.next_key::<String>()? {
-                    match key.as_str() {
-                        "used_percent" => w.used_percent = m.next_value::<Number>()?.0,
-                        "window_minutes" => w.window_minutes = m.next_value::<Number>()?.0,
-                        _ => {
-                            m.next_value::<IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(w)
-            }
-            fn visit_seq<A: SeqAccess<'de>>(
-                self,
-                mut s: A,
-            ) -> std::result::Result<Window, A::Error> {
-                while s.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(Window::default())
-            }
-            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Window, E> {
-                Ok(Window::default())
-            }
-            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Window, E> {
-                Ok(Window::default())
-            }
-            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Window, E> {
-                Ok(Window::default())
-            }
-            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Window, E> {
-                Ok(Window::default())
-            }
-            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Window, E> {
-                Ok(Window::default())
-            }
-            fn visit_unit<E: de::Error>(self) -> std::result::Result<Window, E> {
-                Ok(Window::default())
-            }
-        }
-        d.deserialize_any(V)
-    }
-}
-
-/// A JSON number (a `bool` counts as 0 or 1, as in Python), else `None`.
-struct Number(Option<f64>);
-
-impl<'de> Deserialize<'de> for Number {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Number;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("any JSON value")
-            }
-            fn visit_bool<E: de::Error>(self, v: bool) -> std::result::Result<Number, E> {
-                Ok(Number(Some(f64::from(u8::from(v)))))
-            }
-            fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Number, E> {
-                Ok(Number(Some(v as f64)))
-            }
-            fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Number, E> {
-                Ok(Number(Some(v as f64)))
-            }
-            fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Number, E> {
-                Ok(Number(Some(v)))
-            }
-            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Number, E> {
-                Ok(Number(None))
-            }
-            fn visit_unit<E: de::Error>(self) -> std::result::Result<Number, E> {
-                Ok(Number(None))
-            }
-            fn visit_map<A: MapAccess<'de>>(
-                self,
-                mut m: A,
-            ) -> std::result::Result<Number, A::Error> {
-                while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-                Ok(Number(None))
-            }
-            fn visit_seq<A: SeqAccess<'de>>(
-                self,
-                mut s: A,
-            ) -> std::result::Result<Number, A::Error> {
-                while s.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(Number(None))
-            }
-        }
-        d.deserialize_any(V)
-    }
-}
-
-/// A rollout record's `timestamp` as `str(rec.get("timestamp") or "")` reads it.
-#[derive(Default)]
-struct Stamp(PyStr);
-
-impl<'de> Deserialize<'de> for Stamp {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Stamp;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("any JSON value")
-            }
-            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Stamp, E> {
-                Ok(Stamp(v.into()))
-            }
-            fn visit_bool<E: de::Error>(self, v: bool) -> std::result::Result<Stamp, E> {
-                Ok(Stamp(if v { "True" } else { "" }.into()))
-            }
-            fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Stamp, E> {
-                Ok(Stamp(
-                    if v == 0 { String::new() } else { v.to_string() }.into(),
-                ))
-            }
-            fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Stamp, E> {
-                Ok(Stamp(
-                    if v == 0 { String::new() } else { v.to_string() }.into(),
-                ))
-            }
-            fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Stamp, E> {
-                Ok(Stamp(
-                    if v == 0.0 { String::new() } else { py_float(v) }.into(),
-                ))
-            }
-            fn visit_unit<E: de::Error>(self) -> std::result::Result<Stamp, E> {
-                Ok(Stamp::default())
-            }
-            fn visit_map<A: MapAccess<'de>>(
-                self,
-                mut m: A,
-            ) -> std::result::Result<Stamp, A::Error> {
-                while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-                Ok(Stamp::default())
-            }
-            fn visit_seq<A: SeqAccess<'de>>(
-                self,
-                mut s: A,
-            ) -> std::result::Result<Stamp, A::Error> {
-                while s.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(Stamp::default())
-            }
-        }
-        d.deserialize_any(V)
-    }
-}
 
 /// The meter reading kept when the run's first status was written (`status.read_meter_start`).
 pub fn read_meter_start(root: &Path) -> Meter {
@@ -881,7 +600,11 @@ pub fn is_park_reason(reason: &PyStr) -> bool {
 
 /// The run's status from its snapshot (`status.build_status`); the Codex meter is read from
 /// `sessions_dir` unless `meter` is given.
-pub fn build_status(snap: &Snapshot, sessions_dir: &Path, meter: Option<Meter>) -> Result<Status> {
+pub fn build_status(
+    snap: &Snapshot,
+    sessions_dir: &Path,
+    meter: Option<Meter>,
+) -> std::result::Result<Status, Failure> {
     let reqs = requests(&snap.events);
     let cards = &snap.cards;
     let accepted = cards
@@ -906,7 +629,7 @@ pub fn build_status(snap: &Snapshot, sessions_dir: &Path, meter: Option<Meter>) 
     if !parked.is_empty() && actionable {
         // Only built when needed: it names this binary and the run directory.
         // `Path.absolute()`, spelled as pathlib spells it.
-        let root = std::path::absolute(&snap.root).map_err(|e| Error::io(&snap.root, e))?;
+        let root = std::path::absolute(&snap.root).map_err(|e| Failure::io(&snap.root, e))?;
         let root = pure_path(root.as_os_str());
         let cli = human::shell_quote(testing::self_path().as_os_str());
         let dir = human::shell_quote(root.as_os_str());
@@ -1120,19 +843,45 @@ pub fn write_status(run_dir: &Path, sessions_dir: &Path) -> Result<Status> {
 /// with no `run.json` is skipped, and a failure is only a warning, since rendering must never
 /// break the engine.
 pub fn checkpoint(run_dir: &Path) {
+    checkpoint_to(
+        run_dir,
+        &usage::default_sessions_dir(),
+        &mut std::io::stderr().lock(),
+    );
+}
+
+/// `checkpoint`, with the warning written to `warnings`.
+fn checkpoint_to(run_dir: &Path, sessions_dir: &Path, warnings: &mut dyn Write) {
     if !run_paths(run_dir).run_json.is_file() {
         return;
     }
-    if let Err(e) = write_status(run_dir, &usage::default_sessions_dir()) {
-        let _ = writeln!(
-            std::io::stderr(),
-            "leadhand: could not write status.json: {e}"
-        );
+    if let Err(e) = write_status(run_dir, sessions_dir) {
+        let _ = writeln!(warnings, "leadhand: could not write status.json: {e}");
     }
 }
 
 // --------------------------------------------------------------------------
 // Command
+
+/// The run's status; when it cannot be built, the last `status.json` with an attention line
+/// saying why, since reading must not fail on a live or crashed run. The reason is the
+/// failure's own lossless text.
+fn status_or_rebuilt(snap: &Snapshot, sessions_dir: &Path) -> Result<Status> {
+    let failure = match build_status(snap, sessions_dir, None) {
+        Ok(s) => return Ok(s),
+        Err(failure) => failure,
+    };
+    let read = std::fs::read(&snap.paths.status)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|t| serde_json::from_str::<Status>(&t).ok());
+    let Some(mut s) = read else {
+        return Err(Error::msg(format!("cannot read the run: {failure}")));
+    };
+    s.attention
+        .push(cat("status rebuilt from status.json: ", &failure.text));
+    Ok(s)
+}
 
 /// The run directory a command was given as a path, checked: the Python's `not a run
 /// directory` error unless it holds `run.json` or `events.jsonl`.
@@ -1154,23 +903,7 @@ pub fn command(arg: Option<&OsStr>, json: bool) -> Result<ExitCode> {
     let cwd = std::env::current_dir().map_err(|e| Error::io(Path::new("."), e))?;
     let root = runsel::select_run("status", arg, &cwd)?;
     checked_run_dir(&root)?;
-    let snap = load(&root);
-    let s = match build_status(&snap, &usage::default_sessions_dir(), None) {
-        Ok(s) => s,
-        // Reading must not fail on a live or crashed run: fall back to the last status.json.
-        Err(e) => {
-            let read = std::fs::read(&snap.paths.status)
-                .ok()
-                .and_then(|b| String::from_utf8(b).ok())
-                .and_then(|t| serde_json::from_str::<Status>(&t).ok());
-            let Some(mut s) = read else {
-                return Err(Error::msg(format!("cannot read the run: {e}")));
-            };
-            s.attention
-                .push(format!("status rebuilt from status.json: {e}").into());
-            s
-        }
-    };
+    let s = status_or_rebuilt(&load(&root), &usage::default_sessions_dir())?;
     let mut out = std::io::stdout().lock();
     if json {
         writeln!(out, "{}", wire::to_output(&s)?)?;
@@ -1341,32 +1074,6 @@ mod tests {
     }
 
     #[test]
-    fn meter_prefers_the_weekly_window_and_the_latest_stamp() {
-        let dir = run_dir();
-        let sessions = dir.path().join("sessions");
-        let day = sessions.join("2026/01/02");
-        fs::create_dir_all(&day).unwrap();
-        assert_eq!(codex_meter(&sessions), Meter::default());
-        fs::write(
-            day.join("rollout-a.jsonl"),
-            "{\"timestamp\":\"2026-01-02T05:00:00.000Z\",\"payload\":{\"rate_limits\":{\
-             \"primary\":{\"used_percent\":3,\"window_minutes\":300},\
-             \"secondary\":{\"used_percent\":41.5,\"window_minutes\":10080}}}}\n\
-             {\"timestamp\":\"2026-01-02T04:00:00.000Z\",\"payload\":{\"rate_limits\":{\
-             \"primary\":{\"used_percent\":99,\"window_minutes\":10080}}}}\n\
-             {\"payload\":{\"rate_limits\":null}}\n\
-             not json rate_limits\n",
-        )
-        .unwrap();
-        let m = codex_meter(&sessions);
-        assert_eq!(m.percent, Some(41.5));
-        assert_eq!(m.observed_at, Some("2026-01-02T05:00:00.000Z".into()));
-        // A matched name that cannot be stat'ed leaves the meter unknown, as in the Python.
-        std::os::unix::fs::symlink("/nonexistent", day.join("rollout-dangling.jsonl")).unwrap();
-        assert_eq!(codex_meter(&sessions), Meter::default());
-    }
-
-    #[test]
     fn write_status_takes_the_meter_once_and_fails_on_an_unwritable_status() {
         let dir = run_dir();
         let root = dir.path();
@@ -1386,5 +1093,91 @@ mod tests {
         fs::remove_file(root.join("status.json")).unwrap();
         fs::create_dir(root.join("status.json")).unwrap();
         assert!(write_status(root, &sessions).is_err());
+    }
+
+    #[test]
+    fn a_lock_that_cannot_be_taken_is_a_lossless_problem() {
+        let dir = run_dir();
+        // A directory name that is not UTF-8 where the system allows one (Linux; macOS
+        // refuses to create it), else a plain one: the problem names the lock file exactly.
+        let odd = dir.path().join(OsStr::from_bytes(b"run-\xff"));
+        let root = if fs::create_dir(&odd).is_ok() {
+            odd
+        } else {
+            let plain = dir.path().join("run-\u{e9}");
+            fs::create_dir(&plain).unwrap();
+            plain
+        };
+        fs::create_dir(root.join("state.lock")).unwrap();
+        let snap = load(&root);
+        let lock = run_paths(&root).state_lock;
+        let open = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap_err();
+        let want = cat(
+            "event log could not be read: ",
+            &Failure::io(&lock, open).text,
+        );
+        assert_eq!(snap.problems[1], want);
+        let text = wire::ascii_json(&snap.problems[1]);
+        assert!(!text.contains("\\ufffd"), "{text}");
+    }
+
+    #[test]
+    fn a_status_rebuilt_from_status_json_says_why_losslessly() {
+        let dir = run_dir();
+        let root = dir.path();
+        fs::write(root.join("run.json"), "{\"run_id\": \"abc123\"}").unwrap();
+        write_events(
+            root,
+            &[
+                r#""kind":"card_cut","card":1,"branch":"b","base":"a""#,
+                r#""kind":"parked","card":1,"reason":"why""#,
+            ],
+        );
+        let sessions = root.join("no sessions");
+        let previous = write_status(root, &sessions).unwrap();
+        // A run directory that cannot be made absolute (an empty path): the status cannot
+        // name it in the unpark hint, so the last status.json is shown, saying why.
+        let mut snap = load(root);
+        snap.numbers = vec![1];
+        snap.cards = fold_cards(&snap.events, &snap.numbers);
+        snap.root = PathBuf::new();
+        let failure = build_status(&snap, &sessions, None).unwrap_err();
+        let s = status_or_rebuilt(&snap, &sessions).unwrap();
+        let mut want = previous.attention.clone();
+        want.push(cat("status rebuilt from status.json: ", &failure.text));
+        assert_eq!(s.attention, want);
+        assert_eq!(
+            failure.text,
+            Failure::io(Path::new(""), std::path::absolute("").unwrap_err()).text
+        );
+    }
+
+    #[test]
+    fn checkpoint_warns_with_the_python_prefix_and_carries_on() {
+        let dir = run_dir();
+        let root = dir.path();
+        let sessions = root.join("no sessions");
+        let mut warnings = Vec::new();
+        // No run.json: nothing is written, nothing said.
+        checkpoint_to(root, &sessions, &mut warnings);
+        assert!(warnings.is_empty() && !root.join("status.json").exists());
+        fs::write(root.join("run.json"), "{\"run_id\": \"abc123\"}").unwrap();
+        checkpoint_to(root, &sessions, &mut warnings);
+        assert!(warnings.is_empty() && root.join("status.json").is_file());
+        // status.json can no longer be written.
+        fs::remove_file(root.join("status.json")).unwrap();
+        fs::create_dir(root.join("status.json")).unwrap();
+        checkpoint_to(root, &sessions, &mut warnings);
+        let text = String::from_utf8(warnings).unwrap();
+        assert!(
+            text.starts_with("leadhand: could not write status.json: "),
+            "{text}"
+        );
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.ends_with('\n'));
     }
 }
