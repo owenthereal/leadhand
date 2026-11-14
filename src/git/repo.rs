@@ -1,0 +1,227 @@
+//! Which repository a directory belongs to (spec, "Which repository and run a directory
+//! belongs to"), and the sparse-checkout refusal (R63; `gitops.sparse_checkout_problem`).
+
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+
+use super::Git;
+use crate::error::{Error, Result};
+
+/// The repository a directory belongs to: the main working tree of its Git common directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoIdentity {
+    /// The main working tree's top, as Git names it (symlinks resolved).
+    pub top: PathBuf,
+    /// The Git common directory, absolute.
+    pub common_dir: PathBuf,
+}
+
+/// The repository `any_dir` lies in. From a subdirectory that's the checkout's top; from
+/// anywhere in a linked worktree (a run's `<repo>/.worktrees/<slug>`, or one elsewhere) it's
+/// the main working tree's top, not the worktree's. An error outside a Git checkout, and for
+/// a bare repository, which has no main working tree.
+///
+/// This replaces `gitops.checkout_top`, which resolves a linked worktree to that worktree.
+pub fn repo_identity(any_dir: &Path) -> Result<RepoIdentity> {
+    let git = Git::at(any_dir)?;
+    let common_dir = rev_parse_path(&git, &["--path-format=absolute", "--git-common-dir"])?;
+    let git_dir = rev_parse_path(&git, &["--path-format=absolute", "--git-dir"])?;
+    let top = if git_dir == common_dir {
+        // The main working tree itself (or a bare repository, which Git refuses here).
+        rev_parse_path(&git, &["--show-toplevel"])?
+    } else {
+        main_worktree(&git)?
+    };
+    Ok(RepoIdentity { top, common_dir })
+}
+
+/// Why a run cannot use the checkout at `top` because it is sparse (R63), or `None`: the
+/// Python's refusal text. `git worktree add` copies a sparse checkout into a run's
+/// worktrees, so this holds for every run. `core.sparseCheckout` is read as `top`'s own
+/// worktree sees it; a value Git does not read as `true` is not sparse (`gitops.is_sparse`).
+pub fn sparse_problem(top: &Path) -> Result<Option<String>> {
+    let args = ["config", "--bool", "--get", "core.sparseCheckout"].map(OsStr::new);
+    let out = Git::at(top)?.output(&args)?;
+    let sparse = out.status.success() && out.stdout.trim_ascii() == b"true";
+    Ok(sparse.then(|| {
+        format!(
+            "{} is a sparse checkout (core.sparseCheckout): sparse checkouts are not supported \
+             in this version; turn it off (git sparse-checkout disable) to run leadhand here",
+            top.display()
+        )
+    }))
+}
+
+/// One path from `git rev-parse <args>`: its output without the newline Git ends it with.
+/// rev-parse has no `-z`, so one path per call keeps a path that holds a newline whole.
+fn rev_parse_path(git: &Git, args: &[&str]) -> Result<PathBuf> {
+    let argv: Vec<&OsStr> = std::iter::once("rev-parse")
+        .chain(args.iter().copied())
+        .map(OsStr::new)
+        .collect();
+    let out = git.run(&argv)?;
+    let path = out.strip_suffix(b"\n").unwrap_or(&out);
+    if path.is_empty() {
+        return Err(Error::msg(format!(
+            "git rev-parse {}: no path (in {})",
+            args.join(" "),
+            git.cwd().display()
+        )));
+    }
+    Ok(PathBuf::from(OsStr::from_bytes(path)))
+}
+
+/// The main working tree's top: the first entry of `git worktree list --porcelain -z`.
+fn main_worktree(git: &Git) -> Result<PathBuf> {
+    let out = git.run(&["worktree", "list", "--porcelain", "-z"].map(OsStr::new))?;
+    // Each entry is NUL-terminated fields, ended by an empty one; the main worktree is first.
+    let first: Vec<&[u8]> = out
+        .split(|b| *b == 0)
+        .take_while(|f| !f.is_empty())
+        .collect();
+    let path = first.first().and_then(|f| f.strip_prefix(b"worktree "));
+    match path {
+        Some(_) if first.contains(&&b"bare"[..]) => Err(Error::msg(format!(
+            "{} belongs to a bare repository, which has no main working tree",
+            git.cwd().display()
+        ))),
+        Some(path) if !path.is_empty() => Ok(PathBuf::from(OsStr::from_bytes(path))),
+        _ => Err(Error::msg(format!(
+            "git worktree list: no main working tree listed (in {})",
+            git.cwd().display()
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::fixture::Fixture;
+
+    fn real(p: &Path) -> PathBuf {
+        p.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn repo_identity_from_subdirectory_is_top() {
+        let f = Fixture::new();
+        let repo = f.make_repo("my repo");
+        f.commit(&repo, &[("src/deep/x.txt", "x\n")], "deep");
+        let want = RepoIdentity {
+            top: real(&repo),
+            common_dir: real(&repo.join(".git")),
+        };
+        for dir in [repo.clone(), repo.join("src"), repo.join("src/deep")] {
+            assert_eq!(repo_identity(&dir).unwrap(), want, "{dir:?}");
+        }
+    }
+
+    #[test]
+    fn repo_identity_from_linked_worktree_is_main_top() {
+        let f = Fixture::new();
+        let repo = f.make_repo("my repo");
+        f.commit(&repo, &[("src/x.txt", "x\n")], "src");
+        let want = RepoIdentity {
+            top: real(&repo),
+            common_dir: real(&repo.join(".git")),
+        };
+        // A run's worktree inside the repository, and a linked worktree elsewhere.
+        let inside = repo.join(".worktrees/my slug");
+        let outside = f.root().join("elsewhere/wt");
+        f.git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "run",
+                inside.to_str().unwrap(),
+            ],
+        );
+        f.git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                outside.to_str().unwrap(),
+            ],
+        );
+        for dir in [&inside, &inside.join("src"), &outside, &outside.join("src")] {
+            assert_eq!(repo_identity(dir).unwrap(), want, "{dir:?}");
+        }
+    }
+
+    #[test]
+    fn repo_identity_refuses_a_directory_outside_any_repository() {
+        let f = Fixture::new();
+        let plain = f.root().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let e = repo_identity(&plain).unwrap_err();
+        assert!(e.message.contains("not a git repository"), "{e}");
+        assert!(repo_identity(Path::new("relative")).is_err());
+    }
+
+    #[test]
+    fn repo_identity_refuses_a_bare_repository_main() {
+        let f = Fixture::new();
+        let repo = f.make_repo("my repo");
+        let bare = f.root().join("bare.git");
+        f.git(
+            f.root(),
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                repo.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        let wt = f.root().join("bare wt");
+        f.git(
+            &bare,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                wt.to_str().unwrap(),
+            ],
+        );
+        let e = repo_identity(&wt).unwrap_err();
+        assert!(e.message.contains("bare repository"), "{e}");
+        assert!(repo_identity(&bare).is_err());
+    }
+
+    #[test]
+    fn sparse_problem_is_the_python_refusal() {
+        let f = Fixture::new();
+        let repo = f.make_repo("my repo");
+        assert_eq!(sparse_problem(&repo).unwrap(), None);
+        f.git(
+            &repo,
+            &["sparse-checkout", "set", "--no-cone", "/README.md"],
+        );
+        assert_eq!(
+            sparse_problem(&repo).unwrap().as_deref(),
+            Some(&*format!(
+                "{} is a sparse checkout (core.sparseCheckout): sparse checkouts are not \
+                 supported in this version; turn it off (git sparse-checkout disable) to run \
+                 leadhand here",
+                repo.display()
+            ))
+        );
+        f.git(&repo, &["sparse-checkout", "disable"]);
+        assert_eq!(sparse_problem(&repo).unwrap(), None);
+        f.git(&repo, &["config", "core.sparseCheckout", "maybe"]);
+        assert_eq!(
+            sparse_problem(&repo).unwrap(),
+            None,
+            "not a boolean: Git says no"
+        );
+        assert!(sparse_problem(Path::new("relative")).is_err());
+    }
+}
