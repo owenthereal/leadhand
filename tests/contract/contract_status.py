@@ -224,8 +224,10 @@ class FixRound(unittest.TestCase):
 
     def test_unreadable_log_is_an_attention_line(self):
         w = RunDir(self, cards=1)
-        w.paths.events.chmod(0)
-        self.addCleanup(w.paths.events.chmod, 0o644)
+        # A directory where the event log should be: opening it for reading fails with
+        # EISDIR for every user, root included, where chmod(0) would not stop root.
+        w.paths.events.unlink()
+        w.paths.events.mkdir()
         att = status(w)
         self.assertTrue(any(a.startswith("event log could not be read") for a in att), att)
 
