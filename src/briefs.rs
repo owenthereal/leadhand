@@ -115,15 +115,21 @@ const UNPARSED: (&str, &str, &str) = ("Status", "BLOCKED", "");
 /// The Python matches with `re.IGNORECASE` over Unicode, so `ſ` matches `s`, `ı` and `İ`
 /// match `i`, and the Kelvin sign matches `k`; this matches the same lines. Where its
 /// `capitalize()` then makes a key it has no values for (`reſult`, `verdİct`), the Python
-/// raises `KeyError`; here that head is unparsed.
-pub fn parse_report_head(text: &str) -> (&'static str, &'static str, &'static str) {
+/// raises `KeyError`, and so does this: `UnknownHeadKey` (S2-R32), which a caller
+/// propagates as the Python's exception propagates.
+pub fn parse_report_head(
+    text: &str,
+) -> std::result::Result<(&'static str, &'static str, &'static str), UnknownHeadKey> {
     let lines: Vec<String> = py_splitlines(text)
         .into_iter()
         .map(clean)
         .filter(|line| !line.is_empty())
         .collect();
-    let Some((key, word)) = lines.first().and_then(|first| head(first)) else {
-        return UNPARSED;
+    let Some((key, word)) = (match lines.first() {
+        Some(first) => head(first)?,
+        None => None,
+    }) else {
+        return Ok(UNPARSED);
     };
     let allowed: &[&'static str] = match key {
         "Status" => &STATUS_VALUES,
@@ -135,7 +141,7 @@ pub fn parse_report_head(text: &str) -> (&'static str, &'static str, &'static st
         .iter()
         .find(|v| Some(v.to_ascii_lowercase()) == word)
     else {
-        return UNPARSED;
+        return Ok(UNPARSED);
     };
     let mut blocked_by = "";
     if key == "Status" && *value == "BLOCKED" {
@@ -150,7 +156,39 @@ pub fn parse_report_head(text: &str) -> (&'static str, &'static str, &'static st
             }
         }
     }
-    (key, value, blocked_by)
+    Ok((key, value, blocked_by))
+}
+
+/// The Python's `KeyError` from `parse_report_head`: a head whose case-folded key
+/// `capitalize()`s to a name with no values (`reſult` → `Reſult`). `key` is that name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownHeadKey {
+    pub key: String,
+}
+
+impl std::fmt::Display for UnknownHeadKey {
+    /// As the Python's uncaught exception names it: `KeyError: 'Reſult'`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KeyError: {}", py_repr(&self.key))
+    }
+}
+
+impl From<UnknownHeadKey> for Error {
+    fn from(e: UnknownHeadKey) -> Error {
+        Error::msg(e.to_string())
+    }
+}
+
+/// `str.capitalize()`: the first character in title case, the rest lowercased.
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first
+            .to_uppercase()
+            .chain(chars.flat_map(char::to_lowercase))
+            .collect(),
+        None => String::new(),
+    }
 }
 
 /// `briefs._clean`: emphasis marks removed, stripped, leading `#` and `>` removed, stripped.
@@ -168,46 +206,49 @@ fn folds_to(c: char, p: char) -> bool {
         || matches!((p, c), ('s', 'ſ') | ('i', 'İ' | 'ı') | ('k', '\u{212a}'))
 }
 
-/// `line` after the case-folded `word`, and whether the matched text was all ASCII but for
-/// a leading `ſ` (whether Python's `capitalize()` gives back the word's own key).
-fn after_folded<'a>(line: &'a str, word: &str) -> Option<(&'a str, bool)> {
-    let mut rest = line;
-    let mut keyed = true;
-    for (i, p) in word.chars().enumerate() {
-        let c = rest.chars().next()?;
+/// The text of `line` that matched the case-folded `word`, and the rest after it.
+fn after_folded<'a>(line: &'a str, word: &str) -> Option<(&'a str, &'a str)> {
+    let mut at = 0;
+    for p in word.chars() {
+        let c = line[at..].chars().next()?;
         if !folds_to(c, p) {
             return None;
         }
-        keyed &= c.is_ascii() || (i == 0 && c == 'ſ');
-        rest = &rest[c.len_utf8()..];
+        at += c.len_utf8();
     }
-    Some((rest, keyed))
+    Some(line.split_at(at))
 }
 
 /// `_HEAD`: `(status|verdict|result)\s*:\s*([A-Za-z]+)\s*$`, case-folded; the key as the
-/// Python names it, and the value word.
-fn head(line: &str) -> Option<(&'static str, &str)> {
+/// Python names it, and the value word. `None` when the line does not match; the Python's
+/// `KeyError` when it matches but `capitalize()` does not give the key back.
+fn head(line: &str) -> std::result::Result<Option<(&'static str, &str)>, UnknownHeadKey> {
     for (word, key) in [
         ("status", "Status"),
         ("verdict", "Verdict"),
         ("result", "Result"),
     ] {
-        let Some((rest, keyed)) = after_folded(line, word) else {
+        let Some((matched, rest)) = after_folded(line, word) else {
             continue;
         };
-        let rest = rest.trim_start_matches(py_isspace).strip_prefix(':')?;
+        let Some(rest) = rest.trim_start_matches(py_isspace).strip_prefix(':') else {
+            return Ok(None);
+        };
         let rest = rest.trim_start_matches(py_isspace);
         let letters = rest
             .find(|c: char| !is_head_letter(c))
             .unwrap_or(rest.len());
         let (value, tail) = rest.split_at(letters);
         if value.is_empty() || !tail.chars().all(py_isspace) {
-            return None;
+            return Ok(None);
         }
-        // A key `capitalize()` does not give back raises KeyError in the Python.
-        return keyed.then_some((key, value));
+        let named = capitalize(matched);
+        if named != key {
+            return Err(UnknownHeadKey { key: named });
+        }
+        return Ok(Some((key, value)));
     }
-    None
+    Ok(None)
 }
 
 /// `[A-Za-z]` under Unicode `IGNORECASE`.
@@ -229,9 +270,9 @@ fn folded_lower(word: &str) -> Option<String> {
 
 /// `_BLOCKED_BY`: `blocked by\s*:\s*(.+?)\s*$`, case-folded; the reason.
 fn blocked_reason(line: &str) -> Option<&str> {
-    let (rest, _) = after_folded(line, "blocked")?;
+    let (_, rest) = after_folded(line, "blocked")?;
     let rest = rest.strip_prefix(' ')?;
-    let (rest, _) = after_folded(rest, "by")?;
+    let (_, rest) = after_folded(rest, "by")?;
     let rest = rest.trim_start_matches(py_isspace).strip_prefix(':')?;
     let reason = py_strip(rest);
     (!reason.is_empty()).then_some(reason)
@@ -391,31 +432,95 @@ mod tests {
             "**",
             "status:ready\u{2028}Blocked by: environment",
         ];
+        let cases: Vec<String> = cases.iter().map(|s| s.to_string()).collect();
+        let theirs = python_heads(&cases);
+        assert!(theirs.iter().all(|r| r.is_ok()), "{theirs:?}");
+        assert_same_heads(&cases, theirs);
+    }
+
+    /// `briefs.parse_report_head` of each text: the triple, or the key its `KeyError` names.
+    fn python_heads(texts: &[String]) -> Vec<std::result::Result<Vec<String>, String>> {
         let code = "import json, sys\nfrom leadhand import briefs\n\
-                    print(json.dumps([list(briefs.parse_report_head(t)) for t in json.loads(sys.argv[1])]))\n";
-        let arg = serde_json::to_string(&cases).unwrap();
-        let theirs: Vec<Vec<String>> =
+                    out = []\n\
+                    for t in json.loads(sys.argv[1]):\n\
+                    \x20   try:\n\
+                    \x20       out.append(['ok', *briefs.parse_report_head(t)])\n\
+                    \x20   except KeyError as e:\n\
+                    \x20       out.append(['KeyError', e.args[0]])\n\
+                    print(json.dumps(out))\n";
+        let arg = serde_json::to_string(texts).unwrap();
+        let out: Vec<Vec<String>> =
             serde_json::from_slice(&python(code, &[OsStr::new(&arg)])).unwrap();
-        for (text, want) in cases.iter().zip(theirs) {
-            let (k, v, b) = parse_report_head(text);
-            assert_eq!([k, v, b], [&want[0], &want[1], &want[2]], "{text:?}");
+        out.into_iter()
+            .map(|mut r| match r[0].as_str() {
+                "ok" => Ok(r.split_off(1)),
+                _ => Err(r.remove(1)),
+            })
+            .collect()
+    }
+
+    fn assert_same_heads(texts: &[String], theirs: Vec<std::result::Result<Vec<String>, String>>) {
+        assert_eq!(texts.len(), theirs.len());
+        for (text, want) in texts.iter().zip(theirs) {
+            let ours = parse_report_head(text)
+                .map(|(k, v, b)| vec![k.to_string(), v.to_string(), b.to_string()])
+                .map_err(|e| e.key);
+            assert_eq!(ours, want, "{text:?}");
         }
     }
 
     #[test]
-    fn parse_report_head_where_python_raises() {
-        // `capitalize()` turns these keys into names `HEAD_VALUES` does not have, and the
-        // Python raises KeyError; Rust takes them as unparsed.
-        for text in [
-            "re\u{17f}ult: pass",
-            "verd\u{130}ct: clean",
-            "verd\u{131}ct: clean",
+    fn parse_report_head_fails_where_python_raises() {
+        // Each of the four folding letters (ſ, ı, İ, the Kelvin sign) in every position of
+        // every key, with a value that matches: the Python raises KeyError where
+        // `capitalize()` gives a key with no values, and matches or not otherwise (S2-R32).
+        let mut texts = Vec::new();
+        for (word, value) in [
+            ("status", "READY"),
+            ("verdict", "clean"),
+            ("result", "pass"),
         ] {
-            assert_eq!(
-                parse_report_head(text),
-                ("Status", "BLOCKED", ""),
-                "{text:?}"
-            );
+            for at in 0..word.len() {
+                for fold in ['\u{17f}', '\u{131}', '\u{130}', '\u{212a}'] {
+                    let mut key: Vec<char> = word.chars().collect();
+                    key[at] = fold;
+                    let key: String = key.into_iter().collect();
+                    texts.push(format!("{key}: {value}"));
+                    texts.push(format!("**{key}**: {value}\nBlocked by: environment"));
+                }
+            }
         }
+        let theirs = python_heads(&texts);
+        let raised = theirs.iter().filter(|r| r.is_err()).count();
+        // `statuſ`, `verdıct`, `verdİct` and `reſult` raise (two texts each); `ſtatus` parses,
+        // and a letter that folds to none of the key's is no match.
+        assert_eq!(raised, 2 * 4, "{theirs:?}");
+        assert_same_heads(&texts, theirs);
+        let err = parse_report_head("re\u{17f}ult: pass").unwrap_err();
+        assert_eq!(err.key, "Re\u{17f}ult");
+        assert_eq!(err.to_string(), "KeyError: 'Re\u{17f}ult'");
+        assert_eq!(Error::from(err).message, "KeyError: 'Re\u{17f}ult'");
+        assert_eq!(
+            parse_report_head("\u{17f}tatus: ready"),
+            Ok(("Status", "READY", ""))
+        );
+    }
+
+    #[test]
+    fn parse_report_head_reads_the_kelvin_sign_in_a_value() {
+        // The Kelvin sign lowers to `k`, so `BLOC\u{212a}ED` is BLOCKED.
+        let texts: Vec<String> = [
+            "Status: BLOC\u{212a}ED",
+            "status: bloc\u{212a}ed\nBlocked by: usage limit",
+            "Status: BLO\u{212a}\u{212a}ED",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(parse_report_head(&texts[0]), Ok(("Status", "BLOCKED", "")));
+        assert_eq!(
+            parse_report_head(&texts[1]),
+            Ok(("Status", "BLOCKED", "usage limit"))
+        );
+        assert_same_heads(&texts, python_heads(&texts));
     }
 }
