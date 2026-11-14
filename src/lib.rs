@@ -3,9 +3,12 @@
 //! The binary (`src/main.rs`) is `cli::main`.
 
 pub mod cli;
+pub mod config;
+pub mod deck;
 pub mod error;
 pub mod git;
 pub mod procs;
+pub mod route;
 pub mod safedir;
 pub mod store;
 pub mod sys;

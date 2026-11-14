@@ -7,14 +7,17 @@
 //! `report`, `check`, `launch-line`, `version`) carry a one-line purpose and an example in
 //! their help. Long flags may be abbreviated to any unambiguous prefix, as argparse allows.
 
-use std::ffi::OsString;
+pub mod human;
+
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 use crate::error::{EXIT_STILL_RUNNING, Error, Result};
+use crate::{config, deck};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -61,6 +64,8 @@ pub enum Command {
         deck: OsString,
         #[arg(long, default_value = ".")]
         repo: OsString,
+        #[arg(long, help = "print the result as one JSON object")]
+        json: bool,
     },
 
     #[command(about = "print the route for a card and role")]
@@ -339,6 +344,24 @@ fn parse(
 fn run(command: Command, name: &str, _caller: &Result<Caller>) -> Result<ExitCode> {
     match command {
         Command::Version => version(),
+        Command::Check { deck, repo, json } => check(&deck, &repo, json),
+        Command::Route {
+            deck,
+            card,
+            role,
+            attempt,
+            last_vendor,
+            repo,
+            installed,
+        } => route(RouteArgs {
+            deck: &deck,
+            card,
+            role: &role,
+            attempt,
+            last_vendor,
+            repo: &repo,
+            installed: installed.as_deref(),
+        }),
         _ => Err(Error::msg(format!("not ported yet: {name}"))),
     }
 }
@@ -348,14 +371,182 @@ fn run(command: Command, name: &str, _caller: &Result<Caller>) -> Result<ExitCod
 fn report(e: &Error) -> ExitCode {
     if e.exit == EXIT_STILL_RUNNING {
         let _ = writeln!(std::io::stdout(), "{}", e.message);
+        ExitCode::from(e.exit)
     } else {
+        human::fail_with_fix(e.clone())
+    }
+}
+
+// --------------------------------------------------------------------------
+// check
+
+/// `check`'s result as `--json` prints it: the same information as the text output.
+#[derive(Debug, serde::Serialize)]
+struct CheckReport {
+    ok: bool,
+    /// The deck's card count; `None` when the deck, the repository or the configuration did
+    /// not load.
+    cards: Option<usize>,
+    problems: Vec<CheckProblem>,
+    /// The one command that fixes every error, when there is one.
+    fix: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CheckProblem {
+    level: &'static str,
+    card: Option<u32>,
+    message: String,
+}
+
+/// `check` (`deck._cmd_check`), for the repository the `--repo` directory belongs to (the
+/// main working tree's top, deliberate change 1). The contract output is the text on stdout:
+/// one problem per line, then `ok: <n> cards` when there is no error; a deck, repository or
+/// configuration that does not load is its one `error: …` line. When one command fixes every
+/// error, it follows on stderr, alone, as the last line.
+fn check(deck_arg: &OsStr, repo_arg: &OsStr, json: bool) -> Result<ExitCode> {
+    let report = match check_problems(Path::new(deck_arg), Path::new(repo_arg)) {
+        Ok((cards, problems)) => {
+            let errors: Vec<&deck::Problem> = problems
+                .iter()
+                .filter(|p| p.level == deck::Level::Error)
+                .collect();
+            let fix = errors.first().and_then(|first| {
+                let fix = first.fix.as_ref()?;
+                errors
+                    .iter()
+                    .all(|p| p.fix.as_ref() == Some(fix))
+                    .then(|| human::command_line(fix))
+            });
+            CheckReport {
+                ok: errors.is_empty(),
+                cards: Some(cards),
+                problems: problems
+                    .into_iter()
+                    .map(|p| CheckProblem {
+                        level: p.level.as_str(),
+                        card: p.card,
+                        message: p.message,
+                    })
+                    .collect(),
+                fix,
+            }
+        }
+        Err(e) => CheckReport {
+            ok: false,
+            cards: None,
+            problems: vec![CheckProblem {
+                level: deck::Level::Error.as_str(),
+                card: None,
+                message: e.message,
+            }],
+            fix: e.fix,
+        },
+    };
+    let mut text = String::new();
+    for p in &report.problems {
+        text += &format!("{}: {}\n", p.level, p.message);
+    }
+    if let (true, Some(cards)) = (report.ok, report.cards) {
+        text += &format!("ok: {cards} cards\n");
+    }
+    human::print_or_json(&text, &report, json)?;
+    if let (false, Some(fix)) = (json, &report.fix) {
         let mut err = std::io::stderr().lock();
-        let _ = writeln!(err, "error: {}", e.message);
-        if let Some(fix) = &e.fix {
-            let _ = writeln!(err, "{fix}");
+        writeln!(err, "{fix}")?;
+        err.flush()?;
+    }
+    Ok(if report.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// The deck's card count and problems, or why they could not be found.
+fn check_problems(deck_arg: &Path, repo_arg: &Path) -> Result<(usize, Vec<deck::Problem>)> {
+    let deck = deck::parse_deck(deck_arg)?;
+    let given = if repo_arg.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        repo_arg
+    };
+    let given = std::path::absolute(given).map_err(|e| Error::io(given, e))?;
+    let top = crate::git::repo_identity(&given)?.top;
+    let config = config::load_config(&top)?;
+    let problems = deck::check_deck(&deck, &top, &config)?;
+    Ok((deck.cards.len(), problems))
+}
+
+// --------------------------------------------------------------------------
+// route
+
+struct RouteArgs<'a> {
+    deck: &'a OsStr,
+    card: i64,
+    role: &'a OsStr,
+    attempt: i64,
+    last_vendor: Option<Vendor>,
+    repo: &'a OsStr,
+    installed: Option<&'a OsStr>,
+}
+
+/// `route` (`route._cmd_route`), frozen at parity: the route line, then one reason per line;
+/// `ladder exhausted: …` on stderr when the ladder is exhausted. The configuration is the
+/// `--repo` directory's own, as given.
+fn route(args: RouteArgs) -> Result<ExitCode> {
+    let deck = deck::parse_deck(Path::new(args.deck))?;
+    let config = config::load_config(Path::new(args.repo))?;
+    let Some(card) = deck.cards.iter().find(|c| i64::from(c.number) == args.card) else {
+        return Err(Error::msg(format!(
+            "no card {} in {}",
+            args.card,
+            args.deck.to_string_lossy()
+        )));
+    };
+    let installed = match args.installed {
+        Some(text) => crate::route::installed_from(text)?,
+        None => crate::route::installed_on_path(),
+    };
+    let role = args.role.to_string_lossy();
+    let req = crate::route::RouteRequest {
+        role: &role,
+        card: Some(card),
+        attempt: args.attempt,
+        last_implementer_vendor: args.last_vendor.map(Vendor::name),
+        installed: &installed,
+        security: false,
+        profile: deck.profile.as_deref(),
+    };
+    let res = match crate::route::resolve(&config, &req) {
+        Ok(res) => res,
+        Err(crate::route::RouteError::LadderExhausted(m)) => {
+            let mut err = std::io::stderr().lock();
+            writeln!(err, "ladder exhausted: {m}")?;
+            err.flush()?;
+            return Ok(ExitCode::FAILURE);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let r = &res.route;
+    let mut text = format!("{} {} {}\n", r.vendor, r.model, r.effort);
+    for reason in &res.reasons {
+        text += reason;
+        text.push('\n');
+    }
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())?;
+    out.flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
+impl Vendor {
+    fn name(self) -> &'static str {
+        match self {
+            Vendor::Claude => "claude",
+            Vendor::Codex => "codex",
         }
     }
-    ExitCode::from(e.exit)
 }
 
 fn version() -> Result<ExitCode> {
@@ -443,7 +634,9 @@ mod tests {
     #[test]
     fn python_defaults() {
         match parse_ok(&["check", "deck.md"]).0 {
-            Command::Check { deck, repo } => assert_eq!((deck, repo), (os("deck.md"), os("."))),
+            Command::Check { deck, repo, json } => {
+                assert_eq!((deck, repo, json), (os("deck.md"), os("."), false))
+            }
             other => panic!("{other:?}"),
         }
         match parse_ok(&["route", "deck.md", "2", "implementer"]).0 {
@@ -626,7 +819,7 @@ mod tests {
         );
         // Empty values are values.
         match parse_ok(&["check", "", "--repo", ""]).0 {
-            Command::Check { deck, repo } => assert_eq!((deck, repo), (os(""), os(""))),
+            Command::Check { deck, repo, .. } => assert_eq!((deck, repo), (os(""), os(""))),
             other => panic!("{other:?}"),
         }
     }
