@@ -1,0 +1,831 @@
+//! The command line: all seventeen subcommands, with the Python's flags, positional
+//! arguments and defaults (contract item 1), parsed by clap (usage errors exit 2, deliberate
+//! change 4); the one caller-check entry point; and how a command's result becomes output
+//! and an exit code.
+//!
+//! The commands a person types (`run`, `start`, `status`, `pause`, `cancel`, `unpark`,
+//! `report`, `check`, `launch-line`, `version`) carry a one-line purpose and an example in
+//! their help. Long flags may be abbreviated to any unambiguous prefix, as argparse allows.
+
+use std::ffi::OsString;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+
+use crate::error::{EXIT_STILL_RUNNING, Error, Result};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "leadhand",
+    bin_name = "leadhand",
+    about = "carry an approved deck through implementation and review with bounded workers",
+    infer_long_args = true,
+    subcommand_required = true,
+    arg_required_else_help = true,
+    disable_help_subcommand = true
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// The subcommands, in the Python's order.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    #[command(
+        about = "print the leadhand version",
+        after_help = "Example:\n  leadhand version"
+    )]
+    Version,
+
+    #[command(
+        about = "let a parked card continue, with a note for its worker",
+        after_help = "Example:\n  leadhand unpark ~/.leadhand/myapp/runs/2026-11-10-retry-uploads --card 2 \
+                      --note 'Keep the v1 endpoint'"
+    )]
+    Unpark {
+        run_dir: OsString,
+        #[arg(long, allow_negative_numbers = true)]
+        card: i64,
+        #[arg(long, help = "the answer or instruction for the card; - reads stdin")]
+        note: OsString,
+    },
+
+    #[command(
+        about = "validate a deck before a run",
+        after_help = "Example:\n  leadhand check docs/decks/retry-uploads.md --repo ."
+    )]
+    Check {
+        deck: OsString,
+        #[arg(long, default_value = ".")]
+        repo: OsString,
+    },
+
+    #[command(about = "print the route for a card and role")]
+    Route {
+        deck: OsString,
+        #[arg(allow_negative_numbers = true)]
+        card: i64,
+        role: OsString,
+        #[arg(long, default_value_t = 1, allow_negative_numbers = true)]
+        attempt: i64,
+        #[arg(long)]
+        last_vendor: Option<Vendor>,
+        #[arg(long, default_value = ".")]
+        repo: OsString,
+        /// The installed vendors, in place of the PATH lookup (hidden, as in the Python; part
+        /// of the command surface in every build, not a test hook).
+        #[arg(long, hide = true)]
+        installed: Option<OsString>,
+    },
+
+    #[command(about = "run one Codex worker (started detached) and print its reply")]
+    Dispatch(DispatchArgs),
+
+    #[command(about = "stop a Codex dispatch and record its result")]
+    StopDispatch {
+        run_dir: OsString,
+        #[arg(long)]
+        dispatch: OsString,
+    },
+
+    #[command(hide = true)]
+    DispatchRunner { worker_dir: OsString },
+
+    #[command(
+        about = "start a run for a deck (or report the unfinished one)",
+        after_help = "Example:\n  leadhand start docs/decks/retry-uploads.md --repo ."
+    )]
+    Start {
+        deck: OsString,
+        #[arg(long, default_value = ".")]
+        repo: OsString,
+        #[arg(long, help = "start a new run even if one is unfinished")]
+        new: bool,
+    },
+
+    #[command(about = "perform due steps and print the supervisor's next action")]
+    Next { run_dir: OsString },
+
+    #[command(about = "record a worker start or result, a ruling, a park or a diff check")]
+    Record(RecordArgs),
+
+    #[command(
+        about = "pause a run: running workers finish, nothing new starts, it ends blocked",
+        after_help = "Example:\n  leadhand pause ~/.leadhand/myapp/runs/2026-11-10-retry-uploads"
+    )]
+    Pause { run_dir: OsString },
+
+    #[command(
+        about = "cancel a run: stop every worker, end it incomplete (cancelled)",
+        after_help = "Example:\n  leadhand cancel ~/.leadhand/myapp/runs/2026-11-10-retry-uploads"
+    )]
+    Cancel { run_dir: OsString },
+
+    #[command(about = "wait until a dispatch has a result or its deadline passes")]
+    Timer {
+        run_dir: OsString,
+        #[arg(long)]
+        dispatch: OsString,
+    },
+
+    #[command(
+        about = "own a run and start its supervisor session (attended use only)",
+        after_help = "Example:\n  leadhand run ~/.leadhand/myapp/runs/2026-11-10-retry-uploads"
+    )]
+    Run {
+        #[arg(help = "the run directory or its deck.md")]
+        run_dir: OsString,
+        #[arg(long, help = "load the leadhand plugin from this directory")]
+        plugin_dir: Option<OsString>,
+        #[arg(long = "print", hide = true)]
+        print_mode: bool,
+    },
+
+    #[command(
+        about = "print the exact command that launches or resumes a run",
+        after_help = "Example:\n  leadhand launch-line ~/.leadhand/myapp/runs/2026-11-10-retry-uploads"
+    )]
+    LaunchLine {
+        #[arg(help = "the run directory or its deck.md")]
+        run_dir: OsString,
+        #[arg(long, help = "load the leadhand plugin from this directory")]
+        plugin_dir: Option<OsString>,
+    },
+
+    #[command(
+        about = "show a run's headline, attention items, cards and usage",
+        after_help = "Example:\n  leadhand status ~/.leadhand/myapp/runs/2026-11-10-retry-uploads"
+    )]
+    Status {
+        #[arg(
+            help = "the run directory; default: the most recently updated unfinished run under this \
+                      repository's docs_dir"
+        )]
+        run_dir: Option<OsString>,
+    },
+
+    #[command(
+        about = "write report.md for a run and print its path",
+        after_help = "Example:\n  leadhand report ~/.leadhand/myapp/runs/2026-11-10-retry-uploads"
+    )]
+    Report { run_dir: OsString },
+}
+
+#[derive(Debug, Args)]
+pub struct DispatchArgs {
+    #[arg(long, help = "the run directory")]
+    pub run: OsString,
+    #[arg(long)]
+    pub dispatch_id: OsString,
+    #[arg(long, allow_negative_numbers = true)]
+    pub card: Option<i64>,
+    #[arg(long, allow_negative_numbers = true)]
+    pub attempt: i64,
+    #[arg(long)]
+    pub role: OsString,
+    #[arg(long)]
+    pub model: OsString,
+    #[arg(long)]
+    pub effort: OsString,
+    #[arg(long)]
+    pub brief: OsString,
+    #[arg(long)]
+    pub report: OsString,
+    #[arg(long, help = "the workspace the worker runs in")]
+    pub cwd: OsString,
+    #[arg(long, help = "Codex session (thread) ID to resume")]
+    pub resume: Option<OsString>,
+    #[arg(long, help = "the dispatch kind (implement, fix, review, ...)")]
+    pub kind: Option<OsString>,
+    #[arg(long, help = "the branch the worker's changes are committed on")]
+    pub branch: Option<OsString>,
+}
+
+#[derive(Debug, Args)]
+pub struct RecordArgs {
+    pub run_dir: OsString,
+    pub kind: RecordKind,
+    #[arg(long, help = "dispatch ID (started, result)")]
+    pub dispatch: Option<OsString>,
+    #[arg(long, help = "the worker's agent ID (started, result)")]
+    pub worker: Option<OsString>,
+    #[arg(
+        long,
+        conflicts_with = "reply_file",
+        help = "the worker's reply (result); - reads stdin"
+    )]
+    pub reply: Option<OsString>,
+    #[arg(long, help = "a file holding the worker's reply (result)")]
+    pub reply_file: Option<OsString>,
+    #[arg(long, help = "the worker was stopped at its deadline (result)")]
+    pub stopped: bool,
+    #[arg(
+        long,
+        allow_negative_numbers = true,
+        help = "card number (ruling, park, diff-check)"
+    )]
+    pub card: Option<i64>,
+    #[arg(long, help = "the ruling (ruling); - reads stdin")]
+    pub text: Option<OsString>,
+    #[arg(long, help = "why the card is parked (park)")]
+    pub reason: Option<OsString>,
+    #[arg(long, help = "whether the diff is acceptable (diff-check)")]
+    pub ok: Option<YesNo>,
+    #[arg(
+        long,
+        default_value = "",
+        help = "what the diff check found (diff-check)"
+    )]
+    pub note: OsString,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum RecordKind {
+    Started,
+    Result,
+    Ruling,
+    Park,
+    DiffCheck,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Vendor {
+    Claude,
+    Codex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum YesNo {
+    Yes,
+    No,
+}
+
+// --------------------------------------------------------------------------
+// The caller
+
+/// Who is calling: the run anchor a supervisor session (and every runner its `dispatch`
+/// starts) carries. The one caller-check entry point: `main` resolves it once for every
+/// handler, and Plan 2's run guard extends it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Caller {
+    /// `$LEADHAND_RUN_DIR`, when set.
+    pub run_dir: Option<PathBuf>,
+    /// `$LEADHAND_RUN_ID`, when set and not empty. A value that isn't UTF-8 is kept lossily:
+    /// it can never equal a run ID.
+    pub run_id: Option<String>,
+}
+
+/// The caller, from `LEADHAND_RUN_DIR` and `LEADHAND_RUN_ID`. A `LEADHAND_RUN_DIR` that is
+/// set but empty (or only whitespace) is a cleared anchor, never an operator's terminal
+/// (which has none at all), and is refused. Only the handlers that check the run anchor fail
+/// on that refusal (`dispatch`, `stop-dispatch`, `dispatch-runner`); `main` keeps it for them.
+pub fn resolve_caller() -> Result<Caller> {
+    resolve_caller_in(&|name| std::env::var_os(name))
+}
+
+fn resolve_caller_in(env: &dyn Fn(&str) -> Option<OsString>) -> Result<Caller> {
+    let run_dir = env("LEADHAND_RUN_DIR");
+    if let Some(dir) = &run_dir
+        && dir.to_string_lossy().trim().is_empty()
+    {
+        return Err(Error::msg("refused: $LEADHAND_RUN_DIR is set but empty"));
+    }
+    let run_id = env("LEADHAND_RUN_ID")
+        .filter(|id| !id.is_empty())
+        .map(|id| id.to_string_lossy().into_owned());
+    Ok(Caller {
+        run_dir: run_dir.map(PathBuf::from),
+        run_id,
+    })
+}
+
+// --------------------------------------------------------------------------
+// Running a command
+
+/// Parses the command line, resolves the caller, runs the command and prints its error.
+pub fn main() -> ExitCode {
+    let (command, name) = match parse(std::env::args_os()) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            // Help goes to stdout with exit 0; a usage error to stderr with exit 2.
+            let _ = e.print();
+            return ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(2));
+        }
+    };
+    let caller = resolve_caller();
+    match run(command, &name, &caller) {
+        Ok(code) => code,
+        Err(e) => report(&e),
+    }
+}
+
+/// The parsed command and its name as typed (the subcommand clap matched).
+fn parse(
+    argv: impl IntoIterator<Item = impl Into<OsString> + Clone>,
+) -> std::result::Result<(Command, String), clap::Error> {
+    let matches = Cli::command().try_get_matches_from(argv)?;
+    let name = matches.subcommand_name().unwrap_or_default().to_owned();
+    let cli = Cli::from_arg_matches(&matches)?;
+    Ok((cli.command, name))
+}
+
+fn run(command: Command, name: &str, _caller: &Result<Caller>) -> Result<ExitCode> {
+    match command {
+        Command::Version => version(),
+        _ => Err(Error::msg(format!("not ported yet: {name}"))),
+    }
+}
+
+/// Prints `e`: the `still running` line on stdout for exit 75; otherwise `error: <message>`
+/// on stderr, then the fixing command, if any, alone as the last line.
+fn report(e: &Error) -> ExitCode {
+    if e.exit == EXIT_STILL_RUNNING {
+        let _ = writeln!(std::io::stdout(), "{}", e.message);
+    } else {
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "error: {}", e.message);
+        if let Some(fix) = &e.fix {
+            let _ = writeln!(err, "{fix}");
+        }
+    }
+    ExitCode::from(e.exit)
+}
+
+fn version() -> Result<ExitCode> {
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "leadhand {}", env!("CARGO_PKG_VERSION"))?;
+    out.flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const PYTHON_COMMANDS: [&str; 17] = [
+        "version",
+        "unpark",
+        "check",
+        "route",
+        "dispatch",
+        "stop-dispatch",
+        "dispatch-runner",
+        "start",
+        "next",
+        "record",
+        "pause",
+        "cancel",
+        "timer",
+        "run",
+        "launch-line",
+        "status",
+        "report",
+    ];
+    const HUMAN_COMMANDS: [&str; 10] = [
+        "run",
+        "start",
+        "status",
+        "pause",
+        "cancel",
+        "unpark",
+        "report",
+        "check",
+        "launch-line",
+        "version",
+    ];
+
+    fn parse_ok(args: &[&str]) -> (Command, String) {
+        let argv = std::iter::once("leadhand").chain(args.iter().copied());
+        parse(argv).unwrap_or_else(|e| panic!("{args:?} did not parse: {e}"))
+    }
+
+    fn usage_error(args: &[&str]) -> clap::Error {
+        let argv = std::iter::once("leadhand").chain(args.iter().copied());
+        match parse(argv) {
+            Ok((command, _)) => panic!("{args:?} parsed: {command:?}"),
+            Err(e) => e,
+        }
+    }
+
+    fn help(name: &str) -> String {
+        let mut cli = Cli::command();
+        cli.build();
+        let sub = cli
+            .find_subcommand_mut(name)
+            .unwrap_or_else(|| panic!("no {name}"));
+        sub.render_help().to_string()
+    }
+
+    fn os(s: &str) -> OsString {
+        OsString::from(s)
+    }
+
+    #[test]
+    fn clap_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn the_seventeen_python_commands_in_order() {
+        let cli = Cli::command();
+        let names: Vec<&str> = cli.get_subcommands().map(|c| c.get_name()).collect();
+        assert_eq!(names, PYTHON_COMMANDS);
+    }
+
+    #[test]
+    fn python_defaults() {
+        match parse_ok(&["check", "deck.md"]).0 {
+            Command::Check { deck, repo } => assert_eq!((deck, repo), (os("deck.md"), os("."))),
+            other => panic!("{other:?}"),
+        }
+        match parse_ok(&["route", "deck.md", "2", "implementer"]).0 {
+            Command::Route {
+                deck,
+                card,
+                role,
+                attempt,
+                last_vendor,
+                repo,
+                installed,
+            } => {
+                assert_eq!(
+                    (deck, card, role, attempt),
+                    (os("deck.md"), 2, os("implementer"), 1)
+                );
+                assert_eq!((last_vendor, repo, installed), (None, os("."), None));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_ok(&["record", "/r", "diff-check", "--card", "1", "--ok", "yes"]).0 {
+            Command::Record(r) => {
+                assert_eq!(
+                    (r.kind, r.card, r.ok, r.note),
+                    (RecordKind::DiffCheck, Some(1), Some(YesNo::Yes), os(""))
+                );
+                assert!(!r.stopped && r.reply.is_none() && r.reply_file.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_ok(&["status"]).0 {
+            Command::Status { run_dir } => assert_eq!(run_dir, None),
+            other => panic!("{other:?}"),
+        }
+        match parse_ok(&["start", "deck.md"]).0 {
+            Command::Start { repo, new, .. } => assert_eq!((repo, new), (os("."), false)),
+            other => panic!("{other:?}"),
+        }
+        match parse_ok(&["run", "/r"]).0 {
+            Command::Run {
+                plugin_dir,
+                print_mode,
+                ..
+            } => assert_eq!((plugin_dir, print_mode), (None, false)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn python_forms_parse() {
+        let dispatch = [
+            "dispatch",
+            "--run",
+            "/r",
+            "--dispatch-id",
+            "c1-a1-implement-1",
+            "--card",
+            "1",
+            "--attempt",
+            "1",
+            "--role",
+            "implementer",
+            "--model",
+            "gpt-5",
+            "--effort",
+            "high",
+            "--brief",
+            "/w/.leadhand/b.md",
+            "--report",
+            "/w/.leadhand/r.md",
+            "--cwd",
+            "/w",
+            "--resume",
+            "t1",
+            "--kind",
+            "implement",
+            "--branch",
+            "b--card-1",
+        ];
+        match parse_ok(&dispatch) {
+            (Command::Dispatch(d), name) => {
+                assert_eq!(name, "dispatch");
+                assert_eq!(
+                    (d.run, d.dispatch_id, d.card, d.attempt),
+                    (os("/r"), os("c1-a1-implement-1"), Some(1), 1)
+                );
+                assert_eq!(
+                    (d.resume, d.kind, d.branch),
+                    (Some(os("t1")), Some(os("implement")), Some(os("b--card-1")))
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // A run-level dispatch has no card.
+        let card = dispatch.iter().position(|a| *a == "--card").unwrap();
+        let run_level = [&dispatch[..card], &dispatch[card + 2..]].concat();
+        match parse_ok(&run_level) {
+            (Command::Dispatch(d), _) => assert_eq!((d.card, d.attempt), (None, 1)),
+            other => panic!("{other:?}"),
+        }
+        for (args, want) in [
+            (
+                &["stop-dispatch", "/r", "--dispatch", "d1"][..],
+                "stop-dispatch",
+            ),
+            (&["dispatch-runner", "/r/workers/d1"], "dispatch-runner"),
+            (&["next", "/r"], "next"),
+            (&["timer", "/r", "--dispatch", "d1"], "timer"),
+            (&["pause", "/r"], "pause"),
+            (&["cancel", "/r"], "cancel"),
+            (&["report", "/r"], "report"),
+            (
+                &["launch-line", "/r/deck.md", "--plugin-dir", "/p"],
+                "launch-line",
+            ),
+            (&["run", "/r", "--print"], "run"),
+            (&["unpark", "/r", "--card", "2", "--note", "-"], "unpark"),
+            (
+                &[
+                    "record",
+                    "/r",
+                    "result",
+                    "--dispatch",
+                    "d1",
+                    "--worker",
+                    "a1",
+                    "--reply-file",
+                    "/f",
+                    "--stopped",
+                ],
+                "record",
+            ),
+            (
+                &["record", "/r", "ruling", "--card", "1", "--text", "-"],
+                "record",
+            ),
+            (
+                &[
+                    "route",
+                    "deck.md",
+                    "1",
+                    "reviewer",
+                    "--last-vendor",
+                    "codex",
+                    "--installed",
+                    "claude",
+                ],
+                "route",
+            ),
+            (&["start", "deck.md", "--new", "--repo=/repo"], "start"),
+            (&["version"], "version"),
+        ] {
+            assert_eq!(parse_ok(args).1, want, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn argparse_forms_parse_the_same() {
+        // Negative numbers are values, as argparse reads them.
+        match parse_ok(&["unpark", "/r", "--card", "-1", "--note", "n"]).0 {
+            Command::Unpark { card, .. } => assert_eq!(card, -1),
+            other => panic!("{other:?}"),
+        }
+        match parse_ok(&["route", "deck.md", "-2", "implementer"]).0 {
+            Command::Route { card, .. } => assert_eq!(card, -2),
+            other => panic!("{other:?}"),
+        }
+        // Long flags abbreviate to an unambiguous prefix; an exact name wins over a longer one.
+        match parse_ok(&["check", "deck.md", "--rep", "/repo"]).0 {
+            Command::Check { repo, .. } => assert_eq!(repo, os("/repo")),
+            other => panic!("{other:?}"),
+        }
+        match parse_ok(&["record", "/r", "result", "--reply", "done"]).0 {
+            Command::Record(r) => assert_eq!((r.reply, r.reply_file), (Some(os("done")), None)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            usage_error(&["record", "/r", "result", "--repl", "x"]).exit_code(),
+            2
+        );
+        // Empty values are values.
+        match parse_ok(&["check", "", "--repo", ""]).0 {
+            Command::Check { deck, repo } => assert_eq!((deck, repo), (os(""), os(""))),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_errors_exit_2() {
+        for args in [
+            &[][..],
+            &["statu"],
+            &["help"],
+            &["--version"],
+            &["no-such-command", "--help"],
+            &["dispatch", "--run", "/r"],
+            &[
+                "record",
+                "/r",
+                "result",
+                "--reply",
+                "x",
+                "--reply-file",
+                "/f",
+            ],
+            &["record", "/r", "finished"],
+            &["record", "/r", "diff-check", "--ok", "maybe"],
+            &["route", "deck.md", "one", "implementer"],
+            &[
+                "route",
+                "deck.md",
+                "1",
+                "implementer",
+                "--last-vendor",
+                "gemini",
+            ],
+            &["unpark", "/r", "--card", "1"],
+            &["check", "deck.md", "--rpeo", "."],
+            &["version", "extra"],
+        ] {
+            assert_eq!(usage_error(args).exit_code(), 2, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn help_exits_0() {
+        for args in [
+            &["--help"][..],
+            &["-h"],
+            &["dispatch-runner", "--help"],
+            &["record", "-h"],
+        ] {
+            assert_eq!(usage_error(args).exit_code(), 0, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn hidden_surface_parses_but_stays_out_of_help() {
+        let mut cli = Cli::command();
+        let top = cli.render_help().to_string();
+        assert!(!top.contains("dispatch-runner"), "{top}");
+        assert!(top.contains("stop-dispatch"), "{top}");
+        assert!(!help("route").contains("--installed"));
+        assert!(!help("run").contains("--print"));
+    }
+
+    #[test]
+    fn help_names_every_flag_and_record_kind() {
+        let record = help("record");
+        for word in [
+            "--dispatch",
+            "--worker",
+            "--reply",
+            "--reply-file",
+            "--stopped",
+            "--card",
+            "--text",
+            "--reason",
+            "--ok",
+            "--note",
+            "started",
+            "result",
+            "ruling",
+            "park",
+            "diff-check",
+        ] {
+            assert!(record.contains(word), "{word} not in\n{record}");
+        }
+    }
+
+    #[test]
+    fn every_human_command_has_a_purpose_and_an_example() {
+        for name in HUMAN_COMMANDS {
+            let text = help(name);
+            let lines: Vec<&str> = text.lines().collect();
+            assert!(
+                !lines[0].is_empty() && !lines[0].starts_with("Usage:"),
+                "{text}"
+            );
+            let at = lines
+                .iter()
+                .position(|l| *l == "Example:")
+                .unwrap_or_else(|| panic!("no example:\n{text}"));
+            assert!(
+                lines[at + 1].starts_with(&format!("  leadhand {name}")),
+                "{text}"
+            );
+            // The example itself parses.
+            let words = shell_words(lines[at + 1].trim());
+            let args: Vec<&str> = words.iter().skip(1).map(String::as_str).collect();
+            assert_eq!(parse_ok(&args).1, name, "{text}");
+        }
+    }
+
+    /// Splits a line into words at spaces, keeping single-quoted text whole.
+    fn shell_words(line: &str) -> Vec<String> {
+        let (mut words, mut word, mut quoted) = (Vec::new(), String::new(), false);
+        for c in line.chars() {
+            match c {
+                '\'' => quoted = !quoted,
+                ' ' if !quoted => {
+                    words.extend((!word.is_empty()).then(|| std::mem::take(&mut word)))
+                }
+                c => word.push(c),
+            }
+        }
+        words.extend((!word.is_empty()).then_some(word));
+        words
+    }
+
+    #[test]
+    fn unported_commands_say_so_and_exit_1() {
+        // `pause` is ported last (Task 17).
+        let (command, name) = parse_ok(&["pause", "/r"]);
+        let e = run(
+            command,
+            &name,
+            &Ok(Caller {
+                run_dir: None,
+                run_id: None,
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(e, Error::msg("not ported yet: pause"));
+        assert_eq!(e.exit, 1);
+    }
+
+    #[test]
+    fn version_is_the_python_version() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0");
+    }
+
+    fn caller(vars: &[(&str, &str)]) -> Result<Caller> {
+        let env: HashMap<String, OsString> =
+            vars.iter().map(|(k, v)| (k.to_string(), os(v))).collect();
+        resolve_caller_in(&move |name| env.get(name).cloned())
+    }
+
+    #[test]
+    fn caller_from_the_run_anchor() {
+        assert_eq!(
+            caller(&[]),
+            Ok(Caller {
+                run_dir: None,
+                run_id: None
+            })
+        );
+        assert_eq!(
+            caller(&[
+                ("LEADHAND_RUN_DIR", "/runs/a run"),
+                ("LEADHAND_RUN_ID", "2026-11-10-x-1a2b")
+            ]),
+            Ok(Caller {
+                run_dir: Some(PathBuf::from("/runs/a run")),
+                run_id: Some("2026-11-10-x-1a2b".into())
+            })
+        );
+        // An empty run ID counts as unset, as in the Python.
+        assert_eq!(
+            caller(&[("LEADHAND_RUN_ID", "")]),
+            Ok(Caller {
+                run_dir: None,
+                run_id: None
+            })
+        );
+    }
+
+    #[test]
+    fn set_but_empty_run_dir_is_refused() {
+        for value in ["", " ", "\t\n"] {
+            let e = caller(&[("LEADHAND_RUN_DIR", value), ("LEADHAND_RUN_ID", "x")]).unwrap_err();
+            assert_eq!(
+                e,
+                Error::msg("refused: $LEADHAND_RUN_DIR is set but empty"),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn errors_print_as_error_lines_and_exit_with_their_code() {
+        assert_eq!(report(&Error::msg("x")), ExitCode::from(1));
+        assert_eq!(report(&Error::refused("x")), ExitCode::from(3));
+        assert_eq!(
+            report(&Error::still_running("still running: x")),
+            ExitCode::from(75)
+        );
+    }
+}

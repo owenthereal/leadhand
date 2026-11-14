@@ -1,0 +1,17 @@
+[package]
+name = "leadhand"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[features]
+# Compiles in the test hooks, honoured only with LEADHAND_TESTING=1. Release builds leave it off.
+testing = []
+
+[dependencies]
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+rustix = { version = "1.1.6", features = ["fs", "process"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
