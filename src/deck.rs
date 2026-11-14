@@ -10,11 +10,17 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 use crate::config::{
-    Config, Route, parse_route, py_isspace, py_repr, py_splitlines, py_strip, unsupported_in_repo,
-    unsupported_settings, unsupported_warnings,
+    Config, Route, in_file, parse_route, unsupported_in_repo, unsupported_settings,
+    unsupported_warnings,
 };
-use crate::error::{Error, Result};
+use crate::error::{Error, Failure};
 use crate::git::Git;
+use crate::pytext::{py_isspace, py_repr, py_splitlines, py_strip};
+use crate::wire::PyStr;
+
+/// Loading and checking keep a failure's text lossless (`Failure`); `?` turns it into an
+/// `Error`.
+type Result<T, E = Failure> = std::result::Result<T, E>;
 
 pub const HEADER_KEYS: [&str; 7] = [
     "Source", "Base", "Branch", "Build", "Test", "Profile", "Finish",
@@ -107,7 +113,7 @@ pub enum Level {
 pub struct Problem {
     pub level: Level,
     pub card: Option<u32>,
-    pub message: String,
+    pub message: PyStr,
     pub fix: Option<Vec<OsString>>,
 }
 
@@ -122,23 +128,22 @@ impl Level {
 
 /// A deck that does not parse (`deck.DeckError`): `line <n>: <message>`, or the message alone
 /// for line 0.
-fn deck_error(message: impl fmt::Display, line: usize) -> Error {
+fn deck_error(message: impl fmt::Display, line: usize) -> Failure {
     if line == 0 {
-        Error::msg(message.to_string())
+        Failure::msg(&message.to_string())
     } else {
-        Error::msg(format!("line {line}: {message}"))
+        Failure::msg(&format!("line {line}: {message}"))
     }
 }
 
 /// The deck at `path`. The file must be UTF-8; its digest is sha256 of its bytes, in hex.
 pub fn parse_deck(path: &Path) -> Result<Deck> {
-    let raw = std::fs::read(path).map_err(|e| Error::io(path, e))?;
+    let raw = std::fs::read(path).map_err(|e| Failure::io(path, e))?;
     let digest: String = Sha256::digest(&raw)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let text = std::str::from_utf8(&raw)
-        .map_err(|e| Error::msg(format!("{}: not UTF-8: {e}", path.display())))?;
+    let text = std::str::from_utf8(&raw).map_err(|e| in_file(path, &format!("not UTF-8: {e}")))?;
     let lines = py_splitlines(text);
     let n = lines.len();
     let mut i = 0;
@@ -570,7 +575,7 @@ fn cycle_message(left: &[u32]) -> String {
 }
 
 /// The cards in dependency order, smallest ready number first; an error for a cycle.
-pub fn dependency_order(deck: &Deck) -> Result<Vec<u32>> {
+pub fn dependency_order(deck: &Deck) -> Result<Vec<u32>, Error> {
     let (order, left) = cycle_free_order(deck);
     if left.is_empty() {
         Ok(order)
@@ -591,49 +596,57 @@ pub fn check_deck(deck: &Deck, repo_top: &Path, config: &Config) -> Result<Vec<P
             fix: u.fix,
         })
         .collect();
-    let mut add = |level, card, message: String| {
+    // Every message is the deck's or the configuration's text (UTF-8) or leadhand's own,
+    // except the one naming the repository, which keeps its bytes.
+    fn add(out: &mut Vec<Problem>, level: Level, card: Option<u32>, message: impl Into<PyStr>) {
         out.push(Problem {
             level,
             card,
-            message,
+            message: message.into(),
             fix: None,
         });
-    };
+    }
     for msg in unsupported_settings(config) {
-        add(Level::Error, None, msg);
+        add(&mut out, Level::Error, None, msg);
     }
     for msg in unsupported_warnings(config) {
-        add(Level::Warning, None, msg);
+        add(&mut out, Level::Warning, None, msg);
     }
     if let Some(finish) = deck.finish.as_deref().filter(|f| *f != "none") {
         add(
+            &mut out,
             Level::Error,
             None,
             format!("not supported in this version: Finish: {finish}"),
         );
     }
     if py_strip(&deck.build).is_empty() {
-        add(Level::Error, None, "Build is empty".into());
+        add(&mut out, Level::Error, None, "Build is empty");
     }
     if py_strip(&deck.test).is_empty() {
-        add(Level::Error, None, "Test is empty".into());
+        add(&mut out, Level::Error, None, "Test is empty");
     }
     let sha = &deck.base_sha;
     let hex = (4..=64).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit());
     if !hex {
         add(
+            &mut out,
             Level::Error,
             None,
             format!("base commit {} is not a commit hash", py_repr(sha)),
         );
     } else {
         let object = OsString::from(format!("{sha}^{{commit}}"));
-        let git = Git::at(repo_top)?.with_deadline(GIT_TIMEOUT);
+        let git = Git::try_at(repo_top)?.with_deadline(GIT_TIMEOUT);
         if !git.ok(&[OsStr::new("cat-file"), OsStr::new("-e"), &object]) {
             add(
+                &mut out,
                 Level::Error,
                 None,
-                format!("base commit {sha} not found in {}", repo_top.display()),
+                PyStr::from_os_parts(&[
+                    OsStr::new(&format!("base commit {sha} not found in ")),
+                    repo_top.as_os_str(),
+                ]),
             );
         }
     }
@@ -642,6 +655,7 @@ pub fn check_deck(deck: &Deck, repo_top: &Path, config: &Config) -> Result<Vec<P
     for c in &deck.cards {
         if !numbers.insert(c.number) {
             add(
+                &mut out,
                 Level::Error,
                 Some(c.number),
                 format!("duplicate card number {}", c.number),
@@ -652,21 +666,28 @@ pub fn check_deck(deck: &Deck, repo_top: &Path, config: &Config) -> Result<Vec<P
         let p = format!("card {}: ", c.number);
         let card = Some(c.number);
         for key in &c.missing {
-            add(Level::Error, card, format!("{p}missing {key}"));
+            add(&mut out, Level::Error, card, format!("{p}missing {key}"));
         }
         if c.role == "scout" {
             add(
+                &mut out,
                 Level::Error,
                 card,
                 format!("{p}not supported in this version: scout cards"),
             );
         }
         if c.hard && c.hard_reason.is_empty() {
-            add(Level::Error, card, format!("{p}Hard: yes needs a reason"));
+            add(
+                &mut out,
+                Level::Error,
+                card,
+                format!("{p}Hard: yes needs a reason"),
+            );
         }
         for d in &c.depends_on {
             if !numbers.contains(d) {
                 add(
+                    &mut out,
                     Level::Error,
                     card,
                     format!("{p}depends on unknown card {d}"),
@@ -675,6 +696,7 @@ pub fn check_deck(deck: &Deck, repo_top: &Path, config: &Config) -> Result<Vec<P
         }
         for (ln, key) in &c.unknown_keys {
             add(
+                &mut out,
                 Level::Warning,
                 card,
                 format!("{p}line {ln}: \"{key}\" is not a card field; treated as context"),
@@ -685,6 +707,7 @@ pub fn check_deck(deck: &Deck, repo_top: &Path, config: &Config) -> Result<Vec<P
             let rel: PathBuf = Path::new(path).components().collect();
             if !repo_top.join(rel).exists() {
                 add(
+                    &mut out,
                     Level::Warning,
                     card,
                     format!("{p}allowed path {path} does not exist yet"),
@@ -695,12 +718,13 @@ pub fn check_deck(deck: &Deck, repo_top: &Path, config: &Config) -> Result<Vec<P
 
     let (_, left) = cycle_free_order(deck);
     if !left.is_empty() {
-        add(Level::Error, None, cycle_message(&left));
+        add(&mut out, Level::Error, None, cycle_message(&left));
     }
 
     for r in &deck.requirements {
         if r.cards.is_empty() {
             add(
+                &mut out,
                 Level::Warning,
                 None,
                 format!("requirement {} is uncovered (cards none)", r.id),
@@ -709,6 +733,7 @@ pub fn check_deck(deck: &Deck, repo_top: &Path, config: &Config) -> Result<Vec<P
         for cn in &r.cards {
             if !numbers.contains(cn) {
                 add(
+                    &mut out,
                     Level::Error,
                     None,
                     format!(
@@ -779,6 +804,136 @@ Context: pointers to the plan section and files, not copies.
             let p = self.0.path().join("deck.md");
             std::fs::write(&p, text).unwrap();
             p
+        }
+    }
+
+    /// The Python's regex applied to `inputs` by `python3`: `expr` over `x`, with the deck
+    /// module's patterns in scope.
+    fn python(expr: &str, inputs: &[&str]) -> Vec<serde_json::Value> {
+        let inputs: Vec<serde_json::Value> = inputs.iter().map(|s| serde_json::json!(s)).collect();
+        crate::pytext::tests::python_eval(
+            "from leadhand.deck import _REQ, _HEADER_SPLIT, _FIELD, _HARD, _CARD",
+            expr,
+            &inputs,
+        )
+    }
+
+    #[test]
+    fn requirement_matches_the_python_regex() {
+        let cases = [
+            "- R1 Thing \u{2192} cards 1",
+            "- R1 Thing -> card 1",
+            "- R12 a \u{2192} b \u{2192} cards 1, 2",
+            "- R1 a -> b \u{2192} cards 3 -> card 4",
+            "- R1 a \u{2192} cards 1 \u{2192} nothing",
+            "- R1 a \u{2192} cards none",
+            "- R1 a \u{2192}cards 1",
+            "- R1 \u{2192} cards 1",
+            "- R1\t\tx\u{2192}  card\t7",
+            "- R1 a cards 1",
+            "- R1\u{2192} cards 1",
+            "- R1 a \u{2192} cardsx 1",
+            "- R1 a \u{2192} cards",
+            "- R1 a --> cards 2",
+            "- Rx a \u{2192} cards 1",
+            "- R a \u{2192} cards 1",
+            "-R1 a \u{2192} cards 1",
+            "- R1 caf\u{e9} \u{2192} cards 1,2 ,3",
+        ];
+        let theirs = python(
+            "(lambda m: [m.group(1), m.group(2).strip(), m.group(3)] if m else None)(_REQ.match(x))",
+            &cases,
+        );
+        for (case, want) in cases.iter().zip(theirs) {
+            let ours = requirement(case).map(|(id, text, list)| [id, py_strip(text), list]);
+            assert_eq!(serde_json::json!(ours), want, "{case:?}");
+        }
+    }
+
+    #[test]
+    fn header_split_matches_the_python_regex() {
+        let cases = [
+            "Base: main @ abc  Branch: b",
+            "Base: main @ abc      Branch: leadhand/x",
+            "Base: main @ abc Branch: b",
+            "Base: main @ abc\t\tBranch: b",
+            "Build: make build                 Test: make test",
+            "Profile: standard                 Finish: none",
+            "Source: a  b  c",
+            "Source: a  Nope: b",
+            "Source: a  Base:x  Branch: y",
+            "Source: a \u{a0}Branch: y",
+            "Source: a   Branch : y",
+        ];
+        let theirs = python("_HEADER_SPLIT.split(x)", &cases);
+        for (case, want) in cases.iter().zip(theirs) {
+            assert_eq!(serde_json::json!(split_header(case)), want, "{case:?}");
+        }
+    }
+
+    #[test]
+    fn field_card_and_hard_match_the_python_regexes() {
+        let fields = [
+            "- Role: implementer",
+            "- Done when:   tests pass  ",
+            "- Done when : x",
+            "- Depends on:1",
+            "- lower: x",
+            "- Files: src/a.py",
+            "- X1: y",
+            "-  Role: x",
+            "- Role x",
+            "- A:b:c",
+            "- R\u{e9}le: x",
+            "- : x",
+        ];
+        let theirs = python(
+            "(lambda m: [m.group(1), m.group(2)] if m else None)(_FIELD.match(x))",
+            &fields,
+        );
+        for (case, want) in fields.iter().zip(theirs) {
+            assert_eq!(serde_json::json!(field_line(case)), want, "{case:?}");
+        }
+        let cards = [
+            "## Card 3: Retry uploads",
+            "## Card 3:   spaced title   ",
+            "## Card 3:",
+            "## Card 12:x",
+            "## Card 3 : x",
+            "## Card x: y",
+            "##  Card 3: y",
+            "## Card 007: y",
+        ];
+        let theirs = python(
+            "(lambda m: [m.group(1), m.group(2)] if m else None)(_CARD.match(x))",
+            &cards,
+        );
+        for (case, want) in cards.iter().zip(theirs) {
+            assert_eq!(serde_json::json!(card_heading(case)), want, "{case:?}");
+        }
+        let hards = [
+            "yes",
+            "yes \u{2014} no test can check it",
+            "yes \u{2013} x",
+            "yes - x",
+            "yes: x",
+            "yes:x",
+            "yes -",
+            "yes because",
+            "yess",
+            "yes \u{2014}   spaced  ",
+            "Yes - x",
+        ];
+        let theirs = python(
+            "(lambda m: (m.group(1) or '').strip() if m else None)(_HARD.match(x))",
+            &hards,
+        );
+        for (case, want) in hards.iter().zip(theirs) {
+            assert_eq!(
+                serde_json::json!(hard_yes(case).map(py_strip)),
+                want,
+                "{case:?}"
+            );
         }
     }
 

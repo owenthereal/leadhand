@@ -8,6 +8,7 @@ pub mod deck;
 pub mod error;
 pub mod git;
 pub mod procs;
+pub mod pytext;
 pub mod route;
 pub mod safedir;
 pub mod store;

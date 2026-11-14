@@ -13,13 +13,14 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Failure, Result};
 
 /// How long a Git call may take (`gitops.GIT_TIMEOUT`).
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -78,11 +79,17 @@ impl Git {
     /// Git in `cwd`, with the default deadline. Refuses a relative or missing `cwd`, or one
     /// that is not a directory.
     pub fn at(cwd: &Path) -> Result<Git> {
+        Ok(Git::try_at(cwd)?)
+    }
+
+    /// As `at`, with the refusal's text kept lossless.
+    pub fn try_at(cwd: &Path) -> std::result::Result<Git, Failure> {
         if !cwd.is_absolute() || !cwd.is_dir() {
-            return Err(Error::msg(format!(
-                "git: workspace '{}' is not an existing absolute directory",
-                cwd.display()
-            )));
+            return Err(Failure::of(&[
+                OsStr::new("git: workspace '"),
+                cwd.as_os_str(),
+                OsStr::new("' is not an existing absolute directory"),
+            ]));
         }
         Ok(Git {
             cwd: cwd.to_path_buf(),
@@ -129,12 +136,22 @@ impl Git {
     /// for commands whose exit status is part of the answer. An error only when Git could
     /// not be run or missed its deadline.
     pub fn output(&self, args: &[&OsStr]) -> Result<Output> {
+        Ok(self.spawn(args, &[])?)
+    }
+
+    /// As `output`, with the error's text kept lossless.
+    pub fn try_output(&self, args: &[&OsStr]) -> std::result::Result<Output, Failure> {
         self.spawn(args, &[])
     }
 
     /// The error for a command that failed (the Python's `_fail`): its arguments, exit, the
     /// working directory and Git's stderr (else its stdout), shown lossily.
     pub fn failure(&self, args: &[&OsStr], out: &Output) -> Error {
+        self.failure_text(args, out).into()
+    }
+
+    /// As `failure`, with the text kept lossless.
+    pub fn failure_text(&self, args: &[&OsStr], out: &Output) -> Failure {
         let code = out
             .status
             .code()
@@ -145,15 +162,23 @@ impl Git {
         } else {
             &out.stderr
         };
-        Error::msg(format!(
-            "git {} failed with exit {code} (in {}): {}",
-            shown(args),
-            self.cwd.display(),
-            String::from_utf8_lossy(detail).trim()
-        ))
+        let head = format!(" failed with exit {code} (in ");
+        let mut parts = vec![OsStr::new("git ")];
+        parts.extend(joined(args));
+        parts.extend([
+            OsStr::new(&head),
+            self.cwd.as_os_str(),
+            OsStr::new("): "),
+            OsStr::from_bytes(trim_text(detail)),
+        ]);
+        Failure::of(&parts)
     }
 
-    fn spawn(&self, args: &[&OsStr], env: &[(&str, &OsStr)]) -> Result<Output> {
+    fn spawn(
+        &self,
+        args: &[&OsStr],
+        env: &[(&str, &OsStr)],
+    ) -> std::result::Result<Output, Failure> {
         let started = Instant::now();
         let mut child = Command::new("git")
             .args(SAFE_CONFIG)
@@ -204,24 +229,65 @@ impl Git {
 
     /// Kill Git, reap it, and the error. A process Git started that still holds the pipes is
     /// left to finish on its own, as the Python leaves it; its reader threads end with it.
-    fn stop(&self, child: &mut Child, args: &[&OsStr], what: &str) -> Error {
+    fn stop(&self, child: &mut Child, args: &[&OsStr], what: &str) -> Failure {
         let _ = child.kill();
         let _ = child.wait();
         self.error(args, what)
     }
 
-    fn timed_out(&self, child: &mut Child, args: &[&OsStr]) -> Error {
+    fn timed_out(&self, child: &mut Child, args: &[&OsStr]) -> Failure {
         let secs = self.deadline.as_secs_f64();
         self.stop(child, args, &format!("timed out after {secs}s"))
     }
 
-    fn error(&self, args: &[&OsStr], what: &str) -> Error {
-        Error::msg(format!(
-            "git {}: {what} (in {})",
-            shown(args),
-            self.cwd.display()
-        ))
+    fn error(&self, args: &[&OsStr], what: &str) -> Failure {
+        let tail = format!(": {what} (in ");
+        let mut parts = vec![OsStr::new("git ")];
+        parts.extend(joined(args));
+        parts.extend([OsStr::new(&tail), self.cwd.as_os_str(), OsStr::new(")")]);
+        Failure::of(&parts)
     }
+}
+
+/// The arguments as an error message shows them: separated by spaces, bytes kept.
+fn joined<'a>(args: &[&'a OsStr]) -> Vec<&'a OsStr> {
+    let mut out = Vec::with_capacity(args.len() * 2);
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            out.push(OsStr::new(" "));
+        }
+        out.push(*a);
+    }
+    out
+}
+
+/// `bytes` without leading and trailing whitespace (ASCII, and the Unicode whitespace of any
+/// valid UTF-8 at either end), as `str::trim` trims the text.
+fn trim_text(bytes: &[u8]) -> &[u8] {
+    let mut start = 0;
+    for chunk in bytes.utf8_chunks() {
+        let valid = chunk.valid();
+        let kept = valid.trim_start();
+        start += valid.len() - kept.len();
+        if !kept.is_empty() || !chunk.invalid().is_empty() {
+            break;
+        }
+    }
+    let rest = &bytes[start..];
+    let mut end = rest.len();
+    loop {
+        // The last character, when the tail ends in valid UTF-8.
+        let last = (1..=end.min(4)).find_map(|n| {
+            let mut chars = std::str::from_utf8(&rest[end - n..end]).ok()?.chars();
+            let c = chars.next()?;
+            chars.next().is_none().then_some((c, n))
+        });
+        match last {
+            Some((c, n)) if c.is_whitespace() => end -= n,
+            _ => break,
+        }
+    }
+    &rest[..end]
 }
 
 /// Read `pipe` to its end on a thread of its own, and send the bytes as field `i`.
@@ -236,12 +302,6 @@ fn read_on_thread(
         let read = pipe.read_to_end(&mut buf).map(|_| buf);
         let _ = tx.send((i, read));
     });
-}
-
-/// The arguments as an error message shows them.
-fn shown(args: &[&OsStr]) -> String {
-    let shown: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
-    shown.join(" ")
 }
 
 /// A Git call's environment: the inherited one without `REPO_VARS`, then `SAFE_ENV`, then
@@ -525,6 +585,38 @@ mod tests {
                 .starts_with("git rev-parse --verify --quiet nope failed with exit 1 (in "),
             "{e}"
         );
+    }
+
+    #[test]
+    fn failure_text_keeps_bytes_and_failure_shows_them_as_before() {
+        let f = Fixture::new();
+        let repo = f.make_repo("my repo");
+        let git = Git::at(&repo).unwrap();
+        let args = [
+            os("rev-parse"),
+            os("--verify"),
+            OsStr::from_bytes(b"no-\xff"),
+        ];
+        let out = git.output(&args).unwrap();
+        let lossless = git.failure_text(&args, &out);
+        let json = crate::wire::ascii_json(&lossless.text);
+        assert!(
+            json.starts_with("\"git rev-parse --verify no-\\udcff failed with exit 128 (in "),
+            "{json}"
+        );
+        // The Error's text is what it was: the arguments, cwd and stderr shown lossily, trimmed.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            git.failure(&args, &out).message,
+            format!(
+                "git rev-parse --verify no-\u{fffd} failed with exit 128 (in {}): {}",
+                repo.display(),
+                stderr.trim()
+            )
+        );
+        assert_eq!(trim_text(b" \t\xc2\xa0x \xff y\n\xe2\x80\x83"), b"x \xff y");
+        assert_eq!(trim_text(b"\xff \n"), b"\xff");
+        assert_eq!(trim_text(b" \n "), b"");
     }
 
     #[test]

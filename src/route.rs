@@ -3,11 +3,11 @@
 
 use std::ffi::OsStr;
 use std::fmt;
-use std::path::{Path, PathBuf};
 
-use crate::config::{Config, EFFORTS, RoleSpec, Route, VENDORS, py_repr, py_strip};
+use crate::config::{Config, EFFORTS, RoleSpec, Route, VENDORS};
 use crate::deck::Card;
 use crate::error::Error;
+use crate::pytext::{py_repr, py_strip, which};
 
 /// The effort steps each profile adds.
 pub const PROFILE_SHIFT: [(&str, i64); 3] = [("lean", -1), ("standard", 0), ("thorough", 1)];
@@ -291,28 +291,11 @@ pub fn resolve(config: &Config, req: &RouteRequest) -> Result<Resolution, RouteE
 
 /// The vendors whose CLI is on `PATH` (`shutil.which`), in `VENDORS` order.
 pub fn installed_on_path() -> Vec<String> {
-    let path = std::env::var_os("PATH").unwrap_or_else(|| "/bin:/usr/bin".into());
     VENDORS
         .into_iter()
-        .filter(|v| on_path(&path, v))
+        .filter(|v| which(v).is_some())
         .map(str::to_string)
         .collect()
-}
-
-/// Whether `PATH` holds an executable file `name` (an empty entry is the current directory).
-fn on_path(path: &OsStr, name: &str) -> bool {
-    std::env::split_paths(path).any(|dir| {
-        let candidate: PathBuf = if dir.as_os_str().is_empty() {
-            PathBuf::from(name)
-        } else {
-            dir.join(name)
-        };
-        is_executable_file(&candidate)
-    })
-}
-
-fn is_executable_file(p: &Path) -> bool {
-    p.exists() && !p.is_dir() && rustix::fs::access(p, rustix::fs::Access::EXEC_OK).is_ok()
 }
 
 /// The vendors `--installed` names: a comma list, whitespace around names ignored

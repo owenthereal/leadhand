@@ -79,6 +79,25 @@ impl PyStr {
         Ok(OsString::from_vec(out))
     }
 
+    /// The OS bytes of `parts`, concatenated, decoded as `from_os` decodes them: text made of
+    /// generated words and paths, kept lossless.
+    pub fn from_os_parts(parts: &[&OsStr]) -> PyStr {
+        let mut bytes = Vec::new();
+        for part in parts {
+            bytes.extend_from_slice(part.as_bytes());
+        }
+        PyStr::from_os(OsStr::from_bytes(&bytes))
+    }
+
+    /// For display: the OS bytes `to_os` gives, shown lossily, as `Path::display` shows a
+    /// path (a surrogate `to_os` refuses becomes U+FFFD).
+    pub fn shown(&self) -> String {
+        match self.to_os() {
+            Ok(os) => os.to_string_lossy().into_owned(),
+            Err(_) => self.lossy().into_owned(),
+        }
+    }
+
     /// For display only: a lone surrogate becomes U+FFFD.
     pub fn lossy(&self) -> Cow<'_, str> {
         match std::str::from_utf8(&self.0) {
@@ -96,6 +115,13 @@ impl From<&str> for PyStr {
     /// Valid text, as it is.
     fn from(s: &str) -> PyStr {
         PyStr(s.as_bytes().to_vec())
+    }
+}
+
+impl From<String> for PyStr {
+    /// Valid text, as it is.
+    fn from(s: String) -> PyStr {
+        PyStr(s.into_bytes())
     }
 }
 

@@ -16,7 +16,8 @@ use std::process::ExitCode;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
-use crate::error::{EXIT_STILL_RUNNING, Error, Result};
+use crate::error::{EXIT_STILL_RUNNING, Error, Failure, Result};
+use crate::wire::PyStr;
 use crate::{config, deck};
 
 #[derive(Debug, Parser)]
@@ -380,7 +381,8 @@ fn report(e: &Error) -> ExitCode {
 // --------------------------------------------------------------------------
 // check
 
-/// `check`'s result as `--json` prints it: the same information as the text output.
+/// `check`'s result as `--json` prints it: the same information as the text output. Its
+/// text is lossless (`PyStr`): a path that is not UTF-8 is written as Python writes it.
 #[derive(Debug, serde::Serialize)]
 struct CheckReport {
     ok: bool,
@@ -389,14 +391,14 @@ struct CheckReport {
     cards: Option<usize>,
     problems: Vec<CheckProblem>,
     /// The one command that fixes every error, when there is one.
-    fix: Option<String>,
+    fix: Option<PyStr>,
 }
 
 #[derive(Debug, serde::Serialize)]
 struct CheckProblem {
     level: &'static str,
     card: Option<u32>,
-    message: String,
+    message: PyStr,
 }
 
 /// `check` (`deck._cmd_check`), for the repository the `--repo` directory belongs to (the
@@ -405,7 +407,23 @@ struct CheckProblem {
 /// configuration that does not load is its one `error: …` line. When one command fixes every
 /// error, it follows on stderr, alone, as the last line.
 fn check(deck_arg: &OsStr, repo_arg: &OsStr, json: bool) -> Result<ExitCode> {
-    let report = match check_problems(Path::new(deck_arg), Path::new(repo_arg)) {
+    let report = check_report(check_problems(Path::new(deck_arg), Path::new(repo_arg)));
+    human::print_or_json(&check_text(&report), &report, json)?;
+    if let (false, Some(fix)) = (json, &report.fix) {
+        let mut err = std::io::stderr().lock();
+        writeln!(err, "{}", fix.shown())?;
+        err.flush()?;
+    }
+    Ok(if report.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// The report for the problems found, or for the failure that kept them from being found.
+fn check_report(found: std::result::Result<(usize, Vec<deck::Problem>), Failure>) -> CheckReport {
+    match found {
         Ok((cards, problems)) => {
             let errors: Vec<&deck::Problem> = problems
                 .iter()
@@ -416,7 +434,7 @@ fn check(deck_arg: &OsStr, repo_arg: &OsStr, json: bool) -> Result<ExitCode> {
                 errors
                     .iter()
                     .all(|p| p.fix.as_ref() == Some(fix))
-                    .then(|| human::command_line(fix))
+                    .then(|| PyStr::from_os(&human::command_line(fix)))
             });
             CheckReport {
                 ok: errors.is_empty(),
@@ -432,46 +450,44 @@ fn check(deck_arg: &OsStr, repo_arg: &OsStr, json: bool) -> Result<ExitCode> {
                 fix,
             }
         }
-        Err(e) => CheckReport {
+        // The failure's own lossless text: never an `Error`'s message.
+        Err(failure) => CheckReport {
             ok: false,
             cards: None,
             problems: vec![CheckProblem {
                 level: deck::Level::Error.as_str(),
                 card: None,
-                message: e.message,
+                message: failure.text,
             }],
-            fix: e.fix,
+            fix: None,
         },
-    };
+    }
+}
+
+/// The text output: one problem per line, then `ok: <n> cards` when there is no error.
+fn check_text(report: &CheckReport) -> String {
     let mut text = String::new();
     for p in &report.problems {
-        text += &format!("{}: {}\n", p.level, p.message);
+        text += &format!("{}: {}\n", p.level, p.message.shown());
     }
     if let (true, Some(cards)) = (report.ok, report.cards) {
         text += &format!("ok: {cards} cards\n");
     }
-    human::print_or_json(&text, &report, json)?;
-    if let (false, Some(fix)) = (json, &report.fix) {
-        let mut err = std::io::stderr().lock();
-        writeln!(err, "{fix}")?;
-        err.flush()?;
-    }
-    Ok(if report.ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    text
 }
 
 /// The deck's card count and problems, or why they could not be found.
-fn check_problems(deck_arg: &Path, repo_arg: &Path) -> Result<(usize, Vec<deck::Problem>)> {
+fn check_problems(
+    deck_arg: &Path,
+    repo_arg: &Path,
+) -> std::result::Result<(usize, Vec<deck::Problem>), Failure> {
     let deck = deck::parse_deck(deck_arg)?;
     let given = if repo_arg.as_os_str().is_empty() {
         Path::new(".")
     } else {
         repo_arg
     };
-    let given = std::path::absolute(given).map_err(|e| Error::io(given, e))?;
+    let given = std::path::absolute(given).map_err(|e| Failure::io(given, e))?;
     let top = crate::git::repo_identity(&given)?.top;
     let config = config::load_config(&top)?;
     let problems = deck::check_deck(&deck, &top, &config)?;
@@ -1019,6 +1035,68 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    #[test]
+    fn check_json_keeps_path_bytes_as_python_writes_them() {
+        use std::os::unix::ffi::OsStrExt;
+        let top = OsStr::from_bytes(b"/runs/odd-\xff");
+        let problem = deck::Problem {
+            level: deck::Level::Error,
+            card: None,
+            message: PyStr::from_os_parts(&[OsStr::new("base commit abc1234 not found in "), top]),
+            fix: Some(vec!["git".into(), "-C".into(), top.into()]),
+        };
+        let report = check_report(Ok((1, vec![problem])));
+        assert_eq!(
+            crate::wire::to_output(&report).unwrap(),
+            "{\"ok\": false, \"cards\": 1, \"problems\": [{\"level\": \"error\", \"card\": null, \
+             \"message\": \"base commit abc1234 not found in /runs/odd-\\udcff\"}], \
+             \"fix\": \"git -C '/runs/odd-\\udcff'\"}"
+        );
+        // The text lines show the path as before: lossily.
+        assert_eq!(
+            check_text(&report),
+            "error: base commit abc1234 not found in /runs/odd-\u{fffd}\n"
+        );
+        // A load failure's JSON is the failure's own lossless text, never an Error's.
+        let failure = Failure::io(
+            Path::new(OsStr::from_bytes(b"/decks/d\xff.md")),
+            std::io::Error::from_raw_os_error(2),
+        );
+        let report = check_report(Err(failure));
+        let json = crate::wire::to_output(&report).unwrap();
+        assert!(
+            json.contains(
+                "\"message\": \"[Errno 2] No such file or directory: '/decks/d\\udcff.md'\""
+            ),
+            "{json}"
+        );
+        assert!(json.contains("\"cards\": null"), "{json}");
+        assert_eq!(
+            check_text(&report),
+            "error: [Errno 2] No such file or directory: '/decks/d\u{fffd}.md'\n"
+        );
+        // And Python reads the JSON back to the same path bytes.
+        let script = "import json,os,sys; r = json.loads(sys.stdin.read()); \
+                      sys.stdout.buffer.write(os.fsencode(r['problems'][0]['message']))";
+        let mut child = std::process::Command::new("python3")
+            .args(["-B", "-c", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(json.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(
+            out.stdout,
+            b"[Errno 2] No such file or directory: '/decks/d\xff.md'"
+        );
     }
 
     #[test]

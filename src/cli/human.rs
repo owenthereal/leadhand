@@ -62,11 +62,10 @@ pub fn shell_quote(word: &OsStr) -> OsString {
     OsString::from_vec(out)
 }
 
-/// `argv` as one shell command line, each word quoted; shown lossily (a fix line is display
-/// text, as an error message is).
-pub fn command_line(argv: &[OsString]) -> String {
+/// `argv` as one shell command line, each word quoted, its bytes kept.
+pub fn command_line(argv: &[OsString]) -> OsString {
     let words: Vec<Vec<u8>> = argv.iter().map(|w| shell_quote(w).into_vec()).collect();
-    String::from_utf8_lossy(&words.join(&b' ')).into_owned()
+    OsString::from_vec(words.join(&b' '))
 }
 
 #[cfg(test)]
@@ -134,5 +133,7 @@ mod tests {
             command_line(&argv),
             "git -C '/tmp/my repo' sparse-checkout disable"
         );
+        let odd = [OsString::from("git"), OsStr::from_bytes(b"/r \xff").into()];
+        assert_eq!(command_line(&odd).as_bytes(), b"git '/r \xff'");
     }
 }

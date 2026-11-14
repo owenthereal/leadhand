@@ -15,13 +15,18 @@ use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::ser::{Serialize, SerializeMap, Serializer};
 use toml::de::{DeTable, DeValue};
 
-use crate::error::{Error, Result};
+use crate::error::Failure;
+use crate::pytext::{expand_user, py_float, py_repr, py_split, py_splitlines, py_strip, real_path};
+use crate::wire::PyStr;
+
+/// Every failure here keeps its text lossless (`Failure`); `?` turns it into an `Error`.
+type Result<T, E = Failure> = std::result::Result<T, E>;
 
 pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 pub const VENDORS: [&str; 2] = ["claude", "codex"];
@@ -182,24 +187,24 @@ impl Config {
 /// command does (as an argument vector).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unsupported {
-    pub message: String,
+    pub message: PyStr,
     pub fix: Option<Vec<OsString>>,
 }
 
 /// `<model> <effort>` for `vendor` (`config.parse_route`).
 pub fn parse_route(vendor: &str, text: &str) -> Result<Route> {
     if !VENDORS.contains(&vendor) {
-        return Err(Error::msg(format!("unknown vendor {}", py_repr(vendor))));
+        return Err(cerr(format!("unknown vendor {}", py_repr(vendor))));
     }
     let parts: Vec<&str> = py_split(text).collect();
     let [model, effort] = parts[..] else {
-        return Err(Error::msg(format!(
+        return Err(cerr(format!(
             "expected '<model> <effort>', got {}",
             py_repr(text)
         )));
     };
     if !EFFORTS.contains(&effort) {
-        return Err(Error::msg(format!(
+        return Err(cerr(format!(
             "effort {} is not one of {}",
             py_repr(effort),
             EFFORTS.join(", ")
@@ -303,11 +308,9 @@ pub fn unsupported_in_repo(config: &Config, repo_top: &Path) -> Result<Vec<Unsup
     let root = real_path(repo_top);
     let docs = real_path(&docs_dir_for(config, repo_top));
     if docs.starts_with(&root) {
+        let head = format!("{NOT_SUPPORTED}docs_dir inside the repository (");
         out.push(Unsupported {
-            message: format!(
-                "{NOT_SUPPORTED}docs_dir inside the repository ({})",
-                docs.display()
-            ),
+            message: PyStr::from_os_parts(&[OsStr::new(&head), docs.as_os_str(), OsStr::new(")")]),
             fix: None,
         });
     }
@@ -320,7 +323,7 @@ pub fn unsupported_in_repo(config: &Config, repo_top: &Path) -> Result<Vec<Unsup
             OsStr::new("disable"),
         ];
         out.push(Unsupported {
-            message: format!("{NOT_SUPPORTED}{sparse}"),
+            message: PyStr::from_os_parts(&[OsStr::new(NOT_SUPPORTED), &sparse]),
             fix: Some(fix.map(OsStr::to_os_string).to_vec()),
         });
     }
@@ -597,10 +600,15 @@ fn read_file(path: &Path) -> Result<Table> {
     if !path.is_file() {
         return Ok(Vec::new());
     }
-    let bytes = std::fs::read(path).map_err(|e| Error::io(path, e))?;
-    let text = String::from_utf8(bytes)
-        .map_err(|e| cerr(format!("{}: not UTF-8: {e}", path.display())))?;
-    parse_toml(&text).map_err(|e| cerr(format!("{}: {e}", path.display())))
+    let bytes = std::fs::read(path).map_err(|e| Failure::io(path, e))?;
+    let text = String::from_utf8(bytes).map_err(|e| in_file(path, &format!("not UTF-8: {e}")))?;
+    parse_toml(&text).map_err(|e| in_file(path, &e))
+}
+
+/// `<path>: <what>`, the path's bytes kept.
+pub(crate) fn in_file(path: &Path, what: &str) -> Failure {
+    let tail = format!(": {what}");
+    Failure::of(&[path.as_os_str(), OsStr::new(&tail)])
 }
 
 /// A TOML document as an ordered table; the error as one line, with its position.
@@ -711,8 +719,8 @@ impl<'de> Deserialize<'de> for Val {
 // --------------------------------------------------------------------------
 // Validation (`config._build`)
 
-fn cerr(m: impl Into<String>) -> Error {
-    Error::msg(m)
+fn cerr(m: impl AsRef<str>) -> Failure {
+    Failure::msg(m.as_ref())
 }
 
 #[derive(Clone, Copy)]
@@ -1013,205 +1021,6 @@ fn has_exactly(t: &Table, keys: &[&str]) -> bool {
     t.len() == keys.len() && keys.iter().all(|k| lookup(t, k).is_some())
 }
 
-// --------------------------------------------------------------------------
-// Paths, as Python's os.path resolves them
-
-/// `path` made absolute and resolved as far as it exists, `..` and symlinks included
-/// (`os.path.realpath`, not strict).
-pub(crate) fn real_path(path: &Path) -> PathBuf {
-    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut real = PathBuf::from("/");
-    for part in abs.components() {
-        match part {
-            Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
-            Component::ParentDir => {
-                real.pop();
-            }
-            Component::Normal(name) => {
-                real.push(name);
-                if let Ok(resolved) = real.canonicalize() {
-                    real = resolved;
-                }
-            }
-        }
-    }
-    real
-}
-
-/// `~` and `~/…` expanded to the home directory (`os.path.expanduser`). `~user` forms are
-/// left as they are.
-fn expand_user(path: &OsStr) -> OsString {
-    let bytes = path.as_bytes();
-    if !(bytes == b"~" || bytes.starts_with(b"~/")) {
-        return path.to_os_string();
-    }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::home_dir().map(PathBuf::into_os_string))
-        .unwrap_or_default();
-    let mut out = home.as_bytes().to_vec();
-    while out.last() == Some(&b'/') {
-        out.pop();
-    }
-    out.extend_from_slice(&bytes[1..]);
-    if out.is_empty() {
-        out.push(b'/');
-    }
-    OsString::from_vec(out)
-}
-
-// --------------------------------------------------------------------------
-// Python's text rules, for parity in parsing and messages
-
-/// `str.isspace`: Unicode White_Space, plus U+001C..U+001F.
-pub(crate) fn py_isspace(c: char) -> bool {
-    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
-}
-
-/// `str.strip()`.
-pub(crate) fn py_strip(s: &str) -> &str {
-    s.trim_matches(py_isspace)
-}
-
-/// `str.split()`.
-pub(crate) fn py_split(s: &str) -> impl Iterator<Item = &str> {
-    s.split(py_isspace).filter(|w| !w.is_empty())
-}
-
-/// `str.splitlines()`: lines end at `\n`, `\r\n`, `\r`, `\v`, `\f`, U+001C..U+001E, U+0085,
-/// U+2028 and U+2029.
-pub(crate) fn py_splitlines(s: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut chars = s.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        let boundary = matches!(
-            c,
-            '\n' | '\r'
-                | '\u{0b}'
-                | '\u{0c}'
-                | '\u{1c}'
-                | '\u{1d}'
-                | '\u{1e}'
-                | '\u{85}'
-                | '\u{2028}'
-                | '\u{2029}'
-        );
-        if boundary {
-            out.push(&s[start..i]);
-            let mut end = i + c.len_utf8();
-            if c == '\r' && chars.peek().map(|(_, n)| *n) == Some('\n') {
-                chars.next();
-                end += 1;
-            }
-            start = end;
-        }
-    }
-    if start < s.len() {
-        out.push(&s[start..]);
-    }
-    out
-}
-
-/// `repr(s)` for a `str`.
-pub(crate) fn py_repr(s: &str) -> String {
-    let quote = if s.contains('\'') && !s.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push(quote);
-    for c in s.chars() {
-        let cp = c as u32;
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            c if c == quote => {
-                out.push('\\');
-                out.push(c);
-            }
-            c if !py_printable(c) => match cp {
-                0..=0xff => out.push_str(&format!("\\x{cp:02x}")),
-                0x100..=0xffff => out.push_str(&format!("\\u{cp:04x}")),
-                _ => out.push_str(&format!("\\U{cp:08x}")),
-            },
-            c => out.push(c),
-        }
-    }
-    out.push(quote);
-    out
-}
-
-/// An approximation of `str.isprintable` for one character: not a control, format, separator
-/// (other than the space) or private-use character.
-fn py_printable(c: char) -> bool {
-    let cp = c as u32;
-    !(c.is_control()
-        || (c.is_whitespace() && c != ' ')
-        || matches!(
-            cp,
-            0xad | 0x600..=0x605
-                | 0x61c
-                | 0x6dd
-                | 0x70f
-                | 0x180e
-                | 0x200b..=0x200f
-                | 0x202a..=0x202e
-                | 0x2060..=0x2064
-                | 0x2066..=0x206f
-                | 0xfeff
-                | 0xfff9..=0xfffb
-                | 0xe000..=0xf8ff
-                | 0xf0000..=0xffffd
-                | 0x100000..=0x10fffd
-        ))
-}
-
-/// `repr(x)` (and `str(x)`) for a `float`: the shortest digits that read back, in fixed
-/// notation for exponents -4 to 15, else as `d.ddde±XX`.
-fn py_float(x: f64) -> String {
-    if x.is_nan() {
-        return "nan".into();
-    }
-    if x.is_infinite() {
-        return if x > 0.0 { "inf" } else { "-inf" }.into();
-    }
-    if x == 0.0 {
-        return if x.is_sign_negative() { "-0.0" } else { "0.0" }.into();
-    }
-    let sci = format!("{:e}", x.abs());
-    let (mantissa, exp) = sci.split_once('e').expect("{:e} writes an exponent");
-    let exp: i32 = exp.parse().expect("{:e} writes an integer exponent");
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let sign = if x < 0.0 { "-" } else { "" };
-    if (-4..16).contains(&exp) {
-        let point = exp + 1;
-        let body = if point <= 0 {
-            format!("0.{}{digits}", "0".repeat(point.unsigned_abs() as usize))
-        } else if point as usize >= digits.len() {
-            format!("{digits}{}.0", "0".repeat(point as usize - digits.len()))
-        } else {
-            format!(
-                "{}.{}",
-                &digits[..point as usize],
-                &digits[point as usize..]
-            )
-        };
-        format!("{sign}{body}")
-    } else {
-        let (first, rest) = digits.split_at(1);
-        let mantissa = if rest.is_empty() {
-            first.to_string()
-        } else {
-            format!("{first}.{rest}")
-        };
-        let esign = if exp < 0 { '-' } else { '+' };
-        format!("{sign}{mantissa}e{esign}{:02}", exp.abs())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1315,6 +1124,111 @@ mod tests {
         let live = f.load().unwrap();
         let json = crate::wire::to_pretty(&ConfigSnapshot(&live)).unwrap();
         assert_eq!(config_from_snapshot(&json).unwrap(), live);
+    }
+
+    #[test]
+    fn messages_and_refusals_match_python() {
+        let cases = [
+            "[run]\ncost_limit_usd = 2.5\n",
+            "[run]\ncost_limit_usd = 1e-05\n",
+            "[run]\ncost_limit_usd = 0.1\n",
+            "[run]\ncost_limit_usd = 5\n",
+            "[run]\ncost_limit_usd = 2.0\n",
+            "[run]\ncost_limit_usd = 1e20\n",
+            "[run]\ncost_limit_usd = 123456.789\n",
+            "[run]\ncost_limit_usd = 'x'\n",
+            "[run]\nworktree = \"it's\"\n",
+            "[run]\nworktree = 'say \"hi\"'\n",
+            "[run]\nworktree = \"both ' and \\\"\"\n",
+            "[run]\nworktree = \"tab\\tbell\\u0007caf\\u00e9\\u00a0\"\n",
+            "[run]\nworktree = [1, 2.5, true, 'x', {a = 1}]\n",
+            "[run]\nworktree = 1.5\n",
+            "[run]\nzz = 1\naa = 2\n",
+            "profile = 'Lean'\n",
+            "zeta = 1\nalpha = 2\n",
+            "[capacity]\ncodex_pause_percent = 101\n",
+            "[capacity]\ncodex_pause_percent = 9.5\n",
+            "[codex]\nwritable_dirs = ['a', 1]\n",
+            "[limits]\nx = { steps = 1, minutes = 2, z = 3 }\n",
+            "[limits]\nverifier = { steps = 1, minutes = 2 }\nimplementer = { steps = 3, minutes = 2 }\n",
+            "[prices.x]\ninput = 1\n",
+            "[roles.zeta]\nclaude = 'x'\n[roles.alpha]\nclaude = 'y'\n",
+            "[roles.implementer]\nprefer = 3\n",
+            "[roles.implementer]\nclaude = ['a']\n",
+            "[roles.implementer]\nclaude = 'sonnet extreme'\n",
+            "[roles.dealer]\nprefer = 'codex'\n",
+            "[after_run]\nstep = 'merge'\n",
+            "[after_run]\nstep = 'pr'\non_incomplete = 'draft-pr'\n",
+            "[notify]\ncommand = 'say x'\n[capacity]\ncodex_pause_percent = 3\n",
+            "preset = '.x'\n",
+            "preset = 'nope'\n",
+            "preset = 3\n",
+        ];
+        let prelude = "import tempfile\nfrom pathlib import Path\nfrom leadhand import config as cfg\n\
+            def load(text):\n\
+            \x20   d = Path(tempfile.mkdtemp()); (d / 'repo').mkdir(); u = d / 'user.toml'\n\
+            \x20   u.write_text(text, encoding='utf-8')\n\
+            \x20   try:\n\
+            \x20       c = cfg.load_config(d / 'repo', user_file=u)\n\
+            \x20   except cfg.ConfigError as e:\n\
+            \x20       return ['error', str(e)]\n\
+            \x20   return ['ok', cfg.unsupported_settings(c) + cfg.unsupported_warnings(c)]";
+        let inputs: Vec<serde_json::Value> = cases.iter().map(|c| serde_json::json!(c)).collect();
+        let theirs = crate::pytext::tests::python_eval(prelude, "load(x)", &inputs);
+        for (case, want) in cases.iter().zip(theirs) {
+            let ours = match Files::new(case, "").load() {
+                Ok(c) => {
+                    let mut all = unsupported_settings(&c);
+                    all.extend(unsupported_warnings(&c));
+                    serde_json::json!(["ok", all])
+                }
+                Err(f) => serde_json::json!(["error", f.to_string()]),
+            };
+            assert_eq!(ours, want, "{case:?}");
+        }
+    }
+
+    #[test]
+    fn a_dangling_link_into_the_repository_is_inside_it() {
+        // os.path.realpath follows a link whose target does not exist yet, so a docs_dir
+        // reached through one is refused like the place it names.
+        let f = crate::git::fixture::Fixture::new();
+        let repo = f.make_repo("my repo");
+        let link = f.root().join("docs link");
+        std::os::unix::fs::symlink(repo.join("notes/docs"), &link).unwrap();
+        let user = f.root().join("user.toml");
+        std::fs::write(&user, format!("docs_dir = \"{}\"\n", link.display())).unwrap();
+        let c = load_config_from(&repo, &user).unwrap();
+        let refused: Vec<String> = unsupported_in_repo(&c, &repo)
+            .unwrap()
+            .into_iter()
+            .map(|u| u.message.shown())
+            .collect();
+        assert_eq!(
+            refused,
+            [format!(
+                "not supported in this version: docs_dir inside the repository ({})",
+                repo.join("notes/docs").display()
+            )]
+        );
+    }
+
+    #[test]
+    fn repository_refusals_keep_the_path_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        // Linux allows a folder name that is not UTF-8; macOS refuses to create one.
+        let f = crate::git::fixture::Fixture::new();
+        let parent = f.root().join(OsStr::from_bytes(b"odd-\xff"));
+        if std::fs::create_dir(&parent).is_err() {
+            return;
+        }
+        let repo = f.make_repo_in(&parent, "my repo");
+        let user = f.root().join("user.toml");
+        std::fs::write(&user, "docs_dir = \"notes\"\n").unwrap();
+        let c = load_config_from(&repo, &user).unwrap();
+        let refused = unsupported_in_repo(&c, &repo).unwrap();
+        let json = crate::wire::ascii_json(&refused[0].message);
+        assert!(json.contains("odd-\\udcff/my repo/notes)"), "{json}");
     }
 
     #[test]

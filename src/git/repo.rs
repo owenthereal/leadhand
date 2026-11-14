@@ -1,12 +1,12 @@
 //! Which repository a directory belongs to (spec, "Which repository and run a directory
 //! belongs to"), and the sparse-checkout refusal (R63; `gitops.sparse_checkout_problem`).
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use super::Git;
-use crate::error::{Error, Result};
+use crate::error::Failure;
 
 /// The repository a directory belongs to: the main working tree of its Git common directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,8 +23,10 @@ pub struct RepoIdentity {
 /// a bare repository, which has no main working tree.
 ///
 /// This replaces `gitops.checkout_top`, which resolves a linked worktree to that worktree.
-pub fn repo_identity(any_dir: &Path) -> Result<RepoIdentity> {
-    let git = Git::at(any_dir)?;
+///
+/// The error's text is kept lossless (`Failure`); `?` turns it into an `Error`.
+pub fn repo_identity(any_dir: &Path) -> Result<RepoIdentity, Failure> {
+    let git = Git::try_at(any_dir)?;
     let common_dir = rev_parse_path(&git, &["--path-format=absolute", "--git-common-dir"])?;
     let git_dir = rev_parse_path(&git, &["--path-format=absolute", "--git-dir"])?;
     let top = if git_dir == common_dir {
@@ -37,44 +39,46 @@ pub fn repo_identity(any_dir: &Path) -> Result<RepoIdentity> {
 }
 
 /// Why a run cannot use the checkout at `top` because it is sparse (R63), or `None`: the
-/// Python's refusal text. `git worktree add` copies a sparse checkout into a run's
-/// worktrees, so this holds for every run. `core.sparseCheckout` is read as `top`'s own
-/// worktree sees it; a value Git does not read as `true` is not sparse (`gitops.is_sparse`).
-pub fn sparse_problem(top: &Path) -> Result<Option<String>> {
+/// Python's refusal text, with `top`'s bytes kept. `git worktree add` copies a sparse
+/// checkout into a run's worktrees, so this holds for every run. `core.sparseCheckout` is read
+/// as `top`'s own worktree sees it; a value Git does not read as `true` is not sparse
+/// (`gitops.is_sparse`).
+pub fn sparse_problem(top: &Path) -> Result<Option<OsString>, Failure> {
     let args = ["config", "--bool", "--get", "core.sparseCheckout"].map(OsStr::new);
-    let out = Git::at(top)?.output(&args)?;
+    let out = Git::try_at(top)?.try_output(&args)?;
     let sparse = out.status.success() && out.stdout.trim_ascii() == b"true";
     Ok(sparse.then(|| {
-        format!(
-            "{} is a sparse checkout (core.sparseCheckout): sparse checkouts are not supported \
+        let mut text = top.as_os_str().to_os_string();
+        text.push(
+            " is a sparse checkout (core.sparseCheckout): sparse checkouts are not supported \
              in this version; turn it off (git sparse-checkout disable) to run leadhand here",
-            top.display()
-        )
+        );
+        text
     }))
 }
 
 /// One path from `git rev-parse <args>`: its output without the newline Git ends it with.
 /// rev-parse has no `-z`, so one path per call keeps a path that holds a newline whole.
-fn rev_parse_path(git: &Git, args: &[&str]) -> Result<PathBuf> {
+fn rev_parse_path(git: &Git, args: &[&str]) -> Result<PathBuf, Failure> {
     let argv: Vec<&OsStr> = std::iter::once("rev-parse")
         .chain(args.iter().copied())
         .map(OsStr::new)
         .collect();
-    let out = git.run(&argv)?;
+    let out = run(git, &argv)?;
     let path = out.strip_suffix(b"\n").unwrap_or(&out);
     if path.is_empty() {
-        return Err(Error::msg(format!(
-            "git rev-parse {}: no path (in {})",
-            args.join(" "),
-            git.cwd().display()
-        )));
+        let head = format!("git rev-parse {}: no path (in ", args.join(" "));
+        return Err(in_cwd(&head, git, ")"));
     }
     Ok(PathBuf::from(OsStr::from_bytes(path)))
 }
 
 /// The main working tree's top: the first entry of `git worktree list --porcelain -z`.
-fn main_worktree(git: &Git) -> Result<PathBuf> {
-    let out = git.run(&["worktree", "list", "--porcelain", "-z"].map(OsStr::new))?;
+fn main_worktree(git: &Git) -> Result<PathBuf, Failure> {
+    let out = run(
+        git,
+        &["worktree", "list", "--porcelain", "-z"].map(OsStr::new),
+    )?;
     // Each entry is NUL-terminated fields, ended by an empty one; the main worktree is first.
     let first: Vec<&[u8]> = out
         .split(|b| *b == 0)
@@ -82,16 +86,33 @@ fn main_worktree(git: &Git) -> Result<PathBuf> {
         .collect();
     let path = first.first().and_then(|f| f.strip_prefix(b"worktree "));
     match path {
-        Some(_) if first.contains(&&b"bare"[..]) => Err(Error::msg(format!(
-            "{} belongs to a bare repository, which has no main working tree",
-            git.cwd().display()
-        ))),
+        Some(_) if first.contains(&&b"bare"[..]) => Err(in_cwd(
+            "",
+            git,
+            " belongs to a bare repository, which has no main working tree",
+        )),
         Some(path) if !path.is_empty() => Ok(PathBuf::from(OsStr::from_bytes(path))),
-        _ => Err(Error::msg(format!(
-            "git worktree list: no main working tree listed (in {})",
-            git.cwd().display()
-        ))),
+        _ => Err(in_cwd(
+            "git worktree list: no main working tree listed (in ",
+            git,
+            ")",
+        )),
     }
+}
+
+/// `git.run`, with a failure's text kept lossless.
+fn run(git: &Git, args: &[&OsStr]) -> Result<Vec<u8>, Failure> {
+    let out = git.try_output(args)?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        Err(git.failure_text(args, &out))
+    }
+}
+
+/// `<head><git's directory><tail>`.
+fn in_cwd(head: &str, git: &Git, tail: &str) -> Failure {
+    Failure::of(&[OsStr::new(head), git.cwd().as_os_str(), OsStr::new(tail)])
 }
 
 #[cfg(test)]
@@ -161,8 +182,22 @@ mod tests {
         let plain = f.root().join("plain");
         std::fs::create_dir(&plain).unwrap();
         let e = repo_identity(&plain).unwrap_err();
-        assert!(e.message.contains("not a git repository"), "{e}");
+        assert!(e.to_string().contains("not a git repository"), "{e}");
         assert!(repo_identity(Path::new("relative")).is_err());
+    }
+
+    #[test]
+    fn repo_identity_failure_keeps_the_path_bytes() {
+        // A directory name that is not UTF-8 (Linux allows it; macOS refuses to create it).
+        let f = Fixture::new();
+        let odd = f.root().join(OsStr::from_bytes(b"plain-\xff"));
+        if std::fs::create_dir(&odd).is_err() {
+            return;
+        }
+        let e = repo_identity(&odd).unwrap_err();
+        let text = crate::wire::ascii_json(&e.text);
+        assert!(text.contains("plain-\\udcff"), "{text}");
+        assert!(!text.contains("\\ufffd"), "{text}");
     }
 
     #[test]
@@ -192,7 +227,7 @@ mod tests {
             ],
         );
         let e = repo_identity(&wt).unwrap_err();
-        assert!(e.message.contains("bare repository"), "{e}");
+        assert!(e.to_string().contains("bare repository"), "{e}");
         assert!(repo_identity(&bare).is_err());
     }
 
@@ -206,13 +241,13 @@ mod tests {
             &["sparse-checkout", "set", "--no-cone", "/README.md"],
         );
         assert_eq!(
-            sparse_problem(&repo).unwrap().as_deref(),
-            Some(&*format!(
+            sparse_problem(&repo).unwrap(),
+            Some(OsString::from(format!(
                 "{} is a sparse checkout (core.sparseCheckout): sparse checkouts are not \
                  supported in this version; turn it off (git sparse-checkout disable) to run \
                  leadhand here",
                 repo.display()
-            ))
+            )))
         );
         f.git(&repo, &["sparse-checkout", "disable"]);
         assert_eq!(sparse_problem(&repo).unwrap(), None);

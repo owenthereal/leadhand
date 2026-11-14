@@ -5,8 +5,11 @@
 //! for a dispatch that already has one; 75 `dispatch` still running; 97 a test crash point
 //! (`testing::crash_point`, testing builds only).
 
+use std::ffi::OsStr;
 use std::fmt;
 use std::path::Path;
+
+use crate::wire::PyStr;
 
 /// An error with its display text and exit code. The message is display text: paths in it
 /// are converted lossily, so no JSON a command prints ever takes text from an `Error`.
@@ -52,17 +55,7 @@ impl Error {
     /// An I/O error on `path`, worded as Python's `OSError` words it, so the file is named:
     /// `[Errno 2] No such file or directory: '<path>'`, the path shown lossily.
     pub fn io(path: &Path, err: std::io::Error) -> Self {
-        let shown = path.to_string_lossy();
-        match err.raw_os_error() {
-            Some(n) => {
-                let text = err.to_string();
-                let text = text
-                    .strip_suffix(&format!(" (os error {n})"))
-                    .unwrap_or(&text);
-                Self::msg(format!("[Errno {n}] {text}: '{shown}'"))
-            }
-            None => Self::msg(format!("{err}: '{shown}'")),
-        }
+        Failure::io(path, err).into()
     }
 
     /// The command that fixes this error; the commands a person types print it as the last line.
@@ -85,6 +78,57 @@ impl std::error::Error for Error {}
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Error::msg(e.to_string())
+    }
+}
+
+/// A failure whose text a command prints as data (`check --json`), so it is kept lossless:
+/// paths and Git's output in it are decoded as `PyStr::from_os` decodes them. For display it
+/// converts into an `Error` (exit 1) whose message is the same text, shown lossily. It carries
+/// no fix command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    pub text: PyStr,
+}
+
+impl Failure {
+    /// Text with no path in it.
+    pub fn msg(text: &str) -> Failure {
+        Failure { text: text.into() }
+    }
+
+    /// The text made of `parts`, generated words and OS bytes alike.
+    pub fn of(parts: &[&OsStr]) -> Failure {
+        Failure {
+            text: PyStr::from_os_parts(parts),
+        }
+    }
+
+    /// An I/O error on `path`, as `Error::io` words it, with the path kept.
+    pub fn io(path: &Path, err: std::io::Error) -> Failure {
+        let head = match err.raw_os_error() {
+            Some(n) => {
+                let text = err.to_string();
+                let text = text
+                    .strip_suffix(&format!(" (os error {n})"))
+                    .unwrap_or(&text)
+                    .to_string();
+                format!("[Errno {n}] {text}: '")
+            }
+            None => format!("{err}: '"),
+        };
+        Failure::of(&[OsStr::new(&head), path.as_os_str(), OsStr::new("'")])
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text.shown())
+    }
+}
+
+impl From<Failure> for Error {
+    fn from(f: Failure) -> Error {
+        Error::msg(f.text.shown())
     }
 }
 
