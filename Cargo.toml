@@ -12,6 +12,14 @@ testing = []
 [dependencies]
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
 rustix = { version = "1.1.6", features = ["fs", "process"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+sha2 = "0.11.1"
+signal-hook = "0.4.6"
+toml = "1.2.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.191"
 
 [dev-dependencies]
 tempfile = "3.27.0"

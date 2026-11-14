@@ -49,6 +49,11 @@ def _bin_var(name: str) -> Path | None:
 
 RUST_BIN = _bin_var("LEADHAND_RUST_BIN")
 PY_BIN = _bin_var("LEADHAND_PY_BIN")
+if os.path.realpath(BIN) == os.path.realpath(ROUTER) and "LEADHAND_TEST_CLI" in os.environ:
+    # Behind the router the harness names the CLI itself (hermetic_env); an inherited value
+    # would be dropped, and each binary would then name itself, bypassing the router.
+    raise RuntimeError("LEADHAND_TEST_CLI is set, but with LEADHAND_BIN as the router the suite sets it "
+                       "itself: unset it and run again")
 FAKES = ROOT / "tests" / "fakes"
 COMMANDS = ("cancel", "check", "dispatch", "dispatch-runner", "launch-line", "next", "pause", "record", "report",
             "route", "run", "start", "status", "stop-dispatch", "timer", "unpark", "version")
@@ -183,8 +188,9 @@ def hermetic_env(test: unittest.TestCase, tmp: Path, *, installed=("claude",), c
     env.update({name: str(path) for name, path in (("LEADHAND_RUST_BIN", RUST_BIN), ("LEADHAND_PY_BIN", PY_BIN))
                 if path is not None})
     # Ruling S2-R5: behind the router, both implementations call themselves through it. A test's
-    # own value (dict(env, LEADHAND_TEST_CLI=...)) replaces this one. A LEADHAND_TEST_CLI in this
-    # process's own environment is a stray hook: dropped above, like the others, and not replaced.
+    # own value (dict(env, LEADHAND_TEST_CLI=...)) replaces this one. The process environment
+    # holds no LEADHAND_TEST_CLI in router mode (refused at import), so one here was patched in
+    # by a harness test of the dropping above (contract_self.HermeticEnv), which runs no binary.
     if router_mode() and "LEADHAND_TEST_CLI" not in os.environ:
         env["LEADHAND_TEST_CLI"] = str(_router_cli())
     return env

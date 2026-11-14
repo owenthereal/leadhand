@@ -7,12 +7,13 @@
 # - anything else runs "$LEADHAND_PY_BIN", default <repo>/scripts/leadhand.
 # It execs the chosen binary with the arguments unchanged, so the process stays the same.
 
-case ${LEADHAND_RUST_COMMANDS-} in
-    all) rust=yes ;;
+# The list as the harness reads it: whitespace stripped, "all" anywhere in it meaning all.
+list=$(printf '%s' "${LEADHAND_RUST_COMMANDS-}" | tr -d ' \t\n\r')
+case ",$list," in
+    *,all,*) rust=yes ;;
     *)
         rust=no
         if [ "$#" -gt 0 ] && [ -n "$1" ]; then
-            list=$(printf '%s' "${LEADHAND_RUST_COMMANDS-}" | tr -d ' \t')
             case ",$list," in
                 *",$1,"*) rust=yes ;;
             esac

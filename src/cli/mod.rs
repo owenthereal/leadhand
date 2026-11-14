@@ -273,9 +273,9 @@ pub enum YesNo {
 pub struct Caller {
     /// `$LEADHAND_RUN_DIR`, when set.
     pub run_dir: Option<PathBuf>,
-    /// `$LEADHAND_RUN_ID`, when set and not empty. A value that isn't UTF-8 is kept lossily:
-    /// it can never equal a run ID.
-    pub run_id: Option<String>,
+    /// `$LEADHAND_RUN_ID`, when set and not empty, as given: unvalidated, so the run-anchor
+    /// check compares it byte for byte with the run's ID.
+    pub run_id: Option<OsString>,
 }
 
 /// The caller, from `LEADHAND_RUN_DIR` and `LEADHAND_RUN_ID`. A `LEADHAND_RUN_DIR` that is
@@ -293,9 +293,7 @@ fn resolve_caller_in(env: &dyn Fn(&str) -> Option<OsString>) -> Result<Caller> {
     {
         return Err(Error::msg("refused: $LEADHAND_RUN_DIR is set but empty"));
     }
-    let run_id = env("LEADHAND_RUN_ID")
-        .filter(|id| !id.is_empty())
-        .map(|id| id.to_string_lossy().into_owned());
+    let run_id = env("LEADHAND_RUN_ID").filter(|id| !id.is_empty());
     Ok(Caller {
         run_dir: run_dir.map(PathBuf::from),
         run_id,
@@ -805,6 +803,11 @@ mod tests {
                 run_id: None
             })
         );
+        // Kept byte for byte, unvalidated: bytes that aren't UTF-8 included.
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(b"run-\xff\xfe".to_vec());
+        let got = resolve_caller_in(&|name| (name == "LEADHAND_RUN_ID").then(|| raw.clone()));
+        assert_eq!(got.unwrap().run_id, Some(raw.clone()));
     }
 
     #[test]
