@@ -3,6 +3,7 @@
 //! The binary (`src/main.rs`) is `cli::main`.
 
 pub mod briefs;
+pub mod briefs_write;
 pub mod cli;
 pub mod config;
 pub mod deck;

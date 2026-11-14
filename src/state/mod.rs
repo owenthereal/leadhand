@@ -29,7 +29,7 @@ pub use outcome::{
     decide_outcome,
 };
 pub use paths::{RunPaths, new_run_dir, run_paths};
-pub use write::{append_attempt, append_event, read_attempts, two_phase};
+pub use write::{append_attempt, append_event, read_attempts, two_phase, two_phase_resume};
 
 use crate::error::{Error, Result};
 use crate::wire::{self, PyStr};
@@ -127,7 +127,7 @@ fn iso_millis(t: SystemTime) -> String {
 }
 
 /// The proleptic Gregorian date `days` after 1970-01-01 (Howard Hinnant's `civil_from_days`).
-fn civil(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);

@@ -441,7 +441,7 @@ const DECIMAL_ZEROS: [u32; 68] = [
     0x1FBF0,
 ];
 
-fn is_decimal(c: char) -> bool {
+pub(crate) fn is_decimal(c: char) -> bool {
     let c = u32::from(c);
     DECIMAL_ZEROS.iter().any(|z| (*z..*z + 10).contains(&c))
 }

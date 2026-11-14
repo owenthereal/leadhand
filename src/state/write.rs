@@ -64,6 +64,23 @@ pub fn two_phase<T>(
     Ok(out)
 }
 
+/// The resume form of `two_phase`, for a step whose intent is already recorded (a crash came
+/// between it and the completion): runs `act` again (it must be idempotent), passes
+/// `point_after`, then appends the completion. The intent and the crash point before the act
+/// are not repeated, as the Python's resume paths skip them (`_finish_accept` passes only
+/// `after_fast_forward`).
+pub fn two_phase_resume<T>(
+    paths: &RunPaths,
+    act: impl FnOnce() -> Result<T>,
+    point_after: &str,
+    done: impl FnOnce(&T) -> Event,
+) -> Result<T> {
+    let out = act()?;
+    crash_point(point_after);
+    append_event(paths, done(&out))?;
+    Ok(out)
+}
+
 /// The `seq` after the log's last line `last` (1 for an empty log): it must have an integer
 /// `seq`, as the Python requires (`isinstance(prev, int)`, a `bool` not counting).
 fn next_seq(last: Option<&RawValue>) -> Result<u64> {
@@ -413,23 +430,39 @@ mod tests {
         };
         let paths = run_paths(Path::new(&run));
         let acted = paths.root.join("acted");
+        let act = || fs::write(&acted, "").map_err(|e| Error::io(&acted, e));
+        if std::env::var_os(CHILD_RESUME).is_some() {
+            two_phase_resume(&paths, act, "after_rebase", |_| ruling("done")).unwrap();
+            return;
+        }
         two_phase(
             &paths,
             ruling("intent"),
             "before_rebase",
-            || fs::write(&acted, "").map_err(|e| Error::io(&acted, e)),
+            act,
             "after_rebase",
             |_| ruling("done"),
         )
         .unwrap();
     }
 
+    /// Set: `two_phase_child` takes the resume form.
+    const CHILD_RESUME: &str = "LEADHAND_TEST_TWO_PHASE_RESUME";
+
     /// `two_phase_child` with the crash hooks crashing at `at`; returns its exit code, the
     /// events' texts, whether the act ran, and the crash points passed.
     fn crash_child(at: &str) -> (Option<i32>, Vec<String>, bool, Vec<String>) {
+        crash_child_in(at, false)
+    }
+
+    fn crash_child_in(at: &str, resume: bool) -> (Option<i32>, Vec<String>, bool, Vec<String>) {
         let tmp = run_dir();
         let log = tmp.path().join("crash.log");
-        let out = Command::new(std::env::current_exe().unwrap())
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        if resume {
+            child.env(CHILD_RESUME, "1");
+        }
+        let out = child
             .args([
                 "state::write::tests::two_phase_child",
                 "--exact",
@@ -485,6 +518,18 @@ mod tests {
             (Some(0), vec!["intent".into(), "done".into()], true)
         );
         assert_eq!(passed, ["before_rebase", "after_rebase"]);
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn two_phase_resume_passes_only_the_point_after() {
+        // The intent is already recorded: the act runs again, then only the point after it.
+        let (code, texts, acted, passed) = crash_child_in("after_rebase", true);
+        assert_eq!((code, texts, acted), (Some(97), Vec::new(), true));
+        assert_eq!(passed, ["after_rebase"]);
+        let (code, texts, acted, passed) = crash_child_in("before_rebase", true);
+        assert_eq!((code, texts, acted), (Some(0), vec!["done".into()], true));
+        assert_eq!(passed, ["after_rebase"]);
     }
 
     #[cfg(not(feature = "testing"))]

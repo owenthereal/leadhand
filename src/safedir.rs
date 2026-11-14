@@ -54,31 +54,43 @@ impl SafeDir {
     /// The bytes of the regular file `name` here, at most `max` of them; `None` when it is
     /// missing. A symlink, or anything but a regular file, is an error.
     pub fn read_file(&self, name: &OsStr, max: u64) -> Result<Option<Vec<u8>>> {
-        let shown = self.child(name)?;
+        self.read_file_checked(name, max).map_err(Error::from)
+    }
+
+    /// As `read_file`, with why it failed kept apart (`FileProblem`), for a caller that words
+    /// the failure itself (the engine notes a brief or report it did not copy, with the OS's
+    /// own reason, as the Python notes `strerror`).
+    pub fn read_file_checked(
+        &self,
+        name: &OsStr,
+        max: u64,
+    ) -> std::result::Result<Option<Vec<u8>>, FileProblem> {
+        let shown = self.child(name).map_err(FileProblem::Name)?;
         let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
         let fd = match openat(&self.fd, name, flags, Mode::empty()) {
             Ok(fd) => fd,
             Err(Errno::NOENT) => return Ok(None),
-            Err(e) => return Err(Error::io(&shown, e.into())),
+            Err(e) => return Err(FileProblem::Os(shown, e.into())),
         };
-        let stat = fstat(&fd).map_err(|e| Error::io(&shown, e.into()))?;
+        let stat = match fstat(&fd) {
+            Ok(stat) => stat,
+            Err(e) => return Err(FileProblem::Os(shown, e.into())),
+        };
         if !FileType::from_raw_mode(stat.st_mode).is_file() {
-            return Err(Error::msg(format!(
-                "not a regular file: '{}'",
-                shown.display()
-            )));
+            return Err(FileProblem::NotRegular(shown));
         }
-        let too_large = || Error::msg(format!("larger than {max} bytes: '{}'", shown.display()));
         if u64::try_from(stat.st_size).unwrap_or(0) > max {
-            return Err(too_large());
+            return Err(FileProblem::TooLarge(shown, max));
         }
         let mut data = Vec::new();
-        File::from(fd)
+        if let Err(e) = File::from(fd)
             .take(max.saturating_add(1))
             .read_to_end(&mut data)
-            .map_err(|e| Error::io(&shown, e))?;
+        {
+            return Err(FileProblem::Os(shown, e));
+        }
         if data.len() as u64 > max {
-            return Err(too_large());
+            return Err(FileProblem::TooLarge(shown, max));
         }
         Ok(Some(data))
     }
@@ -124,6 +136,35 @@ impl SafeDir {
     fn child(&self, name: &OsStr) -> Result<PathBuf> {
         one_component(name, &self.path)?;
         Ok(self.path.join(name))
+    }
+}
+
+/// Why `SafeDir::read_file_checked` read nothing: each names the file.
+#[derive(Debug)]
+pub enum FileProblem {
+    /// The name is not one path component.
+    Name(Error),
+    /// The OS refused (a symlink is `ELOOP`), or reading failed.
+    Os(PathBuf, std::io::Error),
+    /// Not a regular file (a FIFO, a socket, a folder, a device).
+    NotRegular(PathBuf),
+    /// Larger than the cap.
+    TooLarge(PathBuf, u64),
+}
+
+impl From<FileProblem> for Error {
+    /// As `read_file` words it.
+    fn from(p: FileProblem) -> Error {
+        match p {
+            FileProblem::Name(e) => e,
+            FileProblem::Os(path, e) => Error::io(&path, e),
+            FileProblem::NotRegular(path) => {
+                Error::msg(format!("not a regular file: '{}'", path.display()))
+            }
+            FileProblem::TooLarge(path, max) => {
+                Error::msg(format!("larger than {max} bytes: '{}'", path.display()))
+            }
+        }
     }
 }
 

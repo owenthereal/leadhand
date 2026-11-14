@@ -1,12 +1,13 @@
 //! Git: the runner every Git call goes through (spec, bug class 3), which repository a
 //! directory belongs to (spec, "Which repository and run a directory belongs to"), and what a
-//! worker changed and how its work is staged for the runner's commit (`stage`), and a run's
-//! base and worktree (`workspace`).
+//! worker changed and how its work is staged for the runner's commit (`stage`), a run's base
+//! and worktree (`workspace`), and its card branches and acceptance (`cards`).
 //!
 //! Nothing outside this module starts a `git` process: later modules call `Git` only. The
 //! one other place that runs `git` is the unit tests' fixture below, which plays the operator
 //! and the workers (the Python's `tests/gitfixture.py`), and exists only under `cfg(test)`.
 
+pub mod cards;
 mod repo;
 mod runner;
 pub mod stage;

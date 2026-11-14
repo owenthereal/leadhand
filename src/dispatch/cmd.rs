@@ -211,6 +211,17 @@ fn write_request(wd: &Path, req: &DispatchRequest) -> Result<()> {
     )))
 }
 
+/// `write_request`: writes the dispatch's `request.json` unless it is there (an error when the
+/// one there is another request), under the worker folder's owner lock, so a cancel can then
+/// finalize a dispatch whose runner was never started; the worker folder.
+pub fn write_dispatch_request(req: &DispatchRequest) -> Result<PathBuf> {
+    let wd = req.run_dir.join("workers").join(&req.dispatch_id);
+    fs::create_dir_all(&wd).map_err(|e| Error::io(&wd, e))?;
+    let _owner = owner_lock(&wd, None)?;
+    write_request(&wd, req)?;
+    Ok(wd)
+}
+
 // --------------------------------------------------------------------------
 // Starting or attaching
 

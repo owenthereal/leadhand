@@ -393,7 +393,7 @@ fn unhonoured_step_limits(config: &Config, max_turns: &dyn Fn(&str) -> Option<i6
     out
 }
 
-fn limits_key(role: &str) -> &str {
+pub(crate) fn limits_key(role: &str) -> &str {
     LIMITS_ROLE
         .iter()
         .find(|(r, _)| *r == role)
