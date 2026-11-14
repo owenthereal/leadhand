@@ -5,7 +5,10 @@
 pub mod cli;
 pub mod error;
 pub mod procs;
+pub mod safedir;
+pub mod store;
 pub mod sys;
 pub mod testing;
+pub mod wire;
 
 pub use error::{Error, Result};

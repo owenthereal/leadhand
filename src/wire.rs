@@ -1,0 +1,704 @@
+//! The JSON wire representation both implementations share (spec, contract item 13;
+//! Global Constraints, "The wire representation").
+//!
+//! Python carries an undecodable path byte `0xXX` as the lone surrogate U+DCXX
+//! (`surrogateescape`) and writes JSON with `ensure_ascii=True`, so the byte appears in every
+//! file as `\udcXX`. `serde_json` refuses such a string as a `String` or a `Value`, but its
+//! `deserialize_bytes` returns any JSON string as WTF-8 (UTF-8 that also allows surrogate code
+//! points in their 3-byte form), and keeps distinct JSON strings distinct. `PyStr` holds those
+//! bytes exactly, and writes them back as the ASCII literal Python writes, through
+//! `RawValue`. So carried text (paths, refs, worker and vendor text) never passes through
+//! `Value` or `String`.
+//!
+//! Surrogateescape happens only at the filesystem boundary: `PyStr::from_os` and
+//! `PyStr::to_os`.
+//!
+//! The writers here (`to_line`, `to_output`, `to_pretty`) escape every string as
+//! `ensure_ascii=True` does, so a record Rust writes is ASCII like one Python writes.
+
+use std::borrow::Cow;
+use std::ffi::{OsStr, OsString};
+use std::fmt;
+use std::io;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+use serde::de::{self, Unexpected, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::ser::{Formatter, PrettyFormatter};
+use serde_json::value::RawValue;
+
+use crate::error::{Error, Result};
+
+/// A record kept exactly as read: never re-serialized, so it is reproduced byte for byte.
+pub type RawLine = Box<RawValue>;
+
+/// A JSON string as Python holds it: its WTF-8 bytes, exactly as `deserialize_bytes` returns
+/// them. Lone surrogates included, every JSON string round-trips distinctly.
+///
+/// Invariant: the bytes are well-formed WTF-8 (generalized UTF-8 with no surrogate pair
+/// written as two 3-byte halves), which every constructor checks or guarantees.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PyStr(Vec<u8>);
+
+impl PyStr {
+    /// The WTF-8 bytes.
+    pub fn as_wtf8(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// OS bytes decoded as Python's `surrogateescape` decodes them: each byte that is not part
+    /// of valid UTF-8 becomes U+DC80..U+DCFF.
+    pub fn from_os(s: &OsStr) -> PyStr {
+        let mut out = Vec::with_capacity(s.len());
+        for chunk in s.as_bytes().utf8_chunks() {
+            out.extend_from_slice(chunk.valid().as_bytes());
+            for &byte in chunk.invalid() {
+                // Only bytes 0x80..=0xFF are ever invalid: ASCII always decodes.
+                push_wtf8(0xDC00 + u32::from(byte), &mut out);
+            }
+        }
+        PyStr(out)
+    }
+
+    /// Encoded back as Python's `surrogateescape` encodes: U+DC80..U+DCFF become their bytes.
+    /// Any other lone surrogate is an error, as Python's encoder raises.
+    pub fn to_os(&self) -> Result<OsString> {
+        let mut out = Vec::with_capacity(self.0.len());
+        for (position, cp) in code_points(&self.0).enumerate() {
+            match cp {
+                0xDC80..=0xDCFF => out.push((cp - 0xDC00) as u8),
+                0xD800..=0xDFFF => {
+                    return Err(Error::msg(format!(
+                        "'utf-8' codec can't encode character '\\u{cp:04x}' in position \
+                         {position}: surrogates not allowed"
+                    )));
+                }
+                _ => push_wtf8(cp, &mut out),
+            }
+        }
+        Ok(OsString::from_vec(out))
+    }
+
+    /// For display only: a lone surrogate becomes U+FFFD.
+    pub fn lossy(&self) -> Cow<'_, str> {
+        match std::str::from_utf8(&self.0) {
+            Ok(text) => Cow::Borrowed(text),
+            Err(_) => Cow::Owned(
+                code_points(&self.0)
+                    .map(|cp| char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl From<&str> for PyStr {
+    /// Valid text, as it is.
+    fn from(s: &str) -> PyStr {
+        PyStr(s.as_bytes().to_vec())
+    }
+}
+
+impl fmt::Debug for PyStr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&ascii_json(self))
+    }
+}
+
+impl Serialize for PyStr {
+    /// The ASCII literal, emitted through `RawValue` so no serializer re-escapes it.
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let raw = RawValue::from_string(ascii_json(self)).map_err(serde::ser::Error::custom)?;
+        raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PyStr {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<PyStr, D::Error> {
+        deserializer.deserialize_bytes(PyStrVisitor)
+    }
+}
+
+struct PyStrVisitor;
+
+impl Visitor<'_> for PyStrVisitor {
+    type Value = PyStr;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a string")
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<PyStr, E> {
+        Ok(PyStr::from(v))
+    }
+
+    /// `serde_json` gives every JSON string here, as WTF-8.
+    fn visit_bytes<E: de::Error>(self, v: &[u8]) -> std::result::Result<PyStr, E> {
+        if is_wtf8(v) {
+            Ok(PyStr(v.to_vec()))
+        } else {
+            Err(E::invalid_value(Unexpected::Bytes(v), &self))
+        }
+    }
+}
+
+/// The code point at the start of `b` and its length, in generalized UTF-8 (surrogates
+/// allowed in their 3-byte form); `None` when malformed.
+fn decode(b: &[u8]) -> Option<(u32, usize)> {
+    let lead = *b.first()?;
+    let (len, min, init) = match lead {
+        0x00..=0x7F => return Some((u32::from(lead), 1)),
+        0xC2..=0xDF => (2, 0x80, u32::from(lead & 0x1F)),
+        0xE0..=0xEF => (3, 0x800, u32::from(lead & 0x0F)),
+        0xF0..=0xF4 => (4, 0x1_0000, u32::from(lead & 0x07)),
+        _ => return None,
+    };
+    let mut cp = init;
+    for &byte in b.get(1..len)? {
+        if byte & 0xC0 != 0x80 {
+            return None;
+        }
+        cp = (cp << 6) | u32::from(byte & 0x3F);
+    }
+    (min..=0x10_FFFF).contains(&cp).then_some((cp, len))
+}
+
+/// Whether `b` is well-formed WTF-8: generalized UTF-8 in which no leading surrogate is
+/// directly followed by a trailing one (that pair is one 4-byte character).
+fn is_wtf8(b: &[u8]) -> bool {
+    let (mut i, mut after_lead) = (0, false);
+    while i < b.len() {
+        let Some((cp, len)) = decode(&b[i..]) else {
+            return false;
+        };
+        if after_lead && (0xDC00..=0xDFFF).contains(&cp) {
+            return false;
+        }
+        after_lead = (0xD800..=0xDBFF).contains(&cp);
+        i += len;
+    }
+    true
+}
+
+/// The code points of a `PyStr`'s bytes. They are well-formed by its invariant; a malformed
+/// byte would come out as U+FFFD.
+fn code_points(b: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        let rest = b.get(i..).filter(|r| !r.is_empty())?;
+        let (cp, len) = decode(rest).unwrap_or((0xFFFD, 1));
+        i += len;
+        Some(cp)
+    })
+}
+
+/// Appends `cp`'s generalized UTF-8 form (a surrogate in 3 bytes).
+fn push_wtf8(cp: u32, out: &mut Vec<u8>) {
+    // The casts keep the low bits, which the masks have already chosen.
+    match cp {
+        0..=0x7F => out.push(cp as u8),
+        0x80..=0x7FF => out.extend([0xC0 | (cp >> 6) as u8, 0x80 | (cp & 0x3F) as u8]),
+        0x800..=0xFFFF => out.extend([
+            0xE0 | (cp >> 12) as u8,
+            0x80 | ((cp >> 6) & 0x3F) as u8,
+            0x80 | (cp & 0x3F) as u8,
+        ]),
+        _ => out.extend([
+            0xF0 | (cp >> 18) as u8,
+            0x80 | ((cp >> 12) & 0x3F) as u8,
+            0x80 | ((cp >> 6) & 0x3F) as u8,
+            0x80 | (cp & 0x3F) as u8,
+        ]),
+    }
+}
+
+/// Appends `cp` as `ensure_ascii=True` writes it inside a string: printable ASCII as is
+/// (`"` and `\` escaped), the short escapes for `\n \r \t \b \f`, and `\uXXXX` for every
+/// other UTF-16 code unit (a surrogate pair above U+FFFF).
+fn push_escaped(cp: u32, out: &mut String) {
+    match cp {
+        0x22 => out.push_str("\\\""),
+        0x5C => out.push_str("\\\\"),
+        0x0A => out.push_str("\\n"),
+        0x0D => out.push_str("\\r"),
+        0x09 => out.push_str("\\t"),
+        0x08 => out.push_str("\\b"),
+        0x0C => out.push_str("\\f"),
+        0x20..=0x7E => out.push(char::from(cp as u8)),
+        0x1_0000.. => {
+            let v = cp - 0x1_0000;
+            out.push_str(&format!(
+                "\\u{:04x}\\u{:04x}",
+                0xD800 + (v >> 10),
+                0xDC00 + (v & 0x3FF)
+            ));
+        }
+        _ => out.push_str(&format!("\\u{cp:04x}")),
+    }
+}
+
+/// The quoted JSON literal Python's `ensure_ascii=True` writes for `s`.
+pub fn ascii_json(s: &PyStr) -> String {
+    let mut out = String::with_capacity(s.0.len() + 2);
+    out.push('"');
+    for cp in code_points(&s.0) {
+        push_escaped(cp, &mut out);
+    }
+    out.push('"');
+    out
+}
+
+/// The record's `kind`, read alone; no other field is validated.
+pub fn event_kind(line: &RawLine) -> Result<String> {
+    #[derive(Deserialize)]
+    struct Kind {
+        kind: String,
+    }
+    serde_json::from_str::<Kind>(line.get())
+        .map(|k| k.kind)
+        .map_err(|e| Error::msg(format!("a record with no readable kind: {e}")))
+}
+
+/// One JSONL line, without its newline: `json.dumps(v, ensure_ascii=True,
+/// separators=(",", ":"))`.
+pub fn to_line<T: Serialize + ?Sized>(value: &T) -> Result<String> {
+    write(value, Layout::Line)
+}
+
+/// What a command prints: `json.dumps(v, ensure_ascii=True)`.
+pub fn to_output<T: Serialize + ?Sized>(value: &T) -> Result<String> {
+    write(value, Layout::Spaced)
+}
+
+/// A JSON file's body, without its final newline: `json.dump(v, f, indent=2,
+/// ensure_ascii=True)`.
+pub fn to_pretty<T: Serialize + ?Sized>(value: &T) -> Result<String> {
+    write(value, Layout::Pretty(PrettyFormatter::with_indent(b"  ")))
+}
+
+fn write<T: Serialize + ?Sized>(value: &T, layout: Layout) -> Result<String> {
+    let mut out = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, PyFormatter(layout));
+    value
+        .serialize(&mut serializer)
+        .map_err(|e| Error::msg(format!("cannot write the record as JSON: {e}")))?;
+    // ASCII, apart from any raw value kept as read, which is a `str`.
+    Ok(String::from_utf8(out).expect("serde_json writes UTF-8"))
+}
+
+/// Python's three `json.dumps` layouts.
+enum Layout {
+    /// `separators=(",", ":")`.
+    Line,
+    /// The default separators, `", "` and `": "`.
+    Spaced,
+    /// `indent=2`.
+    Pretty(PrettyFormatter<'static>),
+}
+
+/// `serde_json`'s writer with Python's layouts and `ensure_ascii=True` escaping.
+struct PyFormatter(Layout);
+
+impl Formatter for PyFormatter {
+    fn begin_array<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        match &mut self.0 {
+            Layout::Pretty(p) => p.begin_array(w),
+            _ => w.write_all(b"["),
+        }
+    }
+
+    fn end_array<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        match &mut self.0 {
+            Layout::Pretty(p) => p.end_array(w),
+            _ => w.write_all(b"]"),
+        }
+    }
+
+    fn begin_array_value<W: ?Sized + io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> io::Result<()> {
+        match &mut self.0 {
+            Layout::Pretty(p) => p.begin_array_value(w, first),
+            Layout::Spaced if !first => w.write_all(b", "),
+            Layout::Line if !first => w.write_all(b","),
+            _ => Ok(()),
+        }
+    }
+
+    fn end_array_value<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        match &mut self.0 {
+            Layout::Pretty(p) => p.end_array_value(w),
+            _ => Ok(()),
+        }
+    }
+
+    fn begin_object<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        match &mut self.0 {
+            Layout::Pretty(p) => p.begin_object(w),
+            _ => w.write_all(b"{"),
+        }
+    }
+
+    fn end_object<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        match &mut self.0 {
+            Layout::Pretty(p) => p.end_object(w),
+            _ => w.write_all(b"}"),
+        }
+    }
+
+    fn begin_object_key<W: ?Sized + io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> io::Result<()> {
+        match &mut self.0 {
+            Layout::Pretty(p) => p.begin_object_key(w, first),
+            Layout::Spaced if !first => w.write_all(b", "),
+            Layout::Line if !first => w.write_all(b","),
+            _ => Ok(()),
+        }
+    }
+
+    fn begin_object_value<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        match &mut self.0 {
+            Layout::Pretty(p) => p.begin_object_value(w),
+            Layout::Spaced => w.write_all(b": "),
+            Layout::Line => w.write_all(b":"),
+        }
+    }
+
+    fn end_object_value<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        match &mut self.0 {
+            Layout::Pretty(p) => p.end_object_value(w),
+            _ => Ok(()),
+        }
+    }
+
+    /// The unescaped run of a string: everything but `"`, `\` and control characters, which
+    /// `serde_json` escapes as Python does. What is not printable ASCII is escaped here.
+    fn write_string_fragment<W: ?Sized + io::Write>(
+        &mut self,
+        w: &mut W,
+        fragment: &str,
+    ) -> io::Result<()> {
+        if fragment.bytes().all(|b| (0x20..0x7F).contains(&b)) {
+            return w.write_all(fragment.as_bytes());
+        }
+        let mut out = String::with_capacity(fragment.len() * 2);
+        for c in fragment.chars() {
+            push_escaped(u32::from(c), &mut out);
+        }
+        w.write_all(out.as_bytes())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::Path;
+    use std::process::Command;
+
+    use serde::{Deserialize, Serialize};
+    use serde_json::value::RawValue;
+
+    use super::*;
+    use crate::store::{append_jsonl, read_jsonl};
+
+    /// Runs `code` under the Python reference (`PYTHONPATH=scripts/lib python3 -B -c`) with
+    /// `args`; returns its stdout, failing the test if it fails.
+    pub(crate) fn python(code: &str, args: &[&OsStr]) -> Vec<u8> {
+        let lib = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/lib");
+        let out = Command::new("python3")
+            .args(["-B", "-c", code])
+            .args(args)
+            .env("PYTHONPATH", lib)
+            .output()
+            .expect("run python3");
+        assert!(
+            out.status.success(),
+            "python3 failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Rec {
+        path: PyStr,
+    }
+
+    #[test]
+    fn python_written_surrogate_escape_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path();
+        let file = run.join("records.jsonl");
+        let write = "import sys\nfrom pathlib import Path\nfrom leadhand import state\n\
+                     run = Path(sys.argv[1])\n\
+                     state.append_jsonl(state.run_paths(run), run / 'records.jsonl',\n\
+                     \x20   {'path': b'a\\xffb'.decode('utf-8', 'surrogateescape')})\n";
+        python(write, &[run.as_os_str()]);
+        assert_eq!(fs::read(&file).unwrap(), b"{\"path\":\"a\\udcffb\"}\n");
+
+        let read: Vec<(Rec, RawLine)> = read_jsonl(run, &file).unwrap();
+        assert_eq!(read.len(), 1);
+        let rec = &read[0].0;
+        assert_eq!(rec.path.as_wtf8(), b"\x61\xed\xb3\xbf\x62");
+        assert_eq!(rec.path.to_os().unwrap().into_vec(), b"\x61\xff\x62");
+        assert_eq!(to_line(rec).unwrap(), r#"{"path":"a\udcffb"}"#);
+
+        // Written back through the store, Python reads the string it wrote.
+        append_jsonl(run, &file, rec).unwrap();
+        let check = "import json, sys\n\
+                     lines = [json.loads(l) for l in open(sys.argv[1], encoding='ascii')]\n\
+                     want = b'a\\xffb'.decode('utf-8', 'surrogateescape')\n\
+                     print([l['path'] == want for l in lines])\n";
+        assert_eq!(python(check, &[file.as_os_str()]), b"[True, True]\n");
+    }
+
+    #[test]
+    fn distinct_strings_stay_distinct() {
+        let read = |literal: &str| {
+            serde_json::from_str::<Rec>(&format!(r#"{{"path":{literal}}}"#))
+                .unwrap()
+                .path
+        };
+        let cases: [(&str, &[u8]); 4] = [
+            (r#""\u00e9""#, b"\xc3\xa9"),
+            (r#""\udcc3\udca9""#, b"\xed\xb3\x83\xed\xb2\xa9"),
+            (r#""\ud800""#, b"\xed\xa0\x80"),
+            (
+                r#""\udced\udca0\udc80""#,
+                b"\xed\xb3\xad\xed\xb2\xa0\xed\xb2\x80",
+            ),
+        ];
+        for (literal, wtf8) in cases {
+            let s = read(literal);
+            assert_eq!(s.as_wtf8(), wtf8, "{literal}");
+            assert_eq!(ascii_json(&s), literal);
+            assert_eq!(
+                to_line(&Rec { path: s }).unwrap(),
+                format!(r#"{{"path":{literal}}}"#)
+            );
+        }
+        assert_ne!(read(cases[0].0), read(cases[1].0));
+        assert_ne!(read(cases[2].0), read(cases[3].0));
+    }
+
+    #[test]
+    fn fs_boundary_is_surrogateescape() {
+        let e_acute = PyStr::from_os(OsStr::from_bytes(b"\xc3\xa9"));
+        assert_eq!(ascii_json(&e_acute), r#""\u00e9""#);
+        assert_eq!(e_acute.to_os().unwrap().into_vec(), b"\xc3\xa9");
+        let ff = PyStr::from_os(OsStr::from_bytes(b"\xff"));
+        assert_eq!(ascii_json(&ff), r#""\udcff""#);
+        assert_eq!(ff.to_os().unwrap().into_vec(), b"\xff");
+
+        // Harder byte strings decode as Python's surrogateescape decodes them, and encode back.
+        let cases: [&[u8]; 7] = [
+            b"\xed\xa0\x80",
+            b"\xe2\x82A",
+            b"\xf0\x9f\x98A",
+            b"a\xc0\xafb",
+            b"\xf4\x90\x80\x80",
+            b"ok\xf0\x9f\x98\x80\xe9",
+            b"\x80\xbf\xc2",
+        ];
+        let hex: Vec<OsString> = cases
+            .iter()
+            .map(|b| {
+                b.iter()
+                    .map(|x| format!("{x:02x}"))
+                    .collect::<String>()
+                    .into()
+            })
+            .collect();
+        let args: Vec<&OsStr> = hex.iter().map(OsString::as_os_str).collect();
+        let decode = "import json, sys\nfor h in sys.argv[1:]:\n\
+                      \x20   print(json.dumps(bytes.fromhex(h).decode('utf-8', 'surrogateescape')))\n";
+        let python_out = String::from_utf8(python(decode, &args)).unwrap();
+        for (bytes, want) in cases.iter().zip(python_out.lines()) {
+            let s = PyStr::from_os(OsStr::from_bytes(bytes));
+            assert_eq!(ascii_json(&s), want, "{bytes:x?}");
+            assert_eq!(s.to_os().unwrap().into_vec(), *bytes);
+        }
+    }
+
+    #[test]
+    fn to_os_refuses_other_lone_surrogates() {
+        let read = |literal: &str| {
+            serde_json::from_str::<Rec>(&format!(r#"{{"path":{literal}}}"#))
+                .unwrap()
+                .path
+        };
+        let err = read(r#""a\ud800""#).to_os().unwrap_err();
+        assert_eq!(
+            err.message,
+            r"'utf-8' codec can't encode character '\ud800' in position 1: surrogates not allowed"
+        );
+        assert!(read(r#""\udc7f""#).to_os().is_err());
+        assert!(read(r#""\ude00""#).to_os().is_err());
+        assert_eq!(read(r#""\udc80""#).to_os().unwrap().into_vec(), b"\x80");
+        assert_eq!(read(r#""\ud83d\ude00""#).lossy(), "\u{1f600}");
+        assert_eq!(read(r#""a\ud800b""#).lossy(), "a\u{fffd}b");
+    }
+
+    #[test]
+    fn lone_surrogate_survives_storage_action_and_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path();
+        let write = "import sys\nfrom pathlib import Path\nfrom leadhand import state\n\
+                     state.append_event(state.run_paths(Path(sys.argv[1])), 'ruling',\n\
+                     \x20   path=b'a\\xffb'.decode('utf-8', 'surrogateescape'))\n";
+        python(write, &[run.as_os_str()]);
+
+        // The event, read typed, with its raw line.
+        #[derive(Deserialize)]
+        struct Ruling {
+            seq: u64,
+            path: PyStr,
+        }
+        let events: Vec<(Ruling, RawLine)> = read_jsonl(run, &run.join("events.jsonl")).unwrap();
+        let (event, raw) = &events[0];
+        assert_eq!(
+            (event.seq, event_kind(raw).unwrap().as_str()),
+            (1, "ruling")
+        );
+        assert_eq!(event.path.as_wtf8(), b"a\xed\xb3\xbfb");
+
+        // A stored record.
+        #[derive(Serialize, Deserialize)]
+        struct Stored {
+            card: u32,
+            path: PyStr,
+        }
+        let attempts = run.join("attempts.jsonl");
+        let line = append_jsonl(
+            run,
+            &attempts,
+            &Stored {
+                card: 1,
+                path: event.path.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(line.get(), r#"{"card":1,"path":"a\udcffb"}"#);
+        let stored: Vec<(Stored, RawLine)> = read_jsonl(run, &attempts).unwrap();
+        assert_eq!(stored[0].0.path, event.path);
+
+        // An action the CLI prints, carrying the path and the event as found.
+        #[derive(Serialize)]
+        struct Action<'a> {
+            action: &'static str,
+            path: &'a PyStr,
+            event: &'a RawValue,
+        }
+        let printed = to_output(&Action {
+            action: "dispatch",
+            path: &stored[0].0.path,
+            event: raw,
+        })
+        .unwrap();
+        assert_eq!(
+            printed,
+            format!(
+                r#"{{"action": "dispatch", "path": "a\udcffb", "event": {}}}"#,
+                raw.get()
+            )
+        );
+
+        // A RawLine round trip leaves it byte-identical.
+        let again: RawLine = serde_json::from_str(&printed).unwrap();
+        assert_eq!(serde_json::to_string(&again).unwrap(), printed);
+        #[derive(Deserialize)]
+        struct Printed {
+            path: PyStr,
+            event: RawLine,
+        }
+        let back: Printed = serde_json::from_str(again.get()).unwrap();
+        assert_eq!(back.path.as_wtf8(), b"a\xed\xb3\xbfb");
+        assert_eq!(back.event.get(), raw.get());
+
+        // No `Value` was involved: any step through one would have refused the string.
+        assert!(serde_json::from_str::<serde_json::Value>(raw.get()).is_err());
+        assert!(serde_json::from_str::<serde_json::Value>(&printed).is_err());
+
+        // And Python reads the printed path as the string it wrote.
+        let check = "import json, sys\nv = json.loads(sys.argv[1])\n\
+                     print(v['path'] == b'a\\xffb'.decode('utf-8', 'surrogateescape') == v['event']['path'])\n";
+        assert_eq!(python(check, &[OsStr::new(&printed)]), b"True\n");
+    }
+
+    #[test]
+    fn vendor_reader_ignores_lone_surrogate_in_unused_field() {
+        #[derive(Deserialize)]
+        struct Message {
+            id: String,
+        }
+        let line = r#"{"id":"m1","text":"x\udcffy"}"#;
+        assert_eq!(serde_json::from_str::<Message>(line).unwrap().id, "m1");
+        // A reader through `Value` would have failed on the field it does not use.
+        assert!(serde_json::from_str::<serde_json::Value>(line).is_err());
+    }
+
+    #[test]
+    fn non_ascii_text_written_as_ascii_escapes() {
+        #[derive(Serialize)]
+        struct Doc<'a> {
+            s: &'a str,
+            p: PyStr,
+            n: [u8; 2],
+            e: [u8; 0],
+            o: BTreeMap<String, u8>,
+        }
+        let strings = [
+            "\u{e9}",
+            "\u{1f600}",
+            "a\"b\\c\n\t\r\u{8}\u{c}\u{1}\u{1f}\u{7f}/",
+            "\u{4e2d}\u{6587} \u{2028}",
+            "plain",
+        ];
+        let dump = "import json, sys\nfor s in sys.argv[1:]:\n\
+                    \x20   d = {'s': s, 'p': s, 'n': [1, 2], 'e': [], 'o': {}}\n\
+                    \x20   print(json.dumps([json.dumps(s, ensure_ascii=True),\n\
+                    \x20       json.dumps(d, ensure_ascii=True, separators=(',', ':')),\n\
+                    \x20       json.dumps(d, ensure_ascii=True),\n\
+                    \x20       json.dumps(d, ensure_ascii=True, indent=2)]))\n";
+        let args: Vec<&OsStr> = strings.iter().map(OsStr::new).collect();
+        let out = String::from_utf8(python(dump, &args)).unwrap();
+        for (s, line) in strings.iter().zip(out.lines()) {
+            let want: Vec<String> = serde_json::from_str(line).unwrap();
+            let doc = Doc {
+                s,
+                p: PyStr::from(*s),
+                n: [1, 2],
+                e: [],
+                o: BTreeMap::new(),
+            };
+            assert_eq!(ascii_json(&doc.p), want[0], "{s:?}");
+            assert_eq!(to_line(&doc).unwrap(), want[1], "{s:?}");
+            assert_eq!(to_output(&doc).unwrap(), want[2], "{s:?}");
+            assert_eq!(to_pretty(&doc).unwrap(), want[3], "{s:?}");
+        }
+        assert_eq!(ascii_json(&PyStr::from("\u{e9}")), r#""\u00e9""#);
+        assert_eq!(ascii_json(&PyStr::from("\u{1f600}")), r#""\ud83d\ude00""#);
+    }
+
+    #[test]
+    fn event_kind_reads_only_kind() {
+        let raw: RawLine =
+            serde_json::from_str(r#"{"seq":3,"path":"\udcff","kind":"ruling"}"#).unwrap();
+        assert_eq!(event_kind(&raw).unwrap(), "ruling");
+        let none: RawLine = serde_json::from_str(r#"{"seq":3}"#).unwrap();
+        assert!(event_kind(&none).is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_bytes_are_not_a_pystr() {
+        // Only a reader that hands over raw bytes could produce these; the store reads text.
+        assert!(serde_json::from_slice::<Rec>(b"{\"path\":\"a\xffb\"}").is_err());
+    }
+}

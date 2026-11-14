@@ -6,6 +6,7 @@
 //! (`testing::crash_point`, testing builds only).
 
 use std::fmt;
+use std::path::Path;
 
 /// An error with its display text and exit code. The message is display text: paths in it
 /// are converted lossily, so no JSON a command prints ever takes text from an `Error`.
@@ -46,6 +47,22 @@ impl Error {
     /// `dispatch` is still running: `m` is the whole line, printed on stdout; exit 75.
     pub fn still_running(m: impl Into<String>) -> Self {
         Self::new(m, EXIT_STILL_RUNNING)
+    }
+
+    /// An I/O error on `path`, worded as Python's `OSError` words it, so the file is named:
+    /// `[Errno 2] No such file or directory: '<path>'`, the path shown lossily.
+    pub fn io(path: &Path, err: std::io::Error) -> Self {
+        let shown = path.to_string_lossy();
+        match err.raw_os_error() {
+            Some(n) => {
+                let text = err.to_string();
+                let text = text
+                    .strip_suffix(&format!(" (os error {n})"))
+                    .unwrap_or(&text);
+                Self::msg(format!("[Errno {n}] {text}: '{shown}'"))
+            }
+            None => Self::msg(format!("{err}: '{shown}'")),
+        }
     }
 
     /// The command that fixes this error; the commands a person types print it as the last line.
@@ -97,5 +114,16 @@ mod tests {
             Error::from(std::io::Error::other("disk full")),
             Error::msg("disk full")
         );
+    }
+
+    #[test]
+    fn io_errors_name_the_path() {
+        let missing = std::io::Error::from_raw_os_error(2);
+        assert_eq!(
+            Error::io(Path::new("/runs/r 1/events.jsonl"), missing).message,
+            "[Errno 2] No such file or directory: '/runs/r 1/events.jsonl'"
+        );
+        let e = Error::io(Path::new("/x"), std::io::Error::other("short write"));
+        assert_eq!((e.message.as_str(), e.exit), ("short write: '/x'", 1));
     }
 }
