@@ -305,6 +305,12 @@ fn resolve_caller_in(env: &dyn Fn(&str) -> Option<OsString>) -> Result<Caller> {
 
 /// Parses the command line, resolves the caller, runs the command and prints its error.
 pub fn main() -> ExitCode {
+    // First, as every Python command does (R41a): drop the run.lock descriptor a supervisor's
+    // Bash command inherited, so a long-lived command never keeps the run locked.
+    let lock = std::env::var_os("LEADHAND_RUN_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| PathBuf::from(dir).join("run.lock"));
+    crate::sys::close_inherited_fd("LEADHAND_LOCK_FD", lock.as_deref());
     let (command, name) = match parse(std::env::args_os()) {
         Ok(parsed) => parsed,
         Err(e) => {

@@ -4,6 +4,8 @@
 
 pub mod cli;
 pub mod error;
+pub mod procs;
+pub mod sys;
 pub mod testing;
 
 pub use error::{Error, Result};
