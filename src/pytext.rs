@@ -299,10 +299,101 @@ fn is_executable_file(p: &Path) -> bool {
     p.exists() && !p.is_dir() && rustix::fs::access(p, rustix::fs::Access::EXEC_OK).is_ok()
 }
 
+/// `str(PurePosixPath(path))`: a path as `pathlib` holds it, so a path printed back is the
+/// Python's spelling. Repeated and trailing slashes and `.` components go (`..` stays); an
+/// empty path is `.`; exactly two leading slashes are kept, as POSIX allows.
+pub fn pure_path(path: &OsStr) -> PathBuf {
+    let bytes = path.as_bytes();
+    let lead: &[u8] = if bytes.starts_with(b"//") && !bytes.starts_with(b"///") {
+        b"//"
+    } else if bytes.starts_with(b"/") {
+        b"/"
+    } else {
+        b""
+    };
+    let parts: Vec<&[u8]> = bytes
+        .split(|b| *b == b'/')
+        .filter(|p| !p.is_empty() && *p != b".")
+        .collect();
+    let mut out = lead.to_vec();
+    out.extend_from_slice(&parts.join(&b'/'));
+    if out.is_empty() {
+        out.push(b'.');
+    }
+    PathBuf::from(OsString::from_vec(out))
+}
+
+/// `f"{x:.{digits}f}"`: fixed-point, correctly rounded, ties to even on the exact value, as
+/// Python formats it.
+pub fn py_fixed(x: f64, digits: usize) -> String {
+    format!("{x:.digits$}")
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn pure_path_is_pathlib_spelling() {
+        let cases = [
+            "//a//b/./c/",
+            "///a",
+            "",
+            "./a",
+            "a/..",
+            ".",
+            "a/./",
+            "/",
+            "//",
+            "a//b",
+            "/runs/2026-11-10-retry uploads/",
+        ];
+        let theirs = python_map(
+            "__import__('pathlib').PurePosixPath(x).__str__()",
+            &strings(&cases),
+        );
+        for (case, want) in cases.iter().zip(theirs) {
+            assert_eq!(
+                pure_path(OsStr::new(case)),
+                Path::new(want.as_str().unwrap()),
+                "{case:?}"
+            );
+        }
+        assert_eq!(
+            pure_path(OsStr::from_bytes(b"./r\xff//"))
+                .as_os_str()
+                .as_bytes(),
+            b"r\xff"
+        );
+    }
+
+    #[test]
+    fn fixed_point_matches_python() {
+        let xs = [
+            0.25,
+            0.125,
+            2.5,
+            0.35,
+            1.005,
+            0.045,
+            12.25,
+            0.0,
+            -0.0,
+            1e-9,
+            123456.785,
+            99.95,
+            0.000_123_456_7,
+            31.0,
+            1e21,
+        ];
+        let inputs: Vec<serde_json::Value> = xs.iter().map(|x| serde_json::json!(x)).collect();
+        let theirs = python_map("[f'{x:.1f}', f'{x:.2f}', f'{x:.6f}']", &inputs);
+        for (x, want) in xs.iter().zip(theirs) {
+            let ours = serde_json::json!([py_fixed(*x, 1), py_fixed(*x, 2), py_fixed(*x, 6)]);
+            assert_eq!(ours, want, "{x:e}");
+        }
+    }
 
     /// `expr` (a Python expression over `x`) applied by `python3` to each input; the results
     /// as JSON values.

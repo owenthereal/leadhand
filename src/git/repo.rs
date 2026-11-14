@@ -38,6 +38,37 @@ pub fn repo_identity(any_dir: &Path) -> Result<RepoIdentity, Failure> {
     Ok(RepoIdentity { top, common_dir })
 }
 
+/// The linked worktree a directory lies in (a run's workspace or its evidence base
+/// worktree), with its admin folder, where the run record is kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkedWorktree {
+    /// The worktree's top, as Git names it (symlinks resolved).
+    pub top: PathBuf,
+    /// Its admin folder in the common directory (`<common>/worktrees/<name>`), absolute.
+    pub git_dir: PathBuf,
+    /// The repository it belongs to.
+    pub repo: RepoIdentity,
+}
+
+/// The linked worktree `any_dir` lies in, or `None` when it lies in a main working tree.
+/// An error outside a Git checkout, as `repo_identity`.
+pub fn linked_worktree(any_dir: &Path) -> Result<Option<LinkedWorktree>, Failure> {
+    let git = Git::try_at(any_dir)?;
+    let common_dir = rev_parse_path(&git, &["--path-format=absolute", "--git-common-dir"])?;
+    let git_dir = rev_parse_path(&git, &["--path-format=absolute", "--git-dir"])?;
+    if git_dir == common_dir {
+        return Ok(None);
+    }
+    Ok(Some(LinkedWorktree {
+        top: rev_parse_path(&git, &["--show-toplevel"])?,
+        git_dir,
+        repo: RepoIdentity {
+            top: main_worktree(&git)?,
+            common_dir,
+        },
+    }))
+}
+
 /// Why a run cannot use the checkout at `top` because it is sparse (R63), or `None`: the
 /// Python's refusal text, with `top`'s bytes kept. `git worktree add` copies a sparse
 /// checkout into a run's worktrees, so this holds for every run. `core.sparseCheckout` is read
@@ -174,6 +205,45 @@ mod tests {
         for dir in [&inside, &inside.join("src"), &outside, &outside.join("src")] {
             assert_eq!(repo_identity(dir).unwrap(), want, "{dir:?}");
         }
+    }
+
+    #[test]
+    fn linked_worktree_names_the_worktree_and_its_admin_folder() {
+        let f = Fixture::new();
+        let repo = f.make_repo("my repo");
+        f.commit(&repo, &[("src/x.txt", "x\n")], "src");
+        let inside = repo.join(".worktrees/my slug");
+        f.git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "run",
+                inside.to_str().unwrap(),
+            ],
+        );
+        for dir in [&inside, &inside.join("src")] {
+            let wt = linked_worktree(dir).unwrap().unwrap();
+            assert_eq!(wt.top, real(&inside), "{dir:?}");
+            // Git names the admin folder after the worktree, its space made safe.
+            assert_eq!(
+                wt.git_dir.parent(),
+                Some(&*real(&repo.join(".git/worktrees")))
+            );
+            let gitdir = std::fs::read(wt.git_dir.join("gitdir")).unwrap();
+            assert_eq!(
+                gitdir.trim_ascii_end(),
+                real(&inside).join(".git").as_os_str().as_bytes()
+            );
+            assert_eq!(wt.repo, repo_identity(&repo).unwrap());
+        }
+        // The main working tree is not a linked worktree; outside a checkout is an error.
+        assert_eq!(linked_worktree(&repo.join("src")).unwrap(), None);
+        let plain = f.root().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert!(linked_worktree(&plain).is_err());
     }
 
     #[test]

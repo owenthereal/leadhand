@@ -4,7 +4,7 @@
 //!
 //! - `lock`: `state_lock`, re-entrant within the process (`state.state_lock`);
 //! - `jsonl`: append one line and read whole lines (`state._append`, `state._read_jsonl`);
-//! - `atomic`: replace a JSON file atomically (`state.write_json_atomic`).
+//! - `atomic`: replace a JSON file (`state.write_json_atomic`), or any file, atomically.
 //!
 //! Records are written through `crate::wire`, as ASCII JSON.
 
@@ -22,7 +22,7 @@ mod atomic;
 mod jsonl;
 mod lock;
 
-pub use atomic::write_json_atomic;
+pub use atomic::{write_file_atomic, write_json_atomic};
 pub use jsonl::{append_jsonl, append_jsonl_with, read_jsonl};
 pub use lock::{StateLock, state_lock};
 

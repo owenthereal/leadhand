@@ -166,19 +166,28 @@ pub enum Command {
         after_help = "Example:\n  leadhand status ~/.leadhand/myapp/runs/2026-11-10-retry-uploads"
     )]
     Status {
-        #[arg(
-            help = "the run directory; default: the most recently updated unfinished run under this \
-                      repository's docs_dir"
-        )]
+        #[arg(help = RUN_HELP)]
         run_dir: Option<OsString>,
+        #[arg(long, help = "print the status as one JSON object")]
+        json: bool,
     },
 
     #[command(
         about = "write report.md for a run and print its path",
         after_help = "Example:\n  leadhand report ~/.leadhand/myapp/runs/2026-11-10-retry-uploads"
     )]
-    Report { run_dir: OsString },
+    Report {
+        #[arg(help = RUN_HELP)]
+        run_dir: Option<OsString>,
+        #[arg(long, help = "print the report's path as one JSON object")]
+        json: bool,
+    },
 }
+
+/// How the commands that find a run take it (spec, "Commands you type").
+const RUN_HELP: &str = "the run: its directory, its deck.md, its run ID, its directory's name or \
+                        its slug; default: the run whose worktree holds the current directory, \
+                        else the only unfinished run of this repository";
 
 #[derive(Debug, Args)]
 pub struct DispatchArgs {
@@ -363,6 +372,11 @@ fn run(command: Command, name: &str, _caller: &Result<Caller>) -> Result<ExitCod
             repo: &repo,
             installed: installed.as_deref(),
         }),
+        // An empty run argument is none at all, as the Python's `if args.run_dir` reads it.
+        Command::Status { run_dir, json } => {
+            crate::status::command(run_dir.as_deref().filter(|d| !d.is_empty()), json)
+        }
+        Command::Report { run_dir, json } => crate::report::command(run_dir.as_deref(), json),
         _ => Err(Error::msg(format!("not ported yet: {name}"))),
     }
 }
@@ -684,7 +698,13 @@ mod tests {
             other => panic!("{other:?}"),
         }
         match parse_ok(&["status"]).0 {
-            Command::Status { run_dir } => assert_eq!(run_dir, None),
+            Command::Status { run_dir, json } => assert_eq!((run_dir, json), (None, false)),
+            other => panic!("{other:?}"),
+        }
+        match parse_ok(&["report", "/r"]).0 {
+            Command::Report { run_dir, json } => {
+                assert_eq!((run_dir, json), (Some(os("/r")), false))
+            }
             other => panic!("{other:?}"),
         }
         match parse_ok(&["start", "deck.md"]).0 {

@@ -246,6 +246,20 @@ pub fn load_config_from(repo_top: &Path, user_file: &Path) -> Result<Config> {
     build(&merge(merge(preset, user), repo))
 }
 
+/// A run's configuration (`config.load_run_config`): the snapshot `start` wrote into the run
+/// directory, so a worker that edits the files mid-run changes nothing for the run; a run
+/// started before snapshots existed reads the live files of `repo`.
+pub fn load_run_config(run_dir: &Path, repo: &Path) -> Result<Config> {
+    let path = run_dir.join(SNAPSHOT);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return load_config(repo),
+        Err(e) => return Err(Failure::io(&path, e)),
+    };
+    let text = String::from_utf8(bytes).map_err(|e| in_file(&path, &format!("not UTF-8: {e}")))?;
+    config_from_snapshot(&text)
+}
+
 /// The run docs directory, always absolute: `{repo}` is the repository folder's name, `~` the
 /// home directory, and a relative `docs_dir` is resolved against the repository
 /// (`config.docs_dir_for`).

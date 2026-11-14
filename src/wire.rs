@@ -11,10 +11,12 @@
 //! `Value` or `String`.
 //!
 //! Surrogateescape happens only at the filesystem boundary: `PyStr::from_os` and
-//! `PyStr::to_os`.
+//! `PyStr::to_os`. A JSON object keyed by carried text is a `PyMap`, since `serde_json` takes
+//! no `PyStr` as a map key.
 //!
 //! The writers here (`to_line`, `to_output`, `to_pretty`) escape every string as
-//! `ensure_ascii=True` does, so a record Rust writes is ASCII like one Python writes.
+//! `ensure_ascii=True` does, so a record Rust writes is ASCII like one Python writes, and write
+//! floats as Python's `repr` does.
 
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
@@ -37,7 +39,7 @@ pub type RawLine = Box<RawValue>;
 ///
 /// Invariant: the bytes are well-formed WTF-8 (generalized UTF-8 with no surrogate pair
 /// written as two 3-byte halves), which every constructor checks or guarantees.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PyStr(Vec<u8>);
 
 impl PyStr {
@@ -122,6 +124,89 @@ impl From<String> for PyStr {
     /// Valid text, as it is.
     fn from(s: String) -> PyStr {
         PyStr(s.into_bytes())
+    }
+}
+
+impl PyStr {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Appends `s` as Python's `+` joins strings: a leading surrogate at the end and a
+    /// trailing one at the start of `s` become the one character they encode, so the bytes
+    /// stay well-formed WTF-8 (and the result is written as the same `\uXXXX` pair).
+    pub fn push(&mut self, s: &PyStr) {
+        let lead = self
+            .0
+            .len()
+            .checked_sub(3)
+            .and_then(|at| decode(&self.0[at..]))
+            .map(|(cp, _)| cp)
+            .filter(|cp| (0xD800..=0xDBFF).contains(cp));
+        let trail = decode(&s.0)
+            .map(|(cp, _)| cp)
+            .filter(|cp| (0xDC00..=0xDFFF).contains(cp));
+        match (lead, trail) {
+            (Some(lead), Some(trail)) => {
+                self.0.truncate(self.0.len() - 3);
+                push_wtf8(
+                    0x1_0000 + ((lead - 0xD800) << 10) + (trail - 0xDC00),
+                    &mut self.0,
+                );
+                self.0.extend_from_slice(&s.0[3..]);
+            }
+            _ => self.0.extend_from_slice(&s.0),
+        }
+    }
+
+    /// Appends valid text.
+    pub fn push_str(&mut self, s: &str) {
+        self.0.extend_from_slice(s.as_bytes());
+    }
+
+    /// `parts`, joined as `push` joins two.
+    pub fn concat(parts: &[&PyStr]) -> PyStr {
+        let mut out = PyStr::default();
+        for part in parts {
+            out.push(part);
+        }
+        out
+    }
+
+    /// Python's `str.startswith` for valid text.
+    pub fn starts_with(&self, prefix: &str) -> bool {
+        self.0.starts_with(prefix.as_bytes())
+    }
+
+    /// Python's `in` for valid text: WTF-8 is self-synchronizing, so a byte match is a match
+    /// of whole characters.
+    pub fn contains(&self, needle: &str) -> bool {
+        needle.is_empty() || self.0.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    /// `str.strip(chars)` for ASCII `chars` (`str.rstrip` with `start` false). Only ASCII
+    /// bytes are cut, and they are never part of a longer character, so the rest is whole.
+    pub fn strip_ascii(&self, chars: &[u8], start: bool) -> PyStr {
+        let keep = |b: &u8| !chars.contains(b);
+        let from = if start {
+            self.0.iter().position(keep).unwrap_or(self.0.len())
+        } else {
+            0
+        };
+        let to = self
+            .0
+            .iter()
+            .rposition(keep)
+            .map_or(from, |i| i + 1)
+            .max(from);
+        PyStr(self.0[from..to].to_vec())
+    }
+
+    /// The OS bytes `to_os` gives, or the lossy text when a surrogate has no byte (for text
+    /// printed to a terminal or written to a file, as Python's `surrogateescape` writes it).
+    pub fn to_os_lossy(&self) -> OsString {
+        self.to_os()
+            .unwrap_or_else(|_| OsString::from(self.lossy().into_owned()))
     }
 }
 
@@ -274,6 +359,123 @@ pub fn ascii_json(s: &PyStr) -> String {
     out
 }
 
+/// A JSON object whose keys are carried text (ref names, file names, model names): its
+/// entries in file order, as a Python `dict` keeps them. `serde_json` takes no `PyStr` as a
+/// map key, so this is the map type for any record keyed by such text.
+///
+/// A repeated key keeps its first position and its last value, as `json.loads` does. Written
+/// as a JSON object; when a key is not valid UTF-8 (a lone surrogate), the object is written
+/// compact (`to_line`'s layout) whatever the writer's layout, the same JSON either way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PyMap<V>(pub Vec<(PyStr, V)>);
+
+impl<V> Default for PyMap<V> {
+    fn default() -> PyMap<V> {
+        PyMap(Vec::new())
+    }
+}
+
+impl<V> PyMap<V> {
+    pub fn get(&self, key: &PyStr) -> Option<&V> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.0.iter().map(|(_, v)| v)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The value at `key`, inserted last (as `dict.setdefault`) when it is not there.
+    pub fn entry(&mut self, key: &PyStr, default: impl FnOnce() -> V) -> &mut V {
+        let at = match self.0.iter().position(|(k, _)| k == key) {
+            Some(at) => at,
+            None => {
+                self.0.push((key.clone(), default()));
+                self.0.len() - 1
+            }
+        };
+        &mut self.0[at].1
+    }
+}
+
+impl<'de, V: Deserialize<'de>> Deserialize<'de> for PyMap<V> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct MapVisitor<V>(std::marker::PhantomData<V>);
+
+        impl<'de, V: Deserialize<'de>> Visitor<'de> for MapVisitor<V> {
+            type Value = PyMap<V>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> std::result::Result<PyMap<V>, A::Error> {
+                let mut out: Vec<(PyStr, V)> = Vec::new();
+                while let Some(key) = access.next_key::<PyStr>()? {
+                    let value = access.next_value::<V>()?;
+                    match out.iter_mut().find(|(k, _)| *k == key) {
+                        Some(entry) => entry.1 = value,
+                        None => out.push((key, value)),
+                    }
+                }
+                Ok(PyMap(out))
+            }
+        }
+
+        deserializer.deserialize_map(MapVisitor(std::marker::PhantomData))
+    }
+}
+
+impl<V: Serialize> Serialize for PyMap<V> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::{Error as _, SerializeMap};
+        let keys: Option<Vec<&str>> = self
+            .0
+            .iter()
+            .map(|(k, _)| std::str::from_utf8(&k.0).ok())
+            .collect();
+        if let Some(keys) = keys {
+            let mut map = serializer.serialize_map(Some(self.0.len()))?;
+            for (key, (_, value)) in keys.into_iter().zip(&self.0) {
+                map.serialize_entry(key, value)?;
+            }
+            return map.end();
+        }
+        let mut text = String::from("{");
+        for (i, (key, value)) in self.0.iter().enumerate() {
+            if i > 0 {
+                text.push(',');
+            }
+            text.push_str(&ascii_json(key));
+            text.push(':');
+            text.push_str(&to_line(value).map_err(|e| S::Error::custom(e.message))?);
+        }
+        text.push('}');
+        RawValue::from_string(text)
+            .map_err(S::Error::custom)?
+            .serialize(serializer)
+    }
+}
+
+/// For an `Option<Option<T>>` field read with `#[serde(default, deserialize_with =
+/// "wire::present")]`: an absent field is `None`, `null` is `Some(None)`. For the fields whose
+/// absence and `null` the Python tells apart (`d.get(key, default)`, `key in d`).
+pub fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// The record's `kind`, read alone; no other field is validated.
 pub fn event_kind(line: &RawLine) -> Result<String> {
     #[derive(Deserialize)]
@@ -400,6 +602,12 @@ impl Formatter for PyFormatter {
             Layout::Pretty(p) => p.end_object_value(w),
             _ => Ok(()),
         }
+    }
+
+    /// A float as Python's `repr` writes it (`1e-05`, not `1e-5`). `serde_json` writes a
+    /// non-finite float as `null` without calling this.
+    fn write_f64<W: ?Sized + io::Write>(&mut self, w: &mut W, value: f64) -> io::Result<()> {
+        w.write_all(crate::pytext::py_float(value).as_bytes())
     }
 
     /// The unescaped run of a string: everything but `"`, `\` and control characters, which
@@ -720,6 +928,67 @@ pub(crate) mod tests {
         assert_eq!(event_kind(&raw).unwrap(), "ruling");
         let none: RawLine = serde_json::from_str(r#"{"seq":3}"#).unwrap();
         assert!(event_kind(&none).is_err());
+    }
+
+    #[test]
+    fn pymap_keeps_order_and_carried_keys() {
+        // Keys a Python dict holds: a non-UTF-8 ref name, non-ASCII and astral text; a repeated
+        // key keeps its first position and its last value, as json.loads does.
+        let text = r#"{"refs/heads/a\udcffb": "x", "\u00e9": "y", "\ud83d\ude00": "z", "refs/heads/a\udcffb": "w"}"#;
+        let map: PyMap<PyStr> = serde_json::from_str(text).unwrap();
+        let keys: Vec<&[u8]> = map.0.iter().map(|(k, _)| k.as_wtf8()).collect();
+        assert_eq!(
+            keys,
+            [
+                &b"refs/heads/a\xed\xb3\xbfb"[..],
+                b"\xc3\xa9",
+                "\u{1f600}".as_bytes()
+            ]
+        );
+        assert_eq!(map.get(&PyStr::from("\u{e9}")), Some(&PyStr::from("y")));
+        let want = r#"{"refs/heads/a\udcffb":"w","\u00e9":"y","\ud83d\ude00":"z"}"#;
+        assert_eq!(to_line(&map).unwrap(), want);
+        // Python reads it back as the same dict.
+        let check = "import json, sys\n\
+                     d = json.loads(sys.argv[1])\n\
+                     print(list(d) == ['refs/heads/a\\udcffb', '\\u00e9', '\\U0001f600'], d['\\u00e9'])\n";
+        assert_eq!(python(check, &[OsStr::new(want)]), b"True y\n");
+        // With UTF-8 keys every layout is Python's own.
+        let plain: PyMap<u32> = serde_json::from_str(r#"{"b": 1, "a": 2}"#).unwrap();
+        assert_eq!(to_output(&plain).unwrap(), r#"{"b": 1, "a": 2}"#);
+        assert_eq!(to_pretty(&plain).unwrap(), "{\n  \"b\": 1,\n  \"a\": 2\n}");
+    }
+
+    #[test]
+    fn push_joins_text_as_python_concatenates() {
+        let read = |literal: &str| serde_json::from_str::<PyStr>(literal).unwrap();
+        // A leading surrogate then a trailing one: the character they encode, written as the
+        // same pair Python writes for the joined string.
+        let mut s = read(r#""a\ud83d""#);
+        s.push(&read(r#""\ude00b""#));
+        assert_eq!(s.as_wtf8(), "a\u{1f600}b".as_bytes());
+        assert_eq!(ascii_json(&s), r#""a\ud83d\ude00b""#);
+        // Anything else is kept as it is.
+        let mut t = read(r#""\udcff""#);
+        t.push_str(" and ");
+        t.push(&read(r#""\ud800""#));
+        assert_eq!(ascii_json(&t), r#""\udcff and \ud800""#);
+        assert!(t.contains(" and ") && !t.starts_with(" "));
+        assert_eq!(
+            PyStr::concat(&[&PyStr::from("x"), &read(r#""\udc80""#)]).as_wtf8(),
+            b"x\xed\xb2\x80"
+        );
+    }
+
+    #[test]
+    fn floats_are_written_as_python_writes_them() {
+        let floats = vec![
+            0.0, 1.0, 15.0, 0.1, 5.2e-05, 1e-07, 1e16, 123456.789, -2.5, 1e22,
+        ];
+        let check = "import json\nprint(json.dumps([0.0, 1.0, 15.0, 0.1, 5.2e-05, 1e-07, 1e16, \
+                     123456.789, -2.5, 1e22], separators=(',', ':')))\n";
+        let want = python(check, &[]);
+        assert_eq!(format!("{}\n", to_line(&floats).unwrap()).as_bytes(), want);
     }
 
     #[test]

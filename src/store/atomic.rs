@@ -20,10 +20,16 @@ use crate::wire;
 pub fn write_json_atomic<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
     let mut data = wire::to_pretty(value)?.into_bytes();
     data.push(b'\n');
+    write_file_atomic(path, &data)
+}
+
+/// Replaces `path` with `data` the same way: a file such as `report.md`
+/// (`report.write_report`).
+pub fn write_file_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let dir = parent(path);
     let (tmp, file) = create_temp(dir, path)?;
     let replaced = (|| {
-        (&file).write_all(&data).map_err(|e| Error::io(&tmp, e))?;
+        (&file).write_all(data).map_err(|e| Error::io(&tmp, e))?;
         fsync(&file, &tmp)?;
         drop(file);
         fs::rename(&tmp, path).map_err(|e| Error::io(path, e))

@@ -9,11 +9,16 @@ pub mod error;
 pub mod git;
 pub mod procs;
 pub mod pytext;
+pub mod report;
 pub mod route;
+pub mod runsel;
 pub mod safedir;
+pub mod state;
+pub mod status;
 pub mod store;
 pub mod sys;
 pub mod testing;
+pub mod usage;
 pub mod wire;
 
 pub use error::{Error, Result};
