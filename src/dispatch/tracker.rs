@@ -15,13 +15,15 @@ use std::thread;
 use std::time::Instant;
 
 use serde::{Serialize, Serializer};
+use serde_json::value::RawValue;
 
 use super::request::StoppedProc;
 use super::runner::{Action, Event, Ladder, Liveness, Runner, Sig};
-use super::{PROCS, TAG_VAR};
+use super::{PROCS, RUNNER, TAG_VAR, read_json_object};
 use crate::error::Result;
 use crate::procs::{self, ProcId, ProcInfo};
 use crate::store::write_json_atomic;
+use crate::wire::{PyMap, PyStr};
 
 /// `procs.json`: the recorded processes still alive, by pid, and the last tag sweep's
 /// unreadable environments when there were any.
@@ -95,6 +97,36 @@ impl Tracker {
         }
     }
 
+    /// The tracker of a dispatch whose runner is gone (`_Tracker.load`): Codex as `runner.json`
+    /// records it, the descendants `procs.json` last recorded (those with a pid and a start
+    /// time), and the dispatch tag. A record that does not read as one (no integer pid and
+    /// group) is no process.
+    pub fn load(wd: &Path) -> Result<Tracker> {
+        let runner = read_json_object(&wd.join(RUNNER))?.unwrap_or_default();
+        let saved = read_json_object(&wd.join(PROCS))?.unwrap_or_default();
+        let codex = runner
+            .get(&PyStr::from("codex"))
+            .and_then(|raw| proc_record(raw));
+        let tag = runner
+            .get(&PyStr::from("tag"))
+            .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())
+            .filter(|tag| !tag.is_empty());
+        let mut tracker = Tracker::new(wd, codex, None, tag);
+        let descendants = saved
+            .get(&PyStr::from("descendants"))
+            .and_then(|raw| serde_json::from_str::<Vec<Box<RawValue>>>(raw.get()).ok())
+            .unwrap_or_default();
+        for raw in &descendants {
+            if let Some(rec) = proc_record(raw)
+                && rec.pid != 0
+                && rec.start.as_deref().is_some_and(|s| !s.is_empty())
+            {
+                tracker.add(rec);
+            }
+        }
+        Ok(tracker)
+    }
+
     /// Codex's exit status, once our child has exited (it is reaped then).
     pub fn exited(&mut self) -> Option<ExitStatus> {
         if self.exit.is_none()
@@ -161,7 +193,7 @@ impl Tracker {
 
     /// `find_tagged`: every live process carrying the dispatch tag. Processes whose
     /// environment cannot be read (or a platform where none can) are noted in `procs.json`.
-    fn find_tagged(&mut self) {
+    pub fn find_tagged(&mut self) {
         let Some(tag) = &self.tag else {
             return;
         };
@@ -268,6 +300,24 @@ impl Tracker {
         out.sort_by_key(|p| p.pid);
         out
     }
+}
+
+/// A process record as a worker folder's files hold it (`{pid, pgid, start}`), read leniently:
+/// `None` unless `pid` and `pgid` are integers; a start time that is not a string is none.
+pub(crate) fn proc_record(raw: &RawValue) -> Option<StoppedProc> {
+    let map: PyMap<Box<RawValue>> = serde_json::from_str(raw.get()).ok()?;
+    let int = |key: &str| {
+        map.get(&PyStr::from(key))
+            .and_then(|raw| serde_json::from_str::<i32>(raw.get()).ok())
+    };
+    let start = map
+        .get(&PyStr::from("start"))
+        .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok());
+    Some(StoppedProc {
+        pid: int("pid")?,
+        pgid: int("pgid")?,
+        start,
+    })
 }
 
 fn record_of(p: &ProcInfo) -> StoppedProc {

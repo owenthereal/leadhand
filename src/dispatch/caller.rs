@@ -118,7 +118,7 @@ pub(crate) fn py_name(p: &Path) -> OsString {
 }
 
 /// `Path(p).parent`, of the `pathlib` spelling.
-fn py_parent(p: &Path) -> PathBuf {
+pub(crate) fn py_parent(p: &Path) -> PathBuf {
     let pure = pure_path(p.as_os_str()).into_os_string().into_vec();
     let parent = match pure.iter().rposition(|b| *b == b'/') {
         // `/x` and `//x` keep their root; `/` and `//` are their own parent.
@@ -389,7 +389,7 @@ fn resolves_in_place(root: &Path, path: &Path) -> Result<bool> {
 }
 
 /// `os.path.relpath(path, start)` of two absolute, normalized paths.
-fn relpath(path: &Path, start: &Path) -> PathBuf {
+pub(crate) fn relpath(path: &Path, start: &Path) -> PathBuf {
     let parts = |p: &Path| -> Vec<Vec<u8>> {
         p.as_os_str()
             .as_bytes()

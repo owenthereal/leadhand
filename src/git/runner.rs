@@ -7,12 +7,13 @@
 //!   output named from the top with `a/` and `b/`;
 //! - drops the variables that point Git at another repository (`REPO_VARS`), and sets
 //!   `SAFE_ENV` (no terminal prompt, no git-lfs smudge);
-//! - reads nothing from stdin, and is killed at its deadline;
+//! - reads nothing from stdin unless the call gives it input (`run_input`, the Python's
+//!   `input=`), and is killed at its deadline;
 //! - returns stdout as bytes, with Git's stderr carried in the error.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -101,6 +102,11 @@ impl Git {
         &self.cwd
     }
 
+    /// The deadline of each call.
+    pub fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
     /// The same Git with another deadline per call (`FETCH_TIMEOUT` for a fetch).
     pub fn with_deadline(&self, deadline: Duration) -> Git {
         Git {
@@ -118,7 +124,19 @@ impl Git {
     /// As `run`, with `env` set last (the Python's `env` overlay), so it can set a variable
     /// the runner otherwise removes, such as a temporary `GIT_INDEX_FILE`.
     pub fn run_env(&self, args: &[&OsStr], env: &[(&str, &OsStr)]) -> Result<Vec<u8>> {
-        let out = self.spawn(args, env)?;
+        let out = self.spawn(args, env, None)?;
+        self.succeeded(args, out)
+    }
+
+    /// As `run`, with `input` fed on Git's stdin (the Python's `git(..., input=...)`), then end
+    /// of file. It is written from a thread of its own, so a Git that writes before it has read
+    /// everything never blocks on a full pipe.
+    pub fn run_input(&self, args: &[&OsStr], input: &[u8]) -> Result<Vec<u8>> {
+        let out = self.spawn(args, &[], Some(input))?;
+        self.succeeded(args, out)
+    }
+
+    fn succeeded(&self, args: &[&OsStr], out: Output) -> Result<Vec<u8>> {
         if out.status.success() {
             Ok(out.stdout)
         } else {
@@ -136,12 +154,22 @@ impl Git {
     /// for commands whose exit status is part of the answer. An error only when Git could
     /// not be run or missed its deadline.
     pub fn output(&self, args: &[&OsStr]) -> Result<Output> {
-        Ok(self.spawn(args, &[])?)
+        Ok(self.spawn(args, &[], None)?)
     }
 
     /// As `output`, with the error's text kept lossless.
     pub fn try_output(&self, args: &[&OsStr]) -> std::result::Result<Output, Failure> {
-        self.spawn(args, &[])
+        Ok(self.spawn(args, &[], None)?)
+    }
+
+    /// As `output`, telling a missed deadline apart: `None` when Git was killed at its
+    /// deadline (the Python's `subprocess.TimeoutExpired`, which its caller words itself).
+    pub fn output_or_timeout(&self, args: &[&OsStr]) -> Result<Option<Output>> {
+        match self.spawn(args, &[], None) {
+            Ok(out) => Ok(Some(out)),
+            Err(e) if e.timed_out => Ok(None),
+            Err(e) => Err(e.failure.into()),
+        }
     }
 
     /// The error for a command that failed (the Python's `_fail`): its arguments, exit, the
@@ -178,7 +206,8 @@ impl Git {
         &self,
         args: &[&OsStr],
         env: &[(&str, &OsStr)],
-    ) -> std::result::Result<Output, Failure> {
+        input: Option<&[u8]>,
+    ) -> std::result::Result<Output, SpawnError> {
         let started = Instant::now();
         let mut child = Command::new("git")
             .args(SAFE_CONFIG)
@@ -186,11 +215,23 @@ impl Git {
             .current_dir(&self.cwd)
             .env_clear()
             .envs(child_env(std::env::vars_os(), env))
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| self.error(args, &e.to_string()))?;
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            // Written on its own thread, then closed (end of file). A Git that exits before
+            // reading it all breaks the pipe, which ends the write; its exit status tells.
+            let input = input.to_vec();
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(&input);
+            });
+        }
         // Each pipe is read to its end on its own thread, so neither fills while Git waits,
         // and the deadline covers the reading too.
         let (tx, rx) = mpsc::channel();
@@ -201,10 +242,10 @@ impl Git {
             let left = self.deadline.saturating_sub(started.elapsed());
             match rx.recv_timeout(left) {
                 Ok((i, Ok(buf))) => got[i] = Some(buf),
-                Ok((_, Err(e))) => return Err(self.stop(&mut child, args, &e.to_string())),
+                Ok((_, Err(e))) => return Err(self.stop(&mut child, args, &e.to_string()).into()),
                 Err(RecvTimeoutError::Timeout) => return Err(self.timed_out(&mut child, args)),
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err(self.stop(&mut child, args, "its output was lost"));
+                    return Err(self.stop(&mut child, args, "its output was lost").into());
                 }
             }
         }
@@ -216,7 +257,7 @@ impl Git {
                     return Err(self.timed_out(&mut child, args));
                 }
                 Ok(None) => std::thread::sleep(EXIT_POLL),
-                Err(e) => return Err(self.stop(&mut child, args, &e.to_string())),
+                Err(e) => return Err(self.stop(&mut child, args, &e.to_string()).into()),
             }
         };
         let [stdout, stderr] = got.map(Option::unwrap_or_default);
@@ -235,9 +276,12 @@ impl Git {
         self.error(args, what)
     }
 
-    fn timed_out(&self, child: &mut Child, args: &[&OsStr]) -> Failure {
+    fn timed_out(&self, child: &mut Child, args: &[&OsStr]) -> SpawnError {
         let secs = self.deadline.as_secs_f64();
-        self.stop(child, args, &format!("timed out after {secs}s"))
+        SpawnError {
+            failure: self.stop(child, args, &format!("timed out after {secs}s")),
+            timed_out: true,
+        }
     }
 
     fn error(&self, args: &[&OsStr], what: &str) -> Failure {
@@ -246,6 +290,33 @@ impl Git {
         parts.extend(joined(args));
         parts.extend([OsStr::new(&tail), self.cwd.as_os_str(), OsStr::new(")")]);
         Failure::of(&parts)
+    }
+}
+
+/// Why a Git call gave no output: its error, and whether that was its deadline.
+struct SpawnError {
+    failure: Failure,
+    timed_out: bool,
+}
+
+impl From<Failure> for SpawnError {
+    fn from(failure: Failure) -> SpawnError {
+        SpawnError {
+            failure,
+            timed_out: false,
+        }
+    }
+}
+
+impl From<SpawnError> for Failure {
+    fn from(e: SpawnError) -> Failure {
+        e.failure
+    }
+}
+
+impl From<SpawnError> for Error {
+    fn from(e: SpawnError) -> Error {
+        e.failure.into()
     }
 }
 
@@ -649,6 +720,36 @@ mod tests {
         );
         assert!(e.message.contains("timed out after 0.3s (in "), "{e}");
         assert_eq!(Git::at(&repo).unwrap().deadline, GIT_TIMEOUT);
+        // The same deadline, told apart from any other failure.
+        let hang = [os("-c"), os("alias.hang=!sleep 2"), os("hang")];
+        assert!(git.output_or_timeout(&hang).unwrap().is_none());
+        let fine = git
+            .output_or_timeout(&[os("rev-parse"), os("HEAD")])
+            .unwrap();
+        assert!(fine.is_some_and(|out| out.status.success()));
+    }
+
+    #[test]
+    fn input_is_fed_on_stdin_then_end_of_file() {
+        let f = Fixture::new();
+        let repo = f.make_repo("my repo");
+        let git = Git::at(&repo).unwrap();
+        let args = [os("hash-object"), os("--stdin")];
+        // `printf 'hello\n' | git hash-object --stdin`.
+        let out = git.run_input(&args, b"hello\n").unwrap();
+        assert_eq!(out, b"ce013625030ba8dba906f756967f9e9ca394464a\n");
+        // More than a pipe holds, with bytes that are not UTF-8: written whole, never blocked.
+        let big: Vec<u8> = (0..4_000_000u32).map(|i| (i % 251) as u8).collect();
+        let got = git.run_input(&args, &big).unwrap();
+        let file = f.root().join("big");
+        std::fs::write(&file, &big).unwrap();
+        let want = f.git(&repo, &["hash-object", file.to_str().unwrap()]) + "\n";
+        assert_eq!(got, want.as_bytes());
+        // Without input, stdin is still nothing at all: Git reads end of file at once.
+        assert_eq!(
+            git.run(&args).unwrap(),
+            b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\n"
+        );
     }
 
     #[test]

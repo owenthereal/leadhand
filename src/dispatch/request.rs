@@ -223,9 +223,21 @@ pub fn read_request(worker_dir: &Path) -> Result<Option<DispatchRequest>> {
     read_typed(&worker_dir.join(super::REQUEST))
 }
 
-/// The worker folder's `result.json` (`dispatch.load_result`), `None` the same way.
+/// The worker folder's `result.json` (`dispatch.load_result`), `None` the same way, and also
+/// for an empty object (`_result_from(d) if d else None`).
 pub fn load_result(worker_dir: &Path) -> Result<Option<DispatchResult>> {
-    read_typed(&worker_dir.join(super::RESULT))
+    let file = worker_dir.join(super::RESULT);
+    let Some(text) = super::read_json_text(&file)? else {
+        return Ok(None);
+    };
+    let empty = serde_json::from_str::<crate::wire::PyMap<serde::de::IgnoredAny>>(&text)
+        .is_ok_and(|map| map.is_empty());
+    if empty {
+        return Ok(None);
+    }
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| Error::msg(format!("{}: {e}", file.display())))
 }
 
 fn read_typed<T: serde::de::DeserializeOwned>(file: &Path) -> Result<Option<T>> {
@@ -520,6 +532,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_result(wd).unwrap().unwrap().steps, 2);
+        // An empty object is no result (`_result_from(d) if d else None`); an object without
+        // a status is still an error, as `_result_from`'s KeyError.
+        for empty in [&b"{}"[..], b" { }\n"] {
+            std::fs::write(wd.join("result.json"), empty).unwrap();
+            assert_eq!(load_result(wd).unwrap(), None, "{empty:?}");
+        }
+        std::fs::write(wd.join("result.json"), b"{\"steps\": 1}").unwrap();
+        assert!(load_result(wd).is_err());
         // An object that does not fit is an error, as `request_from_json` raises.
         std::fs::write(wd.join("request.json"), b"{\"model\": \"m\"}").unwrap();
         assert!(read_request(wd).is_err());

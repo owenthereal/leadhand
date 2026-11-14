@@ -1,5 +1,6 @@
-//! Git: the runner every Git call goes through (spec, bug class 3), and which repository a
-//! directory belongs to (spec, "Which repository and run a directory belongs to").
+//! Git: the runner every Git call goes through (spec, bug class 3), which repository a
+//! directory belongs to (spec, "Which repository and run a directory belongs to"), and what a
+//! worker changed and how its work is staged for the runner's commit (`stage`).
 //!
 //! Nothing outside this module starts a `git` process: later modules call `Git` only. The
 //! one other place that runs `git` is the unit tests' fixture below, which plays the operator
@@ -7,11 +8,15 @@
 
 mod repo;
 mod runner;
+pub mod stage;
 
 pub use repo::{
     LinkedWorktree, RepoIdentity, git_common_dir, linked_worktree, repo_identity, sparse_problem,
 };
 pub use runner::{FETCH_TIMEOUT, GIT_TIMEOUT, Git, REPO_VARS, SAFE_CONFIG, SAFE_ENV, split_nul};
+pub use stage::{
+    stage_work, status_entries, top_and_prefix, unhide_index_entries, untracked_files,
+};
 
 #[cfg(test)]
 pub(crate) mod fixture {

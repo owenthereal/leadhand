@@ -352,7 +352,7 @@ fn parse(
     Ok((cli.command, name))
 }
 
-fn run(command: Command, name: &str, _caller: &Result<Caller>) -> Result<ExitCode> {
+fn run(command: Command, name: &str, caller: &Result<Caller>) -> Result<ExitCode> {
     match command {
         Command::Version => version(),
         Command::Check { deck, repo, json } => check(&deck, &repo, json),
@@ -378,6 +378,13 @@ fn run(command: Command, name: &str, _caller: &Result<Caller>) -> Result<ExitCod
             crate::status::command(run_dir.as_deref().filter(|d| !d.is_empty()), json)
         }
         Command::Report { run_dir, json } => crate::report::command(run_dir.as_deref(), json),
+        Command::Dispatch(args) => crate::dispatch::cmd::dispatch_command(&args, caller),
+        Command::StopDispatch { run_dir, dispatch } => {
+            crate::dispatch::cmd::stop_command(&run_dir, &dispatch, caller)
+        }
+        Command::DispatchRunner { worker_dir } => {
+            crate::dispatch::cmd::runner_command(&worker_dir, caller)
+        }
         _ => Err(Error::msg(format!("not ported yet: {name}"))),
     }
 }

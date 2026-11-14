@@ -14,10 +14,9 @@
 //! its children, as the Python's `SIG_IGN` and `Popen(close_fds=True)` do.
 
 use std::collections::VecDeque;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -46,8 +45,8 @@ use super::{
     worker_env, write_text,
 };
 use crate::briefs::worker_prompt;
-use crate::error::{Error, Failure, Result};
-use crate::git::{Git, git_common_dir, split_nul};
+use crate::error::{Error, Result};
+use crate::git::{git_common_dir, untracked_files};
 use crate::state::utc_now;
 use crate::store::write_json_atomic;
 use crate::sys::detach_session;
@@ -323,30 +322,6 @@ fn record_untracked(wd: &Path, req: &DispatchRequest) -> Result<()> {
         error,
     };
     write_json_atomic(&path, &record)
-}
-
-/// `gitops.untracked_files`: the untracked paths Git does not ignore, named from the
-/// worktree's top; a nested repository is its folder with a trailing slash.
-fn untracked_files(ws: &Path) -> std::result::Result<Vec<PyStr>, Failure> {
-    let git = Git::try_at(ws)?;
-    let args = [
-        "ls-files",
-        "--others",
-        "--exclude-standard",
-        "-z",
-        "--full-name",
-        "--",
-        ":/",
-    ]
-    .map(OsStr::new);
-    let out = git.try_output(&args)?;
-    if !out.status.success() {
-        return Err(git.failure_text(&args, &out));
-    }
-    Ok(split_nul(&out.stdout)
-        .iter()
-        .map(|p| PyStr::from_os(OsStr::from_bytes(p)))
-        .collect())
 }
 
 /// How a launch went.
@@ -660,7 +635,9 @@ impl Shell<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::os::fd::BorrowedFd;
+    use std::os::unix::ffi::OsStrExt;
     use std::process::Output;
 
     use serde::Deserialize;
@@ -849,6 +826,42 @@ mod tests {
                 candidate.display()
             );
         }
+    }
+
+    // CATALOG: test_dispatch.py::FixRoundTests::test_launch_rechecks_cancel_immediately_before_starting
+    #[test]
+    fn launch_rechecks_cancel_immediately_before_starting() {
+        let w = World::new();
+        let flag = w.root.join("started");
+        let mut record = RunnerRecord {
+            runner: own_record(),
+            codex: None,
+            generation: 1,
+            tag: format!("{}:d1:1", w.run_id),
+            started_wall: wall_now(),
+            started_at: utc_now(),
+            launching: None,
+        };
+        // A program that leaves a mark if it ever starts.
+        let prepared = Prepared {
+            argv: Ok(["/bin/sh", "-c", "echo ran > \"$0\""]
+                .into_iter()
+                .map(OsString::from)
+                .chain([flag.clone().into_os_string()])
+                .collect()),
+            env: std::env::vars_os().collect(),
+            prompt: Vec::new(),
+        };
+        let launched = launch(&w.wd, &mut record, &prepared, &w.ws, &|| true).unwrap();
+        assert!(matches!(launched, Launch::Cancelled));
+        assert!(!flag.exists(), "the program started");
+        assert!(!w.wd.join(STREAM).exists());
+        let saved: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&fs::read(w.wd.join(RUNNER)).unwrap()).unwrap();
+        assert_eq!(saved["codex"], serde_json::Value::Null);
+        let launching = saved["launching"].as_object().expect("the launch intent");
+        assert_eq!(launching["aborted"], serde_json::Value::Bool(true));
+        assert!(launching["at"].is_string());
     }
 
     /// The worker folder `runner_child` runs the runner in.

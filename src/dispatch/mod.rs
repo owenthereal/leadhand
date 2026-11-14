@@ -10,12 +10,21 @@
 //! - `runner`: the detached runner's pure core, a state machine (spec, decision 6);
 //! - `shell`: the runner's life, and the threads and I/O around the core;
 //! - `tracker`: Codex and its recorded processes, which the stop ladder signals;
-//! - `finalize`: classifying, committing, charging, the attempt and `result.json`.
+//! - `finalize`: classifying, committing, charging, the attempt and `result.json`;
+//! - `commit`: the runner's commit of a Codex worker's work (ruling R39);
+//! - `own`: who owns a dispatch (`owner.lock`, `runner.lock`, `runner.json`), and replacing
+//!   or spawning its runner;
+//! - `cancel`: stopping a dispatch and confirming everything is gone;
+//! - `cmd`: the `dispatch`, `stop-dispatch` and `dispatch-runner` commands.
 
 pub mod argv;
 pub mod caller;
+pub mod cancel;
+pub mod cmd;
+pub mod commit;
 pub mod env;
 pub mod finalize;
+pub mod own;
 pub mod request;
 pub mod runner;
 pub mod shell;
@@ -38,10 +47,14 @@ pub use caller::{
     Anchor, anchored_run, anchored_worker, base_worktree_path, check_caller, check_dispatch_id,
     check_request, evidence_dirs, runner_worker, worker_dir,
 };
+pub use cancel::cancel;
+pub use cmd::{dispatch, request_for};
+pub use commit::{RunnerCommits, commit_work, untracked_to_take};
 pub use env::{
     ASKPASS_RESET, BLOCKING_ENV, CREDENTIAL_HELPER_RESET, CREDENTIAL_VARS, Env, TAG_VAR,
     blocking_env, codex_overrides, worker_env,
 };
+pub use own::{RunnerState, runner_alive, runner_state};
 pub use request::{
     BlockedBy, DispatchRequest, DispatchResult, ExitReason, Status, StoppedProc, load_result,
     read_request, thread_id,
