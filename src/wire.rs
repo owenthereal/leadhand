@@ -48,6 +48,11 @@ impl PyStr {
         &self.0
     }
 
+    /// The text whose WTF-8 bytes are `bytes`; `None` unless they are well-formed WTF-8.
+    pub fn from_wtf8(bytes: Vec<u8>) -> Option<PyStr> {
+        is_wtf8(&bytes).then_some(PyStr(bytes))
+    }
+
     /// OS bytes decoded as Python's `surrogateescape` decodes them: each byte that is not part
     /// of valid UTF-8 becomes U+DC80..U+DCFF.
     pub fn from_os(s: &OsStr) -> PyStr {
@@ -202,6 +207,11 @@ impl PyStr {
         PyStr(self.0[from..to].to_vec())
     }
 
+    /// `repr(s)`, as Python shows it in an error message: a surrogate escape as `\udcXX`.
+    pub fn repr(&self) -> String {
+        crate::pytext::py_repr_code_points(code_points(&self.0))
+    }
+
     /// The OS bytes `to_os` gives, or the lossy text when a surrogate has no byte (for text
     /// printed to a terminal or written to a file, as Python's `surrogateescape` writes it).
     pub fn to_os_lossy(&self) -> OsString {
@@ -293,7 +303,7 @@ fn is_wtf8(b: &[u8]) -> bool {
 
 /// The code points of a `PyStr`'s bytes. They are well-formed by its invariant; a malformed
 /// byte would come out as U+FFFD.
-fn code_points(b: &[u8]) -> impl Iterator<Item = u32> + '_ {
+fn code_points(b: &[u8]) -> impl Iterator<Item = u32> + Clone + '_ {
     let mut i = 0;
     std::iter::from_fn(move || {
         let rest = b.get(i..).filter(|r| !r.is_empty())?;
@@ -995,5 +1005,27 @@ pub(crate) mod tests {
     fn invalid_utf8_bytes_are_not_a_pystr() {
         // Only a reader that hands over raw bytes could produce these; the store reads text.
         assert!(serde_json::from_slice::<Rec>(b"{\"path\":\"a\xffb\"}").is_err());
+    }
+
+    #[test]
+    fn repr_matches_python_with_lone_surrogates() {
+        let texts: Vec<PyStr> = [
+            r#""N\udcff""#,
+            r#""it's \ud800""#,
+            r#""\"q\" and 'q' \udfff\n""#,
+            r#""café 😀 \u0007""#,
+            r#""""#,
+        ]
+        .iter()
+        .map(|t| serde_json::from_str(t).unwrap())
+        .collect();
+        let code =
+            "import json, sys\nprint(json.dumps([repr(t) for t in json.loads(sys.argv[1])]))\n";
+        let arg = to_line(&texts).unwrap();
+        let theirs: Vec<String> =
+            serde_json::from_str(std::str::from_utf8(&python(code, &[OsStr::new(&arg)])).unwrap())
+                .unwrap();
+        let ours: Vec<String> = texts.iter().map(PyStr::repr).collect();
+        assert_eq!(ours, theirs);
     }
 }

@@ -56,7 +56,7 @@ impl CardRef {
 }
 
 /// `int(text)` for ASCII decimal text; `None` where Python raises.
-fn py_int(text: &str) -> Option<i64> {
+pub(crate) fn py_int(text: &str) -> Option<i64> {
     let text = text.trim_matches(py_isspace);
     let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
     let well_formed = !digits.is_empty()

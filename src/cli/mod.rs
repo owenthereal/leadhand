@@ -301,10 +301,11 @@ pub fn resolve_caller() -> Result<Caller> {
     resolve_caller_in(&|name| std::env::var_os(name))
 }
 
-fn resolve_caller_in(env: &dyn Fn(&str) -> Option<OsString>) -> Result<Caller> {
+pub(crate) fn resolve_caller_in(env: &dyn Fn(&str) -> Option<OsString>) -> Result<Caller> {
     let run_dir = env("LEADHAND_RUN_DIR");
+    // `not session.strip()`: Python's whitespace, U+001C..U+001F included.
     if let Some(dir) = &run_dir
-        && dir.to_string_lossy().trim().is_empty()
+        && crate::pytext::py_strip(&dir.to_string_lossy()).is_empty()
     {
         return Err(Error::msg("refused: $LEADHAND_RUN_DIR is set but empty"));
     }

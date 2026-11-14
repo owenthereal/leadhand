@@ -62,30 +62,36 @@ pub fn py_splitlines(s: &str) -> Vec<&str> {
 
 /// `repr(s)` for a `str`.
 pub fn py_repr(s: &str) -> String {
-    let quote = if s.contains('\'') && !s.contains('"') {
+    py_repr_code_points(s.chars().map(u32::from))
+}
+
+/// `repr(s)` for a `str` given as its code points, lone surrogates included (escaped, as
+/// Python escapes every unprintable character): `PyStr::repr`.
+pub(crate) fn py_repr_code_points(cps: impl Iterator<Item = u32> + Clone) -> String {
+    let has = |q: u32| cps.clone().any(|cp| cp == q);
+    let quote = if has(u32::from('\'')) && !has(u32::from('"')) {
         '"'
     } else {
         '\''
     };
-    let mut out = String::with_capacity(s.len() + 2);
+    let mut out = String::new();
     out.push(quote);
-    for c in s.chars() {
-        let cp = c as u32;
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            c if c == quote => {
+    for cp in cps {
+        match char::from_u32(cp) {
+            Some('\\') => out.push_str("\\\\"),
+            Some('\t') => out.push_str("\\t"),
+            Some('\n') => out.push_str("\\n"),
+            Some('\r') => out.push_str("\\r"),
+            Some(c) if c == quote => {
                 out.push('\\');
                 out.push(c);
             }
-            c if !py_printable(c) => match cp {
+            Some(c) if py_printable(c) => out.push(c),
+            _ => match cp {
                 0..=0xff => out.push_str(&format!("\\x{cp:02x}")),
                 0x100..=0xffff => out.push_str(&format!("\\u{cp:04x}")),
                 _ => out.push_str(&format!("\\U{cp:08x}")),
             },
-            c => out.push(c),
         }
     }
     out.push(quote);
@@ -229,6 +235,54 @@ fn pushed(mut path: PathBuf, names: &[&[u8]]) -> PathBuf {
         path.push(OsStr::from_bytes(name));
     }
     path
+}
+
+/// `os.path.normpath(path)`: repeated slashes, `.` and `name/..` pairs go (a `..` at the
+/// root goes too; leading ones of a relative path stay); exactly two leading slashes are
+/// kept; an empty result is `.`. No symlink is looked at.
+pub fn normpath(path: &OsStr) -> PathBuf {
+    let bytes = path.as_bytes();
+    if bytes.is_empty() {
+        return PathBuf::from(".");
+    }
+    let lead: &[u8] = if bytes.starts_with(b"//") && !bytes.starts_with(b"///") {
+        b"//"
+    } else if bytes.starts_with(b"/") {
+        b"/"
+    } else {
+        b""
+    };
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for part in bytes.split(|b| *b == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." if !lead.is_empty() || parts.last().is_some_and(|p| *p != b"..") => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let mut out = lead.to_vec();
+    out.extend_from_slice(&parts.join(&b'/'));
+    if out.is_empty() {
+        out.push(b'.');
+    }
+    PathBuf::from(OsString::from_vec(out))
+}
+
+/// `os.path.abspath(path)`: `path` joined onto the working directory when relative, then
+/// `normpath`. Fails as `os.getcwd` fails, when the working directory is gone.
+pub fn abspath(path: &Path) -> std::io::Result<PathBuf> {
+    if path.as_os_str().as_bytes().starts_with(b"/") {
+        return Ok(normpath(path.as_os_str()));
+    }
+    let mut joined = std::env::current_dir()?.into_os_string().into_vec();
+    // `os.path.join`: a separator only where the working directory does not end with one.
+    if !joined.ends_with(b"/") {
+        joined.push(b'/');
+    }
+    joined.extend_from_slice(path.as_os_str().as_bytes());
+    Ok(normpath(OsStr::from_bytes(&joined)))
 }
 
 /// `~` and `~/…` expanded to the home directory (`os.path.expanduser`). `~user` forms are
@@ -658,5 +712,50 @@ pub(crate) mod tests {
                 "{case} (HOME={home:?})"
             );
         }
+    }
+
+    #[test]
+    fn normpath_and_abspath_match_python() {
+        let cases = [
+            "",
+            ".",
+            "/",
+            "//",
+            "///",
+            "////x",
+            "//x/../y",
+            "a/b/../../..",
+            "../a/./b//c/",
+            "/../x",
+            "/a/b/../../../c",
+            "a/..",
+            "./",
+            "x/./y/.",
+            "/runs/r 1/workers/c1-a1",
+            "caf\u{e9}/../d",
+            "relative/dir",
+        ];
+        let inputs = strings(&cases);
+        let norm = python_map("__import__('os').path.normpath(x)", &inputs);
+        let abs = python_map("__import__('os').path.abspath(x)", &inputs);
+        for ((case, want_norm), want_abs) in cases.iter().zip(norm).zip(abs) {
+            assert_eq!(
+                normpath(OsStr::new(case)).to_str().unwrap(),
+                want_norm.as_str().unwrap(),
+                "normpath {case:?}"
+            );
+            assert_eq!(
+                abspath(Path::new(case)).unwrap().to_str().unwrap(),
+                want_abs.as_str().unwrap(),
+                "abspath {case:?}"
+            );
+        }
+        // Bytes that are not UTF-8 pass through untouched.
+        assert_eq!(
+            normpath(OsStr::from_bytes(b"/a/\xff/./b/.."))
+                .as_os_str()
+                .as_bytes(),
+            b"/a/\xff"
+        );
     }
 }
