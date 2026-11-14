@@ -8,10 +8,13 @@
 //!   device-and-inode check `launch._close_if_same` makes, and the thread count it relies on;
 //! - the steps a child takes before `exec`: `setsid` (`detach_session`) and keeping one
 //!   descriptor open across `exec` (`pass_fd_to_child`);
-//! - the dispatch runner's start: SIGHUP ignored (`ignore_sighup`, ruling S2-R37), and every
-//!   inherited descriptor kept from its children (`keep_inherited_fds_from_children`, S2-R38);
-//! - the launcher's SIGINT and SIGTERM handler, which forwards them to its child
-//!   (`forward_signals`), and the `errno` it keeps.
+//! - the dispatch runner's start: SIGHUP set to `SIG_IGN` with `signal(2)` (`ignore_sighup`,
+//!   ruling S2-R37), and every inherited descriptor kept from its children
+//!   (`keep_inherited_fds_from_children`, S2-R38);
+//! - the launcher's SIGINT and SIGTERM forwarding handler (`forward_signals`, ruling S2-R40):
+//!   installed and restored with `sigaction(2)`, so the previous dispositions come back as the
+//!   Python restores its handlers; it sends with rustix's `kill_process` and keeps `errno` for
+//!   the code it interrupts.
 //!
 //! The safe layer over the process table is `crate::procs`.
 
@@ -25,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use libc::c_int;
 use rustix::io::{Errno, FdFlags, fcntl_getfd, fcntl_setfd};
-use rustix::process::Signal;
+use rustix::process::{Pid, Signal};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -247,7 +250,7 @@ static FORWARDING: AtomicBool = AtomicBool::new(false);
 
 /// The handler `forward_signals` installs. It runs in signal context, so it only reads and
 /// writes atomics and makes one `kill(2)` call, all async-signal-safe; `errno` is kept for
-/// the code it interrupted.
+/// the code it interrupted (rustix calls libc's `kill` on macOS, which may set it).
 extern "C" fn forward(sig: c_int) {
     let saved = errno::get();
     match FORWARD_TO.load(Ordering::SeqCst) {
@@ -258,11 +261,14 @@ extern "C" fn forward(sig: c_int) {
             }
         }
         pid if pid > 0 => {
-            // SAFETY: `kill(2)` takes two integers and touches no memory. `pid` is the child,
-            // which is not reaped until `child_exited` has set `FORWARD_TO` to -1 (the caller
-            // waits with `WNOWAIT` first), so it cannot be another process's pid. A failure
-            // (the child is a zombie) is ignored, as the Python ignores ProcessLookupError.
-            unsafe { libc::kill(pid, sig) };
+            // `pid` is the child, which is not reaped until `child_exited` has set `FORWARD_TO`
+            // to -1 (the caller waits with `WNOWAIT` first), so it cannot be another process's
+            // pid. `kill(2)` is async-signal-safe, and the conversions allocate nothing. A
+            // failure (the child is a zombie) is ignored, as the Python ignores
+            // ProcessLookupError.
+            if let (Some(pid), Some(sig)) = (Pid::from_raw(pid), Signal::from_named_raw(sig)) {
+                let _ = rustix::process::kill_process(pid, sig);
+            }
             FORWARDED.fetch_add(1, Ordering::SeqCst);
         }
         _ => {}

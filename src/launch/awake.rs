@@ -83,15 +83,26 @@ pub fn stop(child: Option<Child>) {
         // Not reaped yet, so the pid is still the child's.
         let _ = kill_process(Pid::from_child(&child), Signal::TERM);
     }
-    let deadline = Instant::now() + KEEP_AWAKE_TIMEOUT;
-    while Instant::now() < deadline {
+    if exited_within(&mut child, KEEP_AWAKE_TIMEOUT) {
+        return;
+    }
+    // As `proc.kill(); proc.wait(timeout=KEEP_AWAKE_TIMEOUT)`: bounded too. One that outlives
+    // even SIGKILL's wait is left behind rather than hanging the launcher.
+    let _ = child.kill();
+    exited_within(&mut child, KEEP_AWAKE_TIMEOUT);
+}
+
+/// Whether `child` has exited (and is reaped) within `timeout`; also true when it can no
+/// longer be waited for.
+fn exited_within(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
         match child.try_wait() {
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            _ => return,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => return false,
+            _ => return true,
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -152,5 +163,20 @@ mod tests {
         done.wait().unwrap();
         stop(Some(done));
         stop(None);
+    }
+
+    #[test]
+    fn waiting_is_bounded() {
+        // A child that ignores SIGTERM is still running when the wait gives up.
+        let mut stubborn = Command::new("sh")
+            .args(["-c", "trap '' TERM; sleep 30"])
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        assert!(!exited_within(&mut stubborn, Duration::from_millis(200)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        stubborn.kill().unwrap();
+        assert!(exited_within(&mut stubborn, KEEP_AWAKE_TIMEOUT));
     }
 }

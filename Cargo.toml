@@ -18,8 +18,10 @@ sha2 = "0.11.1"
 signal-hook = "0.4.6"
 toml = "1.2.1"
 
-# The macOS process-table calls; and, on both, the runner's SIGHUP disposition and the
-# close-on-exec marking of inherited descriptors (ruling S2-R37, S2-R38).
+# The macOS process-table calls; and, on both: the runner's SIGHUP set to SIG_IGN and the
+# close-on-exec marking of inherited descriptors (rulings S2-R37, S2-R38), and the launcher's
+# SIGINT/SIGTERM forwarding handler, installed and restored with sigaction, with the errno it
+# keeps (ruling S2-R40).
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 libc = "0.2.191"
 

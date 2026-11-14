@@ -206,10 +206,12 @@ class Paths(unittest.TestCase):
         meta = w.sup.meta()
         r = w.run()
         self.assertEqual(r.code, 1, r)
+        # The error line, then the one command that fixes it alone on the last line.
+        fix = [cli, "start", meta["deck_source"], "--repo", meta["repo"]]
         self.assertEqual(r.stderr, "error: this run has ended: complete; only a blocked or unfinished run "
-                                   "continues. Start a new run from the deck with: "
-                                   + shlex.join([cli, "start", meta["deck_source"], "--repo", meta["repo"]]) + "\n",
+                                   "continues. Start a new run from the deck with:\n" + shlex.join(fix) + "\n",
                          r)
+        self.assertEqual(shlex.split(r.stderr.splitlines()[-1]), fix)
         self.assertEqual(len(w.starts()), 2)
 
 

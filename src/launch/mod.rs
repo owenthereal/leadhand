@@ -396,35 +396,16 @@ fn launch_owned(
         && o.outcome.as_deref() != Some("blocked")
     {
         // Only a blocked or unfinished run continues: a relaunch must never reopen a run that
-        // completed, failed or was cancelled. The start command is a person's to copy, so its
-        // bytes are kept.
-        let outcome = o.outcome.as_deref().unwrap_or("None");
-        let qualifier = o.qualifier.as_deref().filter(|q| !q.is_empty());
-        let mut text = format!("error: this run has ended: {outcome}").into_bytes();
-        if let Some(q) = qualifier {
-            text.extend_from_slice(format!(" ({q})").as_bytes());
-        }
-        text.extend_from_slice(
-            b"; only a blocked or unfinished run continues. Start a new run from the deck with: ",
-        );
-        text.extend_from_slice(start_command(meta, &cli).as_bytes());
-        text.push(b'\n');
-        let mut err = std::io::stderr().lock();
-        err.write_all(&text)?;
-        err.flush()?;
-        return Ok(1);
+        // completed, failed or was cancelled.
+        return refuse(&ended_refusal(o, meta, &cli));
     }
     let workspace = meta.workspace()?;
     if let Some(problem) = tools_inside(&workspace, &cli, plugin_dir) {
         return Err(Error::msg(problem));
     }
     let repo = meta.repo()?;
-    if meta.in_place() {
-        return Err(Error::msg(format!(
-            "not supported in this version: run.worktree = false (this run works in the \
-             checkout {} itself); start a new run of the deck, which works in a worktree",
-            repo.display()
-        )));
+    if let Some(text) = in_place_refusal(meta, &cli) {
+        return refuse(&text);
     }
     // As at start: so a sparse checkout found later is a worker's (R63). A checkout that does
     // not read is left to `next`, which refuses the run anyway.
@@ -481,6 +462,52 @@ fn launch_owned(
     supervise(lock, cmd, plugin.as_deref(), supervisor_alive)
 }
 
+/// A refusal whose one fixing command a person copies (spec, "Commands you type"): the
+/// `error: <head>` line, then the command alone on the last line, its bytes kept.
+fn fix_refusal(head: &[u8], fix: &OsStr) -> Vec<u8> {
+    let mut text = b"error: ".to_vec();
+    text.extend_from_slice(head);
+    text.push(b'\n');
+    text.extend_from_slice(fix.as_bytes());
+    text.push(b'\n');
+    text
+}
+
+/// Prints a refusal `fix_refusal` made, and gives exit 1.
+fn refuse(text: &[u8]) -> Result<u8> {
+    let mut err = std::io::stderr().lock();
+    err.write_all(text)?;
+    err.flush()?;
+    Ok(1)
+}
+
+/// The refusal of a run that has ended (`run`'s terminal-outcome check), with the command
+/// that starts a new run of its deck.
+fn ended_refusal(o: &crate::state::events::Outcome, meta: &Meta, cli: &Path) -> Vec<u8> {
+    let outcome = o.outcome.as_deref().unwrap_or("None");
+    let mut head = format!("this run has ended: {outcome}");
+    if let Some(q) = o.qualifier.as_deref().filter(|q| !q.is_empty()) {
+        head += &format!(" ({q})");
+    }
+    head += "; only a blocked or unfinished run continues. Start a new run from the deck with:";
+    fix_refusal(head.as_bytes(), &start_command(meta, cli))
+}
+
+/// The refusal of an in-place run (deliberate change 1: the Python's checkout claim is gone),
+/// with the command that starts a new run of its deck in a worktree; `None` for a worktree
+/// run.
+fn in_place_refusal(meta: &Meta, cli: &Path) -> Option<Vec<u8>> {
+    let repo = meta.path("repo").filter(|_| meta.in_place())?;
+    let mut head = b"not supported in this version: run.worktree = false (this run works in the \
+                     checkout "
+        .to_vec();
+    head.extend_from_slice(repo.as_os_str().as_bytes());
+    head.extend_from_slice(
+        b" itself); start a new run of the deck, which works in a worktree, with:",
+    );
+    Some(fix_refusal(&head, &start_command(meta, cli)))
+}
+
 /// The attended-use warning, and R28's when the CLI's path holds whitespace.
 fn warn(cli: &Path) -> Result<()> {
     let cli = cli.as_os_str().as_bytes();
@@ -507,9 +534,21 @@ fn warn(cli: &Path) -> Result<()> {
 /// `supervisor_alive` is true while it runs, so an error then leaves the lock held.
 fn supervise(
     lock: &RunLock,
+    cmd: Command,
+    plugin_dir: Option<&Path>,
+    supervisor_alive: &mut bool,
+) -> Result<u8> {
+    supervise_with(lock, cmd, plugin_dir, supervisor_alive, &|_| {})
+}
+
+/// `supervise`, calling `after_exit` once the supervisor has exited and been reaped, while
+/// the forwarding is still installed (where the Python's test runs its handler).
+fn supervise_with(
+    lock: &RunLock,
     mut cmd: Command,
     plugin_dir: Option<&Path>,
     supervisor_alive: &mut bool,
+    after_exit: &dyn Fn(&Forwarding),
 ) -> Result<u8> {
     let fwd = sys::forward_signals(&FORWARDED_SIGNALS)
         .map_err(|e| Error::msg(format!("cannot forward signals: {e}")))?;
@@ -543,7 +582,7 @@ fn supervise(
         );
     }
     let keep_awake = awake::start(pid.as_raw_pid());
-    let status = wait_forwarding(&fwd, &mut child);
+    let status = wait_forwarding(&fwd, &mut child, after_exit);
     if status.is_ok() {
         *supervisor_alive = false;
     }
@@ -555,8 +594,12 @@ fn supervise(
 
 /// Waits for `child` to exit, then tells the forwarding it has, before reaping it: the
 /// exit is seen with `WNOWAIT`, so until the forwarding drops signals the pid is still the
-/// child's (a zombie), never another process's.
-fn wait_forwarding(fwd: &Forwarding, child: &mut Child) -> std::io::Result<ExitStatus> {
+/// child's (a zombie), never another process's. `after_exit` runs once it is reaped.
+fn wait_forwarding(
+    fwd: &Forwarding,
+    child: &mut Child,
+    after_exit: &dyn Fn(&Forwarding),
+) -> std::io::Result<ExitStatus> {
     let pid = Pid::from_child(child);
     loop {
         match waitid(
@@ -569,7 +612,9 @@ fn wait_forwarding(fwd: &Forwarding, child: &mut Child) -> std::io::Result<ExitS
         }
     }
     fwd.child_exited();
-    child.wait()
+    let status = child.wait();
+    after_exit(fwd);
+    status
 }
 
 /// The launcher's exit code for the supervisor's status: its own code, or 128 + the signal
@@ -594,26 +639,147 @@ mod tests {
 
     use super::*;
 
+    const LAUNCH_CHILD: &str = "LEADHAND_TEST_LAUNCH_CHILD";
+
+    /// `supervise` in this test binary run again as a child (a signal goes to the whole
+    /// process, so not to the multi-threaded test run): a `true` supervisor, then, once it has
+    /// exited and been reaped, a SIGTERM to the launcher. It prints `verdict: <exit code>
+    /// <supervisor alive> <(handled, forwarded) by the handler for that SIGTERM>
+    /// <holder.json names the supervisor>` and exits. PATH is empty, so no keep-awake runs.
+    #[test]
+    fn supervise_child() {
+        if std::env::var_os(LAUNCH_CHILD).is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paths = run_paths(dir.path());
+        let lock = RunLock::acquire(&paths, &PyStr::from("abc123")).unwrap();
+        let mut cmd = Command::new("/usr/bin/true");
+        cmd.stdin(Stdio::null());
+        let deltas = std::cell::Cell::new(None);
+        let after_exit = |fwd: &Forwarding| {
+            let (handled, forwarded) = fwd.counts();
+            kill_process(rustix::process::getpid(), Signal::TERM).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while fwd.counts().0 == handled && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let (h, f) = fwd.counts();
+            deltas.set(Some((h - handled, f - forwarded)));
+        };
+        let mut alive = true;
+        let code = supervise_with(&lock, cmd, None, &mut alive, &after_exit).unwrap();
+        let holder = lock::read_holder(&paths).unwrap();
+        let recorded = field::<i64>(&holder, "supervisor_pid").is_some();
+        lock.release();
+        println!("verdict: {code} {alive} {:?} {recorded}", deltas.get());
+        std::process::exit(0);
+    }
+
     #[test]
     fn signal_after_child_exit_is_not_forwarded() {
-        // The catalogue row (FollowUpTests): a SIGTERM that arrives once the supervisor has
-        // exited (here: once the wait returns) is not forwarded, and the launch returns 0.
-        let fwd = sys::forward_signals(&[Signal::TERM]).unwrap();
-        let mut child = Command::new("true").stdin(Stdio::null()).spawn().unwrap();
-        assert!(
-            fwd.forward_to(Pid::from_child(&child).as_raw_pid())
-                .is_empty()
-        );
-        let status = wait_forwarding(&fwd, &mut child).unwrap();
-        let (handled, forwarded) = fwd.counts();
-        kill_process(rustix::process::getpid(), Signal::TERM).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while fwd.counts().0 == handled && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
+        // The catalogue row (FollowUpTests): a SIGTERM handled once the supervisor has exited
+        // (here: once it has been reaped) is not forwarded ("kills: []"), and the launch
+        // returns 0. A `supervise` that waited for the child any other way would never reach
+        // the point where the signal is sent, and the verdict would say `None`.
+        let empty = tempfile::tempdir().unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "launch::tests::supervise_child",
+                "--exact",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(LAUNCH_CHILD, "1")
+            .env("PATH", empty.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let verdict = text
+            .lines()
+            .find_map(|l| l.split_once("verdict: ").map(|(_, v)| v))
+            .unwrap_or_else(|| {
+                panic!("no verdict: {text}{}", String::from_utf8_lossy(&out.stderr))
+            });
+        assert_eq!(verdict, "0 false Some((1, 0)) true");
+    }
+
+    #[test]
+    fn an_in_place_run_is_refused_with_the_start_command_alone_last() {
+        let dir = tempfile::Builder::new()
+            .prefix("in place ")
+            .tempdir()
+            .unwrap();
+        let repo = dir.path().join("my repo");
+        fs::create_dir_all(repo.join(".worktrees/run")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+        let meta = |workspace: &Path| {
+            let json = format!(
+                r#"{{"workspace": {}, "repo": {}, "deck_source": "/d/my deck.md"}}"#,
+                serde_json::to_string(workspace.to_str().unwrap()).unwrap(),
+                serde_json::to_string(repo.to_str().unwrap()).unwrap()
+            );
+            Meta {
+                map: serde_json::from_str(&json).unwrap(),
+                run_id: PyStr::from("abc123"),
+            }
+        };
+        let cli = Path::new("/opt/lead hand/leadhand");
+        // The checkout itself, by any spelling: in place.
+        for ws in [repo.clone(), link.clone()] {
+            let m = meta(&ws);
+            assert!(m.in_place(), "{ws:?}");
+            let text = String::from_utf8(in_place_refusal(&m, cli).unwrap()).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(
+                lines,
+                [
+                    format!(
+                        "error: not supported in this version: run.worktree = false (this run \
+                         works in the checkout {} itself); start a new run of the deck, which \
+                         works in a worktree, with:",
+                        repo.display()
+                    )
+                    .as_str(),
+                    &format!(
+                        "'/opt/lead hand/leadhand' start '/d/my deck.md' --repo '{}'",
+                        repo.display()
+                    ),
+                ]
+            );
+            assert!(text.ends_with('\n'));
         }
-        assert_eq!(fwd.counts(), (handled + 1, forwarded), "kills: []");
-        drop(fwd);
-        assert_eq!(exit_code(status), 0);
+        // A worktree run: not in place, no refusal.
+        let m = meta(&repo.join(".worktrees/run"));
+        assert!(!m.in_place());
+        assert_eq!(in_place_refusal(&m, cli), None);
+        // Without a repo or a workspace: not in place.
+        let none = Meta {
+            map: serde_json::from_str("{}").unwrap(),
+            run_id: PyStr::from("abc123"),
+        };
+        assert!(!none.in_place());
+    }
+
+    #[test]
+    fn an_ended_run_is_refused_with_the_start_command_alone_last() {
+        let meta = Meta {
+            map: serde_json::from_str(r#"{"deck_source": "/d/my deck.md", "repo": "/r"}"#).unwrap(),
+            run_id: PyStr::from("abc123"),
+        };
+        let o: crate::state::events::Outcome = serde_json::from_str(
+            r#"{"kind": "outcome", "outcome": "incomplete", "qualifier": "cancelled"}"#,
+        )
+        .unwrap();
+        let text = ended_refusal(&o, &meta, Path::new("/bin/leadhand"));
+        assert_eq!(
+            String::from_utf8(text).unwrap(),
+            "error: this run has ended: incomplete (cancelled); only a blocked or unfinished run \
+             continues. Start a new run from the deck with:\n\
+             /bin/leadhand start '/d/my deck.md' --repo /r\n"
+        );
     }
 
     #[test]
