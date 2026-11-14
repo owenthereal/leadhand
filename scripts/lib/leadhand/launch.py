@@ -46,6 +46,7 @@ from pathlib import Path
 
 from . import procs
 from .config import ConfigError, load_config, load_run_config
+from .dispatch import cli_override
 from .gitops import GitError, checkout_top, in_place_checkout_problem, sparse_checkout_problem
 from .state import RunPaths, append_event, read_events, run_paths, write_json_atomic
 
@@ -319,14 +320,20 @@ def keep_awake_prefix(platform: str) -> list[str]:
     return []
 
 
+def _cli_path() -> Path:
+    """The path that names the leadhand CLI: dispatch's test-only override, else CLI_PATH
+    (this module's own, which tests patch)."""
+    return cli_override() or CLI_PATH
+
+
 def cli_settings(cli: Path | None = None) -> str:
     """The --settings overlay: only the leadhand CLI's sandbox exclusion."""
-    cli = CLI_PATH if cli is None else cli
+    cli = _cli_path() if cli is None else cli
     return json.dumps({"sandbox": {"excludedCommands": [f"{cli} *"]}})
 
 
 def first_message(run_dir: Path, cli: Path | None = None) -> str:
-    cli = CLI_PATH if cli is None else cli
+    cli = _cli_path() if cli is None else cli
     return (f"Run the leadhand deck in {run_dir}. leadhand CLI: {cli}. "
             "First invoke the Skill tool with leadhand:run, then follow it.")
 
@@ -353,7 +360,7 @@ def _read_meta(paths: RunPaths) -> dict:
 
 def _start_command(meta: dict) -> str:
     """The operator's command to start a new run of this run's deck (paths quoted)."""
-    cmd = [str(CLI_PATH), "start", str(meta.get("deck_source") or "<deck>")]
+    cmd = [str(_cli_path()), "start", str(meta.get("deck_source") or "<deck>")]
     if meta.get("repo"):
         cmd += ["--repo", str(meta["repo"])]
     return " ".join(shlex.quote(c) for c in cmd)
@@ -423,7 +430,7 @@ def tools_inside(workspace: Path, plugin_dir: Path | None = None) -> str | None:
     the sandbox) or the plugin directory the supervisor loads lies inside the workspace, where
     workers can edit it (security review L6)."""
     ws = os.path.realpath(workspace)
-    for what, path in (("the leadhand CLI", CLI_PATH), ("--plugin-dir", plugin_dir)):
+    for what, path in (("the leadhand CLI", _cli_path()), ("--plugin-dir", plugin_dir)):
         if path is None:
             continue
         real = os.path.realpath(path)
@@ -548,12 +555,13 @@ def run(run_dir: Path, *, plugin_dir: Path | None = None, claude_bin: str = "cla
             plugin_dir=plugin, settings=cli_settings(), model=model, effort=effort,
             print_mode=print_mode)
         env = {**os.environ, "LEADHAND_RUN_ID": run_id, "LEADHAND_RUN_DIR": str(root),
-               "LEADHAND_CLI": str(CLI_PATH), LOCK_FD_ENV: str(fd)}
+               "LEADHAND_CLI": str(_cli_path()), LOCK_FD_ENV: str(fd)}
         if claim is not None:
             env[CHECKOUT_FD_ENV] = str(claim.fd)
-        print(ATTENDED_WARNING.format(cli=CLI_PATH), file=sys.stderr, flush=True)
-        if any(c.isspace() for c in str(CLI_PATH)):
-            print(SPACES_WARNING.format(cli=CLI_PATH), file=sys.stderr, flush=True)
+        cli = _cli_path()
+        print(ATTENDED_WARNING.format(cli=cli), file=sys.stderr, flush=True)
+        if any(c.isspace() for c in str(cli)):
+            print(SPACES_WARNING.format(cli=cli), file=sys.stderr, flush=True)
         sys.stdout.flush()
         return _supervise(lock, fd, argv, workspace, env, plugin_dir=plugin, claim=claim)
     finally:
@@ -673,7 +681,7 @@ def launch_line(run_dir: Path, *, plugin_dir: Path | None = None) -> str:
     if plugin_dir is None:
         recorded = RunLock(run_paths(root), "")._holder().get("plugin_dir")
         plugin_dir = Path(recorded) if isinstance(recorded, str) and recorded else None
-    argv = [str(CLI_PATH), "run", str(root / "deck.md")]
+    argv = [str(_cli_path()), "run", str(root / "deck.md")]
     if plugin_dir is not None:
         argv += ["--plugin-dir", os.path.abspath(plugin_dir)]
     return shlex.join(argv)

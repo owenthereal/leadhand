@@ -46,12 +46,14 @@ to the end; the Task 22 Step 2 checks are added to e2e-raw.md. It implies
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import re
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -65,15 +67,14 @@ from typing import Callable
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-CLI = ROOT / "scripts" / "leadhand"
+# The leadhand binary under test: LEADHAND_BIN, else the Python CLI in this checkout. Resolved,
+# as the CLI resolves its own path: commands run from other folders, and checks match this path.
+CLI = Path(os.environ.get("LEADHAND_BIN") or ROOT / "scripts" / "leadhand").resolve()
 SKILL_FILE = ROOT / "skills" / "run" / "SKILL.md"
-sys.path.insert(0, str(ROOT / "scripts" / "lib"))
 sys.path.insert(0, str(HERE))
 
-from leadhand import procs as lh_procs  # noqa: E402
-from leadhand import usage as lh_usage  # noqa: E402
-
 import codex_push_probe  # noqa: E402
+from codex_push_probe import _claude_session_transcript, _codex_session_file  # noqa: E402
 import make_fixture  # noqa: E402
 
 BUDGET_MINUTES = 45
@@ -101,6 +102,135 @@ REFUSED_RETRY_S = 20.0
 DONE_RE = re.compile(r'\\?"action\\?":\s*\\?"done\\?"')
 REQUIRED_GATES = ("final_review", "evidence", "verify")   # security too when the run requires it
 CARD_PINS = {1: ("claude", "sonnet", "low"), 2: ("codex", "gpt-6-luna", "medium")}
+
+
+# ---------------------------------------------------------------- process identity
+# Copied from scripts/lib/leadhand/procs.py (no leadhand import: the driver runs against any
+# binary). Identity is (pid, start time); a start time is an opaque string in the format the
+# CLI records. Linux reads /proc, macOS sysctl through ctypes (Claude Code's sandbox refuses
+# `ps`), anything else or a failed sysctl falls back to `ps`. Zombies count as gone.
+
+PS_TIMEOUT = 10.0
+
+
+@dataclass(frozen=True)
+class _ProcInfo:
+    pid: int
+    ppid: int
+    pgid: int
+    start: str
+    zombie: bool = False
+
+
+def _proc_stat(pid: int) -> _ProcInfo | None:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_bytes().decode("utf-8", "replace")
+    except (FileNotFoundError, ProcessLookupError, PermissionError, NotADirectoryError):
+        return None
+    # The command name (field 2) may contain spaces and parentheses.
+    rest = raw[raw.rfind(")") + 2:].split()
+    if len(rest) < 20:
+        return None
+    state, ppid, pgid, start = rest[0], int(rest[1]), int(rest[2]), rest[19]
+    return _ProcInfo(pid, ppid, pgid, f"ticks:{start}", zombie=state in ("Z", "X"))
+
+
+_CTL_KERN, _KERN_PROC, _KERN_PROC_PID = 1, 14, 1
+_KINFO_SIZE = 648   # struct kinfo_proc on 64-bit Darwin
+_OFF_START = 0      # kp_proc.p_un.__p_starttime: struct timeval {int64 sec; int32 usec}
+_OFF_STAT = 36      # kp_proc.p_stat (char)
+_OFF_PID = 40       # kp_proc.p_pid
+_OFF_PPID = 560     # kp_eproc.e_ppid
+_OFF_PGID = 564     # kp_eproc.e_pgid
+_SZOMB = 5
+
+_libc = None
+
+
+def _sysctl(mib: list[int], size: int | None) -> bytes | None:
+    """sysctl(mib); with `size` None, ask for the size first. None on failure."""
+    global _libc
+    if _libc is None:
+        _libc = ctypes.CDLL(None, use_errno=True)
+    arr = (ctypes.c_int * len(mib))(*mib)
+    for _ in range(5):
+        if size is None:
+            n = ctypes.c_size_t(0)
+            if _libc.sysctl(arr, len(mib), None, ctypes.byref(n), None, ctypes.c_size_t(0)) != 0:
+                return None
+            want = n.value + n.value // 8 + _KINFO_SIZE * 16
+        else:
+            want = size
+        buf = ctypes.create_string_buffer(want)
+        n = ctypes.c_size_t(want)
+        if _libc.sysctl(arr, len(mib), buf, ctypes.byref(n), None, ctypes.c_size_t(0)) == 0:
+            return buf.raw[:n.value]
+        if ctypes.get_errno() != 12 or size is not None:  # ENOMEM: the table grew; retry
+            return None
+    return None
+
+
+def _kinfo(raw: bytes, offset: int) -> _ProcInfo:
+    sec, usec = struct.unpack_from("qi", raw, offset + _OFF_START)
+    (stat,) = struct.unpack_from("b", raw, offset + _OFF_STAT)
+    (pid,) = struct.unpack_from("i", raw, offset + _OFF_PID)
+    ppid, pgid = struct.unpack_from("ii", raw, offset + _OFF_PPID)
+    return _ProcInfo(pid, ppid, pgid, f"{sec}.{usec:06d}", zombie=stat == _SZOMB)
+
+
+def _darwin_pid(pid: int) -> _ProcInfo | None | bool:
+    """_ProcInfo, None when the pid does not exist, False when sysctl failed."""
+    raw = _sysctl([_CTL_KERN, _KERN_PROC, _KERN_PROC_PID, pid], _KINFO_SIZE)
+    if raw is None:
+        return False
+    if len(raw) < _KINFO_SIZE:
+        return None
+    info = _kinfo(raw, 0)
+    return info if info.pid == pid else None
+
+
+def _ps(args: list[str]) -> str | None:
+    try:
+        r = subprocess.run(["ps", *args], capture_output=True, text=True, timeout=PS_TIMEOUT,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _ps_one(pid: int) -> _ProcInfo | None:
+    out = _ps(["-o", "pid=,ppid=,pgid=,stat=,lstart=", "-p", str(pid)])
+    parts = (out or "").split()
+    if len(parts) < 5 or not all(p.isdigit() for p in parts[:3]):
+        return None
+    return _ProcInfo(int(parts[0]), int(parts[1]), int(parts[2]), "lstart:" + " ".join(parts[4:]),
+                     zombie=parts[3].startswith("Z"))
+
+
+def _process_info(pid: int) -> _ProcInfo | None:
+    """The process's (pid, ppid, pgid, start, zombie), or None if there is none."""
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    if sys.platform.startswith("linux") and os.path.isdir("/proc/self"):
+        return _proc_stat(pid)
+    if sys.platform == "darwin":
+        got = _darwin_pid(pid)
+        if got is not False:
+            return got
+    return _ps_one(pid)
+
+
+def _process_start_time(pid: int) -> str | None:
+    """The process's start time as an opaque string; None if it is gone or a zombie."""
+    info = _process_info(pid)
+    return None if info is None or info.zombie else info.start
+
+
+def _same_process(pid: int | None, start: str | None) -> bool:
+    """True when `pid` is alive (not a zombie) and still has start time `start`."""
+    if not pid or not start:
+        return False
+    return _process_start_time(int(pid)) == start
 
 
 def utc_now() -> str:
@@ -165,7 +295,7 @@ def kill_runner_processes(runner_json: Path, sig: int, roles=("codex", "runner")
         rec = recs.get(role)
         if not rec or not isinstance(rec.get("start"), str):
             continue
-        if lh_procs.same_process(rec["pid"], rec["start"]):
+        if _same_process(rec["pid"], rec["start"]):
             try:
                 os.kill(rec["pid"], sig)
                 done.append((role, rec["pid"]))
@@ -261,7 +391,7 @@ class Session:
 
     def signal(self, sig: int) -> bool:
         """Signal the launcher (it forwards SIGINT/SIGTERM to claude). Checked by pid + start."""
-        if self.launcher_pid and lh_procs.same_process(self.launcher_pid, self.launcher_start):
+        if self.launcher_pid and _same_process(self.launcher_pid, self.launcher_start):
             try:
                 os.kill(self.launcher_pid, sig)
                 return True
@@ -282,7 +412,7 @@ class HeadlessSession(Session):
         self.proc = subprocess.Popen(self.argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.PIPE, stderr=self.err, start_new_session=True)
         self.launcher_pid = self.proc.pid
-        self.launcher_start = lh_procs.process_start_time(self.proc.pid)
+        self.launcher_start = _process_start_time(self.proc.pid)
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
 
@@ -350,7 +480,7 @@ class TmuxSession(Session):
             self.notes["tmux_stderr"] = r.stderr.strip()
         pid = self._fmt("#{pane_pid}")
         self.launcher_pid = int(pid) if pid.isdigit() else None
-        self.launcher_start = lh_procs.process_start_time(self.launcher_pid) if self.launcher_pid else None
+        self.launcher_start = _process_start_time(self.launcher_pid) if self.launcher_pid else None
         self.answered: list[str] = []
         self.selections: list[dict] = []
         self.last_save = 0.0
@@ -425,7 +555,7 @@ class TmuxSession(Session):
             deadline = time.time() + STOP_GRACE_S
             while time.time() < deadline and self.alive():
                 time.sleep(1)
-            if self.alive() and self.launcher_pid and lh_procs.same_process(self.launcher_pid, self.launcher_start):
+            if self.alive() and self.launcher_pid and _same_process(self.launcher_pid, self.launcher_start):
                 os.kill(self.launcher_pid, signal.SIGKILL)
             self.notes["stopped_by_driver"] = True
         self.tmux("kill-session", "-t", self.name)
@@ -545,7 +675,7 @@ class Interrupter:
             self.phase = "skipped: too fast to interrupt"
             return
         codex = runner_processes(wd / "runner.json").get("codex")
-        if not codex or not isinstance(codex.get("start"), str) or not lh_procs.same_process(codex["pid"], codex["start"]):
+        if not codex or not isinstance(codex.get("start"), str) or not _same_process(codex["pid"], codex["start"]):
             return
         now = time.time()
         if self.codex_live_since is None:
@@ -581,7 +711,7 @@ class Interrupter:
         if req.get("vendor") == "codex":
             procs_ = runner_processes(self.d.run_dir / "workers" / did / "runner.json")
             codex = procs_.get("codex")
-            if not codex or not isinstance(codex.get("start"), str) or not lh_procs.same_process(codex["pid"], codex["start"]):
+            if not codex or not isinstance(codex.get("start"), str) or not _same_process(codex["pid"], codex["start"]):
                 return
             runner = procs_.get("runner")
         self.next_dispatch = did
@@ -591,7 +721,7 @@ class Interrupter:
         self._prekill_relaunch()
         holder = read_json(self.d.run_dir / "holder.json")
         pid, start = holder.get("supervisor_pid"), holder.get("supervisor_start")
-        alive = isinstance(pid, int) and isinstance(start, str) and lh_procs.same_process(pid, start)
+        alive = isinstance(pid, int) and isinstance(start, str) and _same_process(pid, start)
         done = False
         if alive:
             try:
@@ -1021,7 +1151,7 @@ class Driver:
     def transcripts(self) -> tuple[list[Path], list[Path]]:
         mains, subs = [], []
         for sid in self.session_ids():
-            p = lh_usage.claude_session_transcript(sid)
+            p = _claude_session_transcript(sid)
             if p is None:
                 continue
             mains.append(p)
@@ -1046,7 +1176,7 @@ class Driver:
         found = []
         for a in read_jsonl(self.run_dir / "attempts.jsonl"):
             if a.get("vendor") == "codex" and a.get("worker_id"):
-                p = lh_usage.codex_session_file(a["worker_id"])
+                p = _codex_session_file(a["worker_id"])
                 if p is not None:
                     cdir.mkdir(exist_ok=True)
                     shutil.copy2(p, cdir / p.name)
@@ -1210,7 +1340,7 @@ class Driver:
         for d in sorted(wdir.iterdir()) if wdir.is_dir() else []:
             req = read_json(d / "request.json")
             res = read_json(d / "result.json")
-            rollout = lh_usage.codex_session_file(res.get("session_id") or "") if res.get("session_id") else None
+            rollout = _codex_session_file(res.get("session_id") or "") if res.get("session_id") else None
             rcwd = None
             if rollout:
                 first = next(iter(read_jsonl(rollout)), {})
@@ -1465,7 +1595,7 @@ class Driver:
         facts, ok = {}, bool(threads)
         for thread, cs in threads.items():
             charged = {k: sum(int((c.get("usage") or {}).get(k) or 0) for c in cs) for k in ("input", "cached", "output")}
-            path = lh_usage.codex_session_file(thread)
+            path = _codex_session_file(thread)
             rollout = rollout_total(path) if path else None
             if rollout is None and path and Path(path).exists():
                 # No token_usage_record at all (killed before its first response): P12 says unknown, so every

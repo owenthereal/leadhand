@@ -127,6 +127,10 @@ class EngineError(RuntimeError):
 # Small helpers
 
 def _now() -> float:
+    """The time; tests shift it by LEADHAND_TEST_CLOCK_OFFSET seconds, honoured only under
+    LEADHAND_TESTING=1."""
+    if os.environ.get("LEADHAND_TESTING") == "1" and os.environ.get("LEADHAND_TEST_CLOCK_OFFSET"):
+        return time.time() + float(os.environ["LEADHAND_TEST_CLOCK_OFFSET"])
     return time.time()
 
 
@@ -907,7 +911,7 @@ def _work_branch(ctx: _Run, req: dict) -> str:
 
 
 def _codex_command(ctx: _Run, req: dict) -> list[str]:
-    cmd = [str(dsp.CLI_PATH), "dispatch", "--run", str(ctx.root), "--dispatch-id", req["dispatch_id"],
+    cmd = [str(dsp.cli_path()), "dispatch", "--run", str(ctx.root), "--dispatch-id", req["dispatch_id"],
            *(["--card", str(req["card"])] if req["card"] is not None else []),
            "--attempt", str(req["attempt"]), "--role", req["role"],
            "--model", req["model"], "--effort", req["effort"], "--brief", req["brief"],
@@ -2439,7 +2443,7 @@ def _write_handoff(ctx: _Run, ended: dict, events: list[dict]) -> None:
     index = _dispatches(events)
     last = max(index.values(), key=lambda d: d.req["seq"]) if index else None
     qualifier = ended.get("qualifier") or ""
-    cli, root = shlex.quote(str(dsp.CLI_PATH)), shlex.quote(str(ctx.root))
+    cli, root = shlex.quote(str(dsp.cli_path())), shlex.quote(str(ctx.root))
     lines = [f"# Handoff: {ctx.deck.title}", "",
              f"Outcome: blocked{f' ({qualifier})' if qualifier else ''}", "",
              "## Where it stopped", "",
@@ -2875,7 +2879,7 @@ def _flag(run_dir: Path, what: str) -> RunPaths:
 
 
 def _run_command(paths: RunPaths) -> str:
-    return f"{shlex.quote(str(dsp.CLI_PATH))} run {shlex.quote(str(paths.root))}"
+    return f"{shlex.quote(str(dsp.cli_path()))} run {shlex.quote(str(paths.root))}"
 
 
 def request_pause(run_dir: Path) -> str:
