@@ -79,8 +79,9 @@ pub struct AttemptRecord {
     pub attempt: Option<i64>,
     pub role: Option<String>,
     pub vendor: Option<String>,
-    pub model: Option<String>,
-    pub effort: Option<String>,
+    /// The request's model and effort: carried text (a Codex request's are `request.json`'s).
+    pub model: Option<PyStr>,
+    pub effort: Option<PyStr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     pub worker_id: Option<PyStr>,

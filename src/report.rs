@@ -346,19 +346,27 @@ fn usage_lines(snap: &Snapshot, summary: &status::UsageSummary) -> Vec<PyStr> {
 
 fn routing(snap: &Snapshot) -> Vec<PyStr> {
     // (role, route) -> status -> count, both sorted as the Python sorts them.
-    let mut table: BTreeMap<(String, String), BTreeMap<String, usize>> = BTreeMap::new();
+    // A route is carried text (the model and effort a dispatch was given); PyStr's byte order
+    // is code point order, as Python sorts `str`.
+    let mut table: BTreeMap<(String, PyStr), BTreeMap<String, usize>> = BTreeMap::new();
     for a in worker_attempts(snap) {
         if a.attempt != Some(1) {
             continue;
         }
-        let route: Vec<&str> = [&a.vendor, &a.model, &a.effort]
+        let vendor = a.vendor.as_deref().map(PyStr::from);
+        let mut route = PyStr::default();
+        for part in [vendor.as_ref(), a.model.as_ref(), a.effort.as_ref()]
             .into_iter()
             .flatten()
             .filter(|s| !s.is_empty())
-            .map(String::as_str)
-            .collect();
+        {
+            if !route.is_empty() {
+                route.push_str(" ");
+            }
+            route.push(part);
+        }
         let role = a.role.clone().unwrap_or_else(|| "None".into());
-        let row = table.entry((role, route.join(" "))).or_default();
+        let row = table.entry((role, route)).or_default();
         let status = a
             .status
             .clone()
@@ -370,7 +378,10 @@ fn routing(snap: &Snapshot) -> Vec<PyStr> {
         .into_iter()
         .map(|((role, route), row)| {
             let counts: Vec<String> = row.iter().map(|(s, n)| format!("{n} {s}")).collect();
-            PyStr::from(format!("- {role} · {route}: {}", counts.join(", ")))
+            let mut line = PyStr::from(format!("- {role} · "));
+            line.push(&route);
+            line.push_str(&format!(": {}", counts.join(", ")));
+            line
         })
         .collect()
 }

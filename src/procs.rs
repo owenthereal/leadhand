@@ -106,6 +106,16 @@ pub fn signal_group_if_same(owner: &ProcId, pgid: i32, sig: Signal) -> bool {
     Pid::from_raw(pgid).is_some_and(|group| kill_process_group(group, sig).is_ok())
 }
 
+/// Sends `sig` to the process `id` names only while it is alive with its recorded start time
+/// (`_Tracker.signal`'s per-process step, for a recorded process whose group was not
+/// signalled). Never this process. True when the signal was sent.
+pub fn signal_if_same(id: &ProcId, sig: Signal) -> bool {
+    if id.pid == getpid().as_raw_pid() || !same_process(Some(id.pid), Some(&id.start)) {
+        return false;
+    }
+    Pid::from_raw(id.pid).is_some_and(|pid| rustix::process::kill_process(pid, sig).is_ok())
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader};
@@ -420,5 +430,23 @@ mod tests {
         assert!(!signal_group_if_same(&owner, pid, Signal::TERM), "gone");
         let mut other = other;
         assert_eq!(other.0.try_wait().unwrap(), None);
+    }
+
+    #[test]
+    fn signal_if_same_needs_the_recorded_start_time() {
+        let mut kid = sleeper(false);
+        let pid = kid.pid();
+        let id = identify(pid).unwrap();
+        let stale = ProcId {
+            pid,
+            start: format!("{}x", id.start),
+        };
+        assert!(!signal_if_same(&stale, Signal::TERM), "a stale identity");
+        // Never this process. SIGCHLD, ignored by default, in case it were sent.
+        assert!(!signal_if_same(&identify(me()).unwrap(), Signal::CHILD));
+        assert_eq!(kid.0.try_wait().unwrap(), None, "nothing was signalled");
+        assert!(signal_if_same(&id, Signal::TERM));
+        assert_eq!(kid.0.wait().unwrap().signal(), Some(Signal::TERM.as_raw()));
+        assert!(!signal_if_same(&id, Signal::TERM), "gone");
     }
 }

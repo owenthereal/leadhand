@@ -26,9 +26,24 @@ pub fn codex_argv(
     env_overrides: &[(OsString, OsString)],
     extra_dirs: &[PathBuf],
 ) -> Result<Vec<OsString>> {
+    codex_argv_parts(req, last_message, git_common, env_overrides, extra_dirs)?
+}
+
+/// `codex_argv`, with its two failures kept apart, as the Python's runner meets them at two
+/// different times: the outer error is a refusal, raised by the Python's `codex_argv` itself
+/// (`ValueError`, before anything starts); the inner one an argument the OS cannot be given
+/// (a lone surrogate that is not a surrogate escape), which the Python's `Popen` raises at the
+/// launch.
+pub fn codex_argv_parts(
+    req: &DispatchRequest,
+    last_message: &Path,
+    git_common: &Path,
+    env_overrides: &[(OsString, OsString)],
+    extra_dirs: &[PathBuf],
+) -> Result<Result<Vec<OsString>>> {
     let program = crate::testing::codex_bin()
         .map_or_else(|| OsString::from("codex"), PathBuf::into_os_string);
-    argv_for(
+    parts_for(
         program,
         req,
         last_message,
@@ -39,6 +54,7 @@ pub fn codex_argv(
 }
 
 /// `codex_argv` with the program given.
+#[cfg(test)]
 fn argv_for(
     program: OsString,
     req: &DispatchRequest,
@@ -47,6 +63,25 @@ fn argv_for(
     env_overrides: &[(OsString, OsString)],
     extra_dirs: &[PathBuf],
 ) -> Result<Vec<OsString>> {
+    parts_for(
+        program,
+        req,
+        last_message,
+        git_common,
+        env_overrides,
+        extra_dirs,
+    )?
+}
+
+/// `codex_argv_parts` with the program given.
+fn parts_for(
+    program: OsString,
+    req: &DispatchRequest,
+    last_message: &Path,
+    git_common: &Path,
+    env_overrides: &[(OsString, OsString)],
+    extra_dirs: &[PathBuf],
+) -> Result<Result<Vec<OsString>>> {
     // Built as the Python builds it, every refusal first; encoded for the OS last, as
     // `subprocess` encodes the Python's list.
     let path = |p: &Path| Arg::Os(pure_path(p.as_os_str()).into_os_string());
@@ -104,12 +139,13 @@ fn argv_for(
         argv.push(Arg::Text(resume.clone()));
     }
     argv.push(text("-"));
-    argv.into_iter()
+    Ok(argv
+        .into_iter()
         .map(|arg| match arg {
             Arg::Os(os) => Ok(os),
             Arg::Text(text) => text.to_os(),
         })
-        .collect()
+        .collect())
 }
 
 /// A `-c` setting: `<key>=<value as a TOML string>`.
@@ -482,6 +518,39 @@ mod tests {
         assert_eq!(argv[0], program);
         assert_eq!(argv[13], "workspace-write");
         assert_eq!(argv[9], "sandbox_workspace_write.network_access=false");
+    }
+
+    #[test]
+    fn codex_argv_parts_keeps_refusals_apart_from_encodings() {
+        let args = |req: &DispatchRequest| {
+            codex_argv_parts(req, Path::new("/l"), Path::new("/g"), &[], &[])
+        };
+        let good = base("implementer");
+        assert_eq!(
+            args(&good).unwrap().unwrap(),
+            codex_argv(&good, Path::new("/l"), Path::new("/g"), &[], &[]).unwrap()
+        );
+        // A model the OS cannot be given: the command line is built (the Python's
+        // `codex_argv` returns), and only encoding it fails.
+        let lone: PyStr = serde_json::from_str(r#""gpt\ud800""#).unwrap();
+        let mut unencodable = base("implementer");
+        unencodable.model = lone.clone();
+        let inner = args(&unencodable).unwrap().unwrap_err();
+        assert!(
+            inner.message.contains("surrogates not allowed"),
+            "{}",
+            inner.message
+        );
+        // A refusal comes first, as the Python raises it before anything is encoded.
+        let mut refused = base("implementer");
+        refused.model = lone;
+        refused.resume = Some(PyStr::from("-x"));
+        let outer = args(&refused).unwrap_err();
+        assert_eq!(outer.message, "bad session id '-x'");
+        // A surrogate escape is a byte, and encodes.
+        let mut escaped = base("implementer");
+        escaped.effort = PyStr::from_os(&os(b"hi\xff"));
+        assert!(args(&escaped).unwrap().is_ok());
     }
 
     #[test]

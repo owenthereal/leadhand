@@ -8,7 +8,9 @@
 mod repo;
 mod runner;
 
-pub use repo::{LinkedWorktree, RepoIdentity, linked_worktree, repo_identity, sparse_problem};
+pub use repo::{
+    LinkedWorktree, RepoIdentity, git_common_dir, linked_worktree, repo_identity, sparse_problem,
+};
 pub use runner::{FETCH_TIMEOUT, GIT_TIMEOUT, Git, REPO_VARS, SAFE_CONFIG, SAFE_ENV, split_nul};
 
 #[cfg(test)]

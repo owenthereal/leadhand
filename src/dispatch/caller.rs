@@ -31,8 +31,11 @@ use serde_json::value::RawValue;
 use crate::briefs::SCRATCH;
 use crate::cli::Caller;
 use crate::error::{Error, Result};
+use crate::git::Git;
 use crate::procs;
-use crate::pytext::{abspath, pure_path, py_float, py_repr, real_path};
+use crate::pytext::{
+    abspath, normpath, pure_path, py_float, py_repr, py_splitlines_bytes, real_path,
+};
 use crate::wire::{PyMap, PyStr};
 
 use super::{DispatchRequest, REQUEST, read_json_object, read_request};
@@ -104,7 +107,7 @@ fn inside(path: &Path, root: &Path, strict: bool) -> bool {
 }
 
 /// `Path(p).name`, of the `pathlib` spelling.
-fn py_name(p: &Path) -> OsString {
+pub(crate) fn py_name(p: &Path) -> OsString {
     let pure = pure_path(p.as_os_str()).into_os_string().into_vec();
     let name = match pure.iter().rposition(|b| *b == b'/') {
         Some(at) => &pure[at + 1..],
@@ -320,6 +323,89 @@ fn allowed_cwds(anchor: &Anchor, workspace: &PyStr, run_dir: &Path) -> Result<Ve
         }
     }
     Ok(out)
+}
+
+/// `evidence_dirs` (security review M3): for an evidence dispatch, the run's evidence base
+/// worktree, where the worker runs the evidence checks (Codex's sandbox lets it write only its
+/// cwd and its `--add-dir` folders); nothing for any other kind. Refused unless the run names
+/// its repository, and the base worktree is a registered worktree of it reached through no
+/// symlink below it (as the engine checks before resetting it). Its real path.
+pub fn evidence_dirs(req: &DispatchRequest) -> Result<Vec<PathBuf>> {
+    if req.kind.as_deref() != Some("evidence") {
+        return Ok(Vec::new());
+    }
+    let paths = crate::state::run_paths(&req.run_dir);
+    let meta = read_json_object(&paths.run_json)?.unwrap_or_default();
+    let Some(repo) = text_field(&meta, "repo").filter(is_abs) else {
+        return Err(refuse(format!(
+            "the run {} names no repository for its evidence base worktree",
+            shown(&paths.root)
+        )));
+    };
+    let repo_path = PathBuf::from(repo.to_os()?);
+    // `Path(meta.get("workspace") or "")`.
+    let workspace = match text_field(&meta, "workspace") {
+        Some(ws) => PathBuf::from(ws.to_os()?),
+        None => PathBuf::new(),
+    };
+    let path = base_worktree_path(&repo_path, &workspace, &py_name(&req.run_dir));
+    if !resolves_in_place(&repo_path, &path)? {
+        return Err(refuse(format!(
+            "the evidence base worktree {} is a symlink or lies behind one",
+            shown(&path)
+        )));
+    }
+    let listed = Git::at(&repo_path)?.run(&["worktree", "list", "--porcelain"].map(OsStr::new))?;
+    let real = real_path(&path);
+    let registered = py_splitlines_bytes(&listed).into_iter().any(|line| {
+        line.strip_prefix(b"worktree ")
+            .is_some_and(|p| real_path(Path::new(OsStr::from_bytes(p))) == real)
+    });
+    if !registered {
+        return Err(refuse(format!(
+            "the evidence base worktree {} is not a worktree of {}",
+            shown(&path),
+            repo.shown()
+        )));
+    }
+    Ok(vec![real])
+}
+
+/// `gitops.resolves_in_place`: whether `path` lies inside `root` and resolves to itself, so
+/// that neither it nor any folder between `root` and it is a symlink (`root`'s own location
+/// may be).
+fn resolves_in_place(root: &Path, path: &Path) -> Result<bool> {
+    let rel = relpath(&absolute(path)?, &absolute(root)?);
+    let rel_bytes = rel.as_os_str().as_bytes();
+    if rel_bytes == b".." || rel_bytes.starts_with(b"../") || rel_bytes.starts_with(b"/") {
+        return Ok(false);
+    }
+    let mut joined = real_path(root).into_os_string().into_vec();
+    if !joined.ends_with(b"/") {
+        joined.push(b'/');
+    }
+    joined.extend_from_slice(rel_bytes);
+    Ok(real_path(path) == normpath(OsStr::from_bytes(&joined)))
+}
+
+/// `os.path.relpath(path, start)` of two absolute, normalized paths.
+fn relpath(path: &Path, start: &Path) -> PathBuf {
+    let parts = |p: &Path| -> Vec<Vec<u8>> {
+        p.as_os_str()
+            .as_bytes()
+            .split(|b| *b == b'/')
+            .filter(|c| !c.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    let (start, path) = (parts(start), parts(path));
+    let common = start.iter().zip(&path).take_while(|(a, b)| a == b).count();
+    let mut rel: Vec<Vec<u8>> = vec![b"..".to_vec(); start.len() - common];
+    rel.extend(path[common..].iter().cloned());
+    if rel.is_empty() {
+        return PathBuf::from(".");
+    }
+    PathBuf::from(OsString::from_vec(rel.join(&b'/')))
 }
 
 /// `check_request`: refused when the request leaves the anchored run (another run
@@ -1185,5 +1271,109 @@ mod tests {
         req.run_dir = PathBuf::from("/runs/r");
         let err = check_request(&req, &anchor).unwrap_err();
         assert!(!err.message.starts_with("refused"), "{}", err.message);
+    }
+
+    #[test]
+    fn evidence_dirs_match_python() {
+        // Security review M3: the evidence base worktree, as `dispatch.evidence_dirs` finds it
+        // or refuses it.
+        let f = crate::git::fixture::Fixture::new();
+        let root = f.root().to_path_buf();
+        let repo = f.make_repo("my repo");
+        let add = |path: &Path| {
+            f.git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    path.to_str().unwrap(),
+                ],
+            );
+        };
+        let worktrees = repo.join(".worktrees");
+        add(&worktrees.join("ws"));
+        add(&worktrees.join("ws--base"));
+        add(&worktrees.join("run in place--base"));
+        add(&root.join("elsewhere"));
+        fs::create_dir(worktrees.join("plain")).unwrap();
+        fs::create_dir(worktrees.join("plain--base")).unwrap();
+        add(&worktrees.join("linked"));
+        symlink(root.join("elsewhere"), worktrees.join("linked--base")).unwrap();
+        // A run per case: (run dir name, run.json).
+        let quoted = |p: &Path| ascii_json(&PyStr::from_os(p.as_os_str()));
+        let meta = |ws: &Path| {
+            format!(
+                "{{\"run_id\": \"r\", \"repo\": {}, \"workspace\": {}}}",
+                quoted(&repo),
+                quoted(ws)
+            )
+        };
+        let runs: Vec<(&str, String)> = vec![
+            ("no repo", "{\"run_id\": \"r\"}".into()),
+            (
+                "relative repo",
+                "{\"run_id\": \"r\", \"repo\": \"my repo\"}".into(),
+            ),
+            ("worktree run", meta(&worktrees.join("ws"))),
+            ("run in place", meta(&repo)),
+            ("unregistered", meta(&worktrees.join("plain"))),
+            ("behind a link", meta(&worktrees.join("linked"))),
+            ("missing", meta(&worktrees.join("gone"))),
+        ];
+        let mut reqs = Vec::new();
+        for (name, json) in &runs {
+            let run = root.join(name);
+            fs::create_dir(&run).unwrap();
+            fs::write(run.join("run.json"), json).unwrap();
+            for kind in [Some("evidence"), Some("review"), None] {
+                let mut req = World {
+                    _tmp: tempfile::tempdir().unwrap(),
+                    t: root.clone(),
+                    ws: repo.clone(),
+                }
+                .request("c1-a1-evidence-1");
+                req.run_dir = run.clone();
+                req.kind = kind.map(str::to_string);
+                reqs.push(req);
+            }
+        }
+        let code = "import json, os, sys\nfrom leadhand import dispatch as d\nout = []\n\
+                    for c in json.loads(sys.argv[1]):\n\
+                    \x20 try:\n\
+                    \x20   dirs = d.evidence_dirs(d.request_from_json(c))\n\
+                    \x20   out.append('ok ' + ' '.join(os.fsencode(p).hex() for p in dirs))\n\
+                    \x20 except d.DispatchError as e:\n\
+                    \x20   out.append('err ' + str(e))\n\
+                    print(json.dumps(out))\n";
+        let arg = to_line(&reqs).unwrap();
+        let theirs: Vec<String> =
+            serde_json::from_str(std::str::from_utf8(&python(code, &[OsStr::new(&arg)])).unwrap())
+                .unwrap();
+        assert_eq!(theirs.len(), reqs.len());
+        let mut found = 0;
+        for (req, want) in reqs.iter().zip(&theirs) {
+            let ours = match evidence_dirs(req) {
+                Ok(dirs) => {
+                    let hex: Vec<String> = dirs
+                        .iter()
+                        .map(|d| {
+                            d.as_os_str()
+                                .as_bytes()
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect()
+                        })
+                        .collect();
+                    format!("ok {}", hex.join(" "))
+                }
+                Err(e) => format!("err {}", e.message),
+            };
+            assert_eq!(&ours, want, "{:?} {:?}", req.run_dir, req.kind);
+            found += usize::from(want.starts_with("ok ") && want.len() > 3);
+        }
+        // The worktree run and the in-place run find theirs; every other kind gets nothing.
+        assert_eq!(found, 2, "{theirs:#?}");
     }
 }

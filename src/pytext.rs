@@ -60,6 +60,35 @@ pub fn py_splitlines(s: &str) -> Vec<&str> {
     out
 }
 
+/// `str.splitlines()` of OS bytes decoded with `surrogateescape`, each line given back as its
+/// bytes: the same line ends as `py_splitlines`. An undecodable byte is never one, and the
+/// multi-byte ends (U+0085, U+2028, U+2029) start with a lead byte, so they are found by
+/// their bytes alone.
+pub fn py_splitlines_bytes(s: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let (mut start, mut i) = (0, 0);
+    while i < s.len() {
+        let end = match &s[i..] {
+            [b'\r', b'\n', ..] => 2,
+            [b'\n' | b'\r' | 0x0b | 0x0c | 0x1c | 0x1d | 0x1e, ..] => 1,
+            [0xc2, 0x85, ..] => 2,
+            [0xe2, 0x80, 0xa8 | 0xa9, ..] => 3,
+            _ => 0,
+        };
+        if end == 0 {
+            i += 1;
+            continue;
+        }
+        out.push(&s[start..i]);
+        i += end;
+        start = i;
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
+}
+
 /// `repr(s)` for a `str`.
 pub fn py_repr(s: &str) -> String {
     py_repr_code_points(s.chars().map(u32::from))
@@ -534,6 +563,38 @@ pub(crate) mod tests {
                 py_splitlines(text)
             ]);
             assert_eq!(ours, want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn splitlines_of_os_bytes_matches_python() {
+        let cases: [&[u8]; 9] = [
+            b"worktree /a\nHEAD x\n\nworktree /b c\n",
+            b"a\r\nb\rc\x0bd\x0ce\x1cf\x1dg\x1eh",
+            b"one \xc2\x85 two \xe2\x80\xa8 three \xe2\x80\xa9 four",
+            b"\xff\n\xfe\xc2\x85\xe2\x80",
+            b"\xe2\x80\xe2\x80\xa8x",
+            b"\xc2\xc2\x85",
+            b"",
+            b"\n\n",
+            b"no end",
+        ];
+        let code = "import json, os, sys\n\
+                    print(json.dumps([[os.fsencode(l).hex() for l in os.fsdecode(bytes.fromhex(a)).splitlines()]\n\
+                    \x20 for a in sys.argv[1:]]))\n";
+        let hexes: Vec<String> = cases
+            .iter()
+            .map(|c| c.iter().map(|b| format!("{b:02x}")).collect())
+            .collect();
+        let args: Vec<&OsStr> = hexes.iter().map(OsStr::new).collect();
+        let out = crate::wire::tests::python(code, &args);
+        let theirs: Vec<Vec<String>> = serde_json::from_slice(&out).unwrap();
+        for (case, want) in cases.iter().zip(theirs) {
+            let ours: Vec<String> = py_splitlines_bytes(case)
+                .iter()
+                .map(|l| l.iter().map(|b| format!("{b:02x}")).collect())
+                .collect();
+            assert_eq!(ours, want, "{case:?}");
         }
     }
 

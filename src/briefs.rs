@@ -207,7 +207,7 @@ fn folds_to(c: char, p: char) -> bool {
 }
 
 /// The text of `line` that matched the case-folded `word`, and the rest after it.
-fn after_folded<'a>(line: &'a str, word: &str) -> Option<(&'a str, &'a str)> {
+pub(crate) fn after_folded<'a>(line: &'a str, word: &str) -> Option<(&'a str, &'a str)> {
     let mut at = 0;
     for p in word.chars() {
         let c = line[at..].chars().next()?;

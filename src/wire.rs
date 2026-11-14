@@ -212,6 +212,28 @@ impl PyStr {
         crate::pytext::py_repr_code_points(code_points(&self.0))
     }
 
+    /// The text as UTF-8, as Python's strict `str.encode("utf-8")` gives it: an error, with
+    /// Python's `UnicodeEncodeError` text, when it holds any lone surrogate (a surrogate
+    /// escape included).
+    pub fn encode_utf8(&self) -> Result<&str> {
+        if let Ok(text) = std::str::from_utf8(&self.0) {
+            return Ok(text);
+        }
+        // The first run of surrogates, by code point position, as the encoder reports it.
+        let surrogate = |cp: &u32| (0xD800..=0xDFFF).contains(cp);
+        let cps: Vec<u32> = code_points(&self.0).collect();
+        let start = cps.iter().position(surrogate).unwrap_or(0);
+        let run = cps[start..].iter().take_while(|cp| surrogate(cp)).count();
+        let what = if run == 1 {
+            format!("character '\\u{:04x}' in position {start}", cps[start])
+        } else {
+            format!("characters in position {start}-{}", start + run - 1)
+        };
+        Err(Error::msg(format!(
+            "'utf-8' codec can't encode {what}: surrogates not allowed"
+        )))
+    }
+
     /// The OS bytes `to_os` gives, or the lossy text when a surrogate has no byte (for text
     /// printed to a terminal or written to a file, as Python's `surrogateescape` writes it).
     pub fn to_os_lossy(&self) -> OsString {
@@ -1027,5 +1049,38 @@ pub(crate) mod tests {
                 .unwrap();
         let ours: Vec<String> = texts.iter().map(PyStr::repr).collect();
         assert_eq!(ours, theirs);
+    }
+
+    #[test]
+    fn encode_utf8_is_python_strict_encode() {
+        let texts: Vec<PyStr> = [
+            r#""plain café 😀""#,
+            r#""ab\udcff\udcfecd\udcffe""#,
+            r#""x\udcffy""#,
+            r#""é😀\udcff""#,
+            r#""lone \ud800 lead""#,
+            r#""\udfff""#,
+            r#""""#,
+        ]
+        .iter()
+        .map(|t| serde_json::from_str(t).unwrap())
+        .collect();
+        let code = "import json, sys\nout = []\n\
+                    for t in json.loads(sys.argv[1]):\n\
+                    \x20 try: out.append(['ok', t.encode('utf-8').decode('utf-8')])\n\
+                    \x20 except UnicodeEncodeError as e: out.append(['err', str(e)])\n\
+                    print(json.dumps(out))\n";
+        let arg = to_line(&texts).unwrap();
+        let theirs: Vec<(String, String)> =
+            serde_json::from_str(std::str::from_utf8(&python(code, &[OsStr::new(&arg)])).unwrap())
+                .unwrap();
+        assert_eq!(theirs.len(), texts.len());
+        for (text, (kind, want)) in texts.iter().zip(&theirs) {
+            let ours = match text.encode_utf8() {
+                Ok(s) => ("ok", s.to_string()),
+                Err(e) => ("err", e.message),
+            };
+            assert_eq!((ours.0, &ours.1), (kind.as_str(), want), "{text:?}");
+        }
     }
 }

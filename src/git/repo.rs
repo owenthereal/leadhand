@@ -38,6 +38,13 @@ pub fn repo_identity(any_dir: &Path) -> Result<RepoIdentity, Failure> {
     Ok(RepoIdentity { top, common_dir })
 }
 
+/// The Git common directory of the checkout `dir` lies in, absolute (`gitops.git_common_dir`):
+/// the folder a Codex worker gets as an `--add-dir`.
+pub fn git_common_dir(dir: &Path) -> Result<PathBuf, Failure> {
+    let git = Git::try_at(dir)?;
+    rev_parse_path(&git, &["--path-format=absolute", "--git-common-dir"])
+}
+
 /// The linked worktree a directory lies in (a run's workspace or its evidence base
 /// worktree), with its admin folder, where the run record is kept.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -244,6 +251,65 @@ mod tests {
         let plain = f.root().join("plain");
         std::fs::create_dir(&plain).unwrap();
         assert!(linked_worktree(&plain).is_err());
+    }
+
+    #[test]
+    fn git_common_dir_matches_python() {
+        let f = Fixture::new();
+        let repo = f.make_repo("my repo");
+        f.commit(&repo, &[("src/x.txt", "x\n")], "src");
+        let inside = repo.join(".worktrees/my slug");
+        f.git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "run",
+                inside.to_str().unwrap(),
+            ],
+        );
+        let env: Vec<(OsString, OsString)> = f
+            .hermetic_env()
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .collect();
+        for dir in [
+            repo.clone(),
+            repo.join("src"),
+            inside.clone(),
+            inside.join("src"),
+        ] {
+            let ours = git_common_dir(&dir).unwrap();
+            let out = std::process::Command::new("python3")
+                .args([
+                    "-B",
+                    "-c",
+                    "import os, sys\nfrom pathlib import Path\nfrom leadhand import gitops\n\
+                     sys.stdout.buffer.write(os.fsencode(gitops.git_common_dir(Path(sys.argv[1]))))\n",
+                ])
+                .arg(&dir)
+                .envs(env.iter().cloned())
+                .env(
+                    "PYTHONPATH",
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/lib"),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(ours.as_os_str().as_bytes(), out.stdout, "{dir:?}");
+            assert_eq!(ours, real(&repo.join(".git")));
+        }
+        // Outside a checkout, Git's own refusal.
+        let plain = f.root().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert!(git_common_dir(&plain).is_err());
+        assert!(git_common_dir(Path::new("relative")).is_err());
     }
 
     #[test]
