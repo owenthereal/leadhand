@@ -25,13 +25,13 @@ use super::runner::POLL;
 use super::tracker::Tracker;
 use super::{
     CANCEL, HEARTBEAT, LAST, PROCS, RAW, RESULT, RUNNER, RUNNER_LOCK, STDERR, STOPPING, STREAM,
-    SUPERSEDED, load_result, open_lock_file, read_json_object, wall_now,
+    SUPERSEDED, StoppedProc, field, load_result, open_lock_file, proc_record, proc_record_in,
+    read_json_object, wall_now,
 };
 use crate::error::{Error, Result};
-use crate::procs::{self, ProcId};
+use crate::procs::ProcId;
 use crate::store::write_json_atomic;
 use crate::sys::detach_session;
-use crate::wire::{PyMap, PyStr};
 
 /// A live runner whose heartbeat is older than this many seconds is looked at again before
 /// it counts as hung.
@@ -130,26 +130,10 @@ fn runner_locked(wd: &Path) -> Result<bool> {
 // --------------------------------------------------------------------------
 // Who is alive
 
-/// A record's identity (`{pid, start}`), when `pid` is an integer and `start` a string.
-fn record_id(map: &PyMap<Box<RawValue>>) -> Option<ProcId> {
-    let pid = map
-        .get(&PyStr::from("pid"))
-        .and_then(|raw| serde_json::from_str::<i32>(raw.get()).ok())?;
-    let start = map
-        .get(&PyStr::from("start"))
-        .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())?;
-    Some(ProcId { pid, start })
-}
-
-/// `_live`: the record's process, while its pid still has the recorded start time.
-fn live(map: &PyMap<Box<RawValue>>) -> Option<ProcId> {
-    record_id(map).filter(|id| procs::same_process(Some(id.pid), Some(&id.start)))
-}
-
-/// `_live` of a JSON value (a record nested in `runner.json`).
-fn live_raw(raw: Option<&RawValue>) -> Option<ProcId> {
-    let map: PyMap<Box<RawValue>> = serde_json::from_str(raw?.get()).ok()?;
-    live(&map)
+/// `_live`: the record's process (`proc_record`), while its pid still has the recorded start
+/// time.
+fn live(rec: Option<StoppedProc>) -> Option<ProcId> {
+    rec.filter(StoppedProc::alive).and_then(|rec| rec.id())
 }
 
 /// `_starting_runner`: a spawned runner that has not written `runner.json` yet, alive, and
@@ -161,13 +145,10 @@ fn starting_runner(wd: &Path) -> Result<Option<(ProcId, f64)>> {
     let Some(spawn) = read_json_object(&wd.join(SPAWN))? else {
         return Ok(None);
     };
-    let Some(id) = live(&spawn) else {
+    let Some(id) = live(proc_record_in(&spawn)) else {
         return Ok(None);
     };
-    let at = spawn
-        .get(&PyStr::from("at"))
-        .and_then(|raw| serde_json::from_str::<f64>(raw.get()).ok())
-        .unwrap_or(0.0);
+    let at = field::<f64>(&spawn, "at").unwrap_or(0.0);
     Ok(Some((id, at)))
 }
 
@@ -186,11 +167,12 @@ pub fn runner_alive(worker_dir: &Path) -> Result<bool> {
 /// `runner.json`'s record when there is one, else `spawn.json`'s.
 pub(crate) fn runner_target(wd: &Path) -> Result<Option<ProcId>> {
     if let Some(runner) = read_json_object(&wd.join(RUNNER))? {
-        return Ok(live_raw(
-            runner.get(&PyStr::from("runner")).map(|raw| &**raw),
-        ));
+        let rec = field::<Box<RawValue>>(&runner, "runner").and_then(|raw| proc_record(&raw));
+        return Ok(live(rec));
     }
-    Ok(read_json_object(&wd.join(SPAWN))?.and_then(|spawn| live(&spawn)))
+    Ok(live(
+        read_json_object(&wd.join(SPAWN))?.and_then(|spawn| proc_record_in(&spawn)),
+    ))
 }
 
 fn mtime(path: &Path) -> Option<f64> {
@@ -319,10 +301,7 @@ pub fn supersede(wd: &Path) -> Result<()> {
     {
         return Err(Error::io(&superseded, e));
     }
-    let named = runner
-        .get(&PyStr::from("generation"))
-        .and_then(|raw| serde_json::from_str::<i64>(raw.get()).ok())
-        .filter(|n| *n != 0);
+    let named = field::<i64>(&runner, "generation").filter(|n| *n != 0);
     let mut n = match named {
         Some(n) => n,
         None => {
@@ -348,8 +327,9 @@ pub fn supersede(wd: &Path) -> Result<()> {
 
 /// `_spawn_runner`: `dispatch-runner <wd>` (this CLI, as `testing::self_path` names it), in a
 /// new session, in the worker folder, with stdin from `/dev/null` and its output appended to
-/// `runner.out` and `runner.err`; and `spawn.json`. Nothing else this process holds reaches it:
-/// the caller has marked every inherited descriptor close-on-exec (`Popen(close_fds=True)`).
+/// `runner.out` and `runner.err`; and `spawn.json`. Nothing else this process holds reaches it
+/// (`Popen(close_fds=True)`): the spawn itself first marks every inherited descriptor
+/// close-on-exec, whoever calls it.
 pub fn spawn_runner(wd: &Path) -> Result<Child> {
     let program = crate::testing::self_path();
     let mut cmd = Command::new(&program);
@@ -359,6 +339,8 @@ pub fn spawn_runner(wd: &Path) -> Result<Child> {
 
 /// `cmd` started as the runner is, and recorded in `spawn.json`.
 fn spawn_detached(wd: &Path, mut cmd: Command) -> Result<Child> {
+    crate::sys::keep_inherited_fds_from_children()
+        .map_err(|e| Error::msg(format!("cannot list this process's descriptors: {e}")))?;
     let append = |name: &str| -> Result<File> {
         let path = wd.join(name);
         OpenOptions::new()
@@ -387,12 +369,14 @@ fn spawn_detached(wd: &Path, mut cmd: Command) -> Result<Child> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::io::{BufRead, BufReader, Read};
     use std::os::unix::process::ExitStatusExt;
 
     use rustix::process::Signal;
 
     use super::*;
+    use crate::procs;
 
     /// A process this test started, in its own session: killed (its whole group) and reaped
     /// when the test ends, pass or fail.
@@ -617,17 +601,17 @@ mod tests {
         assert!(owner_lock(&wd, Some(Instant::now() + Duration::from_secs(5))).is_ok());
     }
 
-    /// The `spawn_detached` child of `spawned_process_holds_none_of_the_callers_descriptors`:
-    /// this test binary run again with a pipe on its stdout and stderr and another inherited
-    /// without close-on-exec, as a supervisor's Bash tool starts `dispatch`.
+    /// The children of the descriptor tests: this test binary run again with a pipe on its
+    /// stdout and stderr and another inherited without close-on-exec, as a supervisor's Bash
+    /// tool starts `dispatch`. Neither marks any descriptor itself first: the spawn must.
     const SPAWN_WD: &str = "LEADHAND_TEST_SPAWN_WD";
 
+    /// `spawn_detached` of `sleep 30`.
     #[test]
     fn spawn_child() {
         let Some(wd) = std::env::var_os(SPAWN_WD) else {
             return;
         };
-        crate::sys::keep_inherited_fds_from_children().unwrap();
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
         let child = spawn_detached(Path::new(&wd), cmd).unwrap();
@@ -635,29 +619,56 @@ mod tests {
         std::process::exit(0);
     }
 
+    /// The library's `dispatch` (no command wrapper), on a run in `SPAWN_WD`, waiting 1.5 s.
+    /// The runner it spawns is `LEADHAND_TEST_CLI`, a stand-in that sleeps.
+    #[cfg(feature = "testing")]
     #[test]
-    fn spawned_process_holds_none_of_the_callers_descriptors() {
-        let (_tmp, wd) = worker_dir();
+    fn dispatch_child() {
+        let Some(run) = std::env::var_os(SPAWN_WD) else {
+            return;
+        };
+        let run = PathBuf::from(run);
+        let req = crate::dispatch::DispatchRequest {
+            model: "gpt-6-luna".into(),
+            effort: "low".into(),
+            role: "implementer".into(),
+            brief: run.join("brief.md"),
+            report: run.join("report.md"),
+            cwd: run.clone(),
+            run_dir: run.clone(),
+            card: Some(1),
+            attempt: 1,
+            dispatch_id: "d1".into(),
+            steps: 50,
+            minutes: 5,
+            network: false,
+            writable_dirs: vec![],
+            resume: None,
+            kind: None,
+            branch: None,
+        };
+        let e = crate::dispatch::dispatch(&req, Duration::from_millis(1500)).unwrap_err();
+        println!("{}", e.message);
+        std::process::exit(0);
+    }
+
+    /// Runs the test `child` as the caller, with `env`; returns its stdout once every pipe it
+    /// held (stdout, stderr and the inherited one) has reached its end, which fails the test if
+    /// whatever it spawned still holds one.
+    fn caller_with_pipes(child: &str, env: &[(&str, &OsStr)]) -> String {
         let (reader, writer) = std::io::pipe().unwrap();
         let mut cmd = Command::new(std::env::current_exe().unwrap());
-        cmd.args([
-            "dispatch::own::tests::spawn_child",
-            "--exact",
-            "--test-threads=1",
-            "--nocapture",
-        ])
-        .env(SPAWN_WD, &wd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        cmd.args([child, "--exact", "--test-threads=1", "--nocapture"])
+            .envs(env.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         {
             use std::os::fd::AsFd;
             crate::sys::pass_fd_to_child(&mut cmd, writer.as_fd());
         }
         let mut caller = cmd.spawn().unwrap();
         drop(writer);
-        // Every pipe the caller held reaches its end once the caller exits: the spawned process
-        // (still running) holds none of them.
         let (tx, rx) = std::sync::mpsc::channel();
         let mut pipes: Vec<Box<dyn Read + Send>> = vec![
             Box::new(caller.stdout.take().unwrap()),
@@ -682,14 +693,92 @@ mod tests {
             }
         }
         assert!(caller.wait().unwrap().success());
-        let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("spawned "), "{out}");
+        String::from_utf8(out).unwrap()
+    }
+
+    /// The process `spawn.json` names: still alive, in its own session's group; then killed.
+    fn spawned_is_alive_then_killed(wd: &Path) -> ProcId {
         let spawn = read_json_object(&wd.join(SPAWN)).unwrap().unwrap();
-        let id = live(&spawn).expect("the spawned process is still alive");
-        assert!(out.contains(&format!("spawned {}", id.pid)), "{out}");
-        assert!(procs::signal_if_same(&id, Signal::KILL));
-        // The new session's own group: never the caller's.
+        let id = live(proc_record_in(&spawn)).expect("the spawned process is still alive");
         let info = crate::sys::proc_info(id.pid);
         assert!(info.is_none_or(|i| i.pgid == id.pid || i.zombie));
+        assert!(crate::procs::signal_if_same(&id, Signal::KILL));
+        id
+    }
+
+    #[test]
+    fn spawned_process_holds_none_of_the_callers_descriptors() {
+        let (_tmp, wd) = worker_dir();
+        let out = caller_with_pipes(
+            "dispatch::own::tests::spawn_child",
+            &[(SPAWN_WD, wd.as_os_str())],
+        );
+        let id = spawned_is_alive_then_killed(&wd);
+        assert!(out.contains(&format!("spawned {}", id.pid)), "{out}");
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn the_library_dispatch_spawns_its_runner_without_the_callers_descriptors() {
+        let (tmp, run) = worker_dir();
+        let stand_in = tmp.path().join("runner stand-in");
+        fs::write(&stand_in, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(
+            &stand_in,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let out = caller_with_pipes(
+            "dispatch::own::tests::dispatch_child",
+            &[
+                (SPAWN_WD, run.as_os_str()),
+                ("LEADHAND_TESTING", OsStr::new("1")),
+                ("LEADHAND_TEST_CLI", stand_in.as_os_str()),
+            ],
+        );
+        assert!(
+            out.contains("still running: run the same command again (dispatch d1)"),
+            "{out}"
+        );
+        spawned_is_alive_then_killed(&run.join("workers").join("d1"));
+    }
+
+    #[test]
+    fn a_live_process_recorded_without_a_group_is_alive_not_dead() {
+        // Liveness is the pid and start time alone, as the Python's `alive()` judges it: a
+        // record without `pgid` still names a live Codex, so the runner is orphaned (stopped,
+        // never replaced alongside it), not dead.
+        let (_tmp, wd) = worker_dir();
+        let codex = python("import time; time.sleep(120)");
+        let tool = python("import time; time.sleep(120)");
+        let without_group = |kid: &Kid| {
+            let info = crate::sys::proc_info(kid.pid()).unwrap();
+            format!("{{\"pid\": {}, \"start\": \"{}\"}}", info.pid, info.start)
+        };
+        let record = format!("{{\"runner\": null, \"codex\": {}}}", without_group(&codex));
+        fs::write(wd.join(RUNNER), record).unwrap();
+        let procs = format!("{{\"descendants\": [{}]}}", without_group(&tool));
+        fs::write(wd.join(PROCS), procs).unwrap();
+        assert_eq!(owner_state(&wd).unwrap(), OwnerState::Orphaned);
+        assert_eq!(
+            super::runner_state(&wd, None).unwrap(),
+            RunnerState::Orphaned
+        );
+        let mut tracker = Tracker::load(&wd).unwrap();
+        let alive: Vec<i32> = tracker.alive().iter().map(|p| p.pid).collect();
+        assert_eq!(alive, [codex.pid(), tool.pid()]);
+        // Stopped by its own pid (never as a group), and listed without one.
+        assert_eq!(
+            crate::dispatch::tracker::stop(
+                &mut tracker,
+                Some(Instant::now() + Duration::from_secs(15))
+            ),
+            []
+        );
+        assert!(tracker.stopped().iter().all(|p| p.pgid.is_none()));
+        assert_eq!(owner_state(&wd).unwrap(), OwnerState::Dead);
+        assert!(!wd.join(SUPERSEDED).exists());
+        codex.kill();
+        tool.kill();
     }
 }

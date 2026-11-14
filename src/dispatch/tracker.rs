@@ -19,11 +19,10 @@ use serde_json::value::RawValue;
 
 use super::request::StoppedProc;
 use super::runner::{Action, Event, Ladder, Liveness, Runner, Sig};
-use super::{PROCS, RUNNER, TAG_VAR, read_json_object};
+use super::{PROCS, RUNNER, TAG_VAR, field, proc_record, read_json_object};
 use crate::error::Result;
 use crate::procs::{self, ProcId, ProcInfo};
 use crate::store::write_json_atomic;
-use crate::wire::{PyMap, PyStr};
 
 /// `procs.json`: the recorded processes still alive, by pid, and the last tag sweep's
 /// unreadable environments when there were any.
@@ -99,23 +98,15 @@ impl Tracker {
 
     /// The tracker of a dispatch whose runner is gone (`_Tracker.load`): Codex as `runner.json`
     /// records it, the descendants `procs.json` last recorded (those with a pid and a start
-    /// time), and the dispatch tag. A record that does not read as one (no integer pid and
-    /// group) is no process.
+    /// time), and the dispatch tag. A record is judged by its pid and start time alone, as the
+    /// Python judges it (`proc_record`); one with no integer pid is no process.
     pub fn load(wd: &Path) -> Result<Tracker> {
         let runner = read_json_object(&wd.join(RUNNER))?.unwrap_or_default();
         let saved = read_json_object(&wd.join(PROCS))?.unwrap_or_default();
-        let codex = runner
-            .get(&PyStr::from("codex"))
-            .and_then(|raw| proc_record(raw));
-        let tag = runner
-            .get(&PyStr::from("tag"))
-            .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())
-            .filter(|tag| !tag.is_empty());
+        let codex = field::<Box<RawValue>>(&runner, "codex").and_then(|raw| proc_record(&raw));
+        let tag = field::<String>(&runner, "tag").filter(|tag| !tag.is_empty());
         let mut tracker = Tracker::new(wd, codex, None, tag);
-        let descendants = saved
-            .get(&PyStr::from("descendants"))
-            .and_then(|raw| serde_json::from_str::<Vec<Box<RawValue>>>(raw.get()).ok())
-            .unwrap_or_default();
+        let descendants: Vec<Box<RawValue>> = field(&saved, "descendants").unwrap_or_default();
         for raw in &descendants {
             if let Some(rec) = proc_record(raw)
                 && rec.pid != 0
@@ -160,9 +151,7 @@ impl Tracker {
             // so it is identified even when its start time could not be read.
             return self.exited().is_none();
         }
-        self.codex
-            .as_ref()
-            .is_some_and(|c| procs::same_process(Some(c.pid), c.start.as_deref()))
+        self.codex.as_ref().is_some_and(StoppedProc::alive)
     }
 
     /// The identity a target is signalled under: a recorded process's own record; Codex,
@@ -175,10 +164,7 @@ impl Tracker {
                 None
             };
         }
-        target.start.clone().map(|start| ProcId {
-            pid: target.pid,
-            start,
-        })
+        target.id()
     }
 
     fn add(&mut self, rec: StoppedProc) {
@@ -221,8 +207,7 @@ impl Tracker {
         if tagged {
             self.find_tagged();
         }
-        self.live
-            .retain(|r| procs::same_process(Some(r.pid), r.start.as_deref()));
+        self.live.retain(StoppedProc::alive);
         let mut descendants = self.live.clone();
         descendants.sort_by_key(|p| p.pid);
         let current = ProcsFile {
@@ -238,11 +223,7 @@ impl Tracker {
 
     pub fn liveness(&mut self) -> Liveness {
         let codex = self.codex_alive();
-        let any = codex
-            || self
-                .live
-                .iter()
-                .any(|r| procs::same_process(Some(r.pid), r.start.as_deref()));
+        let any = codex || self.live.iter().any(StoppedProc::alive);
         Liveness { codex, any }
     }
 
@@ -252,18 +233,14 @@ impl Tracker {
         if self.codex_alive() {
             out.extend(self.codex.clone());
         }
-        out.extend(
-            self.live
-                .iter()
-                .filter(|r| procs::same_process(Some(r.pid), r.start.as_deref()))
-                .cloned(),
-        );
+        out.extend(self.live.iter().filter(|r| r.alive()).cloned());
         out
     }
 
     /// One rung's signal (`_Tracker.signal`): first to each group whose leader is a target
     /// still with its identity, then to each other target, itself, with its identity. Codex
-    /// alone for SIGINT; Codex and every recorded process otherwise.
+    /// alone for SIGINT; Codex and every recorded process otherwise. A record without a group
+    /// is never signalled as a group, only itself.
     pub fn signal(&mut self, sig: Sig) {
         let mut targets: Vec<(StoppedProc, bool)> = Vec::new();
         if self.codex_alive()
@@ -277,16 +254,17 @@ impl Tracker {
         let signal = sig.signal();
         let mut groups: Vec<i32> = Vec::new();
         for (target, is_codex) in &targets {
-            if target.pid == target.pgid
-                && !groups.contains(&target.pgid)
+            if let Some(pgid) = target.pgid
+                && target.pid == pgid
+                && !groups.contains(&pgid)
                 && let Some(id) = self.identity(target, *is_codex)
-                && procs::signal_group_if_same(&id, target.pgid, signal)
+                && procs::signal_group_if_same(&id, pgid, signal)
             {
-                groups.push(target.pgid);
+                groups.push(pgid);
             }
         }
         for (target, is_codex) in &targets {
-            if !groups.contains(&target.pgid)
+            if !target.pgid.is_some_and(|pgid| groups.contains(&pgid))
                 && let Some(id) = self.identity(target, *is_codex)
             {
                 procs::signal_if_same(&id, signal);
@@ -302,28 +280,10 @@ impl Tracker {
     }
 }
 
-/// A process record as a worker folder's files hold it (`{pid, pgid, start}`), read leniently:
-/// `None` unless `pid` and `pgid` are integers; a start time that is not a string is none.
-pub(crate) fn proc_record(raw: &RawValue) -> Option<StoppedProc> {
-    let map: PyMap<Box<RawValue>> = serde_json::from_str(raw.get()).ok()?;
-    let int = |key: &str| {
-        map.get(&PyStr::from(key))
-            .and_then(|raw| serde_json::from_str::<i32>(raw.get()).ok())
-    };
-    let start = map
-        .get(&PyStr::from("start"))
-        .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok());
-    Some(StoppedProc {
-        pid: int("pid")?,
-        pgid: int("pgid")?,
-        start,
-    })
-}
-
 fn record_of(p: &ProcInfo) -> StoppedProc {
     StoppedProc {
         pid: p.pid,
-        pgid: p.pgid,
+        pgid: Some(p.pgid),
         start: Some(p.start.clone()),
     }
 }
@@ -467,7 +427,7 @@ mod tests {
         let pid = pid_of(&child);
         let record = StoppedProc {
             pid,
-            pgid: pid,
+            pgid: Some(pid),
             start: None,
         };
         let mut tracker = Reaped(Tracker::new(tmp.path(), Some(record), Some(child), None));
@@ -511,7 +471,7 @@ mod tests {
         let start = procs::identify(pid).map(|id| id.start);
         let record = StoppedProc {
             pid,
-            pgid: pid,
+            pgid: Some(pid),
             start,
         };
         let mut tracker = Reaped(Tracker::new(tmp.path(), Some(record), Some(child), None));
@@ -547,7 +507,7 @@ mod tests {
         let codex_pid = pid_of(&codex);
         let record = StoppedProc {
             pid: codex_pid,
-            pgid: codex_pid,
+            pgid: Some(codex_pid),
             start: procs::identify(codex_pid).map(|id| id.start),
         };
         let mut stray = sleeper(Some(&tag));

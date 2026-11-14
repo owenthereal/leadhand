@@ -21,7 +21,7 @@ use serde_json::value::RawValue;
 use super::caller::{Anchor, check_request, py_parent, relpath};
 use super::finalize::{CommitOutcome, Commits};
 use super::own::COMMIT_INTENT;
-use super::{DispatchRequest, UNTRACKED, read_json_object};
+use super::{DispatchRequest, UNTRACKED, field, read_json_object};
 use crate::briefs::{SCRATCH, scratch_dir};
 use crate::error::{Error, Result};
 use crate::git::{Git, stage_work, status_entries, top_and_prefix, unhide_index_entries};
@@ -269,9 +269,7 @@ fn commit_steps(
     let head_now = stripped(&calls.run(&["rev-parse", "--verify", "HEAD"], false)?.stdout);
     let intent = read_json_object(&wd.join(COMMIT_INTENT))?;
     if let Some(intent) = &intent {
-        let before = intent
-            .get(&PyStr::from("head_before"))
-            .and_then(|raw| serde_json::from_str::<PyStr>(raw.get()).ok());
+        let before = field::<PyStr>(intent, "head_before");
         if !head_now.is_empty() && before != Some(PyStr::from(head_now.as_str())) {
             let body = calls.run(&["log", "-1", "--format=%B", "HEAD"], true)?;
             let body = String::from_utf8_lossy(&body.stdout).into_owned();

@@ -27,7 +27,8 @@ use super::shell::run_runner_with;
 use super::tracker::Tracker;
 use super::{
     CANCEL, DispatchRequest, DispatchResult, ExitReason, REQUEST, RESULT, RUNNER, anchored_worker,
-    check_caller, check_request, load_result, read_json_object, runner_worker, truthy, wall_now,
+    check_caller, check_request, field, load_result, read_json_object, runner_worker, truthy,
+    wall_now,
 };
 use crate::cli::{Caller, DispatchArgs};
 use crate::config::load_run_config;
@@ -78,10 +79,7 @@ pub fn request_for(run_dir: &Path, dispatch_id: &str, w: Worker) -> Result<Dispa
     let run_dir = absolute(run_dir)?;
     let cwd = absolute(&w.cwd)?;
     let meta = read_json_object(&crate::state::run_paths(&run_dir).run_json)?.unwrap_or_default();
-    let repo = meta
-        .get(&PyStr::from("repo"))
-        .and_then(|raw| serde_json::from_str::<PyStr>(raw.get()).ok())
-        .filter(|r| !r.is_empty());
+    let repo = field::<PyStr>(&meta, "repo").filter(|r| !r.is_empty());
     let repo = match repo {
         Some(repo) => PathBuf::from(repo.to_os()?),
         None => cwd.clone(),
@@ -352,20 +350,18 @@ pub fn dispatch(req: &DispatchRequest, wait: Duration) -> Result<DispatchResult>
 /// A runner that died mid-attempt: what it used is recorded before it is replaced.
 fn finalize_interrupted(wd: &Path, req: &DispatchRequest) -> Result<()> {
     let runner = read_json_object(&wd.join(RUNNER))?.unwrap_or_default();
-    let field = |key: &str| runner.get(&PyStr::from(key)).filter(|raw| truthy(raw));
+    let given = |key: &str| runner.get(&PyStr::from(key)).filter(|raw| truthy(raw));
     let aborted = |raw: &RawValue| {
         serde_json::from_str::<PyMap<Box<RawValue>>>(raw.get())
             .ok()
             .and_then(|launch| launch.get(&PyStr::from("aborted")).map(|a| truthy(a)))
             .unwrap_or(false)
     };
-    let launched = field("codex").is_some() || field("launching").is_some_and(|l| !aborted(l));
+    let launched = given("codex").is_some() || given("launching").is_some_and(|l| !aborted(l));
     if !launched {
         return Ok(());
     }
-    let started_at = runner
-        .get(&PyStr::from("started_at"))
-        .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok());
+    let started_at = field::<String>(&runner, "started_at");
     let tracker = Tracker::load(wd)?;
     let finish = Finish {
         stopped_for: Some(StopReason::Interrupted),

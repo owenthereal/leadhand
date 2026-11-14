@@ -252,12 +252,12 @@ fn own_record() -> StoppedProc {
     match crate::sys::proc_info(pid) {
         Some(me) => StoppedProc {
             pid: me.pid,
-            pgid: me.pgid,
+            pgid: Some(me.pgid),
             start: Some(me.start),
         },
         None => StoppedProc {
             pid,
-            pgid: getpgrp().as_raw_pid(),
+            pgid: Some(getpgrp().as_raw_pid()),
             start: None,
         },
     }
@@ -401,7 +401,7 @@ fn launch(
     let info = crate::sys::proc_info(pid);
     record.codex = Some(StoppedProc {
         pid,
-        pgid: info.as_ref().map_or(pid, |i| i.pgid),
+        pgid: Some(info.as_ref().map_or(pid, |i| i.pgid)),
         start: info.map(|i| i.start),
     });
     write_json_atomic(&runner_json, record)?;
@@ -960,7 +960,7 @@ mod tests {
         r.ended_at = None;
         r.stopped.fill(StoppedProc {
             pid: 0,
-            pgid: 0,
+            pgid: Some(0),
             start: None,
         });
         r

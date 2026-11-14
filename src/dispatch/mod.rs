@@ -101,6 +101,33 @@ pub const SUPERSEDED: &str = "superseded";
 /// The workspace's untracked files when the first runner launched Codex (I3).
 pub const UNTRACKED: &str = "untracked.json";
 
+/// A record's field `key` read leniently, as the Python's `d.get(key)` followed by a type
+/// check: `None` when it is missing or not a `T`.
+pub(crate) fn field<T: serde::de::DeserializeOwned>(
+    map: &PyMap<Box<RawValue>>,
+    key: &str,
+) -> Option<T> {
+    map.get(&PyStr::from(key))
+        .and_then(|raw| serde_json::from_str::<T>(raw.get()).ok())
+}
+
+/// A process record (`{pid, pgid, start}`, also `spawn.json`'s `{pid, start, at}`) read
+/// leniently, as the Python reads it: `None` unless `pid` is an integer; a `pgid` that is not
+/// an integer is none, and so is a start time that is not a string. Liveness is judged from
+/// the pid and start time alone (`StoppedProc::alive`), as `procs.same_process` judges it.
+pub(crate) fn proc_record_in(map: &PyMap<Box<RawValue>>) -> Option<StoppedProc> {
+    Some(StoppedProc {
+        pid: field(map, "pid")?,
+        pgid: field(map, "pgid"),
+        start: field(map, "start"),
+    })
+}
+
+/// `proc_record_in` of a JSON value: `None` unless it is an object.
+pub(crate) fn proc_record(raw: &RawValue) -> Option<StoppedProc> {
+    proc_record_in(&serde_json::from_str(raw.get()).ok()?)
+}
+
 /// A JSON object file as `dispatch._read_json` reads it: `None` when the file is missing,
 /// not UTF-8, not JSON, or not an object; its entries otherwise (a repeated key keeps its
 /// last value, as `json.loads` does). Any other I/O error is an error.

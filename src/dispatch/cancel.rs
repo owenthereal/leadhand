@@ -21,14 +21,14 @@ use super::own::{owner_lock, runner_alive_in, runner_target};
 use super::runner::{CANCEL_FINISH_MARGIN, Finish, POLL, StopReason};
 use super::tracker::{Tracker, stop};
 use super::{
-    CANCEL, DispatchResult, RUNNER, STOPPING, load_result, read_json_object, read_request, wall_now,
+    CANCEL, DispatchResult, RUNNER, STOPPING, field, load_result, read_json_object, read_request,
+    wall_now,
 };
 use crate::error::{Error, Result};
 use crate::procs;
 use crate::state::utc_now;
 use crate::store::write_json_atomic;
 use crate::testing::crash_point;
-use crate::wire::PyStr;
 
 /// How long a cancel waits for everything to be gone (`CANCEL_TIMEOUT`).
 pub const CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -116,18 +116,18 @@ pub(crate) fn cancel_locked(
     if !left.is_empty() {
         let named: Vec<String> = left
             .iter()
-            .map(|p| format!("pid {} (group {})", p.pid, p.pgid))
+            .map(|p| {
+                let group = p.pgid.map_or_else(|| "None".to_string(), |g| g.to_string());
+                format!("pid {} (group {group})", p.pid)
+            })
             .collect();
         return Err(Error::msg(format!(
             "cancel timed out; still alive: {}",
             named.join(", ")
         )));
     }
-    let started_at = read_json_object(&wd.join(RUNNER))?.and_then(|runner| {
-        runner
-            .get(&PyStr::from("started_at"))
-            .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())
-    });
+    let started_at = read_json_object(&wd.join(RUNNER))?
+        .and_then(|runner| field::<String>(&runner, "started_at"));
     let finish = Finish {
         stopped_for: Some(StopReason::Cancelled),
         codex_exit: None,

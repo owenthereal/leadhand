@@ -123,13 +123,32 @@ impl ExitReason {
     }
 }
 
-/// A process the runner stopped, as `result.json` lists it. Codex's own record may have no
-/// start time (`null`), when it could not be read at launch.
+/// A process as the worker folder records it (`runner.json`, `procs.json`) and `result.json`
+/// lists it. Codex's own record may have no start time (`null`), when it could not be read at
+/// launch. Everything leadhand records has a group; a record read without one (a hand-written
+/// or foreign file) is still judged by its pid and start time, and its group is never signalled.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoppedProc {
     pub pid: i32,
-    pub pgid: i32,
+    #[serde(default)]
+    pub pgid: Option<i32>,
     pub start: Option<String>,
+}
+
+impl StoppedProc {
+    /// The identity it is checked under: its pid and start time, when it has one.
+    pub fn id(&self) -> Option<crate::procs::ProcId> {
+        self.start.clone().map(|start| crate::procs::ProcId {
+            pid: self.pid,
+            start,
+        })
+    }
+
+    /// Whether the recorded process is alive with its recorded start time
+    /// (`procs.same_process`).
+    pub fn alive(&self) -> bool {
+        crate::procs::same_process(Some(self.pid), self.start.as_deref())
+    }
 }
 
 /// A dispatch's `result.json`, in the field order `_finalize_body` writes, with the runner's
