@@ -3,10 +3,9 @@
 //! log, observe what `decide` needs (`gather`), carry out the decision (`execute`), until a
 //! step yields the supervisor's action. The card steps it carries out are here too: cutting a
 //! card branch, requesting a dispatch (its guard, its brief, `dispatch_requested`), accepting
-//! a card, writing a test-only fix's diff, recording a Codex runner's result, and the guard
-//! check that tells whether a worker left what it guards as it found it.
+//! a card, writing a test-only fix's diff, and recording a Codex runner's result. Integration
+//! and violations are `integrate`'s and `violations`', which this calls.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::ExitCode;
@@ -14,23 +13,25 @@ use std::process::ExitCode;
 use serde::Serialize;
 use serde_json::value::RawValue;
 
-use super::cards::{Dispatch, Log, Run, by, current_session, is_card, session_env};
+use super::cards::{Dispatch, Log, Run, current_session, session_env};
+use super::integrate;
 use super::next::{Decision, DiffCheck, Need, Observations, Request, RunState, decide};
 use super::protocol::{
     Action, CHECK_KINDS, CheckDiffAction, IMPLEMENTER_KINDS, MAX_STEPS, REPLY_FILE, now, tag,
 };
 use super::record::{cancel_codex, store_result};
 use super::report_text::read_text;
+use super::violations::{self, ensure_clean, find_violation};
 use crate::briefs_write::{BriefSpec, remove_scratch_file, write_brief};
 use crate::config::limits_key;
 use crate::dispatch::{DispatchResult, ExitReason, load_result};
 use crate::error::{Error, Result};
 use crate::git::cards::{
-    branch_ref, card_branch_name, changed_paths, current_branch, cut_card_branch, detect_violation,
-    diff_text, fast_forward, is_ancestor, operation, ref_sha, ref_snapshot,
+    branch_ref, card_branch_name, changed_paths, current_branch, cut_card_branch, diff_text,
+    fast_forward, is_ancestor, merge_base, needs_integration, operation, ref_sha, ref_snapshot,
 };
+use crate::git::untracked_files;
 use crate::git::workspace::head;
-use crate::git::{GIT_TIMEOUT, untracked_files};
 use crate::pytext::path_text;
 use crate::state::events::{self, Opt, given};
 use crate::state::{CardRef, CardStage, Event, append_event, two_phase, two_phase_resume};
@@ -140,8 +141,25 @@ fn gather(st: &RunState, obs: &mut Observations, need: Need) -> Result<()> {
                 .log
                 .dispatch(Some(&id))
                 .ok_or_else(|| Error::msg(format!("no dispatch {id} was requested")))?;
-            let moved = guard_moved(st, &d)?;
-            obs.guards.insert(id, moved);
+            let found = find_violation(run, &st.log, &d)?;
+            obs.guards.insert(id, found);
+        }
+        Need::NeedsIntegration(branch) => {
+            let needs = needs_integration(&run.git()?, &run.branch, &branch)?;
+            obs.needs_integration.insert(branch, needs);
+        }
+        Need::Contains(branch, sha) => {
+            // `_contains`: whether the branch's tip has `sha` in its history.
+            let yes = is_ancestor(&run.git()?, OsStr::new(&sha), &branch_ref(&branch)?)?;
+            obs.contains.insert((branch, sha), yes);
+        }
+        Need::MergeBase(a, b) => {
+            let base = merge_base(&run.git()?, &a.to_os()?, &b.to_os()?)?;
+            obs.merge_bases.insert((a, b), base);
+        }
+        Need::Tip(branch) => {
+            let tip = head(&run.git()?, &branch_ref(&branch)?)?;
+            obs.tips.insert(branch, tip);
         }
     }
     Ok(())
@@ -184,6 +202,21 @@ fn execute(st: &RunState, obs: &Observations, decision: Decision) -> Result<Opti
             store_result(run, &d, &worker, &PyStr::default(), false, true, false)?;
             Ok(None)
         }
+        Decision::Void { dispatch_id, found } => {
+            violations::void(run, &dispatch_id, found.map(|f| *f)).map(|()| None)
+        }
+        Decision::LeftOperation {
+            dispatch_id,
+            branch,
+        } => {
+            let why = PyStr::from(format!("{dispatch_id} left an operation in progress"));
+            ensure_clean(run, &branch, &why, Some(&dispatch_id), true, false).map(|_| None)
+        }
+        Decision::FinishLeftovers => {
+            violations::finish_leftovers(run, &st.log.pending_leftovers()).map(|()| None)
+        }
+        Decision::Integrate { card } => integrate::integrate(run, card).map(|()| None),
+        Decision::Rebase { card } => integrate::rebase_again(run, card).map(|()| None),
         Decision::End(ending) => Err(Error::msg(format!(
             "not ported yet: ending the run{} (Task 16)",
             match (&ending.blocked, &ending.unreconciled) {
@@ -264,33 +297,9 @@ fn no_open_dispatch(st: &RunState, card: u32) -> Result<()> {
     Ok(())
 }
 
-/// R30's check before a check is dispatched and before the engine switches branches
-/// (`_ensure_clean`): anything an implementer left in the workspace (a dirty tree or index,
-/// HEAD off `branch`'s tip, an operation in progress, and with `untracked` the untracked files
-/// it may sweep). Preserving and clearing what it finds is Task 15's, so finding anything
-/// stops here.
-fn ensure_clean(run: &Run, branch: &PyStr, untracked: bool) -> Result<()> {
-    let git = run.git()?;
-    let op = operation(&git)?;
-    let tip = head(&git, &branch_ref(branch)?)?;
-    let v = detect_violation(&git, &tip, branch)?;
-    let loose = if untracked {
-        let paths = untracked_files(&run.ws).map_err(Error::from)?;
-        crate::dispatch::untracked_to_take(&run.root, &run.ws, &paths, GIT_TIMEOUT)?
-    } else {
-        Vec::new()
-    };
-    if op.is_none() && v.is_none() && loose.is_empty() {
-        return Ok(());
-    }
-    Err(Error::msg(
-        "not ported yet: preserving and clearing what an implementer left in the workspace \
-         (Task 15)",
-    ))
-}
-
 /// Puts the workspace on the card branch when HEAD is on another one (`_check_out`): never
-/// while another card has a dispatch open, and only once the workspace is clean.
+/// while another card has a dispatch open; leftovers in the way are kept and cleared first
+/// (R30). Never creates the branch.
 fn check_out(st: &RunState, card: u32, branch: &PyStr) -> Result<()> {
     let git = st.run.git()?;
     let current = current_branch(&git);
@@ -298,7 +307,16 @@ fn check_out(st: &RunState, card: u32, branch: &PyStr) -> Result<()> {
         return Ok(());
     }
     no_open_dispatch(st, card)?;
-    ensure_clean(st.run, current.as_ref().unwrap_or(branch), true)?;
+    let mut why = PyStr::from("before switching to ");
+    why.push(branch);
+    ensure_clean(
+        st.run,
+        current.as_ref().unwrap_or(branch),
+        &why,
+        None,
+        false,
+        true,
+    )?;
     if current_branch(&git).as_ref() != Some(branch) {
         git.run(&[
             OsStr::new("checkout"),
@@ -310,13 +328,24 @@ fn check_out(st: &RunState, card: u32, branch: &PyStr) -> Result<()> {
     Ok(())
 }
 
-/// Cuts a pending card's branch from the run tip (`_step`'s pending branch).
+/// Cuts a pending card's branch from the run tip (`_step`'s pending branch). Leftovers found
+/// in the workspace are kept and cleared instead, and the cut is the next step's.
 fn cut_card(st: &RunState, n: u32) -> Result<()> {
     let run = st.run;
     no_open_dispatch(st, n)?;
     let git = run.git()?;
     let current = current_branch(&git);
-    ensure_clean(run, current.as_ref().unwrap_or(&run.branch), true)?;
+    let why = PyStr::from(format!("before cutting card {n}"));
+    if ensure_clean(
+        run,
+        current.as_ref().unwrap_or(&run.branch),
+        &why,
+        None,
+        false,
+        true,
+    )? {
+        return Ok(());
+    }
     let name = card_branch_name(&run.branch, &n.to_string());
     let recorded = st
         .log
@@ -376,7 +405,8 @@ fn request_dispatch(st: &RunState, r: &Request) -> Result<()> {
         if CHECK_KINDS.contains(&r.kind.as_str()) {
             // Implementer leftovers are preserved and cleared first (R30), so they are not
             // blamed on the check.
-            ensure_clean(run, branch, false)?;
+            let why = PyStr::from(format!("before {} {}", r.kind, r.dispatch_id));
+            ensure_clean(run, branch, &why, None, false, false)?;
             // What the worker must leave as it found it (R14'): the card tip on the card
             // branch, and every ref of the run.
             let expected_head = head(&git, &card_ref)?;
@@ -505,8 +535,8 @@ fn key_error(card: u32) -> Error {
 }
 
 /// Accepts a card: fast-forwards the run branch to its tip, as intent, move and completion
-/// (`_accept`). A card branch that does not contain the run tip is integrated first, and an
-/// integrated card is accepted only at a tip a verify passed on: Task 15's.
+/// (`_accept`'s last part). `decide` has seen that the card branch contains the run tip, and
+/// that an integrated card's tip passed a verify.
 fn accept(run: &Run, card: u32, target: Option<String>) -> Result<()> {
     let Some(target) = target.filter(|t| !t.is_empty()) else {
         return Err(Error::msg(format!("card {card}: no tip to accept")));
@@ -514,27 +544,8 @@ fn accept(run: &Run, card: u32, target: Option<String>) -> Result<()> {
     let log = Log::read(&run.paths)?;
     let cards = log.cards(&run.numbers());
     // `fold_cards(events, ctx.numbers)[card]`.
-    let c = cards.get(&card).ok_or_else(|| key_error(card))?;
-    let branch = c
-        .branch
-        .clone()
-        .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| card_branch_name(&run.branch, &card.to_string()));
+    cards.get(&card).ok_or_else(|| key_error(card))?;
     let git = run.git()?;
-    if !is_ancestor(&git, &run.run_ref().to_os()?, &branch_ref(&branch)?)? {
-        return Err(Error::msg(
-            "not ported yet: integrating a card with the run branch (Task 15)",
-        ));
-    }
-    let integrated = log
-        .events
-        .iter()
-        .any(|e| matches!(e, Event::IntegrationStarted(i) if is_card(i.card.as_ref(), card)));
-    if integrated {
-        return Err(Error::msg(
-            "not ported yet: accepting an integrated card (Task 15)",
-        ));
-    }
     let intent = Event::AcceptStarted(events::AcceptStarted {
         card: Some(CardRef::Number(card.into())),
         target: Some(target.clone()),
@@ -597,124 +608,6 @@ fn write_diff_check(st: &RunState, check: &DiffCheck) -> Result<Action> {
         findings: check.findings.clone(),
         paths: check.changed.clone(),
     }))
-}
-
-/// Whether the dispatch's worker changed what the dispatch guards (`_find_violation`'s
-/// comparison; recording, preserving and undoing it is Task 15's): for a check the card tip
-/// and a clean workspace, and for every guarded dispatch the refs it recorded. Moves the
-/// engine recorded after the dispatch are its own, not the worker's.
-fn guard_moved(st: &RunState, d: &Dispatch) -> Result<bool> {
-    let run = st.run;
-    let req = d.req;
-    let git = run.git()?;
-    // `if req.get("expected_head")`: an empty head is none, as the Python's truthiness reads it.
-    let changed_workspace = match given(&req.expected_head).filter(|h| !h.is_empty()) {
-        Some(expected) => {
-            let branch = given(&req.expected_branch).cloned().unwrap_or_default();
-            detect_violation(&git, expected, &branch)?.is_some()
-        }
-        None => false,
-    };
-    let before = given(&req.refs).cloned().unwrap_or_default();
-    let now = ref_snapshot(&git, &run.branch, run.run_id.as_deref().unwrap_or_default())?;
-    let (latest, owned) = engine_writes(run, &st.log, req.seq);
-    let run_ref = run.run_ref();
-    // An acceptance whose fast-forward happened but whose `accepted` is not recorded yet moved
-    // the run branch to its target: the engine's move too.
-    let targets: HashSet<Option<&str>> = st
-        .log
-        .events
-        .iter()
-        .filter_map(|e| match e {
-            Event::AcceptStarted(a) if a.seq > req.seq => Some(a.target.as_deref()),
-            _ => None,
-        })
-        .collect();
-    let names: BTreeSet<PyStr> = match given(&req.ref_scope) {
-        Some(scope) if !scope.is_empty() => scope.iter().cloned().collect(),
-        _ => before
-            .0
-            .iter()
-            .map(|(k, _)| k.clone())
-            .chain(now.0.iter().map(|(k, _)| k.clone()))
-            .collect(),
-    };
-    let moved = names
-        .iter()
-        .filter(|name| !owned.contains(*name))
-        .any(|name| {
-            let expected: Option<String> = match latest.get(name) {
-                Some(value) => value.clone(),
-                None => before.get(name).cloned().flatten(),
-            };
-            let current = now.get(name).map(String::as_str);
-            if *name == run_ref && targets.contains(&current) {
-                return false;
-            }
-            current != expected.as_deref()
-        });
-    Ok(changed_workspace || moved)
-}
-
-/// What the engine itself recorded moving after event `after` (`_engine_writes`): branch →
-/// the value it last set, and the leadhand refs it wrote (owned outright).
-fn engine_writes(
-    run: &Run,
-    log: &Log,
-    after: u64,
-) -> (HashMap<PyStr, Option<String>>, HashSet<PyStr>) {
-    let mut latest: HashMap<PyStr, Option<String>> = HashMap::new();
-    let mut owned: HashSet<PyStr> = HashSet::new();
-    let heads = |branch: &PyStr| {
-        let mut name = PyStr::from("refs/heads/");
-        name.push(branch);
-        name
-    };
-    for e in log.events.iter().filter(|e| e.seq() > after) {
-        match e {
-            Event::Accepted(a) => {
-                latest.insert(run.run_ref(), a.sha.clone());
-            }
-            Event::CardCut(c) => {
-                if let Some(branch) = c.branch.as_ref().filter(|b| !b.is_empty()) {
-                    latest.insert(heads(branch), c.base.clone());
-                }
-            }
-            Event::Rebased(r) => {
-                if let Some(card) = &r.card {
-                    let branch = card_branch_name(&run.branch, &card.text().lossy());
-                    latest.insert(heads(&branch), r.tip.clone());
-                }
-            }
-            Event::IntegrationStarted(i) => {
-                if let Some(keep) = i.keep.as_ref().filter(|k| !k.is_empty()) {
-                    owned.insert(keep.clone());
-                }
-            }
-            Event::Violation(v) => {
-                if let Some(r) = v.r#ref.as_ref().filter(|r| !r.is_empty()) {
-                    for suffix in ["", "-branch", "-autostash"] {
-                        let mut name = r.clone();
-                        name.push_str(suffix);
-                        owned.insert(name);
-                    }
-                }
-                if let Some(preserved) = given(&v.preserved) {
-                    owned.extend(preserved.values().cloned());
-                }
-                if v.stage.as_deref() == Some("found") && by(v) == "implementer" {
-                    let branch = given(&v.expected_branch).cloned().unwrap_or_default();
-                    latest.insert(heads(&branch), given(&v.expected_head).cloned());
-                } else if v.stage.as_deref() == Some("found") {
-                    for (name, m) in given(&v.refs).map(|r| r.0.as_slice()).unwrap_or_default() {
-                        latest.insert(name.clone(), m.old.clone());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    (latest, owned)
 }
 
 // --------------------------------------------------------------------------
@@ -913,11 +806,18 @@ mod tests {
             std::fs::write(&paths.events, line).unwrap();
             let st = RunState::new(&run, Log::read(&paths).unwrap());
             let d = st.log.dispatch(Some("c1-a1-review-1")).unwrap();
-            guard_moved(&st, &d).unwrap()
+            find_violation(&run, &st.log, &d).unwrap()
         };
-        assert!(!guarded(""));
-        assert!(!guarded(&sha));
-        assert!(guarded(&"0".repeat(40)));
+        assert_eq!(guarded(""), None);
+        assert_eq!(guarded(&sha), None);
+        let found = guarded(&"0".repeat(40)).expect("a moved head is a violation");
+        assert_eq!(
+            (found.head_moved, found.r#ref.as_ref().map(PyStr::lossy)),
+            (
+                Some(Some(true)),
+                Some("refs/leadhand/abc123abc123/violations/1".into())
+            )
+        );
     }
 
     // `fold_cards(events, ctx.numbers)[card]`: a card the fold does not have is the Python's

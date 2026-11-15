@@ -1,6 +1,6 @@
 //! What a worker left in its workspace, and staging it for the runner's own commit (ruling
-//! R39; `gitops.top_and_prefix`, `untracked_files`, `status_entries`, `hidden_index_entries`,
-//! `unhide_index_entries`, `is_sparse`, `stage_work`).
+//! R39; `gitops.top_and_prefix`, `untracked_files`, `status_entries`, `stage_work`). Clearing
+//! the index flags that hide an edit is `preserve`'s.
 //!
 //! Git names paths from the checkout's top (`--full-name`, status and diff output), and a
 //! workspace can be a subdirectory of it (an in-place run started with `--repo
@@ -85,71 +85,6 @@ pub fn status_entries(git: &Git) -> Result<(bool, Vec<PyStr>)> {
     Ok((tracked, untracked))
 }
 
-/// `hidden_index_entries`: the tracked paths, in the whole checkout and named from its top,
-/// whose index entry hides an edit from `status` and `diff`: assume-unchanged (a lowercase
-/// `git ls-files -v` tag) or skip-worktree (`S`).
-fn hidden_index_entries(git: &Git) -> Result<Vec<Vec<u8>>> {
-    let out = git.run(&[
-        os("ls-files"),
-        os("-v"),
-        os("-z"),
-        os("--full-name"),
-        os("--"),
-        os(":/"),
-    ])?;
-    Ok(split_nul(strip_newlines(&out))
-        .into_iter()
-        .filter(|entry| {
-            entry.first().is_some_and(u8::is_ascii_lowercase) || entry.starts_with(b"S ")
-        })
-        .map(|entry| entry.get(2..).unwrap_or_default().to_vec())
-        .collect())
-}
-
-/// `unhide_index_entries`: clears assume-unchanged and skip-worktree wherever
-/// `hidden_index_entries` finds them, so an edit behind them shows in `status` and `diff` again
-/// (a worker can set them after it is dispatched). A sparse checkout a worker turned on is
-/// turned off again. The paths cleared.
-pub fn unhide_index_entries(git: &Git) -> Result<Vec<PyStr>> {
-    let hidden = hidden_index_entries(git)?;
-    if !hidden.is_empty() {
-        let (top, _) = top_and_prefix(git)?;
-        let top = Git::at(&top)?.with_deadline(git.deadline());
-        let mut paths = Vec::new();
-        for p in &hidden {
-            paths.extend_from_slice(p);
-            paths.push(0);
-        }
-        // One mode per call.
-        for flag in ["--no-assume-unchanged", "--no-skip-worktree"] {
-            top.run_input(
-                &[os("update-index"), os(flag), os("-z"), os("--stdin")],
-                &paths,
-            )?;
-        }
-        if is_sparse(&top) {
-            // With the flags already cleared it changes no file, so the edits stay visible.
-            top.run(&[os("sparse-checkout"), os("disable")])?;
-        }
-    }
-    Ok(hidden.iter().map(|p| text(p)).collect())
-}
-
-/// `is_sparse`: whether the checkout is sparse (`core.sparseCheckout`, as that worktree sees
-/// it). False when Git cannot be run.
-fn is_sparse(git: &Git) -> bool {
-    let args = [
-        os("config"),
-        os("--bool"),
-        os("--get"),
-        os("core.sparseCheckout"),
-    ];
-    let Ok(out) = git.with_deadline(GIT_TIMEOUT).output(&args) else {
-        return false;
-    };
-    out.status.success() && out.stdout.trim_ascii() == b"true"
-}
-
 /// The deadline of each Git call of a staging bounded by `deadline` (`stage_work`'s
 /// `timeout()`).
 fn call_deadline(deadline: Option<Instant>) -> Result<Duration> {
@@ -165,7 +100,7 @@ fn call_deadline(deadline: Option<Instant>) -> Result<Duration> {
 
 /// The paths as a NUL-separated pathspec list, for `--pathspec-from-file=- --pathspec-file-nul`
 /// (the argument vector stays short).
-fn pathspecs(paths: &[PyStr]) -> Result<Vec<u8>> {
+pub(super) fn pathspecs(paths: &[PyStr]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     for p in paths {
         out.extend_from_slice(p.to_os()?.as_bytes());
@@ -312,26 +247,6 @@ mod tests {
             untracked_files(&repo).unwrap(),
             texts(&["dir/deep.txt", "new file.txt"])
         );
-    }
-
-    #[test]
-    fn unhide_clears_assume_unchanged_and_skip_worktree() {
-        let f = Fixture::new();
-        let repo = f.make_repo("my repo");
-        f.commit(&repo, &[("b.txt", "b\n")], "b");
-        f.git(&repo, &["update-index", "--assume-unchanged", "README.md"]);
-        f.git(&repo, &["update-index", "--skip-worktree", "b.txt"]);
-        f.write(
-            &repo,
-            &[("README.md", "hidden\n"), ("b.txt", "hidden too\n")],
-        );
-        let git = Git::at(&repo).unwrap();
-        assert!(!status_entries(&git).unwrap().0);
-        let cleared = unhide_index_entries(&git).unwrap();
-        assert_eq!(cleared, texts(&["README.md", "b.txt"]));
-        assert_eq!(f.git(&repo, &["ls-files", "-v"]), "H README.md\nH b.txt");
-        assert!(status_entries(&git).unwrap().0);
-        assert_eq!(unhide_index_entries(&git).unwrap(), Vec::<PyStr>::new());
     }
 
     #[test]

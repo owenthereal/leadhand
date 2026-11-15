@@ -9,10 +9,16 @@
 //! which the shell gathers before deciding again. The shell (`engine::shell`) does the I/O: it
 //! loops step after step, as the Python does, until a step yields an action.
 //!
-//! Integration, violations, the end-of-run gates and the outcome, and recovery are Tasks
-//! 15–17: where the loop reaches one of them, `decide` returns `Decision::Unported` (or
-//! `Decision::End`, the outcome's seam), and `next` fails with `not ported yet: …` rather than
-//! guess.
+//! Integration (rebasing a card onto the run tip, the integrate attempt after a conflict, the
+//! re-review and the verify of an integrated card) and violations (a check that changed what
+//! it guards, an implementer's leftovers) are decided here; their Git work is the shell's, in
+//! `integrate` and `violations`. A step that spans I/O and a decision in the Python is two
+//! steps here: the I/O first (recording a violation and restoring it, clearing leftovers),
+//! then, on the next step, what follows from what it recorded.
+//!
+//! The end-of-run gates and the outcome, and recovery, are Tasks 16–17: where the loop reaches
+//! one of them, `decide` returns `Decision::Unported` (or `Decision::End`, the outcome's seam),
+//! and `next` fails with `not ported yet: …` rather than guess.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
@@ -23,8 +29,8 @@ use super::cards::{
 };
 use super::protocol::{
     Action, AnswerAction, DispatchAction, DoneAction, IMPLEMENTER_KINDS, REPLY_FILE, REVIEW_KINDS,
-    Resume, RouteView, StopWorkerAction, WaitAction, budget_seconds, card_dispatch_id, format_time,
-    parse_time, tag,
+    Resume, RouteView, StopWorkerAction, VIOLATION_CAP, WaitAction, budget_seconds,
+    card_dispatch_id, format_time, parse_time, tag, voided_notes,
 };
 use super::report_text::question;
 use crate::briefs::{CODEX_AGENT, agent_for, scratch_dir};
@@ -32,7 +38,7 @@ use crate::briefs_write::dispatch_message;
 use crate::config::Route;
 use crate::dispatch::DispatchResult;
 use crate::error::Error;
-use crate::git::cards::is_test_or_doc_path;
+use crate::git::cards::{card_branch_name, is_test_or_doc_path};
 use crate::pytext::path_text;
 use crate::route::{RouteError, RouteRequest, resolve};
 use crate::state::events::{self, given};
@@ -87,8 +93,17 @@ pub struct Observations {
     pub changed: HashMap<(String, String), Vec<PyStr>>,
     /// A report's text, by its path (`None` when there is none).
     pub texts: HashMap<PyStr, Option<String>>,
-    /// Whether a dispatch's worker changed what its dispatch guards, by dispatch ID.
-    pub guards: HashMap<String, bool>,
+    /// A dispatch's guard checked, by dispatch ID: the `found` violation to record when its
+    /// worker changed what the dispatch guards, `None` when it left it as it found it.
+    pub guards: HashMap<String, Option<events::Violation>>,
+    /// Whether the run tip is not in a card branch's history, by the card branch.
+    pub needs_integration: HashMap<PyStr, bool>,
+    /// Whether a branch's tip has a commit in its history, by (branch, commit).
+    pub contains: HashMap<(PyStr, String), bool>,
+    /// `git merge-base a b`, by (a, b).
+    pub merge_bases: HashMap<(PyStr, PyStr), String>,
+    /// A branch's tip, by branch.
+    pub tips: HashMap<PyStr, String>,
 }
 
 /// One more thing to observe before deciding.
@@ -105,6 +120,14 @@ pub enum Need {
     /// Whether a dispatch's worker left what its dispatch guards as it found it: the card tip,
     /// a clean workspace and the run's refs for a check; the run branch for an implementer.
     Guard(String),
+    /// Whether the run tip is not in this card branch's history (`needs_integration`).
+    NeedsIntegration(PyStr),
+    /// Whether this branch's tip has this commit in its history (`_contains`).
+    Contains(PyStr, String),
+    /// The merge base of two revisions.
+    MergeBase(PyStr, PyStr),
+    /// This branch's tip.
+    Tip(PyStr),
 }
 
 /// A dispatch to request (`engine._request`): the shell checks out the card branch, takes the
@@ -200,6 +223,24 @@ pub enum Decision {
     },
     /// Record a Claude worker reconciliation started, past its deadline, as interrupted.
     StoreInterrupted { dispatch_id: String },
+    /// Void a check dispatch whose worker changed what it guards (`_void`): record `found`
+    /// when given, then keep what the worker changed, put it back and record `restored`,
+    /// unless that is recorded.
+    Void {
+        dispatch_id: String,
+        found: Option<Box<events::Violation>>,
+    },
+    /// An implementer dispatch left a Git operation in progress (`_left_operation`): keep and
+    /// clear it as leftovers, which makes the dispatch BLOCKED (environment).
+    LeftOperation { dispatch_id: String, branch: PyStr },
+    /// Keep and clear every implementer leftovers recorded and not restored yet
+    /// (`_finish_leftovers`).
+    FinishLeftovers,
+    /// Integrate the card with the run tip: `integration_started`, then the rebase (`_accept`).
+    Integrate { card: u32 },
+    /// Rebase the integrating card again from its latest `integration_started`
+    /// (`_integration_step` after a crash).
+    Rebase { card: u32 },
     /// End the run (Task 16).
     End(Ending),
     /// A step a later task ports.
@@ -267,7 +308,7 @@ fn step(st: &RunState, obs: &Observations) -> Step<Decision> {
         }));
     }
     if !st.log.pending_leftovers().is_empty() {
-        return unported("restoring an implementer's leftovers", 15);
+        return Ok(Decision::FinishLeftovers);
     }
     if !st.log.run_dispatches().is_empty() {
         return unported(
@@ -289,9 +330,9 @@ fn step(st: &RunState, obs: &Observations) -> Step<Decision> {
             card: n,
             target: c.accept_target.clone(),
         }),
-        CardStage::Integrating => unported("integrating a card with the run branch", 15),
+        CardStage::Integrating => integration_step(st, obs, c),
         CardStage::Reviewed => after_verdict(st, obs, c),
-        CardStage::Fixing if c.dispatch_kind.as_deref() != Some("fix") => request_fix(st, c),
+        CardStage::Fixing if c.dispatch_kind.as_deref() != Some("fix") => request_fix(st, obs, c),
         _ => {
             let Some(d) = st.log.dispatch(c.dispatch_id.as_deref()) else {
                 return fail(format!(
@@ -489,21 +530,47 @@ fn extra(pairs: Vec<(&str, PyStr)>) -> PyMap<Option<PyStr>> {
     )
 }
 
-/// The commit the card's work starts from: its cut base (`_card_base`). Once it has been
-/// integrated, where its branch meets the run branch: Task 15's.
-fn card_base(st: &RunState, c: &CardState) -> Step<String> {
-    let integrated = c.branch.as_ref().is_some_and(|b| !b.is_empty())
-        && st.log.events.iter().any(
-            |e| matches!(e, Event::IntegrationStarted(i) if is_card(i.card.as_ref(), c.number)),
-        );
-    if integrated {
-        return unported("the base of an integrated card", 15);
+/// The commit the card's work starts from: its cut base, or, once it has been integrated,
+/// where its branch meets the run branch, the run tip it was rebased onto (`_card_base`).
+fn card_base(st: &RunState, obs: &Observations, c: &CardState) -> Step<String> {
+    if let Some(branch) = c.branch.as_ref().filter(|b| !b.is_empty())
+        && integrated(st, c.number)
+    {
+        let key = (st.run.run_ref(), heads(branch));
+        return match obs.merge_bases.get(&key) {
+            Some(base) => Ok(base.clone()),
+            None => need(Need::MergeBase(key.0, key.1)),
+        };
     }
     Ok(c.base.clone().unwrap_or_default())
 }
 
+/// `refs/heads/<branch>`.
+fn heads(branch: &PyStr) -> PyStr {
+    let mut name = PyStr::from("refs/heads/");
+    name.push(branch);
+    name
+}
+
+/// The card's branch as the run records it, else the name it is cut under
+/// (`c.branch or card_branch_name(ctx.branch, n)`).
+fn card_branch(st: &RunState, c: &CardState) -> PyStr {
+    c.branch
+        .clone()
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| card_branch_name(&st.run.branch, &c.number.to_string()))
+}
+
+/// Whether the card was ever integrated (an `integration_started` for it).
+fn integrated(st: &RunState, card: u32) -> bool {
+    st.log
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::IntegrationStarted(i) if is_card(i.card.as_ref(), card)))
+}
+
 /// The request, with its deterministic dispatch ID and the card's base.
-fn request(st: &RunState, c: &CardState, mut r: Request) -> Step<Decision> {
+fn request(st: &RunState, obs: &Observations, c: &CardState, mut r: Request) -> Step<Decision> {
     let n = 1 + st
         .log
         .events
@@ -516,7 +583,7 @@ fn request(st: &RunState, c: &CardState, mut r: Request) -> Step<Decision> {
         })
         .count();
     r.dispatch_id = card_dispatch_id(c.number, r.attempt, &r.kind, n);
-    r.base = card_base(st, c)?;
+    r.base = card_base(st, obs, c)?;
     Ok(Decision::Request(Box::new(r)))
 }
 
@@ -532,7 +599,7 @@ fn start_attempt(
     let (role, route) = resolve_or_park(st, obs, c.number, "implementer", attempt, last_vendor)?;
     let mut r = Request::new(c.number, "implement", attempt, &role, route);
     r.notes = notes;
-    request(st, c, r)
+    request(st, obs, c, r)
 }
 
 /// A fresh worker on the next rung of the ladder, with the previous report in its brief
@@ -605,7 +672,7 @@ fn request_review(
         .and_then(|r| r.tip.clone())
         .filter(|t| !t.is_empty())
         .or_else(|| c.tip.clone());
-    let base = card_base(st, c)?;
+    let base = card_base(st, obs, c)?;
     let mut r = Request::new(c.number, "review", implementer.attempt(), &role, route);
     r.extra = extra(vec![
         (
@@ -614,11 +681,11 @@ fn request_review(
         ),
         ("implementer_report", report_copy(implementer)),
     ]);
-    request(st, c, r)
+    request(st, obs, c, r)
 }
 
 /// The fix round's implementer, resumed with the findings (`_request_fix`).
-fn request_fix(st: &RunState, c: &CardState) -> Step<Decision> {
+fn request_fix(st: &RunState, obs: &Observations, c: &CardState) -> Step<Decision> {
     let rounds: Vec<&events::FixRound> = st
         .log
         .events
@@ -646,7 +713,7 @@ fn request_fix(st: &RunState, c: &CardState) -> Step<Decision> {
         ("round".into(), Some(round.into())),
     ]);
     r.resume = Some(implementer.id().to_string());
-    request(st, c, r)
+    request(st, obs, c, r)
 }
 
 /// A dispatch whose worker has not reported (`_in_flight`): the dispatch action until a worker
@@ -841,31 +908,25 @@ fn dispatch_action(st: &RunState, obs: &Observations, d: &Dispatch) -> Step<Disp
 /// A dispatch's result, acted on (`_after_result`).
 fn after_result(st: &RunState, obs: &Observations, c: &CardState, d: &Dispatch) -> Step<Decision> {
     let r = d.result.expect("after_result is called with a result");
-    if d.req.refs.is_some() {
-        // What the dispatch guards must be as the worker found it (R14', I4).
-        if st
-            .log
-            .check_violations()
-            .any(|v| given(&v.dispatch_id).map(String::as_str) == Some(d.id()))
-        {
-            return unported("a voided result (violations)", 15);
-        }
-        match obs.guards.get(d.id()) {
-            None => return need(Need::Guard(d.id().to_string())),
-            Some(true) => return unported("preserving and undoing a worker's violation", 15),
-            Some(false) => {}
-        }
+    if d.req.refs.is_some() && !workspace_kept(st, obs, d)? {
+        // The result is void: what the worker changed was kept and undone, and the same kind
+        // is requested again (or the card parked).
+        return after_void(st, obs, c, d);
     }
     if IMPLEMENTER_KINDS.contains(&d.kind()) {
-        // A rebase, merge or cherry-pick left in progress is the worker's failure.
+        // A rebase, merge or cherry-pick left in progress is the worker's failure: its state
+        // is kept and cleared, and the dispatch counts as BLOCKED (environment).
         if st.log.broken_dispatches().contains(d.id()) {
-            return unported("an implementer that left a Git operation in progress", 15);
+            return worker_failed(st, obs, c, d);
         }
-        if c.branch.as_ref().is_some_and(|b| !b.is_empty()) {
+        if let Some(branch) = c.branch.as_ref().filter(|b| !b.is_empty()) {
             match &obs.operation {
                 None => return need(Need::Operation),
                 Some(Some(_)) => {
-                    return unported("an implementer that left a Git operation in progress", 15);
+                    return Ok(Decision::LeftOperation {
+                        dispatch_id: d.id().to_string(),
+                        branch: branch.clone(),
+                    });
                 }
                 Some(None) => {}
             }
@@ -875,7 +936,24 @@ fn after_result(st: &RunState, obs: &Observations, c: &CardState, d: &Dispatch) 
         return unported("continuing after an interrupted worker", 17);
     }
     if d.kind() == "verify" {
-        return unported("the verify of an integrated card", 15);
+        return match r.result.as_deref() {
+            Some("pass") => {
+                // `d.req["extra"]["tip"]`.
+                let Some(tip) = d.extra().get(&PyStr::from("tip")).cloned() else {
+                    return fail("KeyError: 'tip'".into());
+                };
+                accept(st, obs, c.number, tip.map(|t| t.lossy().into_owned()))
+            }
+            Some("fail") => escalate(
+                st,
+                obs,
+                c,
+                "failed the deck's checks after integration".into(),
+                Some(d),
+                "The verifier's report",
+            ),
+            _ => worker_failed(st, obs, c, d),
+        };
     }
     if REVIEW_KINDS.contains(&d.kind()) {
         if let Some(verdict) = r
@@ -896,7 +974,7 @@ fn after_result(st: &RunState, obs: &Observations, c: &CardState, d: &Dispatch) 
     match r.status.as_deref() {
         Some("READY") => {
             if integrate_origin(st, Some(*d)).is_some() {
-                return unported("an integrate attempt's result", 15);
+                return after_integrate(st, obs, c, d);
             }
             if let Some(fix) = st.log.fix_round(c.number, d.attempt(), Some(d.seq())) {
                 return after_fix(st, obs, c, d, fix);
@@ -912,10 +990,7 @@ fn after_result(st: &RunState, obs: &Observations, c: &CardState, d: &Dispatch) 
                 && !card.hard
                 && tip != attempt_start_tip(st, c, d.attempt())
             {
-                return Ok(Decision::Accept {
-                    card: c.number,
-                    target: tip,
-                });
+                return accept(st, obs, c.number, tip);
             }
             request_review(st, obs, c, d)
         }
@@ -941,7 +1016,7 @@ fn after_result(st: &RunState, obs: &Observations, c: &CardState, d: &Dispatch) 
             let mut r = Request::new(c.number, "answer", d.attempt(), d.role(), d.route());
             r.extra = PyMap(vec![("ruling".into(), ruling.text.clone())]);
             r.resume = Some(d.id().to_string());
-            request(st, c, r)
+            request(st, obs, c, r)
         }
         Some("SPENT") => escalate(
             st,
@@ -973,12 +1048,7 @@ fn attempt_start_tip(st: &RunState, c: &CardState, attempt: i64) -> Option<Strin
 /// BLOCKED from any worker, or a reviewer that ended without a verdict (`_worker_failed`): a
 /// usage limit ends the run blocked; the same step is dispatched again once; a second such
 /// ending ends the run blocked (environment), or for a missing verdict parks the card.
-fn worker_failed(
-    st: &RunState,
-    _obs: &Observations,
-    c: &CardState,
-    d: &Dispatch,
-) -> Step<Decision> {
+fn worker_failed(st: &RunState, obs: &Observations, c: &CardState, d: &Dispatch) -> Step<Decision> {
     let r = d.result.expect("worker_failed is called with a result");
     let broken = st.log.broken_dispatches();
     let head_of = |x: &Dispatch| -> (String, String) {
@@ -1057,7 +1127,7 @@ fn worker_failed(
         .log
         .dispatch(d.req.resumes.as_deref())
         .map(|x| x.id().to_string());
-    request(st, c, again)
+    request(st, obs, c, again)
 }
 
 /// After a review's verdict (`_after_verdict`): clean is accepted; defects get one fix round,
@@ -1079,10 +1149,7 @@ fn after_verdict(st: &RunState, obs: &Observations, c: &CardState) -> Step<Decis
     };
     let attempt = review.attempt();
     if c.verdict.as_deref() == Some("clean") {
-        return Ok(Decision::Accept {
-            card: c.number,
-            target: c.tip.clone(),
-        });
+        return accept(st, obs, c.number, c.tip.clone());
     }
     if st.log.fix_round(c.number, attempt, None).is_none() {
         return Ok(append(Event::FixRound(events::FixRound {
@@ -1138,7 +1205,7 @@ fn after_fix(
                 fix.review.as_deref().unwrap_or("None")
             ));
         };
-        let base = card_base(st, c)?;
+        let base = card_base(st, obs, c)?;
         let mut r = Request::new(
             c.number,
             "rereview",
@@ -1155,7 +1222,7 @@ fn after_fix(
             ("findings".into(), fix.findings.clone()),
             ("implementer_report".into(), Some(report_copy(d))),
         ]);
-        return request(st, c, r);
+        return request(st, obs, c, r);
     }
     let check = st.log.events.iter().find_map(|e| match e {
         Event::DiffChecked(k) if k.dispatch_id.as_deref() == Some(d.id()) => Some(k),
@@ -1163,10 +1230,7 @@ fn after_fix(
     });
     if let Some(check) = check {
         if check.ok == Some(true) {
-            return Ok(Decision::Accept {
-                card: c.number,
-                target: tip,
-            });
+            return accept(st, obs, c.number, tip);
         }
         let mut why = PyStr::from("had its fix rejected by the diff check: ");
         why.push(&check.note.clone().unwrap_or_default());
@@ -1206,6 +1270,442 @@ fn integrate_origin<'l>(st: &'l RunState, d: Option<Dispatch<'l>>) -> Option<Dis
         d = st.log.dispatch(Some(&next));
     }
     None
+}
+
+// -- violations ------------------------------------------------------------------
+
+/// Whether the worker left what its dispatch guards as it found it (`_workspace_kept`'s
+/// `_void`): for a reviewer or verifier the card tip, a clean workspace and the run's refs; for
+/// an implementer-side worker the run branch. A change found now, or one recorded and not
+/// restored yet (a crash between the two phases), is recorded, kept and undone first
+/// (`Decision::Void`); then the result is void, `false`.
+fn workspace_kept(st: &RunState, obs: &Observations, d: &Dispatch) -> Step<bool> {
+    let mine: Vec<&events::Violation> = st
+        .log
+        .check_violations()
+        .filter(|v| given(&v.dispatch_id).map(String::as_str) == Some(d.id()))
+        .collect();
+    let stage = |s: &str| mine.iter().any(|v| v.stage.as_deref() == Some(s));
+    if mine.is_empty() {
+        return match obs.guards.get(d.id()) {
+            None => need(Need::Guard(d.id().to_string())),
+            Some(None) => Ok(true),
+            Some(Some(found)) => Err(Box::new(Decision::Void {
+                dispatch_id: d.id().to_string(),
+                found: Some(Box::new(found.clone())),
+            })),
+        };
+    }
+    if !stage("found") {
+        // `next(e for e in mine if e.get("stage") == "found")`.
+        return fail("StopIteration".into());
+    }
+    if !stage("restored") {
+        return Err(Box::new(Decision::Void {
+            dispatch_id: d.id().to_string(),
+            found: None,
+        }));
+    }
+    Ok(false)
+}
+
+/// What follows a voided result (`_workspace_kept`): the same kind again on the same route,
+/// with a fresh worker for a check (R33) and the voided dispatch's resume chain for an
+/// implementer-side step, the warning added to its brief. After `VIOLATION_CAP` voided runs of
+/// the kind since the card was last unparked, the card is parked instead, and unparking it
+/// re-runs the kind (R32).
+fn after_void(st: &RunState, obs: &Observations, c: &CardState, d: &Dispatch) -> Step<Decision> {
+    let since = st
+        .log
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Unparked(u) if is_card(u.card.as_ref(), c.number) => Some(u.seq),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let count: Vec<&events::Violation> = st
+        .log
+        .check_violations()
+        .filter(|v| {
+            v.stage.as_deref() == Some("found")
+                && is_card(given(&v.card), c.number)
+                && given(&v.dispatch_kind).map(String::as_str) == Some(d.kind())
+                && v.seq > since
+        })
+        .collect();
+    if count.len() > VIOLATION_CAP {
+        // `sorted({...})`: WTF-8 order is code point order.
+        let mut paths: Vec<PyStr> = count
+            .iter()
+            .flat_map(|v| given(&v.paths).into_iter().flatten())
+            .cloned()
+            .collect();
+        paths.sort();
+        paths.dedup();
+        let mut refs: Vec<PyStr> = count
+            .iter()
+            .flat_map(|v| given(&v.refs).into_iter().flat_map(|r| r.0.iter()))
+            .map(|(name, _)| name.clone())
+            .collect();
+        refs.sort();
+        refs.dedup();
+        let mut reason = if paths.is_empty() {
+            PyStr::from(format!("{} workers move refs: ", d.kind()))
+        } else {
+            PyStr::from("checks change tracked files: ")
+        };
+        reason.push(&PyStr::join(
+            if paths.is_empty() { &refs } else { &paths },
+            ", ",
+        ));
+        return Ok(append(Event::Parked(events::Parked {
+            card: Some(CardRef::Number(c.number.into())),
+            reason: Some(reason),
+            cap_dispatch: Some(Some(d.id().to_string())),
+            cap_kind: Some(Some(d.kind().to_string())),
+            ..events::Parked::default()
+        })));
+    }
+    let mut r = Request::new(c.number, d.kind(), d.attempt(), d.role(), d.route());
+    r.extra = d.extra();
+    r.notes = voided_notes(&d.notes());
+    if IMPLEMENTER_KINDS.contains(&d.kind()) {
+        r.resume = st
+            .log
+            .dispatch(d.req.resumes.as_deref())
+            .map(|x| x.id().to_string());
+    }
+    request(st, obs, c, r)
+}
+
+// -- acceptance and integration --------------------------------------------------------
+
+/// Accepts a card at `target` (`_accept`): a card branch that does not contain the run tip is
+/// integrated first, and a card that was integrated is accepted only at a tip a verify passed
+/// on (a verify of it is requested otherwise). Then the run branch is fast-forwarded to it.
+fn accept(st: &RunState, obs: &Observations, card: u32, target: Option<String>) -> Step<Decision> {
+    let Some(target) = target.filter(|t| !t.is_empty()) else {
+        return fail(format!("card {card}: no tip to accept"));
+    };
+    // `fold_cards(events, ctx.numbers)[card]`.
+    let Some(c) = st.cards.get(&card) else {
+        return fail(format!("KeyError: {card}"));
+    };
+    let branch = card_branch(st, c);
+    match obs.needs_integration.get(&branch) {
+        None => return need(Need::NeedsIntegration(branch)),
+        Some(true) => return Ok(Decision::Integrate { card }),
+        Some(false) => {}
+    }
+    if integrated(st, card) && !verified(st, card, &target) {
+        return request_verify(st, obs, c, target);
+    }
+    Ok(Decision::Accept {
+        card,
+        target: Some(target),
+    })
+}
+
+/// Whether a verify of exactly `target` passed, and was not voided (`_verified`).
+fn verified(st: &RunState, card: u32, target: &str) -> bool {
+    let voided = st.log.voided();
+    let target = PyStr::from(target);
+    st.log.dispatches().any(|d| {
+        d.kind() == "verify"
+            && d.is_card(card)
+            && d.extra().get(&PyStr::from("tip")).cloned().flatten() == Some(target.clone())
+            && d.result
+                .is_some_and(|r| r.result.as_deref() == Some("pass"))
+            && !voided.contains(d.id())
+    })
+}
+
+/// A verifier on the integrated card's tip, which must pass before it is accepted
+/// (`_request_verify`).
+fn request_verify(
+    st: &RunState,
+    obs: &Observations,
+    c: &CardState,
+    target: String,
+) -> Step<Decision> {
+    let (role, route) = resolve_or_park(st, obs, c.number, "verifier", 1, None)?;
+    let mut r = Request::new(c.number, "verify", c.attempt.max(1), &role, route);
+    r.extra = extra(vec![("tip", target.into())]);
+    request(st, obs, c, r)
+}
+
+/// The card is integrating and nothing is dispatched for the step (`_integration_step`):
+/// rebase (again, after a crash), dispatch an integrate attempt for a conflict, or re-review a
+/// rebased card.
+fn integration_step(st: &RunState, obs: &Observations, c: &CardState) -> Step<Decision> {
+    let steps: Vec<&Event> = st
+        .log
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::IntegrationStarted(_) | Event::Rebased(_) | Event::Conflict(_)
+            ) && is_card(e.card(), c.number)
+        })
+        .collect();
+    if !steps
+        .iter()
+        .any(|e| matches!(e, Event::IntegrationStarted(_)))
+    {
+        return fail("list index out of range".into());
+    }
+    match steps.last() {
+        Some(Event::Conflict(conflict)) => request_integrate(st, obs, c, conflict),
+        Some(Event::Rebased(rebased)) => request_integration_review(st, obs, c, rebased),
+        _ => Ok(Decision::Rebase { card: c.number }),
+    }
+}
+
+/// After a conflict, a new attempt on the route of the card's last implementer attempt (not
+/// escalated) that may rebase the card branch, and only it, onto the run tip
+/// (`_request_integrate`). Rebasing writes the Git directory, which Codex's sandbox refuses
+/// (R39), so a Codex route integrates on the role's Claude route, a card's pin set aside; with
+/// no Claude worker the card is parked.
+fn request_integrate(
+    st: &RunState,
+    obs: &Observations,
+    c: &CardState,
+    conflict: &events::Conflict,
+) -> Step<Decision> {
+    let card = st.run.card(c.number)?;
+    let empty = || fail("max() arg is an empty sequence".into());
+    let Some(last) = st
+        .log
+        .card_dispatches(c.number, None, Some(&IMPLEMENTER_KINDS))
+        .into_iter()
+        .max_by_key(Dispatch::seq)
+    else {
+        return empty();
+    };
+    let Some(top) = st
+        .log
+        .card_dispatches(c.number, None, None)
+        .iter()
+        .map(Dispatch::attempt)
+        .max()
+    else {
+        return empty();
+    };
+    let Some(cut) = st
+        .log
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::CardCut(k) if is_card(k.card.as_ref(), c.number) => Some(k.seq),
+            _ => None,
+        })
+        .max()
+    else {
+        return empty();
+    };
+    let numbers = st.run.numbers();
+    let mut landed = Vec::new();
+    for e in &st.log.events {
+        if let Event::Accepted(a) = e
+            && a.seq > cut
+            && let Some(CardRef::Number(n)) = a.card
+            && n != i64::from(c.number)
+            && let Some(n) = u32::try_from(n).ok().filter(|n| numbers.contains(n))
+        {
+            let x = st.run.card(n)?;
+            landed.push(format!("card {} ({}): {}", x.number, x.title, x.done_when));
+        }
+    }
+    let mut route = last.route();
+    if route.vendor != "claude" {
+        let mut claude = None;
+        if obs.installed.iter().any(|v| v == "claude") {
+            // A card pinned to Codex still integrates on Claude: the pin is set aside.
+            let mut pinless = card.clone();
+            pinless.route_pin = None;
+            let only = ["claude".to_string()];
+            claude = resolve(
+                &st.run.config,
+                &RouteRequest {
+                    role: last.role(),
+                    card: Some(&pinless),
+                    attempt: 1,
+                    last_implementer_vendor: None,
+                    installed: &only,
+                    security: false,
+                    profile: st.run.deck.profile.as_deref(),
+                },
+            )
+            .ok()
+            .map(|res| res.route);
+        }
+        match claude {
+            Some(found) if found.vendor == "claude" => route = found,
+            _ => return Ok(park(c.number, "integration needs a Claude worker".into())),
+        }
+    }
+    let run_intent = if landed.is_empty() {
+        "(no card was accepted since this card was cut)".to_string()
+    } else {
+        landed.join("; ")
+    };
+    let mut r = Request::new(c.number, "integrate", top + 1, last.role(), route);
+    r.extra = PyMap(vec![
+        ("run_tip".into(), conflict.onto.clone().map(PyStr::from)),
+        (
+            "conflicts".into(),
+            Some(PyStr::join(
+                conflict.paths.as_deref().unwrap_or_default(),
+                ", ",
+            )),
+        ),
+        (
+            "card_intent".into(),
+            Some(format!("card {} ({}): {}", card.number, card.title, card.done_when).into()),
+        ),
+        ("run_intent".into(), Some(run_intent.into())),
+    ]);
+    request(st, obs, c, r)
+}
+
+/// Re-reviews the integrated diff with a fresh reviewer (`_request_integration_review`). Every
+/// integrated card gets it, a low-risk card that `card_review = "by-risk"` let through without
+/// a review included.
+fn request_integration_review(
+    st: &RunState,
+    obs: &Observations,
+    c: &CardState,
+    rebased: &events::Rebased,
+) -> Step<Decision> {
+    let last = st
+        .log
+        .card_dispatches(c.number, None, Some(&IMPLEMENTER_KINDS))
+        .into_iter()
+        .filter(|d| d.result.is_some())
+        .max_by_key(Dispatch::seq);
+    let (role, route) = resolve_or_park(
+        st,
+        obs,
+        c.number,
+        "reviewer",
+        1,
+        last.as_ref().map(Dispatch::vendor),
+    )?;
+    let findings = st
+        .log
+        .events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            Event::VerdictRecorded(v) if is_card(v.card.as_ref(), c.number) => Some(v),
+            _ => None,
+        })
+        .and_then(|v| v.findings.clone())
+        .filter(|f| !f.is_empty())
+        .unwrap_or_else(|| "(none: no review findings before integration)".into());
+    let onto = rebased.onto.as_deref().unwrap_or("None");
+    let tip = rebased.tip.as_deref().unwrap_or("None");
+    let notes = format!(
+        "## Integration\n\nOther cards were accepted while this card waited, so its branch was \
+         rebased onto the run tip {onto}. Review the integrated diff {onto}..{tip} as a whole. \
+         The findings above are from the card's review before integration, if any; check that \
+         the card still does what it should on top of the run tip."
+    );
+    let report = last
+        .as_ref()
+        .map(report_copy)
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| "(none recorded)".into());
+    let mut r = Request::new(c.number, "rereview", c.attempt.max(1), &role, route);
+    r.extra = extra(vec![
+        ("diff_range", format!("{onto}..{tip}").into()),
+        ("findings", findings),
+        ("implementer_report", report),
+    ]);
+    r.notes = notes.into();
+    request(st, obs, c, r)
+}
+
+/// An integrate attempt (or an answer or continuation of one) reported READY
+/// (`_after_integrate`): its branch must now contain the run tip and still hold the card's
+/// changes. Then the card is `rebased`, which its re-review follows; otherwise a fresh worker
+/// on the next rung gets the card, told where its commits before integration are kept.
+fn after_integrate(
+    st: &RunState,
+    obs: &Observations,
+    c: &CardState,
+    d: &Dispatch,
+) -> Step<Decision> {
+    let Some(integ) = st.log.events.iter().rev().find_map(|e| match e {
+        Event::IntegrationStarted(i) if is_card(i.card.as_ref(), c.number) => Some(i),
+        _ => None,
+    }) else {
+        return fail("list index out of range".into());
+    };
+    let branch = card_branch(st, c);
+    let onto = integ.onto.clone().unwrap_or_default();
+    let mut kept = PyStr::default();
+    if let Some(keep) = integ.keep.as_ref().filter(|k| !k.is_empty()) {
+        kept.push_str(" The card's commits before integration are kept on ");
+        kept.push(keep);
+        kept.push_str(".");
+    }
+    let why = |text: &str| {
+        let mut why = PyStr::from(text);
+        why.push(&kept);
+        why
+    };
+    let key = (branch.clone(), onto.clone());
+    match obs.contains.get(&key) {
+        None => return need(Need::Contains(key.0, key.1)),
+        Some(false) => {
+            let why = why("reported READY without rebasing the card branch onto the run tip.");
+            return escalate(st, obs, c, why, None, "The review findings");
+        }
+        Some(true) => {}
+    }
+    let tip = match d
+        .result
+        .and_then(|r| r.tip.clone())
+        .filter(|t| !t.is_empty())
+    {
+        Some(tip) => tip,
+        None => match obs.tips.get(&branch) {
+            Some(tip) => tip.clone(),
+            None => return need(Need::Tip(branch)),
+        },
+    };
+    let integ_tip = integ.tip.clone().unwrap_or_default();
+    let base_key = (PyStr::from(onto.as_str()), PyStr::from(integ_tip.as_str()));
+    let Some(old_base) = obs.merge_bases.get(&base_key).cloned() else {
+        return need(Need::MergeBase(base_key.0, base_key.1));
+    };
+    if !changed(obs, &old_base, &integ_tip)?.is_empty() && changed(obs, &onto, &tip)?.is_empty() {
+        // The card's work vanished (`rebase --skip`, a reset to the run tip): SPENT, not
+        // integrated.
+        let why = why(
+            "ended SPENT: its integration left none of the card's changes on top of the run tip.",
+        );
+        return escalate(st, obs, c, why, None, "The review findings");
+    }
+    Ok(append(Event::Rebased(events::Rebased {
+        card: Some(CardRef::Number(c.number.into())),
+        onto: Some(onto),
+        tip: Some(tip),
+        dispatch_id: Some(Some(d.id().to_string())),
+        ..events::Rebased::default()
+    })))
+}
+
+/// The paths changed between two commits, once observed.
+fn changed(obs: &Observations, a: &str, b: &str) -> Step<Vec<PyStr>> {
+    match obs.changed.get(&(a.to_string(), b.to_string())) {
+        Some(paths) => Ok(paths.clone()),
+        None => need(Need::Changed(a.to_string(), b.to_string())),
+    }
 }
 
 /// Resumes a parked card the operator unparked (`_resume_unparked`): its last implementer
@@ -1255,7 +1755,7 @@ fn resume_unparked(
                 .dispatch(capped.req.resumes.as_deref())
                 .map(|x| x.id().to_string());
         }
-        return request(st, c, r);
+        return request(st, obs, c, r);
     }
     let last = st
         .log
@@ -1285,7 +1785,7 @@ fn resume_unparked(
             );
             r.extra = PyMap(vec![("ruling".into(), Some(note))]);
             r.resume = Some(last.id().to_string());
-            return request(st, c, r);
+            return request(st, obs, c, r);
         }
     }
     let mut notes = PyStr::from(
@@ -1397,12 +1897,15 @@ mod tests {
         )
     }
 
-    /// Decides with every guard observed clean.
+    /// Decides with every guard observed clean and every card branch holding the run tip.
     fn decide_clean(st: &RunState, obs: &mut Observations) -> Decision {
         loop {
             match decide(st, obs) {
                 Decision::Need(Need::Guard(id)) => {
-                    obs.guards.insert(id, false);
+                    obs.guards.insert(id, None);
+                }
+                Decision::Need(Need::NeedsIntegration(branch)) => {
+                    obs.needs_integration.insert(branch, false);
                 }
                 d => return d,
             }
@@ -1457,15 +1960,24 @@ mod tests {
             decide(&st, &fresh),
             Decision::Need(Need::Guard("c1-a1-implement-1".into()))
         );
-        fresh.guards.insert("c1-a1-implement-1".into(), false);
+        fresh.guards.insert("c1-a1-implement-1".into(), None);
         fresh.operation = None;
         assert_eq!(decide(&st, &fresh), Decision::Need(Need::Operation));
-        // A worker that moved what it guards is Task 15's.
-        fresh.guards.insert("c1-a1-implement-1".into(), true);
-        assert!(matches!(
+        // A worker that moved what it guards: its violation is recorded and undone.
+        let found = events::Violation {
+            stage: Some("found".into()),
+            ..events::Violation::default()
+        };
+        fresh
+            .guards
+            .insert("c1-a1-implement-1".into(), Some(found.clone()));
+        assert_eq!(
             decide(&st, &fresh),
-            Decision::Unported { task: 15, .. }
-        ));
+            Decision::Void {
+                dispatch_id: "c1-a1-implement-1".into(),
+                found: Some(Box::new(found)),
+            }
+        );
     }
 
     #[test]
@@ -1826,5 +2338,263 @@ mod tests {
             panic!("no review");
         };
         assert_eq!(r.kind, "review");
+    }
+
+    /// A review of card 1's implementer work (`c1-a1-review-<n>`), started and reported with
+    /// `verdict`.
+    fn review(n: u32, verdict: &str) -> [(&'static str, String); 3] {
+        let id = format!("c1-a1-review-{n}");
+        let req = requested(&id, "review", 1, SONNET)
+            .replace(r#""role":"implementer""#, r#""role":"reviewer""#);
+        let reported = result(&id, "review", "READY", "").replace(
+            r#""head":"Status","verdict":null"#,
+            &format!(r#""head":"Verdict","verdict":"{verdict}""#),
+        );
+        [
+            ("dispatch_requested", req),
+            ("worker_started", started(&id, &format!("w{}", n + 1))),
+            ("result_recorded", reported),
+        ]
+    }
+
+    /// Card 1 cut, implemented and reported READY at `cccc…`.
+    fn implemented() -> Vec<(&'static str, String)> {
+        let id = "c1-a1-implement-1";
+        vec![
+            (CUT.0, CUT.1.to_string()),
+            ("dispatch_requested", requested(id, "implement", 1, SONNET)),
+            ("worker_started", started(id, "w1")),
+            ("result_recorded", result(id, "implement", "READY", "")),
+        ]
+    }
+
+    fn check_violation(n: u32, stage: &str) -> (&'static str, String) {
+        let fields = if stage == "found" {
+            format!(
+                r#""stage":"found","by":"check","dispatch_id":"c1-a1-review-{n}","card":1,"dispatch_kind":"review","n":{n},"ref":"refs/leadhand/abc123abc123/violations/{n}","paths":["README.md"],"head_moved":false,"index_dirty":false,"expected_head":"cccccccccccccccccccccccccccccccccccccccc","expected_branch":"leadhand/demo--card-1","refs":{{}},"preserved":{{}}"#
+            )
+        } else {
+            format!(
+                r#""stage":"restored","by":"check","dispatch_id":"c1-a1-review-{n}","card":1,"n":{n},"ref":"refs/leadhand/abc123abc123/violations/{n}","saved":"dddddddddddddddddddddddddddddddddddddddd","siblings":[],"preserved":{{}}"#
+            )
+        };
+        ("violation", fields)
+    }
+
+    fn lines<'a>(owned: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+        owned.iter().map(|(k, v)| (*k, v.as_str())).collect()
+    }
+
+    // `_void` then `_workspace_kept` (R33): a recorded violation not restored yet is restored
+    // first; then the review is requested again, fresh, with the warning in its brief.
+    #[test]
+    fn decide_voids_a_changed_check_then_reruns_it_with_a_fresh_worker() {
+        let w = world("");
+        let mut owned = implemented();
+        owned.extend(review(1, "defects"));
+        owned.push(check_violation(1, "found"));
+        let st = RunState::new(&w.run, log(&lines(&owned)));
+        assert_eq!(
+            decide_clean(&st, &mut obs(&["claude"])),
+            Decision::Void {
+                dispatch_id: "c1-a1-review-1".into(),
+                found: None
+            }
+        );
+        owned.push(check_violation(1, "restored"));
+        let st = RunState::new(&w.run, log(&lines(&owned)));
+        let Decision::Request(r) = decide_clean(&st, &mut obs(&["claude"])) else {
+            panic!("no re-run");
+        };
+        assert_eq!(
+            (
+                r.dispatch_id.as_str(),
+                r.kind.as_str(),
+                r.role.as_str(),
+                r.resume.as_deref()
+            ),
+            ("c1-a1-review-2", "review", "reviewer", None)
+        );
+        assert_eq!(r.notes, voided_notes(&PyStr::default()));
+        // The voided defects verdict never counted: no verdict was recorded for it.
+        assert!(!st.log.events.iter().any(|e| e.kind() == "verdict_recorded"));
+    }
+
+    // R31's violation cap: a third voided review parks the card, naming the paths, and the
+    // park names the kind to re-run (R32).
+    #[test]
+    fn decide_parks_the_card_at_the_violation_cap() {
+        let w = world("");
+        let mut owned = implemented();
+        for n in 1..=3 {
+            owned.extend(review(n, "clean"));
+            owned.push(check_violation(n, "found"));
+            owned.push(check_violation(n, "restored"));
+        }
+        let st = RunState::new(&w.run, log(&lines(&owned)));
+        let Decision::Append(event) = decide_clean(&st, &mut obs(&["claude"])) else {
+            panic!("no park");
+        };
+        let Event::Parked(p) = *event else {
+            panic!("not a park: {event:?}");
+        };
+        assert_eq!(
+            (p.reason, p.cap_dispatch, p.cap_kind, p.decision),
+            (
+                Some(PyStr::from("checks change tracked files: README.md")),
+                Some(Some("c1-a1-review-3".into())),
+                Some(Some("review".into())),
+                None
+            )
+        );
+    }
+
+    // `_accept`: a card branch without the run tip is integrated first; an integrated card is
+    // accepted only at a tip a verify passed on, so a verify of it is requested.
+    #[test]
+    fn decide_integrates_a_card_behind_the_run_tip_and_verifies_it_before_accepting() {
+        let w = world("");
+        let mut owned = implemented();
+        owned.extend(review(1, "clean"));
+        owned.push((
+            "verdict_recorded",
+            r#""card":1,"verdict":"clean","findings":"/run/cards/1/c1-a1-review-1/report.md","dispatch_id":"c1-a1-review-1""#.into(),
+        ));
+        let st = RunState::new(&w.run, log(&lines(&owned)));
+        let branch = PyStr::from("leadhand/demo--card-1");
+        let mut o = obs(&["claude"]);
+        assert_eq!(
+            decide(&st, &o),
+            Decision::Need(Need::NeedsIntegration(branch.clone()))
+        );
+        o.needs_integration.insert(branch.clone(), true);
+        assert_eq!(decide(&st, &o), Decision::Integrate { card: 1 });
+        o.needs_integration.insert(branch.clone(), false);
+        let tip = "c".repeat(40);
+        assert_eq!(
+            decide(&st, &o),
+            Decision::Accept {
+                card: 1,
+                target: Some(tip.clone())
+            }
+        );
+        // Integrated: rebased, re-reviewed clean, then a verify of the tip before acceptance.
+        let mut owned = implemented();
+        owned.push((
+            "integration_started",
+            format!(r#""card":1,"onto":"{}","tip":"{tip}","keep":"refs/leadhand/abc123abc123/integration/1-1""#, "e".repeat(40)),
+        ));
+        owned.push((
+            "rebased",
+            format!(r#""card":1,"onto":"{}","tip":"{tip}""#, "e".repeat(40)),
+        ));
+        owned.extend(review(1, "clean"));
+        owned.push((
+            "verdict_recorded",
+            r#""card":1,"verdict":"clean","findings":"/f","dispatch_id":"c1-a1-review-1""#.into(),
+        ));
+        let st = RunState::new(&w.run, log(&lines(&owned)));
+        let mut o = obs(&["claude"]);
+        o.needs_integration.insert(branch.clone(), false);
+        let key = (
+            PyStr::from("refs/heads/leadhand/demo"),
+            PyStr::from("refs/heads/leadhand/demo--card-1"),
+        );
+        assert_eq!(
+            decide(&st, &o),
+            Decision::Need(Need::MergeBase(key.0.clone(), key.1.clone()))
+        );
+        o.merge_bases.insert(key, "e".repeat(40));
+        let Decision::Request(r) = decide(&st, &o) else {
+            panic!("no verify");
+        };
+        assert_eq!(
+            (r.dispatch_id.as_str(), r.role.as_str(), r.base.as_str()),
+            ("c1-a1-verify-1", "verifier", "e".repeat(40).as_str())
+        );
+        assert_eq!(
+            r.extra,
+            PyMap(vec![("tip".into(), Some(PyStr::from(tip.as_str())))])
+        );
+    }
+
+    // `_integration_step` and `_request_integrate`: an integration still at its intent is
+    // rebased again; after a conflict, a new attempt on the last implementer's route is asked
+    // to rebase the card branch onto the run tip.
+    #[test]
+    fn decide_rebases_again_or_requests_an_integrate_attempt_after_a_conflict() {
+        let w = world("");
+        let onto = "e".repeat(40);
+        let mut owned = implemented();
+        owned.push((
+            "integration_started",
+            format!(r#""card":1,"onto":"{onto}","tip":"{}","keep":"refs/leadhand/abc123abc123/integration/1-1""#, "c".repeat(40)),
+        ));
+        let st = RunState::new(&w.run, log(&lines(&owned)));
+        assert_eq!(st.cards[&1].state, CardStage::Integrating);
+        assert_eq!(
+            decide_clean(&st, &mut obs(&["claude"])),
+            Decision::Rebase { card: 1 }
+        );
+        owned.push((
+            "conflict",
+            format!(r#""card":1,"onto":"{onto}","paths":["src/a.txt","src/b.txt"]"#),
+        ));
+        let st = RunState::new(&w.run, log(&lines(&owned)));
+        let mut o = obs(&["claude"]);
+        let key = (
+            PyStr::from("refs/heads/leadhand/demo"),
+            PyStr::from("refs/heads/leadhand/demo--card-1"),
+        );
+        o.merge_bases.insert(key, "b".repeat(40));
+        let Decision::Request(r) = decide_clean(&st, &mut o) else {
+            panic!("no integrate attempt");
+        };
+        assert_eq!(
+            (
+                r.dispatch_id.as_str(),
+                r.attempt,
+                r.role.as_str(),
+                r.route.vendor.as_str(),
+                r.resume.as_deref()
+            ),
+            ("c1-a2-integrate-1", 2, "implementer", "claude", None)
+        );
+        let get = |k: &str| {
+            r.extra
+                .get(&PyStr::from(k))
+                .cloned()
+                .flatten()
+                .map(|v| v.lossy().into_owned())
+        };
+        assert_eq!(get("run_tip"), Some(onto.clone()));
+        assert_eq!(get("conflicts").as_deref(), Some("src/a.txt, src/b.txt"));
+        assert_eq!(
+            get("card_intent").as_deref(),
+            Some("card 1 (Card number 1): the card's file exists and the tests pass")
+        );
+        assert_eq!(
+            get("run_intent").as_deref(),
+            Some("(no card was accepted since this card was cut)")
+        );
+        // With no Claude worker installed, a Codex implementer's card is parked instead.
+        let codex = requested(
+            "c1-a1-implement-1",
+            "implement",
+            1,
+            ("codex", "gpt-5", "high"),
+        );
+        owned[1] = ("dispatch_requested", codex);
+        let st = RunState::new(&w.run, log(&lines(&owned)));
+        let Decision::Append(event) = decide_clean(&st, &mut obs(&["codex"])) else {
+            panic!("no park");
+        };
+        let Event::Parked(p) = *event else {
+            panic!("not a park: {event:?}");
+        };
+        assert_eq!(
+            p.reason,
+            Some(PyStr::from("integration needs a Claude worker"))
+        );
     }
 }

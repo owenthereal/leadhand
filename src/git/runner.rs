@@ -136,6 +136,18 @@ impl Git {
         self.succeeded(args, out)
     }
 
+    /// As `run_input`, with `env` set last as `run_env` sets it: a pathspec list on stdin for a
+    /// command that works in a temporary index.
+    pub fn run_env_input(
+        &self,
+        args: &[&OsStr],
+        env: &[(&str, &OsStr)],
+        input: &[u8],
+    ) -> Result<Vec<u8>> {
+        let out = self.spawn(args, env, Some(input))?;
+        self.succeeded(args, out)
+    }
+
     fn succeeded(&self, args: &[&OsStr], out: Output) -> Result<Vec<u8>> {
         if out.status.success() {
             Ok(out.stdout)

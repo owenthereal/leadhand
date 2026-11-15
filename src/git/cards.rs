@@ -1,21 +1,27 @@
-//! Card branches and acceptance (`gitops`: `card_branch_name`, `cut_card_branch`,
-//! `fast_forward`, `changed_paths`, `is_ancestor`, `is_test_or_doc_path`), and the reads of the
-//! run's workspace the card loop makes before it moves anything (`engine._current_branch`,
-//! `_operation`, `_ref_sha`, `_ref_snapshot`; `gitops.detect_violation`).
+//! Card branches, integration and acceptance (`gitops`: `card_branch_name`, `cut_card_branch`,
+//! `needs_integration`, `rebase_onto`, `fast_forward`, `changed_paths`, `is_ancestor`,
+//! `is_test_or_doc_path`), and the reads of the run's workspace the card loop makes before it
+//! moves anything (`engine._current_branch`, `_operation`, `_ref_sha`, `_ref_snapshot`;
+//! `gitops._git_path`, `_rebase_in_progress`).
 //!
 //! Runs happen only in worktrees (deliberate change 1), so nothing here protects ignored files:
-//! the Python's `protect_ignored` is always false for a worktree run. Branch and ref names are
-//! text as the Python holds them (`PyStr`), given to Git as their OS bytes.
+//! the Python's `protect_ignored` is always false for a worktree run, and `rebase_onto` never
+//! looks for files in the way. Branch and ref names are text as the Python holds them
+//! (`PyStr`), given to Git as their OS bytes.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::workspace::{head, ref_exists, worktrees};
-use super::{Git, split_nul, unhide_index_entries};
+use super::{Git, split_nul};
 use crate::error::{Error, Result};
 use crate::pytext::py_splitlines_bytes;
 use crate::wire::{PyMap, PyStr};
+
+/// Prepended to the Git calls that make leadhand's own commits (a rebase, `stash create`,
+/// `commit-tree`): never signed, since signing may prompt (`gitops.NO_SIGN`).
+pub(super) const NO_SIGN: [&str; 2] = ["-c", "commit.gpgsign=false"];
 
 /// Between a run branch and a card number in a card branch's name (`gitops.CARD_INFIX`).
 pub const CARD_INFIX: &str = "--card-";
@@ -31,18 +37,18 @@ pub const OPERATIONS: [(&str, &str); 6] = [
     ("sequencer", "sequencer"),
 ];
 
-fn os(s: &str) -> &OsStr {
+pub(super) fn os(s: &str) -> &OsStr {
     OsStr::new(s)
 }
 
 /// Git's output without its trailing newlines (`gitops.git`'s `rstrip("\n")`).
-fn trim_newlines(out: &[u8]) -> &[u8] {
+pub(super) fn trim_newlines(out: &[u8]) -> &[u8] {
     let end = out.iter().rposition(|b| *b != b'\n').map_or(0, |i| i + 1);
     &out[..end]
 }
 
 /// Text Git printed, as the Python decodes it (`surrogateescape`).
-fn text(bytes: &[u8]) -> PyStr {
+pub(super) fn text(bytes: &[u8]) -> PyStr {
     PyStr::from_os(OsStr::from_bytes(bytes))
 }
 
@@ -60,7 +66,7 @@ pub fn branch_ref(branch: &PyStr) -> Result<OsString> {
 
 /// A command whose exit status answers yes (0) or no (1); any other exit is an error
 /// (`gitops._test`).
-fn yes_or_no(git: &Git, argv: &[&OsStr]) -> Result<bool> {
+pub(super) fn yes_or_no(git: &Git, argv: &[&OsStr]) -> Result<bool> {
     let out = git.output(argv)?;
     match out.status.code() {
         Some(0) => Ok(true),
@@ -79,7 +85,7 @@ pub fn card_branch_name(run_branch: &PyStr, card: &str) -> PyStr {
 
 /// Refuses a name Git does not take as a branch, or one that would read as an option
 /// (`gitops._check_branch_name`).
-fn check_branch_name(git: &Git, name: &PyStr) -> Result<()> {
+pub(super) fn check_branch_name(git: &Git, name: &PyStr) -> Result<()> {
     let refused = || Error::msg(format!("not a valid branch name: {}", name.repr()));
     let Ok(os_name) = name.to_os() else {
         return Err(refused());
@@ -178,6 +184,59 @@ pub fn is_ancestor(git: &Git, ancestor: &OsStr, descendant: &OsStr) -> Result<bo
     )
 }
 
+/// Whether the run tip is not in the card branch's history, so the card has to be integrated
+/// before it can be accepted (`gitops.needs_integration`).
+pub fn needs_integration(git: &Git, run_branch: &PyStr, card_branch: &PyStr) -> Result<bool> {
+    Ok(!is_ancestor(
+        git,
+        &branch_ref(run_branch)?,
+        &branch_ref(card_branch)?,
+    )?)
+}
+
+/// Rebases `card_branch` onto `onto` (`gitops.rebase_onto` in a worktree run): `[]` once it
+/// has; on a conflict the rebase is aborted, which leaves the branch as it was, and the
+/// conflicted paths are returned, sorted. Any other failure is an error. The rebase's commits
+/// are never signed, never update other branches, and never autostash.
+pub fn rebase_onto(git: &Git, card_branch: &PyStr, onto: &str) -> Result<Vec<PyStr>> {
+    let branch = card_branch.to_os()?;
+    let mut args: Vec<&OsStr> = NO_SIGN.iter().map(|a| os(a)).collect();
+    args.extend([
+        os("-c"),
+        os("rebase.updateRefs=false"),
+        os("rebase"),
+        os("--quiet"),
+        os("--no-autostash"),
+        os(onto),
+        &branch,
+    ]);
+    let out = git.output(&args)?;
+    if out.status.success() {
+        return Ok(Vec::new());
+    }
+    // Whatever its exit, as the Python's `_run` reads it.
+    let unmerged = git.output(&[
+        os("diff"),
+        os("--name-only"),
+        os("-z"),
+        os("--diff-filter=U"),
+    ])?;
+    let mut conflicts: Vec<PyStr> = split_nul(&unmerged.stdout)
+        .iter()
+        .map(|p| text(p))
+        .collect();
+    if rebase_in_progress(git)? {
+        git.run(&[os("rebase"), os("--abort")])?;
+    }
+    if conflicts.is_empty() {
+        return Err(git.failure(&args, &out));
+    }
+    // `sorted(set(...))`: WTF-8 order is code point order.
+    conflicts.sort();
+    conflicts.dedup();
+    Ok(conflicts)
+}
+
 /// Moves the run branch forward to `to_sha` and returns the run tip (`gitops.fast_forward`).
 /// Idempotent: a run branch that already contains `to_sha` is left where it is. An error when
 /// it is not a fast-forward, or when the run branch is checked out in another worktree.
@@ -264,6 +323,23 @@ pub fn ref_sha(git: &Git, name: &OsStr) -> Option<String> {
     (!sha.is_empty()).then_some(sha)
 }
 
+/// Where Git keeps `name` for this worktree (`gitops._git_path`:
+/// `rev-parse --path-format=absolute --git-path <name>`).
+pub fn git_path(git: &Git, name: &str) -> Result<PathBuf> {
+    let out = git.run(&[
+        os("rev-parse"),
+        os("--path-format=absolute"),
+        os("--git-path"),
+        os(name),
+    ])?;
+    Ok(PathBuf::from(OsStr::from_bytes(trim_newlines(&out))))
+}
+
+/// Whether a rebase is in progress (`gitops._rebase_in_progress`).
+pub fn rebase_in_progress(git: &Git) -> Result<bool> {
+    Ok(git_path(git, "rebase-merge")?.exists() || git_path(git, "rebase-apply")?.exists())
+}
+
 /// The Git operation left in progress in the workspace (rebase, merge, …), if any
 /// (`engine._operation`).
 pub fn operation(git: &Git) -> Result<Option<&'static str>> {
@@ -306,65 +382,6 @@ pub fn ref_snapshot(git: &Git, run_branch: &PyStr, run_id: &str) -> Result<PyMap
         }
     }
     Ok(snap)
-}
-
-/// How the workspace differs from a branch tip it must be on (`gitops.Violation`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Violation {
-    /// HEAD is not `expected_head` on `expected_branch`.
-    pub head_moved: bool,
-    /// The index differs from HEAD.
-    pub index_dirty: bool,
-    /// Tracked files whose working copy differs from the index.
-    pub tracked_changes: Vec<PyStr>,
-    /// Entries found assume-unchanged or skip-worktree (now cleared).
-    pub hidden: Vec<PyStr>,
-}
-
-/// `None` when the workspace is on `expected_branch` at `expected_head` with a clean index and
-/// clean tracked files (`gitops.detect_violation`). Untracked files (build output) are not a
-/// violation. An entry marked assume-unchanged or skip-worktree is: the mark is cleared first,
-/// so an edit behind it counts as the tracked change it is.
-pub fn detect_violation(
-    git: &Git,
-    expected_head: &str,
-    expected_branch: &PyStr,
-) -> Result<Option<Violation>> {
-    let hidden = unhide_index_entries(git)?;
-    let head_moved = checked_out_branch(git)?.as_ref() != Some(expected_branch)
-        || head(git, os("HEAD"))? != expected_head;
-    let index_dirty = !yes_or_no(
-        git,
-        &[
-            os("diff"),
-            os("--cached"),
-            os("--quiet"),
-            os("--no-ext-diff"),
-            os("HEAD"),
-            os("--"),
-        ],
-    )?;
-    let out = git.run(&[
-        os("diff"),
-        os("--name-only"),
-        os("-z"),
-        os("--no-renames"),
-        os("--no-ext-diff"),
-        os("--"),
-    ])?;
-    let tracked_changes: Vec<PyStr> = split_nul(trim_newlines(&out))
-        .iter()
-        .map(|p| text(p))
-        .collect();
-    if head_moved || index_dirty || !tracked_changes.is_empty() || !hidden.is_empty() {
-        return Ok(Some(Violation {
-            head_moved,
-            index_dirty,
-            tracked_changes,
-            hidden,
-        }));
-    }
-    Ok(None)
 }
 
 /// The test and doc folders that count at the top level only.
@@ -448,6 +465,7 @@ mod tests {
 
     use super::*;
     use crate::git::fixture::Fixture;
+    use crate::git::preserve::detect_violation;
     use crate::git::{prepare_worktree, repo_identity};
 
     const RUN: &str = "leadhand/run-1";
@@ -479,6 +497,75 @@ mod tests {
         assert!(is_ancestor(&git, os(&x), os(&tip_a)).unwrap());
         assert!(is_ancestor(&git, os(&tip_a), os(&tip_a)).unwrap());
         assert!(!is_ancestor(&git, os(&tip_a), os(&x)).unwrap());
+    }
+
+    #[test]
+    fn needs_integration_after_an_independent_accept_then_rebases_onto_the_run_tip() {
+        let f = Fixture::new();
+        let (repo, ws, _) = workspace(&f);
+        let git = Git::at(&ws).unwrap();
+        let (a, _, _) = card(&f, &ws, 1, &[("a.txt", "a\n")]);
+        let (b, _, tip_b) = card(&f, &ws, 2, &[("b.txt", "b\n")]);
+        assert!(!needs_integration(&git, &RUN.into(), &a).unwrap());
+        fast_forward(&git, &RUN.into(), &tip_b).unwrap();
+        assert!(needs_integration(&git, &RUN.into(), &a).unwrap());
+        assert!(!needs_integration(&git, &RUN.into(), &b).unwrap());
+        // Every commit made with the repository's own settings tries to sign, and fails: the
+        // rebase's are never signed.
+        f.git(&repo, &["config", "commit.gpgsign", "true"]);
+        f.git(&repo, &["config", "gpg.program", "false"]);
+        assert_eq!(rebase_onto(&git, &a, RUN).unwrap(), Vec::<PyStr>::new());
+        assert!(!needs_integration(&git, &RUN.into(), &a).unwrap());
+        let tip_a = f.git(&ws, &["rev-parse", &format!("refs/heads/{}", a.lossy())]);
+        assert_eq!(f.git(&ws, &["rev-parse", &format!("{tip_a}^")]), tip_b);
+        assert_eq!(f.git(&ws, &["log", "-1", "--format=%G?", &tip_a]), "N");
+        assert_eq!(f.git(&ws, &["symbolic-ref", "--short", "HEAD"]), a.lossy());
+    }
+
+    #[test]
+    fn rebase_onto_a_conflict_returns_the_paths_and_leaves_the_branch_unchanged() {
+        let f = Fixture::new();
+        let (_, ws, _) = workspace(&f);
+        let git = Git::at(&ws).unwrap();
+        let (a, _, tip_a) = card(
+            &f,
+            &ws,
+            1,
+            &[("shared.txt", "card one\n"), ("z.txt", "z one\n")],
+        );
+        let (_, _, tip_b) = card(
+            &f,
+            &ws,
+            2,
+            &[("z.txt", "z two\n"), ("shared.txt", "card two\n")],
+        );
+        fast_forward(&git, &RUN.into(), &tip_b).unwrap();
+        let conflicts = rebase_onto(&git, &a, RUN).unwrap();
+        assert_eq!(conflicts, [PyStr::from("shared.txt"), PyStr::from("z.txt")]);
+        assert!(!rebase_in_progress(&git).unwrap());
+        assert_eq!(
+            f.git(&ws, &["rev-parse", &format!("refs/heads/{}", a.lossy())]),
+            tip_a
+        );
+        assert_eq!(
+            f.git(&ws, &["status", "--porcelain", "--untracked-files=no"]),
+            ""
+        );
+        // Any other failure is an error, not an empty list: an `onto` that names nothing.
+        let e = rebase_onto(&git, &a, &"0".repeat(40)).unwrap_err();
+        assert!(e.message.starts_with("git -c commit.gpgsign=false -c rebase.updateRefs=false rebase --quiet --no-autostash "), "{e}");
+        assert_eq!(
+            git_path(&git, "rebase-merge").unwrap(),
+            PathBuf::from(f.git(
+                &ws,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "rebase-merge"
+                ]
+            ))
+        );
     }
 
     #[test]

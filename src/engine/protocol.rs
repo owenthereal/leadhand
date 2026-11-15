@@ -58,6 +58,32 @@ pub const TIMER_INTERVAL: f64 = 10.0;
 pub const REPLY_FILE: &str = "reply.txt";
 /// The mechanical steps one `next` may take (`engine.MAX_STEPS`).
 pub const MAX_STEPS: usize = 200;
+/// Voided re-runs per card and kind; one more violation parks the card (`engine.VIOLATION_CAP`).
+pub const VIOLATION_CAP: usize = 2;
+/// The heading of the warning a voided check's re-run gets in its brief (`engine.VOIDED_NOTE`).
+pub const VOIDED_NOTE: &str = "## An earlier run of this check was voided";
+
+/// The brief notes for the re-run of a voided check, the warning added once
+/// (`engine._voided_notes`).
+pub fn voided_notes(notes: &PyStr) -> PyStr {
+    if notes.contains(VOIDED_NOTE) {
+        return notes.clone();
+    }
+    let mut out = if notes.is_empty() {
+        PyStr::default()
+    } else {
+        let mut kept = notes.strip_ascii(b"\n", false);
+        kept.push_str("\n\n");
+        kept
+    };
+    out.push_str(VOIDED_NOTE);
+    out.push_str(
+        "\n\nAn earlier worker on this step changed the workspace or moved a branch it must \
+         leave alone, so its result was voided. Never stage or commit what this brief does not \
+         ask for, check out another branch, or create, move or delete any other ref.",
+    );
+    out
+}
 
 /// A card dispatch's ID: `c<card>-a<attempt>-<kind>-<n>`, `n` counting that kind within the
 /// card's attempt (contract item 8).
@@ -512,5 +538,26 @@ mod tests {
     #[test]
     fn dispatch_ids_follow_the_contract() {
         assert_eq!(card_dispatch_id(1, 2, "review", 3), "c1-a2-review-3");
+    }
+
+    #[test]
+    fn voided_notes_add_the_warning_once_as_the_python_does() {
+        let code = "import json, sys\nfrom leadhand import engine\n\
+                    print(json.dumps([engine._voided_notes(n) for n in sys.argv[1:]]))";
+        let notes = [
+            "",
+            "## The operator's note\n\nGo on.",
+            "trailing newlines\n\n\n",
+            "\n",
+            "caf\u{e9}",
+            "already voided\n\n## An earlier run of this check was voided\n\nkeep",
+        ];
+        let args: Vec<&std::ffi::OsStr> = notes.iter().map(std::ffi::OsStr::new).collect();
+        let theirs: Vec<PyStr> = serde_json::from_slice(&python(code, &args)).unwrap();
+        let ours: Vec<PyStr> = notes.iter().map(|n| voided_notes(&(*n).into())).collect();
+        assert_eq!(ours, theirs);
+        // Again on its own result: unchanged.
+        assert_eq!(voided_notes(&ours[1]), ours[1]);
+        assert_eq!(VIOLATION_CAP, 2);
     }
 }

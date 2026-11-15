@@ -484,6 +484,10 @@ event!(Ruling {
 event!(
     /// A violation `found`, then `restored`. Which fields a record has depends on its stage
     /// and on who it was by: every field but `stage`, `by`, `n` and `ref` is an `Opt`.
+    ///
+    /// The fields are in the one order every record the Python writes keeps (a check's or an
+    /// implementer's, `found` or `restored`, an evidence base worktree's): `saved` follows
+    /// `ref`, and `siblings` comes before `refs` and `preserved`.
     Violation {
         stage: Option<String>,
         by: Option<String>,
@@ -495,6 +499,8 @@ event!(
         dispatch_kind: Opt<String>,
         n: Option<i64>,
         r#ref: Option<PyStr>,
+        #[serde(deserialize_with = "wire::present", skip_serializing_if = "Option::is_none")]
+        saved: Opt<String>,
         #[serde(deserialize_with = "wire::present", skip_serializing_if = "Option::is_none")]
         base_worktree: Opt<PyStr>,
         #[serde(deserialize_with = "wire::present", skip_serializing_if = "Option::is_none")]
@@ -515,6 +521,8 @@ event!(
         after_dispatch: Opt<String>,
         #[serde(deserialize_with = "wire::present", skip_serializing_if = "Option::is_none")]
         why: Opt<PyStr>,
+        #[serde(deserialize_with = "wire::present", skip_serializing_if = "Option::is_none")]
+        siblings: Opt<Vec<PyStr>>,
         /// Each ref the worker moved, with its tips before and after.
         #[serde(deserialize_with = "wire::present", skip_serializing_if = "Option::is_none")]
         refs: Opt<PyMap<RefMove>>,
@@ -525,10 +533,6 @@ event!(
         untracked: Opt<Vec<PyStr>>,
         #[serde(deserialize_with = "wire::present", skip_serializing_if = "Option::is_none")]
         hidden: Opt<Vec<PyStr>>,
-        #[serde(deserialize_with = "wire::present", skip_serializing_if = "Option::is_none")]
-        saved: Opt<String>,
-        #[serde(deserialize_with = "wire::present", skip_serializing_if = "Option::is_none")]
-        siblings: Opt<Vec<PyStr>>,
     }
 );
 
@@ -865,6 +869,55 @@ mod tests {
                 assert_eq!(p.card.as_ref().unwrap().number(), None);
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_violation_record_the_python_writes_is_written_back_byte_for_byte() {
+        // The engine's six violation records, with the fields in the order its calls give
+        // them (`_find_violation`, `_void`, `_ensure_clean`, `_finish_leftovers`,
+        // `_base_violation`, `_restore_base`). Mixed mode reads Rust's and Python's alike.
+        let dir = run_dir();
+        let paths = run_paths(dir.path());
+        let write = "import sys\nfrom pathlib import Path\nfrom leadhand import state\n\
+                     paths = state.run_paths(Path(sys.argv[1]))\n\
+                     a = state.append_event\n\
+                     odd = b'src/a\\xffb.txt'.decode('utf-8', 'surrogateescape')\n\
+                     v = 'refs/leadhand/abc/violations/1'\n\
+                     a(paths, 'violation', stage='found', by='check', dispatch_id='c1-a1-review-1', card=1,\n\
+                     \x20 dispatch_kind='review', n=1, ref=v, paths=[odd], head_moved=True, index_dirty=False,\n\
+                     \x20 expected_head='e' * 40, expected_branch='leadhand/r--card-1',\n\
+                     \x20 refs={'refs/heads/x': {'old': None, 'new': 'd' * 40}}, preserved={'refs/heads/x': v + '-heads-x'},\n\
+                     \x20 hidden=[odd])\n\
+                     a(paths, 'violation', stage='restored', by='check', dispatch_id='c1-a1-review-1', card=1, n=1,\n\
+                     \x20 ref=v, saved='f' * 40, siblings=[v + '-branch'], preserved={'refs/heads/x': v + '-heads-x'})\n\
+                     l = 'refs/leadhand/abc/leftovers/1'\n\
+                     a(paths, 'violation', stage='found', by='implementer', n=1, ref=l, paths=[odd], operation='merge',\n\
+                     \x20 head_moved=False, index_dirty=True, expected_head='e' * 40, expected_branch='leadhand/r--card-1',\n\
+                     \x20 after_dispatch='c1-a1-implement-1', why='before review c1-a1-review-1', untracked=[odd],\n\
+                     \x20 hidden=[odd])\n\
+                     a(paths, 'violation', stage='restored', by='implementer', n=1, ref=l, saved=None,\n\
+                     \x20 after_dispatch=None, siblings=[])\n\
+                     a(paths, 'violation', stage='found', by='check', dispatch_id='run-a1-evidence-1', card=None,\n\
+                     \x20 dispatch_kind='evidence', n=2, ref=None, base_worktree='/w/b--base', base_head='e' * 40,\n\
+                     \x20 paths=['x.txt'], head_moved=False, index_dirty=False, expected_head=None, expected_branch=None,\n\
+                     \x20 refs={}, preserved={})\n\
+                     a(paths, 'violation', stage='restored', by='check', dispatch_id='run-a1-evidence-1', card=None,\n\
+                     \x20 n=2, ref=None, saved='e' * 40, siblings=[], preserved={})\n";
+        python(write, &[dir.path().as_os_str()]);
+        let file = fs::read(&paths.events).unwrap();
+        let events = read_events(&paths).unwrap();
+        let lines: Vec<&[u8]> = file
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(events.len(), 6);
+        for ((event, _), line) in events.iter().zip(&lines) {
+            // The lines are ASCII JSON.
+            assert_eq!(
+                wire::to_line(event).unwrap(),
+                String::from_utf8(line.to_vec()).unwrap()
+            );
         }
     }
 
