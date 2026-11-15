@@ -33,7 +33,8 @@ use std::path::PathBuf;
 pub(super) use gates::waiting_on_decisions;
 
 use super::cards::{
-    Dispatch, Log, Run, active, card_branch, heads, is_card, pick, report_copy, work_branch,
+    Dispatch, Log, Run, active, card_branch, heads, is_card, pick, report_copy, short_sha,
+    work_branch,
 };
 use super::protocol::{
     Action, AnswerAction, DispatchAction, IMPLEMENTER_KINDS, REPLY_FILE, REVIEW_KINDS, Resume,
@@ -465,11 +466,10 @@ pub(super) fn head_problem(run: &Run, log: &Log, run_tip: Option<&str>) -> Optio
     if accepting {
         return None;
     }
-    let short = |s: &str| s.chars().take(12).collect::<String>();
     Some(format!(
         "the run branch {branch} is at {}, not at the last accepted commit {}{}",
-        short(now),
-        short(&expected),
+        short_sha(now),
+        short_sha(&expected),
         if accepted.is_empty() {
             " (the base)"
         } else {

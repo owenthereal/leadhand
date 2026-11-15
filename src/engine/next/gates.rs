@@ -16,7 +16,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{Decision, Ending, Need, Observations, RunRequest, RunState, Step, fail, need};
 use crate::deck::Card;
-use crate::engine::cards::{Log, Run, accepted_cards, card_summary, final_branch, is_final};
+use crate::engine::cards::{
+    Log, Run, accepted_cards, card_summary, final_branch, is_final, short_sha,
+};
 use crate::engine::protocol::{
     Action, DoneAction, GATES, MAX_FINAL_FIX_WAVES, REVIEW_GATES, RISKS, gate_role, run_dispatch_id,
 };
@@ -62,7 +64,7 @@ pub(super) fn end_of_run(st: &RunState, obs: &Observations) -> Step<Decision> {
         if gate == "evidence" && st.run.config.run.evidence == "block" {
             let mut why = PyStr::from(format!(
                 "evidence gaps on {} after {waves} fix waves: ",
-                short(&head)
+                short_sha(&head)
             ));
             why.push(&r.findings.clone().unwrap_or_default());
             return Ok(Decision::End(Ending {
@@ -75,7 +77,7 @@ pub(super) fn end_of_run(st: &RunState, obs: &Observations) -> Step<Decision> {
     let settled_gate = |g: &str| settled.iter().find(|(name, _)| *name == g).map(|(_, r)| *r);
     let holds = settled_gate("evidence")
         .map(|r| {
-            let mut hold = PyStr::from(format!("evidence gaps on {}: ", short(&head)));
+            let mut hold = PyStr::from(format!("evidence gaps on {}: ", short_sha(&head)));
             hold.push(&r.findings.clone().unwrap_or_default());
             vec![hold]
         })
@@ -120,10 +122,6 @@ pub(super) fn run_head(st: &RunState, obs: &Observations) -> Step<String> {
             st.run.branch.shown()
         )),
     }
-}
-
-fn short(sha: &str) -> String {
-    sha.chars().take(12).collect()
 }
 
 /// Every gate, with security only when the highest accepted risk is medium or high (an

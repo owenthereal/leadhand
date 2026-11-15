@@ -18,9 +18,9 @@
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
-use super::cards::{Dispatch, Log, Run, final_branch, heads, os};
+use super::cards::{Dispatch, Log, Run, final_branch, final_card, heads, os};
 use super::next::{RunRequest, RunState};
-use super::protocol::{FINAL, RUN_CHECK_KINDS};
+use super::protocol::RUN_CHECK_KINDS;
 use super::shell::{Guard, NewDispatch, append_request, check_out};
 use super::violations::{ensure_clean, run_id};
 use crate::briefs_write::{BriefSpec, write_brief};
@@ -33,13 +33,9 @@ use crate::git::untracked_files;
 use crate::git::workspace::head;
 use crate::pytext::{path_text, pure_path};
 use crate::state::events::{self, given};
-use crate::state::{CardRef, Event, append_event, two_phase, two_phase_resume};
+use crate::state::{Event, append_event, two_phase, two_phase_resume};
 use crate::testing::crash_point;
 use crate::wire::{PyMap, PyStr};
-
-fn final_card() -> CardRef {
-    CardRef::Text(FINAL.into())
-}
 
 // --------------------------------------------------------------------------
 // Requests

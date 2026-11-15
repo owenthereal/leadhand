@@ -35,7 +35,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use super::cards::{Log, Run, heads, os};
+use super::cards::{Log, Run, heads, os, short_sha};
 use crate::cli::human::shell_quote;
 use crate::error::Result;
 use crate::git::Git;
@@ -58,6 +58,8 @@ pub enum Release {
         prunable: bool,
         fix: Vec<PyStr>,
     },
+    /// No worktree has the branch checked out, and it no longer exists.
+    Deleted,
     /// The run keeps its branch (a blocked run), for this reason.
     Skipped(PyStr),
 }
@@ -120,7 +122,7 @@ pub(super) fn release(run: &Run, log: &Log, ended: &Outcome) -> Result<()> {
         };
         let ws = PathBuf::from(intent.worktree.clone().unwrap_or_default().to_os()?);
         let branch = intent.branch.clone().unwrap_or_default();
-        let skipped = detach(&ws, &branch, intent.sha.as_deref());
+        let skipped = detach(&run.repo, &ws, &branch, intent.sha.as_deref());
         append_event(&run.paths, released_event(&intent, skipped.as_ref()))?;
     }
     Ok(())
@@ -141,10 +143,20 @@ fn released_event(intent: &events::BranchReleaseStarted, skipped: Option<&PyStr>
 /// Detaches the worktree `ws` when it is on `branch` at `sha` (step 3); why not, else. Never
 /// an error: a worktree Git cannot read, or a detach Git refuses, is a reason to skip, and the
 /// report says what Git shows.
-fn detach(ws: &Path, branch: &PyStr, sha: Option<&str>) -> Option<PyStr> {
+///
+/// Bug class 1: Git is run in `ws` only once it is a worktree top of its own, listed by the
+/// run's repository `repo` and not its main working tree. A folder whose `.git` is gone would
+/// otherwise make Git find the enclosing checkout, the operator's, and detach that.
+fn detach(repo: &Path, ws: &Path, branch: &PyStr, sha: Option<&str>) -> Option<PyStr> {
     let why = |text: String| Some(PyStr::from(text));
+    if ws.as_os_str().is_empty() {
+        return why("run.json names no run worktree".into());
+    }
     if !ws.is_dir() {
         return why(format!("the run worktree {} is gone", ws.display()));
+    }
+    if let Some(problem) = not_a_run_worktree(repo, ws) {
+        return why(problem);
     }
     let read = |ws: &Path| -> Result<(Git, Option<PyStr>, String)> {
         let git = Git::at(ws)?;
@@ -156,7 +168,6 @@ fn detach(ws: &Path, branch: &PyStr, sha: Option<&str>) -> Option<PyStr> {
         Ok(state) => state,
         Err(e) => return why(format!("git cannot read the run worktree: {}", e.message)),
     };
-    let short = |s: &str| s.chars().take(12).collect::<String>();
     let wanted = sha.unwrap_or_default();
     match on {
         Some(b) if b == *branch && at == wanted => {
@@ -168,17 +179,65 @@ fn detach(ws: &Path, branch: &PyStr, sha: Option<&str>) -> Option<PyStr> {
         Some(b) if b == *branch => why(format!(
             "the run worktree is on {} at {}, not at the run head {}",
             branch.shown(),
-            short(&at),
-            short(wanted)
+            short_sha(&at),
+            short_sha(wanted)
         )),
         Some(other) => why(format!("the run worktree is on {}", other.shown())),
         None if at == wanted => None,
         None => why(format!(
             "the run worktree is detached at {}, not at the run head {}",
-            short(&at),
-            short(wanted)
+            short_sha(&at),
+            short_sha(wanted)
         )),
     }
+}
+
+/// Why `ws` is not a worktree of its own that the release may detach, or `None`: Git's top
+/// for `ws` must be `ws` itself (real paths), and the run's repository must list it as a
+/// linked worktree, not as its main working tree. Read only.
+fn not_a_run_worktree(repo: &Path, ws: &Path) -> Option<String> {
+    let real = real_path(ws);
+    let top = Git::at(ws)
+        .and_then(|git| git.run(&[os("rev-parse"), os("--show-toplevel")]))
+        .map(|out| real_path(&path_of(trim_newline(&out))));
+    match top {
+        Ok(top) if top == real => {}
+        Ok(top) => {
+            return Some(format!(
+                "the run worktree {} is not a worktree top (Git's top there is {})",
+                ws.display(),
+                top.display()
+            ));
+        }
+        Err(e) => return Some(format!("git cannot read the run worktree: {}", e.message)),
+    }
+    let listed = Git::at(repo).and_then(|git| worktrees(&git));
+    match listed {
+        Ok(entries) => {
+            let at = entries.iter().position(|e| {
+                e.get(&b"worktree"[..])
+                    .is_some_and(|p| real_path(&path_of(p)) == real)
+            });
+            match at {
+                // The first entry is the main working tree.
+                Some(0) => Some(format!(
+                    "the run worktree {} is the repository's main working tree",
+                    ws.display()
+                )),
+                Some(_) => None,
+                None => Some(format!(
+                    "the run worktree {} is not a worktree of {}",
+                    ws.display(),
+                    repo.display()
+                )),
+            }
+        }
+        Err(e) => Some(format!("git cannot list the worktrees: {}", e.message)),
+    }
+}
+
+fn trim_newline(out: &[u8]) -> &[u8] {
+    out.strip_suffix(b"\n").unwrap_or(out)
 }
 
 /// What `git worktree list --porcelain` shows of `branch` (step 5): free when no worktree,
@@ -212,10 +271,20 @@ pub fn branch_status(repo: &Path, ws: &Path, branch: &PyStr) -> Result<Release> 
             fix,
         });
     }
-    let real = real_path(ws);
+    if !git.ok(&[
+        os("rev-parse"),
+        os("--verify"),
+        os("--quiet"),
+        &target.to_os()?,
+    ]) {
+        // Nothing to switch to: Git would refuse `git switch`.
+        return Ok(Release::Deleted);
+    }
+    // An empty path names no worktree: `real_path("")` would be the current directory's.
+    let real = (!ws.as_os_str().is_empty()).then(|| real_path(ws));
     let mine = entries
         .iter()
-        .find(|e| field(e, b"worktree").is_some_and(|p| real_path(&path_of(&p)) == real));
+        .find(|e| field(e, b"worktree").is_some_and(|p| Some(real_path(&path_of(&p))) == real));
     let worktree = match mine {
         None => RunWorktree::Gone,
         Some(e) => match field(e, b"branch") {
@@ -243,15 +312,21 @@ pub fn report_line(branch: &PyStr, ws: &Path, status: &Result<Release>) -> Optio
     line.push_str("`");
     match status {
         Ok(Release::Skipped(_)) => return None,
+        Ok(Release::Deleted) => {
+            line.push_str(" no longer exists: there is nothing to check out");
+        }
         Ok(Release::Free { worktree }) => {
             line.push_str(" is free: check it out anywhere with `git switch ");
             line.push(&PyStr::from_os(&shell_quote(&branch.to_os_lossy())));
+            if ws.as_os_str().is_empty() {
+                line.push_str("` (run.json names no run worktree)");
+                return Some(line);
+            }
             line.push_str("` (the run worktree ");
             line.push(&path_text(ws));
             match worktree {
                 RunWorktree::Detached(sha) => {
-                    let short: String = sha.chars().take(12).collect();
-                    line.push_str(&format!(" is detached at {short})"));
+                    line.push_str(&format!(" is detached at {})", short_sha(sha)));
                 }
                 RunWorktree::On(other) => {
                     line.push_str(" is on ");
@@ -454,14 +529,14 @@ mod tests {
         let (run, sha) = run(&f);
         f.git(&run.ws, &["switch", "-q", "-c", "other"]);
         assert_eq!(
-            detach(&run.ws, &run.branch, Some(&sha)).map(|w| w.lossy().into_owned()),
+            detach(&run.repo, &run.ws, &run.branch, Some(&sha)).map(|w| w.lossy().into_owned()),
             Some("the run worktree is on other".to_string())
         );
         f.git(&run.ws, &["switch", "-q", "--detach"]);
-        assert_eq!(detach(&run.ws, &run.branch, Some(&sha)), None);
+        assert_eq!(detach(&run.repo, &run.ws, &run.branch, Some(&sha)), None);
         let gone = f.root().join("gone");
         assert_eq!(
-            detach(&gone, &run.branch, Some(&sha)).map(|w| w.lossy().into_owned()),
+            detach(&run.repo, &gone, &run.branch, Some(&sha)).map(|w| w.lossy().into_owned()),
             Some(format!("the run worktree {} is gone", gone.display()))
         );
     }
@@ -508,6 +583,81 @@ mod tests {
         assert_eq!(
             fix[0].lossy(),
             format!("git -C '{}' switch --detach", other.display())
+        );
+    }
+
+    // Bug class 1: a worktree folder whose `.git` is gone makes Git find the enclosing
+    // checkout, the operator's. The release must not detach that, even on the run branch at the
+    // run head.
+    #[test]
+    fn a_folder_that_is_no_longer_a_worktree_is_never_detached() {
+        let f = Fixture::new();
+        let (run, sha) = run(&f);
+        std::fs::remove_file(run.ws.join(".git")).unwrap();
+        f.git(&run.repo, &["worktree", "prune"]);
+        f.git(&run.repo, &["switch", "-q", BRANCH]);
+        let ended = outcome(&run, "complete", &sha);
+        let log = Log::read(&run.paths).unwrap();
+        release(&run, &log, &ended).unwrap();
+        let events = read_events(&run.paths).unwrap();
+        let Event::BranchReleased(done) = &events.last().unwrap().0 else {
+            panic!("{events:?}")
+        };
+        assert_eq!(done.skipped, Some(Some(true)));
+        let reason = done.reason.clone().flatten().unwrap().lossy().into_owned();
+        assert!(reason.contains("is not a worktree top"), "{reason}");
+        // The operator's checkout is where it was: on the branch, at the same commit.
+        assert_eq!(
+            f.git(&run.repo, &["symbolic-ref", "--short", "HEAD"]),
+            BRANCH
+        );
+        assert_eq!(f.git(&run.repo, &["rev-parse", "HEAD"]), sha);
+        // The main working tree itself is never the run worktree either.
+        let why = not_a_run_worktree(&run.repo, &run.repo).unwrap();
+        assert!(why.contains("main working tree"), "{why}");
+    }
+
+    #[test]
+    fn a_deleted_branch_is_not_free_to_switch_to() {
+        let f = Fixture::new();
+        let (run, _) = run(&f);
+        f.git(&run.ws, &["switch", "-q", "--detach"]);
+        f.git(
+            &run.repo,
+            &["update-ref", "-d", &format!("refs/heads/{BRANCH}")],
+        );
+        let status = branch_status(&run.repo, &run.ws, &run.branch).unwrap();
+        assert_eq!(status, Release::Deleted);
+        let line = report_line(&run.branch, &run.ws, &Ok(status)).unwrap();
+        assert_eq!(
+            line.lossy(),
+            "- Branch `leadhand/demo` no longer exists: there is nothing to check out"
+        );
+    }
+
+    #[test]
+    fn an_empty_worktree_path_names_no_worktree() {
+        let f = Fixture::new();
+        let (run, sha) = run(&f);
+        f.git(&run.ws, &["switch", "-q", "--detach"]);
+        let empty = Path::new("");
+        let status = branch_status(&run.repo, empty, &run.branch).unwrap();
+        assert_eq!(
+            status,
+            Release::Free {
+                worktree: RunWorktree::Gone
+            }
+        );
+        let line = report_line(&run.branch, empty, &Ok(status)).unwrap();
+        assert!(
+            line.lossy()
+                .ends_with("`git switch leadhand/demo` (run.json names no run worktree)"),
+            "{}",
+            line.lossy()
+        );
+        assert_eq!(
+            detach(&run.repo, empty, &run.branch, Some(&sha)).map(|w| w.lossy().into_owned()),
+            Some("run.json names no run worktree".to_string())
         );
     }
 

@@ -193,12 +193,15 @@ fn holds_nothing(b: &BaseWorktree) -> bool {
     !git.ok(&[os("symbolic-ref"), os("--quiet"), os("HEAD")])
 }
 
-/// Marks the worktree as this run's (`leadhand-run`), records the run directory beside the
-/// marker (`leadhand-run-dir`), then has `base_worktree_ready` recorded.
+/// Records the run directory in the worktree's admin folder (`leadhand-run-dir`), then marks
+/// the worktree as this run's (`leadhand-run`), then has `base_worktree_ready` recorded. The
+/// record comes first: once the marker is there, later preparations see the worktree as the
+/// run's (`mine`) and never claim it again, so a record that failed after the marker would stay
+/// missing.
 fn claim(b: &BaseWorktree, record: &mut dyn FnMut(Record) -> Result<()>) -> Result<()> {
     let marker = marker(b.path)?;
-    std::fs::write(&marker, format!("{}\n", b.run_id)).map_err(|e| Error::io(&marker, e))?;
     write_run_record(b.path, b.run_dir)?;
+    std::fs::write(&marker, format!("{}\n", b.run_id)).map_err(|e| Error::io(&marker, e))?;
     record(Record::Ready)
 }
 
@@ -318,6 +321,41 @@ mod tests {
         let (out, seen) = prepared(&f, &repo, true);
         assert_eq!(out.unwrap(), path);
         assert_eq!(seen, [Record::Ready]);
+    }
+
+    // The run record is written before the marker: a claim whose record fails leaves no
+    // marker, so the next preparation claims the worktree again rather than taking it as the
+    // run's without its record.
+    #[test]
+    fn a_claim_whose_run_record_fails_leaves_no_marker() {
+        let f = Fixture::new();
+        let repo = f.make_repo("repo");
+        let base = f.git(&repo, &["rev-parse", "HEAD"]);
+        let path = repo.join(".worktrees").join("ws--base");
+        f.git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                path.to_str().unwrap(),
+                &base,
+            ],
+        );
+        let admin = PathBuf::from(f.git(&path, &["rev-parse", "--absolute-git-dir"]));
+        // A folder where the record goes: writing the record fails.
+        std::fs::create_dir(admin.join(RUN_RECORD)).unwrap();
+        let (out, seen) = prepared(&f, &repo, true);
+        assert!(out.is_err());
+        assert!(seen.is_empty());
+        assert!(!admin.join(BASE_MARKER).exists());
+        std::fs::remove_dir(admin.join(RUN_RECORD)).unwrap();
+        let (out, seen) = prepared(&f, &repo, true);
+        assert_eq!(out.unwrap(), path);
+        assert_eq!(seen, [Record::Ready]);
+        assert!(admin.join(RUN_RECORD).is_file());
+        assert!(admin.join(BASE_MARKER).is_file());
     }
 
     #[test]

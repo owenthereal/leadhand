@@ -702,6 +702,16 @@ pub fn final_branch(run: &Run) -> PyStr {
     card_branch_name(&run.branch, FINAL)
 }
 
+/// The fix waves' `card`, `"final"`, as their events record it.
+pub fn final_card() -> CardRef {
+    CardRef::Text(FINAL.into())
+}
+
+/// A commit's first 12 characters, as messages and reports show it (`sha[:12]`).
+pub fn short_sha(sha: &str) -> String {
+    sha.chars().take(12).collect()
+}
+
 /// Whether an event's `card` is the fix waves' (`e.get("card") == FINAL`).
 pub fn is_final(card: Option<&CardRef>) -> bool {
     matches!(card, Some(CardRef::Text(t)) if t.as_wtf8() == FINAL.as_bytes())

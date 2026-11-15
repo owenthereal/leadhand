@@ -13,7 +13,7 @@ use std::path::Path;
 use rustix::fs::{FlockOperation, OFlags, flock};
 use rustix::io::Errno;
 
-use super::cards::{Log, Run, card_summary, os};
+use super::cards::{Log, Run, card_summary, os, short_sha};
 use super::next::{Ending, RunState, head_problem, waiting_on_decisions};
 use super::protocol::{Action, DoneAction};
 use super::record::cancel_codex;
@@ -80,7 +80,7 @@ pub(super) fn end(st: &RunState, ending: &Ending) -> Result<()> {
             let card = a.card.as_ref().map_or_else(|| "None".into(), |c| c.text());
             let mut item = PyStr::from("card ");
             item.push(&card);
-            item.push_str(&format!(" at {}", sha.chars().take(12).collect::<String>()));
+            item.push_str(&format!(" at {}", short_sha(sha)));
             missing.push(item);
         }
     }

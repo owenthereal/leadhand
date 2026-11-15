@@ -8,10 +8,12 @@
 use super::gates::{resolve_run, run_head, run_request};
 use super::{Decision, Ending, Need, Observations, RunState, Step, fail, need};
 use crate::deck::Card;
-use crate::engine::cards::{Dispatch, accepted_cards, final_branch, is_final, report_copy};
-use crate::engine::protocol::{FINAL, VIOLATION_CAP, continue_notes, voided_notes};
+use crate::engine::cards::{
+    Dispatch, accepted_cards, final_branch, final_card, is_final, report_copy,
+};
+use crate::engine::protocol::{VIOLATION_CAP, continue_notes, voided_notes};
 use crate::state::events::{self, given};
-use crate::state::{Blocked, CardRef, Event};
+use crate::state::{Blocked, Event};
 use crate::wire::{PyMap, PyStr};
 
 /// Acts on the run-level dispatch `d`'s result: the step, or `None` when the result is
@@ -237,10 +239,6 @@ fn verdict_of<'l>(st: &'l RunState, d: &Dispatch) -> Option<&'l events::VerdictR
         Event::VerdictRecorded(v) if v.dispatch_id.as_deref() == Some(d.id()) => Some(v),
         _ => None,
     })
-}
-
-fn final_card() -> CardRef {
-    CardRef::Text(FINAL.into())
 }
 
 /// Records that a fix wave's implementer result spent the wave (its guard was checked first),
