@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
 
 use crate::error::{Error, Result};
-use crate::state::events::Opt;
+use crate::state::events::{self, Opt};
 use crate::state::{CardRef, Event};
 use crate::wire::{self, PyStr, RawLine};
 
@@ -440,6 +440,17 @@ pub fn spaced(compact: &str) -> String {
         }
     }
     out
+}
+
+/// How long the worker may run, in seconds: its limit, plus the Codex grace for a Codex
+/// route (`_budget_seconds`).
+pub(crate) fn budget_seconds(req: &events::DispatchRequested, minute_seconds: f64) -> f64 {
+    let grace = if req.vendor.as_deref() == Some("codex") {
+        CODEX_GRACE_MINUTES
+    } else {
+        0
+    };
+    (req.minutes.unwrap_or_default() + grace) as f64 * minute_seconds
 }
 
 #[cfg(test)]

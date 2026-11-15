@@ -22,6 +22,17 @@ use super::{Locate, Tokens, Usage, add, json_lines, newest, safe_id};
 use crate::error::{Error, Result};
 use crate::wire::{PyMap, PyStr};
 
+/// Claude Code's transcript folder: `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`
+/// (`engine._projects_dir`, falling back to `usage.default_projects_dir`). A relative
+/// `CLAUDE_CONFIG_DIR` stays relative, so a transcript found under it makes the charge's
+/// "transcript path must be absolute" error, as in the Python (S1-R13).
+pub fn projects_dir() -> PathBuf {
+    match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|h| !h.is_empty()) {
+        Some(home) => PathBuf::from(crate::pytext::expand_user(&home)).join("projects"),
+        None => PathBuf::from(crate::pytext::expand_user(OsStr::new("~"))).join(".claude/projects"),
+    }
+}
+
 /// `<projects_dir>/*/*/subagents/agent-<id>.jsonl`, the newest when several match; `None`
 /// for an ID that cannot name a file (`usage.claude_subagent_transcript`).
 pub fn claude_subagent_transcript(agent_id: &PyStr, projects_dir: &Path) -> Option<PathBuf> {

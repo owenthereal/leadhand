@@ -15,23 +15,21 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use super::cards::{Dispatch, Log, Run, cancel_codex};
-use super::next::{
-    budget_seconds, card_state, current_session, line_starts, projects_dir, read_text,
-};
+use super::cards::{Dispatch, Log, Run, card_state, current_session, work_branch};
 use super::protocol::{
-    Action, IMPLEMENTER_KINDS, REPLY_FILE, RecordOutput, WaitAction, format_time, now, tag,
+    Action, IMPLEMENTER_KINDS, REPLY_FILE, RecordOutput, WaitAction, budget_seconds, format_time,
+    now, tag,
 };
-use crate::briefs::{CODEX_AGENT, after_folded, agent_for, parse_report_head, scratch_dir};
+use super::report_text::{Head, head_of, read_text};
+use crate::briefs::{CODEX_AGENT, agent_for, scratch_dir};
 use crate::briefs_write::{ScratchError, read_scratch_file, strip_pystr};
 use crate::cli::{RecordArgs, RecordKind, YesNo};
-use crate::dispatch::commit::is_decimal;
-use crate::dispatch::runner::has_status_line;
-use crate::dispatch::{DispatchResult, ExitReason, load_result, runner_alive};
+use crate::dispatch::cmd::{Worker, write_dispatch_request};
+use crate::dispatch::{DispatchResult, ExitReason, cancel, load_result, request_for, runner_alive};
 use crate::error::{Error, Result};
 use crate::git::cards::{branch_ref, card_branch_name};
 use crate::git::workspace::{head, resolves_in_place};
-use crate::pytext::{abspath, pure_path, py_isspace};
+use crate::pytext::{abspath, path_text, pure_path};
 use crate::state::events;
 use crate::state::{
     AttemptRecord, CardRef, CardStage, CardState, Event, append_attempt, append_event,
@@ -39,7 +37,7 @@ use crate::state::{
 };
 use crate::store::{state_lock, write_file_atomic};
 use crate::testing::crash_point;
-use crate::usage::{ChargeSource, charge, claude_subagent_transcript, estimate_cost};
+use crate::usage::{ChargeSource, charge, claude_subagent_transcript, estimate_cost, projects_dir};
 use crate::wire::{PyMap, PyStr};
 
 /// What `record` was given (its flags). A `-` for `--reply` or `--text` has been read from
@@ -332,10 +330,6 @@ fn record_codex_result(
     let wd = run.root.join("workers").join(d.id());
     let mut result = load_result(&wd)?;
     if result.is_none() && !stopped && runner_alive(&wd)? {
-        let whose = match &d.req.card {
-            None => "the run".to_string(),
-            Some(c) => format!("card {}", c.text().lossy()),
-        };
         return Ok(RecordOutput::Action(Action::Wait(WaitAction {
             action: tag::Wait,
             dispatch_id: d.id().to_string(),
@@ -343,8 +337,9 @@ fn record_codex_result(
             deadline: d.started.and_then(|s| s.deadline.clone()),
             reply_file: path_text(&reply_file_of(run, d)?),
             reason: format!(
-                "the Codex worker for {whose} is still running; its result is recorded from \
-                 the runner when it finishes (the timer reports it)"
+                "the Codex worker for {} is still running; its result is recorded from \
+                 the runner when it finishes (the timer reports it)",
+                d.whose()
             ),
         })));
     }
@@ -364,10 +359,6 @@ fn record_codex_result(
         false,
         true,
     )
-}
-
-fn path_text(p: &Path) -> PyStr {
-    PyStr::from_os(pure_path(p.as_os_str()).as_os_str())
 }
 
 /// Copies a worker's file into the run folder once (`_copy_if_missing`): `text`, or the
@@ -431,185 +422,6 @@ fn read_scratch(d: &Dispatch, path: &PyStr) -> std::result::Result<Option<Vec<u8
         return Err(not_scratch());
     }
     read_scratch_file(&ws, card, d.id(), &name).map_err(|e| e.reason())
-}
-
-/// The head of a result (`_head`): the report's head line; else, for an interrupted worker,
-/// SPENT marked interrupted; for a stopped one, SPENT; then the reply's head, the Codex
-/// runner's status, a Claude turn-limit note (SPENT), else BLOCKED with the raw reply kept.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Head {
-    status: String,
-    blocked_by: String,
-    head: String,
-    verdict: Option<String>,
-    result: Option<String>,
-    source: &'static str,
-    raw_kept: bool,
-    interrupted: bool,
-    cross_checked: bool,
-}
-
-impl Head {
-    fn status(status: &str, blocked_by: &str, source: &'static str, raw_kept: bool) -> Head {
-        Head {
-            status: status.to_string(),
-            blocked_by: blocked_by.to_string(),
-            head: "Status".into(),
-            verdict: None,
-            result: None,
-            source,
-            raw_kept,
-            interrupted: false,
-            cross_checked: false,
-        }
-    }
-}
-
-/// `_has_status`: text that is not blank and has a status line.
-fn has_status(text: Option<&str>) -> Result<bool> {
-    match text {
-        Some(t) if !t.trim_matches(py_isspace).is_empty() => Ok(has_status_line(t)?),
-        _ => Ok(false),
-    }
-}
-
-fn head_of(
-    report: Option<&str>,
-    reply: &str,
-    codex: Option<&DispatchResult>,
-    stopped: bool,
-    interrupted: bool,
-) -> Result<Head> {
-    let from_text = |text: &str, source: &'static str| -> Result<Head> {
-        let (key, value, blocked_by) = parse_report_head(text)?;
-        let mut out = Head {
-            status: if key == "Status" { value } else { "READY" }.to_string(),
-            blocked_by: blocked_by.to_string(),
-            head: key.to_string(),
-            verdict: (key == "Verdict").then(|| value.to_string()),
-            result: (key == "Result").then(|| value.to_string()),
-            source,
-            raw_kept: false,
-            interrupted: false,
-            cross_checked: false,
-        };
-        if out.verdict.as_deref() == Some("clean")
-            && findings_sections(text).iter().any(|s| severe_finding(s))
-        {
-            out.verdict = Some("defects".into());
-            out.cross_checked = true;
-        }
-        Ok(out)
-    };
-    if has_status(report)? {
-        return from_text(report.unwrap_or_default(), "report");
-    }
-    if interrupted {
-        let mut out = Head::status("SPENT", "", "interrupted", false);
-        out.interrupted = true;
-        return Ok(out);
-    }
-    if stopped {
-        return Ok(Head::status("SPENT", "", "stopped", false));
-    }
-    if has_status(Some(reply))? {
-        return from_text(reply, "reply");
-    }
-    if let Some(codex) = codex {
-        return Ok(Head::status(
-            codex.status.as_str(),
-            codex.blocked_by.as_str(),
-            "runner",
-            true,
-        ));
-    }
-    if turn_limit(reply) {
-        return Ok(Head::status("SPENT", "", "turn limit", true));
-    }
-    Ok(Head::status("BLOCKED", "", "unparsed", true))
-}
-
-/// The `## Findings` sections of a reviewer's report (`_FINDINGS_SECTION.finditer`): from a
-/// `## Findings` line to the next `## ` heading.
-fn findings_sections(text: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut from = 0;
-    while let Some(start) =
-        line_starts(text).find(|s| *s >= from && findings_head(&text[*s..]).is_some())
-    {
-        let group = start + findings_head(&text[start..]).expect("found above");
-        let end = (group..=text.len())
-            .filter(|i| text.is_char_boundary(*i))
-            .find(|i| *i == text.len() || at_h2(text, *i))
-            .unwrap_or(text.len());
-        out.push(&text[group..end]);
-        if end <= from {
-            break;
-        }
-        from = end;
-    }
-    out
-}
-
-/// `^##[ \t]*Findings[ \t\r]*$` at the start of `s`: where the heading's line ends.
-fn findings_head(s: &str) -> Option<usize> {
-    let rest = s.strip_prefix("##")?.trim_start_matches([' ', '\t']);
-    let (_, after) = after_folded(rest, "findings")?;
-    let after_marks = after.trim_start_matches([' ', '\t', '\r']);
-    (after_marks.is_empty() || after_marks.starts_with('\n')).then(|| s.len() - after_marks.len())
-}
-
-/// `^##\s` at `at`.
-fn at_h2(text: &str, at: usize) -> bool {
-    (at == 0 || text.as_bytes()[at - 1] == b'\n')
-        && text[at..]
-            .strip_prefix("##")
-            .and_then(|r| r.chars().next())
-            .is_some_and(py_isspace)
-}
-
-/// `_SEVERE_FINDING.search(section)`: a numbered or bulleted line whose severity tag is high or
-/// medium (`1. [high] …`, `- [Medium] …`).
-fn severe_finding(section: &str) -> bool {
-    line_starts(section).any(|at| {
-        let rest = section[at..].trim_start_matches(py_isspace);
-        let digits: usize = rest
-            .chars()
-            .take_while(|c| is_decimal(*c))
-            .map(char::len_utf8)
-            .sum();
-        let rest = if digits > 0 {
-            match rest[digits..].strip_prefix(['.', ')']) {
-                Some(r) => r,
-                None => return false,
-            }
-        } else if let Some(r) = rest.strip_prefix(['-', '*']) {
-            r
-        } else {
-            return false;
-        };
-        let Some(rest) = rest.trim_start_matches(py_isspace).strip_prefix('[') else {
-            return false;
-        };
-        ["high", "medium"]
-            .iter()
-            .any(|level| after_folded(rest, level).is_some_and(|(_, after)| after.starts_with(']')))
-    })
-}
-
-/// `_TURN_LIMIT.search(reply)`: `stopped at its <n>-turn limit`, any case.
-fn turn_limit(reply: &str) -> bool {
-    reply.char_indices().any(|(at, _)| {
-        let Some((_, rest)) = after_folded(&reply[at..], "stopped at its ") else {
-            return false;
-        };
-        let digits: usize = rest
-            .chars()
-            .take_while(|c| is_decimal(*c))
-            .map(char::len_utf8)
-            .sum();
-        digits > 0 && after_folded(&rest[digits..], "-turn limit").is_some()
-    })
 }
 
 /// Whether a cancel is recorded, or requested and not yet seen by `next` (`_cancelling`).
@@ -1006,11 +818,53 @@ fn record_diff_check(run: &Run, f: &RecordFields) -> Result<RecordOutput> {
     Ok(RecordOutput::Event(Box::new(event)))
 }
 
+/// Stops the dispatch's runner, and Codex with its tool processes, and finalizes
+/// `result.json` (`_cancel_codex`). When the proxy never ran the command, the request is
+/// written first, so a late run of the same command finds the cancelled result instead of
+/// starting Codex.
+pub(crate) fn cancel_codex(
+    run: &Run,
+    cards: &BTreeMap<u32, CardState>,
+    d: &Dispatch,
+) -> Result<DispatchResult> {
+    // The work branch's own errors are the engine's, as the Python's `_work_branch` raises
+    // outside the dispatcher's.
+    let branch = work_branch(run, cards, d)?;
+    let stopped = || -> Result<DispatchResult> {
+        let req = d.req;
+        let path = |p: &Option<PyStr>| -> Result<PathBuf> {
+            Ok(PathBuf::from(p.clone().unwrap_or_default().to_os()?))
+        };
+        let worker = Worker {
+            card: req.card.as_ref().and_then(CardRef::number),
+            attempt: req.attempt.unwrap_or_default(),
+            role: d.role().to_string(),
+            model: req.model.clone().unwrap_or_default().into(),
+            effort: req.effort.clone().unwrap_or_default().into(),
+            brief: path(&req.brief)?,
+            report: path(&req.report)?,
+            cwd: run.ws.clone(),
+            resume: req.resume_session.clone(),
+            kind: req.dispatch_kind.clone(),
+            branch: Some(branch),
+        };
+        let request = request_for(&run.root, d.id(), worker)?;
+        let wd = write_dispatch_request(&request)?;
+        cancel(&wd, crate::dispatch::cancel::CANCEL_TIMEOUT)
+    };
+    stopped().map_err(|e| {
+        Error::msg(format!(
+            "could not stop Codex dispatch {}: {}",
+            d.id(),
+            e.message
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::git::fixture::Fixture;
-    use crate::wire::tests::python;
 
     const DECK: &str = "# Deck: Demo deck\nSource: docs/plan.md\nBase: main @ BASE\n\
         Branch: leadhand/demo\nBuild: true\nTest: true\n\n\
@@ -1098,90 +952,5 @@ mod tests {
                     .is_none()
             );
         }
-    }
-
-    #[test]
-    fn heads_cross_check_findings_as_the_python_does() {
-        let texts = [
-            "Verdict: clean\n## Findings\n2. [High] src/a.py:3 — leaks — close it\n## Notes\nRead the diff.\n",
-            "Verdict: clean\n## Findings\n  1) [medium] src/a.py:3 — x — y\n",
-            "Verdict: clean\n## Findings\n1. [low] src/a.py:3 — nit — rename\n## Notes\n- [high] earlier round: fixed\n1. [medium] fixed\n",
-            "Verdict: clean\n[high] src/a.py:3 outside any section\n## Findings\nNone\n",
-            "Verdict: clean\n## Findings\n- [high] src/a.py:3 — leaks — close it\n",
-            "Verdict: clean\n## Findings\n  * [Medium] src/a.py:3 — x — y\n## Notes\nRead the diff.\n",
-            "Verdict: clean\n## Findings\nNone\n## Notes\n1. [high] src/widget.py:1 — fixed\n",
-            "Verdict: clean\n##findings \r\n- [mediuM] a\n",
-            "Verdict: clean\n## Findings\n\n\n   \n١٢. [hıgh] unicode digits\n",
-            "Verdict: clean\n## Findings x\n- [high] not the heading\n",
-            "Verdict: clean\n## Findings\nNone\n## Findings\n- [high] the second one\n",
-            "Verdict: defects\n## Findings\n- [high] a\n",
-            "Status: READY\n## Findings\n- [high] a\n",
-            "Verdict: clean\n## Findings\n-[high]\n#### Findings\n",
-            "NOTE: this agent stopped at its 150-turn limit before finishing.\n",
-            "stopped at ITS 7-TURN LIMIT",
-            "stopped at its -turn limit",
-        ];
-        let code = "import json, sys\nfrom leadhand import engine\n\
-                    out = []\n\
-                    for t in json.loads(sys.argv[1]):\n\
-                    \x20   h = engine._head(t, '', None, False)\n\
-                    \x20   out.append([h['status'], h['verdict'], h.get('cross_checked', False),\n\
-                    \x20               bool(engine._TURN_LIMIT.search(t))])\n\
-                    print(json.dumps(out))";
-        let arg = serde_json::to_string(&texts).unwrap();
-        let theirs: Vec<(String, Option<String>, bool, bool)> =
-            serde_json::from_slice(&python(code, &[OsStr::new(&arg)])).unwrap();
-        let ours: Vec<(String, Option<String>, bool, bool)> = texts
-            .iter()
-            .map(|t| {
-                let h = head_of(Some(t), "", None, false, false).unwrap();
-                (h.status, h.verdict, h.cross_checked, turn_limit(t))
-            })
-            .collect();
-        assert_eq!(ours, theirs);
-    }
-
-    #[test]
-    fn heads_fall_back_as_the_python_does() {
-        let cases: [(Option<&str>, &str, bool, bool); 7] = [
-            (None, "Status: READY\nReport: x", false, false),
-            (Some("   \n"), "I changed some things.\n", false, false),
-            (
-                None,
-                "NOTE: this agent stopped at its 150-turn limit.\n",
-                false,
-                false,
-            ),
-            (Some("Status: QUESTION\n"), "Status: READY", true, false),
-            (None, "Status: READY", true, false),
-            (None, "", false, true),
-            (Some("Result: pass\n"), "", false, true),
-        ];
-        let code = "import json, sys\nfrom leadhand import engine\n\
-                    out = []\n\
-                    for report, reply, stopped, interrupted in json.loads(sys.argv[1]):\n\
-                    \x20   h = engine._head(report, reply, None, stopped, interrupted)\n\
-                    \x20   out.append([h['status'], h['head'], h['source'], h['raw_kept'], h.get('interrupted', False)])\n\
-                    print(json.dumps(out))";
-        let arg = serde_json::to_string(&cases).unwrap();
-        let theirs: Vec<(String, String, String, bool, bool)> =
-            serde_json::from_slice(&python(code, &[OsStr::new(&arg)])).unwrap();
-        let ours: Vec<(String, String, String, bool, bool)> = cases
-            .iter()
-            .map(|(report, reply, stopped, interrupted)| {
-                let h = head_of(*report, reply, None, *stopped, *interrupted).unwrap();
-                (
-                    h.status,
-                    h.head,
-                    h.source.to_string(),
-                    h.raw_kept,
-                    h.interrupted,
-                )
-            })
-            .collect();
-        assert_eq!(ours, theirs);
-        // A crafted head the Python's parser raises KeyError on fails the same way (S2-R32).
-        let e = head_of(Some("re\u{17f}ult: pass\n"), "", None, false, false).unwrap_err();
-        assert_eq!(e.message, "KeyError: 'Re\u{17f}ult'");
     }
 }

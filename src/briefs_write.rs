@@ -23,7 +23,7 @@ use crate::cli::human::shell_quote;
 use crate::config::ROLE_AGENT;
 use crate::deck::{Card, Deck};
 use crate::error::{Error, Result};
-use crate::pytext::{pure_path, py_isspace, py_repr, py_splitlines_bytes, py_strip};
+use crate::pytext::{path_text, py_isspace, py_repr, py_splitlines_bytes, py_strip};
 use crate::safedir::{FileProblem, SafeDir};
 use crate::wire::{PyMap, PyStr};
 
@@ -231,7 +231,7 @@ fn diagnose(ws: &Path, rel: &[&OsStr], e: Error) -> ScratchError {
             continue;
         };
         let mut text = PyStr::from("refused: the scratch path ");
-        text.push(&PyStr::from_os(pure_path(shown.as_os_str()).as_os_str()));
+        text.push(&path_text(&shown));
         text.push_str(&format!(
             " is {what}; remove it and run the command again (a worker may have planted it)"
         ));
@@ -372,10 +372,6 @@ fn trim_pystr(s: &PyStr, left: bool) -> PyStr {
 /// `str.rstrip("\n")`.
 fn rstrip_newlines(s: &PyStr) -> PyStr {
     s.strip_ascii(b"\n", false)
-}
-
-fn path_text(p: &Path) -> PyStr {
-    PyStr::from_os(pure_path(p.as_os_str()).as_os_str())
 }
 
 /// The card as the deck has it, field by field (`briefs._render_card`).
@@ -551,18 +547,7 @@ fn render_context(c: &Context) -> PyStr {
         lines.extend(["".into(), "## The card, verbatim".into(), "".into()]);
         lines.push(render_card(card).into());
     }
-    join(&lines, "\n")
-}
-
-fn join(parts: &[PyStr], sep: &str) -> PyStr {
-    let mut out = PyStr::default();
-    for (i, p) in parts.iter().enumerate() {
-        if i > 0 {
-            out.push_str(sep);
-        }
-        out.push(p);
-    }
-    out
+    PyStr::join(&lines, "\n")
 }
 
 /// `Template(template).substitute(values)`: each `$name` or `${name}` replaced by its value,
@@ -758,7 +743,7 @@ fn quoted(text: &PyStr) -> PyStr {
             rstrip_pystr(&out)
         })
         .collect();
-    join(&lines, "\n")
+    PyStr::join(&lines, "\n")
 }
 
 // --------------------------------------------------------------------------

@@ -178,6 +178,18 @@ impl PyStr {
         out
     }
 
+    /// `sep.join(parts)`.
+    pub fn join(parts: &[PyStr], sep: &str) -> PyStr {
+        let mut out = PyStr::default();
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                out.push_str(sep);
+            }
+            out.push(part);
+        }
+        out
+    }
+
     /// Python's `str.startswith` for valid text.
     pub fn starts_with(&self, prefix: &str) -> bool {
         self.0.starts_with(prefix.as_bytes())

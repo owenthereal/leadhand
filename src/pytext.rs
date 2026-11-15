@@ -437,6 +437,12 @@ pub fn pure_path(path: &OsStr) -> PathBuf {
     PathBuf::from(OsString::from_vec(out))
 }
 
+/// `str(Path(p))` as text the Python holds: the `pathlib` spelling (`pure_path`), its
+/// undecodable bytes surrogate-escaped (`PyStr::from_os`).
+pub fn path_text(p: &Path) -> crate::wire::PyStr {
+    crate::wire::PyStr::from_os(pure_path(p.as_os_str()).as_os_str())
+}
+
 /// `f"{x:.{digits}f}"`: fixed-point, correctly rounded, ties to even on the exact value, as
 /// Python formats it.
 pub fn py_fixed(x: f64, digits: usize) -> String {

@@ -388,7 +388,7 @@ fn run(command: Command, name: &str, caller: &Result<Caller>) -> Result<ExitCode
             new,
             json,
         } => crate::engine::start::command(&deck, &repo, new, json),
-        Command::Next { run_dir } => crate::engine::next::command(&run_dir),
+        Command::Next { run_dir } => crate::engine::shell::command(&run_dir),
         Command::Record(args) => crate::engine::record::command(args),
         Command::Timer { run_dir, dispatch } => crate::engine::timer::command(&run_dir, &dispatch),
         Command::Dispatch(args) => crate::dispatch::cmd::dispatch_command(&args, caller),

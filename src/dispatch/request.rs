@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::{Error, Result};
-use crate::pytext::pure_path;
+use crate::pytext::{path_text, pure_path};
 use crate::usage::Usage;
 use crate::usage::charges::null_as_default;
 use crate::wire::PyStr;
@@ -273,11 +273,6 @@ fn read_typed<T: serde::de::DeserializeOwned>(file: &Path) -> Result<Option<T>> 
 fn path_from<E: serde::de::Error>(text: &PyStr) -> std::result::Result<PathBuf, E> {
     let os = text.to_os().map_err(|e| E::custom(e.message))?;
     Ok(pure_path(&os))
-}
-
-/// `str(path)`, surrogate-escaped.
-fn path_text(p: &Path) -> PyStr {
-    PyStr::from_os(pure_path(p.as_os_str()).as_os_str())
 }
 
 /// A path field: written as `str(path)`, read as `Path(text)`.

@@ -24,6 +24,7 @@ pub use charges::{
 };
 pub use claude::{
     claude_session_transcript, claude_subagent_transcript, claude_usage, new_claude_usage,
+    projects_dir,
 };
 pub use codex::{codex_cumulative, codex_session_file, codex_stream_usage};
 pub use meter::{METER_SCAN_FILES, Meter, codex_meter};

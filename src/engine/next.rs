@@ -1,12 +1,12 @@
-//! `next` (`engine.next_action`): fold the events, then decide the next step.
+//! `next`'s core (`engine.next_action`): fold the events, then decide the next step.
 //!
-//! The core is pure: `decide(state, observations)` reads the folded log (`RunState`) and what
-//! the shell observed of the world (`Observations`: the clock, the run branch's tip, the
-//! installed vendors, …) and returns one `Decision`: a mechanical step for the shell to carry
-//! out (cut a card branch, request a dispatch, append an event, accept a card), an action for
-//! the supervisor, or a request for one more observation (`Decision::Need`: a Codex result, the
+//! `decide(state, observations)` is pure: it reads the folded log (`RunState`) and what the
+//! shell observed of the world (`Observations`: the clock, the run branch's tip, the installed
+//! vendors, …) and returns one `Decision`: a mechanical step for the shell to carry out (cut a
+//! card branch, request a dispatch, append an event, accept a card), an action for the
+//! supervisor, or a request for one more observation (`Decision::Need`: a Codex result, the
 //! paths a fix changed, a report's text, whether a worker left what it guards as it found it),
-//! which the shell gathers before deciding again. The shell (`next_action`) does the I/O: it
+//! which the shell gathers before deciding again. The shell (`engine::shell`) does the I/O: it
 //! loops step after step, as the Python does, until a step yields an action.
 //!
 //! Integration, violations, the end-of-run gates and the outcome, and recovery are Tasks
@@ -15,38 +15,28 @@
 //! guess.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-
-use serde::Serialize;
-use serde_json::value::RawValue;
+use std::ffi::OsString;
+use std::path::PathBuf;
 
 use super::cards::{
-    Dispatch, Log, Run, accept, active, cancel_codex, card_summary, cut_card, finish_accept,
-    guard_moved, is_card, pick, report_copy, request_dispatch, store_codex, write_diff_check,
+    Dispatch, Log, Run, active, card_summary, is_card, pick, report_copy, work_branch,
 };
 use super::protocol::{
-    Action, AnswerAction, CODEX_GRACE_MINUTES, DispatchAction, DoneAction, IMPLEMENTER_KINDS,
-    MAX_STEPS, REPLY_FILE, REVIEW_KINDS, Resume, RouteView, StopWorkerAction, WaitAction,
-    card_dispatch_id, format_time, now, parse_time, tag,
+    Action, AnswerAction, DispatchAction, DoneAction, IMPLEMENTER_KINDS, REPLY_FILE, REVIEW_KINDS,
+    Resume, RouteView, StopWorkerAction, WaitAction, budget_seconds, card_dispatch_id, format_time,
+    parse_time, tag,
 };
-use super::record::store_result;
-use crate::briefs::{CODEX_AGENT, after_folded, agent_for, scratch_dir};
-use crate::briefs_write::{dispatch_message, strip_pystr};
+use super::report_text::question;
+use crate::briefs::{CODEX_AGENT, agent_for, scratch_dir};
+use crate::briefs_write::dispatch_message;
 use crate::config::Route;
-use crate::dispatch::{DispatchResult, load_result};
-use crate::error::{Error, Result};
-use crate::git::cards::{card_branch_name, changed_paths, is_test_or_doc_path, operation, ref_sha};
-use crate::pytext::{py_isspace, py_strip};
+use crate::dispatch::DispatchResult;
+use crate::error::Error;
+use crate::git::cards::is_test_or_doc_path;
+use crate::pytext::path_text;
 use crate::route::{RouteError, RouteRequest, resolve};
 use crate::state::events::{self, given};
-use crate::state::{Blocked, CardRef, CardStage, CardState, Event, append_event};
-use crate::store::{state_lock, write_json_atomic};
-use crate::usage::{
-    ChargeSource, Source, charge, charged_checkpoint, claude_session_transcript, new_claude_usage,
-    read_charges,
-};
+use crate::state::{Blocked, CardRef, CardStage, CardState, Event};
 use crate::wire::{PyMap, PyStr};
 
 // --------------------------------------------------------------------------
@@ -577,19 +567,8 @@ fn escalate(
             lines.push(line);
         }
     }
-    let notes = join(&lines, "\n");
+    let notes = PyStr::join(&lines, "\n");
     start_attempt(st, obs, c, attempt + 1, Some(last.vendor()), notes)
-}
-
-fn join(parts: &[PyStr], sep: &str) -> PyStr {
-    let mut out = PyStr::default();
-    for (i, p) in parts.iter().enumerate() {
-        if i > 0 {
-            out.push_str(sep);
-        }
-        out.push(p);
-    }
-    out
 }
 
 /// The attempt's latest implementer-side dispatch with a worker, requested before
@@ -711,7 +690,7 @@ fn in_flight(st: &RunState, obs: &Observations, d: &Dispatch) -> Step<Decision> 
         }
     }
     if obs.now < parse_time(&deadline)? {
-        let whose = whose(d);
+        let whose = d.whose();
         let reason = if orphan {
             format!(
                 "the Codex worker for {whose} outlived an earlier supervisor session; no \
@@ -752,14 +731,6 @@ fn in_flight(st: &RunState, obs: &Observations, d: &Dispatch) -> Step<Decision> 
     })))
 }
 
-/// `the run`, or `card <n>` (`_whose`).
-fn whose(d: &Dispatch) -> String {
-    match &d.req.card {
-        None => "the run".to_string(),
-        Some(c) => format!("card {}", c.text().lossy()),
-    }
-}
-
 /// The scratch folder's card component of a dispatch.
 fn scratch_card(d: &Dispatch) -> Option<i64> {
     d.req.card.as_ref().and_then(CardRef::number)
@@ -769,57 +740,6 @@ fn scratch_card(d: &Dispatch) -> Option<i64> {
 fn reply_file(st: &RunState, d: &Dispatch) -> Step<PyStr> {
     let folder = scratch_dir(&st.run.ws, scratch_card(d), d.id())?;
     Ok(path_text(&folder.join(REPLY_FILE)))
-}
-
-pub(crate) fn path_text(p: &Path) -> PyStr {
-    PyStr::from_os(crate::pytext::pure_path(p.as_os_str()).as_os_str())
-}
-
-/// How long the worker may run, in seconds: its limit, plus the Codex grace for a Codex
-/// route (`_budget_seconds`).
-pub(crate) fn budget_seconds(req: &events::DispatchRequested, minute_seconds: f64) -> f64 {
-    let grace = if req.vendor.as_deref() == Some("codex") {
-        CODEX_GRACE_MINUTES
-    } else {
-        0
-    };
-    (req.minutes.unwrap_or_default() + grace) as f64 * minute_seconds
-}
-
-/// The branch a dispatch works on: its card branch (`_work_branch`); the Codex runner commits
-/// implementer work there (R39).
-pub(crate) fn work_branch(
-    run: &Run,
-    cards: &BTreeMap<u32, CardState>,
-    d: &Dispatch,
-) -> Result<PyStr> {
-    let Some(card) = &d.req.card else {
-        return Ok(run.branch.clone());
-    };
-    let c = card_state(cards, Some(card))?;
-    Ok(c.branch
-        .clone()
-        .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| card_branch_name(&run.branch, &card.text().lossy())))
-}
-
-/// The state of the card an event or command names (`engine._card_state`).
-pub(crate) fn card_state<'c>(
-    cards: &'c BTreeMap<u32, CardState>,
-    card: Option<&CardRef>,
-) -> Result<&'c CardState> {
-    let shown = || match card {
-        None => "None".to_string(),
-        Some(CardRef::Number(n)) => n.to_string(),
-        Some(CardRef::Text(t)) => t.repr(),
-    };
-    let Some(n) = card.and_then(CardRef::number) else {
-        return Err(Error::msg(format!("not a card number: {}", shown())));
-    };
-    u32::try_from(n)
-        .ok()
-        .and_then(|n| cards.get(&n))
-        .ok_or_else(|| Error::msg(format!("no card {n} in the deck")))
 }
 
 /// The dispatch line the Codex proxy runs (`_codex_command`).
@@ -1375,368 +1295,6 @@ fn resume_unparked(
     start_attempt(st, obs, c, c.attempt.max(1), None, notes)
 }
 
-/// `_QUESTION.search(text).group(1).strip()`, else `""`: the section under the first
-/// `# Question` heading (any level, any case), up to the next heading.
-pub fn question(text: &str) -> String {
-    for start in line_starts(text) {
-        let rest = &text[start..];
-        let hashes = rest.bytes().take_while(|b| *b == b'#').count();
-        if hashes == 0 {
-            continue;
-        }
-        let rest = rest[hashes..].trim_start_matches(py_isspace);
-        let Some((_, after)) = after_folded(rest, "question") else {
-            continue;
-        };
-        // `\s*$`: the longest run of whitespace that ends at a line end or the text's end.
-        let run: usize = after
-            .chars()
-            .take_while(|c| py_isspace(*c))
-            .map(char::len_utf8)
-            .sum();
-        let end_of_head = (0..=run)
-            .rev()
-            .filter(|i| after.is_char_boundary(*i))
-            .find(|i| after[*i..].is_empty() || after[*i..].starts_with('\n'));
-        let Some(end_of_head) = end_of_head else {
-            continue;
-        };
-        let group_start = text.len() - after.len() + end_of_head;
-        let group_end = (group_start..=text.len())
-            .filter(|i| text.is_char_boundary(*i))
-            .find(|i| *i == text.len() || at_heading(text, *i))
-            .unwrap_or(text.len());
-        return py_strip(&text[group_start..group_end]).to_string();
-    }
-    String::new()
-}
-
-/// The starts of `text`'s lines: 0 and every position after a `\n` (`^` under `MULTILINE`).
-pub(crate) fn line_starts(text: &str) -> impl Iterator<Item = usize> + '_ {
-    std::iter::once(0).chain(
-        text.bytes()
-            .enumerate()
-            .filter(|(_, b)| *b == b'\n')
-            .map(|(i, _)| i + 1),
-    )
-}
-
-/// `^#+\s` at `at`.
-fn at_heading(text: &str, at: usize) -> bool {
-    if at != 0 && text.as_bytes()[at - 1] != b'\n' {
-        return false;
-    }
-    let rest = &text[at..];
-    let hashes = rest.bytes().take_while(|b| *b == b'#').count();
-    hashes > 0 && rest[hashes..].chars().next().is_some_and(py_isspace)
-}
-
-// --------------------------------------------------------------------------
-// The shell
-
-/// `leadhand next RUN_DIR`: the supervisor's next action, as one line of ASCII JSON.
-pub fn command(run_dir: &OsStr) -> Result<ExitCode> {
-    let action = next_action(Path::new(run_dir))?;
-    crate::cli::human::print_or_json("", &action, true)?;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Performs every mechanical step that is due, then returns the supervisor's next action
-/// (`engine.next_action`). `status.json` is rewritten afterwards, whatever happened.
-pub fn next_action(run_dir: &Path) -> Result<Action> {
-    let out = next_action_steps(run_dir);
-    crate::status::checkpoint(run_dir);
-    out
-}
-
-fn next_action_steps(run_dir: &Path) -> Result<Action> {
-    let run = Run::load(run_dir)?;
-    let deck_problem = run.deck_problem();
-    charge_supervisor(&run)?;
-    let session = current_session(&run);
-    let installed =
-        crate::testing::installed_vendors().unwrap_or_else(crate::route::installed_on_path);
-    let base = Observations {
-        minute_seconds: crate::testing::minute_seconds(),
-        installed,
-        session,
-        deck_problem,
-        card_loop_only: crate::testing::card_loop_only(),
-        cli: crate::testing::self_path(),
-        ..Observations::default()
-    };
-    for _ in 0..MAX_STEPS {
-        let st = RunState::new(&run, Log::read(&run.paths)?);
-        let mut obs = Observations {
-            now: now(),
-            run_tip: run_tip(&run),
-            cancel_flag: run.paths.cancel_flag.exists(),
-            pause_flag: run.paths.pause_flag.exists(),
-            ..base.clone()
-        };
-        let mut asked = 0;
-        let decision = loop {
-            match decide(&st, &obs) {
-                Decision::Need(need) if asked < 16 => {
-                    asked += 1;
-                    gather(&st, &mut obs, need)?;
-                }
-                Decision::Need(need) => {
-                    return Err(Error::msg(format!(
-                        "the engine asked for {need:?} again; the run state does not settle"
-                    )));
-                }
-                d => break d,
-            }
-        };
-        if let Some(action) = execute(&st, &obs, decision)? {
-            return Ok(action);
-        }
-    }
-    Err(Error::msg(format!(
-        "no action after {MAX_STEPS} steps; the run state does not settle"
-    )))
-}
-
-/// The run branch's commit, `None` when the workspace or the branch is missing.
-fn run_tip(run: &Run) -> Option<String> {
-    if !run.ws.is_dir() {
-        return None;
-    }
-    let git = run.git().ok()?;
-    ref_sha(&git, &run.run_ref().to_os().ok()?)
-}
-
-/// One observation `decide` asked for.
-fn gather(st: &RunState, obs: &mut Observations, need: Need) -> Result<()> {
-    let run = st.run;
-    match need {
-        Need::CodexResult(id) => {
-            let result = load_result(&run.root.join("workers").join(&id))?;
-            obs.codex_results.insert(id, result);
-        }
-        Need::Operation => {
-            obs.operation = Some(operation(&run.git()?)?.map(str::to_string));
-        }
-        Need::Changed(a, b) => {
-            let paths = changed_paths(&run.git()?, &a, &b)?;
-            obs.changed.insert((a, b), paths);
-        }
-        Need::Text(path) => {
-            let text = read_text(&path)?;
-            obs.texts.insert(path, text);
-        }
-        Need::Guard(id) => {
-            let d = st
-                .log
-                .dispatch(Some(&id))
-                .ok_or_else(|| Error::msg(format!("no dispatch {id} was requested")))?;
-            let moved = guard_moved(st, &d)?;
-            obs.guards.insert(id, moved);
-        }
-    }
-    Ok(())
-}
-
-/// `Path(path).read_text(encoding="utf-8", errors="replace")` (`engine._read_text`): `None`
-/// for an empty name, a missing file or a folder; line ends translated, as text mode does.
-pub(crate) fn read_text(path: &PyStr) -> Result<Option<String>> {
-    if path.is_empty() {
-        return Ok(None);
-    }
-    let path = PathBuf::from(path.to_os()?);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
-            ) =>
-        {
-            return Ok(None);
-        }
-        Err(e) => return Err(Error::io(&path, e)),
-    };
-    Ok(Some(
-        String::from_utf8_lossy(&bytes)
-            .replace("\r\n", "\n")
-            .replace('\r', "\n"),
-    ))
-}
-
-/// Carries out one decision; the action to return, if it yields one.
-fn execute(st: &RunState, obs: &Observations, decision: Decision) -> Result<Option<Action>> {
-    let run = st.run;
-    match decision {
-        Decision::Act(action) => Ok(Some(action)),
-        Decision::Cut(card) => cut_card(st, card).map(|()| None),
-        Decision::Request(r) => request_dispatch(st, &r).map(|()| None),
-        Decision::Append(event) => append_event(&run.paths, *event).map(|_| None),
-        Decision::Accept { card, target } => accept(run, card, target).map(|()| None),
-        Decision::FinishAccept { card, target } => finish_accept(run, card, target).map(|()| None),
-        Decision::CheckDiff(check) => write_diff_check(st, &check).map(Some),
-        Decision::StoreCodex { dispatch_id, then } => {
-            let d = dispatch_of(st, &dispatch_id)?;
-            let result = obs
-                .codex_results
-                .get(&dispatch_id)
-                .cloned()
-                .flatten()
-                .ok_or_else(|| Error::msg(format!("no result for {dispatch_id}")))?;
-            store_codex(st, &d, &result)?;
-            Ok(then)
-        }
-        Decision::StopCodex { dispatch_id, then } => {
-            let d = dispatch_of(st, &dispatch_id)?;
-            let result = cancel_codex(run, &st.cards, &d)?;
-            store_codex(st, &d, &result)?;
-            Ok(then)
-        }
-        Decision::StoreInterrupted { dispatch_id } => {
-            let d = dispatch_of(st, &dispatch_id)?;
-            let worker = d
-                .started
-                .and_then(|s| s.worker_id.clone())
-                .unwrap_or_default();
-            store_result(run, &d, &worker, &PyStr::default(), false, true, false)?;
-            Ok(None)
-        }
-        Decision::End(ending) => Err(Error::msg(format!(
-            "not ported yet: ending the run{} (Task 16)",
-            match (&ending.blocked, &ending.unreconciled) {
-                (Some(b), _) => format!(" blocked ({})", b.as_str()),
-                (None, Some(why)) => format!(" failed: {why}"),
-                (None, None) => String::new(),
-            }
-        ))),
-        Decision::Unported { what, task } => {
-            Err(Error::msg(format!("not ported yet: {what} (Task {task})")))
-        }
-        Decision::Fail(e) => Err(e),
-        Decision::Need(need) => Err(Error::msg(format!("unanswered: {need:?}"))),
-    }
-}
-
-pub(crate) fn dispatch_of<'l>(st: &'l RunState, id: &str) -> Result<Dispatch<'l>> {
-    st.log
-        .dispatch(Some(id))
-        .ok_or_else(|| Error::msg(format!("no dispatch {id} was requested")))
-}
-
-// -- the supervisor's session --------------------------------------------------
-
-/// `$CLAUDE_CODE_SESSION_ID`, stripped; `None` when unset or blank.
-pub(crate) fn session_env() -> Option<PyStr> {
-    let sid = std::env::var_os("CLAUDE_CODE_SESSION_ID")?;
-    Some(strip_pystr(&PyStr::from_os(&sid))).filter(|s| !s.is_empty())
-}
-
-/// The supervisor session making this call: `CLAUDE_CODE_SESSION_ID`, else the last one
-/// `run.json` recorded (`_current_session`).
-pub(crate) fn current_session(run: &Run) -> Option<PyStr> {
-    if let Some(sid) = session_env() {
-        return Some(sid);
-    }
-    let meta = crate::dispatch::read_json_object(&run.paths.run_json).ok()??;
-    crate::dispatch::field::<Vec<PyStr>>(&meta, "supervisor_sessions")?.pop()
-}
-
-/// Claude Code's transcript folder: `$CLAUDE_CONFIG_DIR/projects`, else
-/// `~/.claude/projects` (`engine._projects_dir`, `usage.default_projects_dir`).
-pub(crate) fn projects_dir() -> PathBuf {
-    match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|h| !h.is_empty()) {
-        Some(home) => PathBuf::from(crate::pytext::expand_user(&home)).join("projects"),
-        None => PathBuf::from(crate::pytext::expand_user(OsStr::new("~"))).join(".claude/projects"),
-    }
-}
-
-/// `run.json`, rewritten with one entry's value replaced: every other entry kept as read.
-enum MetaValue<'a> {
-    Raw(&'a RawValue),
-    Sessions(&'a [PyStr]),
-}
-
-impl Serialize for MetaValue<'_> {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        match self {
-            MetaValue::Raw(raw) => raw.serialize(s),
-            MetaValue::Sessions(sessions) => sessions.serialize(s),
-        }
-    }
-}
-
-/// Records the supervisor's session in `run.json` and charges its new usage, once
-/// (`_charge_supervisor`).
-fn charge_supervisor(run: &Run) -> Result<()> {
-    let Some(sid) = session_env() else {
-        return Ok(());
-    };
-    let _lock = state_lock(&run.root)?;
-    let text = std::fs::read(&run.paths.run_json).map_err(|e| Error::io(&run.paths.run_json, e))?;
-    let text = String::from_utf8(text).map_err(|e| Error::msg(e.to_string()))?;
-    let meta: PyMap<Box<RawValue>> =
-        serde_json::from_str(&text).map_err(|e| Error::msg(format!("run.json: {e}")))?;
-    let key = PyStr::from("supervisor_sessions");
-    let mut sessions: Vec<PyStr> = match meta.get(&key) {
-        Some(raw) => serde_json::from_str(raw.get())
-            .map_err(|e| Error::msg(format!("run.json: supervisor_sessions: {e}")))?,
-        None => Vec::new(),
-    };
-    if !sessions.contains(&sid) {
-        sessions.push(sid.clone());
-        let mut out: Vec<(PyStr, MetaValue)> = meta
-            .0
-            .iter()
-            .map(|(k, v)| {
-                let value = if *k == key {
-                    MetaValue::Sessions(&sessions)
-                } else {
-                    MetaValue::Raw(v)
-                };
-                (k.clone(), value)
-            })
-            .collect();
-        if meta.get(&key).is_none() {
-            out.push((key.clone(), MetaValue::Sessions(&sessions)));
-        }
-        write_json_atomic(&run.paths.run_json, &PyMap(out))?;
-    }
-    charge_session(run, &sid)
-}
-
-/// Charges a supervisor session's transcript from its checkpoint; the caller holds the state
-/// lock (`_charge_session`).
-pub(crate) fn charge_session(run: &Run, sid: &PyStr) -> Result<()> {
-    let Some(path) = claude_session_transcript(sid, &projects_dir()) else {
-        return Ok(());
-    };
-    let charges = read_charges(&run.paths)?;
-    let prior = charged_checkpoint(&charges, Source::Claude, sid);
-    let (_, reached) = new_claude_usage(Some(&path), &prior.messages.unwrap_or_default());
-    if reached.is_empty() {
-        return Ok(());
-    }
-    let mut prefix = PyStr::from("supervisor:");
-    prefix.push(sid);
-    prefix.push_str(":");
-    let n = 1 + charges
-        .iter()
-        .filter(|c| c.charge_id.as_wtf8().starts_with(prefix.as_wtf8()))
-        .count();
-    let mut charge_id = prefix;
-    charge_id.push_str(&n.to_string());
-    charge(
-        &run.paths,
-        &charge_id,
-        sid,
-        "supervisor",
-        "supervisor",
-        ChargeSource::ClaudeTranscript(Some(&path)),
-        false,
-    )?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2268,30 +1826,5 @@ mod tests {
             panic!("no review");
         };
         assert_eq!(r.kind, "review");
-    }
-
-    #[test]
-    fn questions_are_read_as_the_python_reads_them() {
-        let texts = [
-            "Status: QUESTION\n## Summary\nx\n## Question\nWhich storage format should widgets use?\nOptions:\n- A: JSON\n## Concerns\nNone\n",
-            "# question  \n\n  Which one?  \n",
-            "### QUESTION\nA?\n#Not a heading\n## Next\nB",
-            "## Questions\nno\n",
-            "## Queſtion\nfolded\n",
-            "##Question\r\nCRLF?\r\n## End\n",
-            "no question here",
-            "## Question\n## Empty\n",
-        ];
-        let code = "import json, sys\nfrom leadhand import engine\n\
-                    out = []\n\
-                    for t in json.loads(sys.argv[1]):\n\
-                    \x20   m = engine._QUESTION.search(t)\n\
-                    \x20   out.append(m.group(1).strip() if m else '')\n\
-                    print(json.dumps(out))";
-        let arg = serde_json::to_string(&texts).unwrap();
-        let theirs: Vec<String> =
-            serde_json::from_slice(&crate::wire::tests::python(code, &[OsStr::new(&arg)])).unwrap();
-        let ours: Vec<String> = texts.iter().map(|t| question(t)).collect();
-        assert_eq!(ours, theirs);
     }
 }
