@@ -19,6 +19,7 @@ use super::protocol::{
     Action, CHECK_KINDS, CheckDiffAction, IMPLEMENTER_KINDS, MAX_STEPS, REPLY_FILE, now, tag,
 };
 use super::record::{cancel_codex, store_result};
+use super::recover::{self, Flag};
 use super::report_text::read_text;
 use super::violations::{self, ensure_clean, find_violation};
 use super::{finish, gates, integrate};
@@ -170,6 +171,14 @@ fn gather(st: &RunState, obs: &mut Observations, need: Need) -> Result<()> {
             let yes = is_ancestor(&run.git()?, &name.to_os()?, OsStr::new(&sha))?;
             obs.ancestors.insert((name, sha), yes);
         }
+        Need::RefSha(name) => {
+            // `_ref_sha`: Git's failure is no commit.
+            let sha = run
+                .git()
+                .ok()
+                .and_then(|git| ref_sha(&git, &name.to_os().ok()?));
+            obs.ref_shas.insert(name, sha);
+        }
     }
     Ok(())
 }
@@ -202,14 +211,26 @@ fn execute(st: &RunState, obs: &Observations, decision: Decision) -> Result<Opti
             store_codex(st, &d, &result)?;
             Ok(then)
         }
-        Decision::StoreInterrupted { dispatch_id } => {
+        Decision::StoreInterrupted {
+            dispatch_id,
+            charge,
+        } => {
             let d = dispatch_of(st, &dispatch_id)?;
             let worker = d
                 .started
                 .and_then(|s| s.worker_id.clone())
                 .unwrap_or_default();
-            store_result(run, &d, &worker, &PyStr::default(), false, true, false)?;
+            store_result(run, &d, &worker, &PyStr::default(), false, true, charge)?;
             Ok(None)
+        }
+        Decision::Reconcile => recover::reconcile_run(st).map(|_| None),
+        Decision::RecordCancel => recover::record_flag(st, Flag::Cancel).map(|()| None),
+        Decision::RecordPause => recover::record_flag(st, Flag::Pause).map(|()| None),
+        Decision::Cancel { codex, then } => {
+            for id in &codex {
+                cancel_codex(run, &st.cards, &dispatch_of(st, id)?)?;
+            }
+            execute(st, obs, *then)
         }
         Decision::Void { dispatch_id, found } => {
             violations::void(run, &dispatch_id, found.map(|f| *f)).map(|()| None)
@@ -226,7 +247,14 @@ fn execute(st: &RunState, obs: &Observations, decision: Decision) -> Result<Opti
         }
         Decision::Integrate { card } => integrate::integrate(run, card).map(|()| None),
         Decision::Rebase { card } => integrate::rebase_again(run, card).map(|()| None),
-        Decision::End(ending) => finish::end(st, &ending).map(|()| None),
+        Decision::End(ending) => {
+            if ending.cancelled {
+                // The earlier sessions ended with the crash or the cancel: charged before the
+                // outcome (`_cancel_step`).
+                recover::charge_earlier_sessions(run)?;
+            }
+            finish::end(st, &ending).map(|()| None)
+        }
         Decision::WrapUp => finish::wrap_up(run).map(Some),
         Decision::RunRequest(r) => gates::request_run(st, &r).map(|()| None),
         Decision::CutFinal { wave, head } => gates::cut_final(st, wave, &head).map(|()| None),
@@ -238,9 +266,6 @@ fn execute(st: &RunState, obs: &Observations, decision: Decision) -> Result<Opti
             target,
             started,
         } => gates::accept_fix(run, &dispatch_id, wave, &target, started).map(|()| None),
-        Decision::Unported { what, task } => {
-            Err(Error::msg(format!("not ported yet: {what} (Task {task})")))
-        }
         Decision::Fail(e) => Err(e),
         Decision::Need(need) => Err(Error::msg(format!("unanswered: {need:?}"))),
     }
@@ -618,7 +643,7 @@ fn accepted(card: u32, target: &str) -> Event {
 
 /// Completes an acceptance whose intent is recorded (`_finish_accept`). Idempotent: a run
 /// branch that already contains the target is left where it is.
-fn finish_accept(run: &Run, card: u32, target: Option<String>) -> Result<()> {
+pub(super) fn finish_accept(run: &Run, card: u32, target: Option<String>) -> Result<()> {
     let target = target.unwrap_or_else(|| "None".to_string());
     let git = run.git()?;
     two_phase_resume(

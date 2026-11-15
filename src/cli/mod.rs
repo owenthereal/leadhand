@@ -50,11 +50,14 @@ pub enum Command {
                       --note 'Keep the v1 endpoint'"
     )]
     Unpark {
-        run_dir: OsString,
+        #[arg(help = RUN_HELP)]
+        run_dir: Option<OsString>,
         #[arg(long, allow_negative_numbers = true)]
         card: i64,
         #[arg(long, help = "the answer or instruction for the card; - reads stdin")]
         note: OsString,
+        #[arg(long, help = "print the result as one JSON object")]
+        json: bool,
     },
 
     #[command(
@@ -124,13 +127,23 @@ pub enum Command {
         about = "pause a run: running workers finish, nothing new starts, it ends blocked",
         after_help = "Example:\n  leadhand pause ~/.leadhand/myapp/runs/2026-11-10-retry-uploads"
     )]
-    Pause { run_dir: OsString },
+    Pause {
+        #[arg(help = RUN_HELP)]
+        run_dir: Option<OsString>,
+        #[arg(long, help = "print the result as one JSON object")]
+        json: bool,
+    },
 
     #[command(
         about = "cancel a run: stop every worker, end it incomplete (cancelled)",
         after_help = "Example:\n  leadhand cancel ~/.leadhand/myapp/runs/2026-11-10-retry-uploads"
     )]
-    Cancel { run_dir: OsString },
+    Cancel {
+        #[arg(help = RUN_HELP)]
+        run_dir: Option<OsString>,
+        #[arg(long, help = "print the result as one JSON object")]
+        json: bool,
+    },
 
     #[command(about = "wait until a dispatch has a result or its deadline passes")]
     Timer {
@@ -331,7 +344,7 @@ pub fn main() -> ExitCode {
         .filter(|dir| !dir.is_empty())
         .map(|dir| PathBuf::from(dir).join("run.lock"));
     crate::sys::close_inherited_fd(lock.as_deref());
-    let (command, name) = match parse(std::env::args_os()) {
+    let (command, _) = match parse(std::env::args_os()) {
         Ok(parsed) => parsed,
         Err(e) => {
             // Help goes to stdout with exit 0; a usage error to stderr with exit 2.
@@ -340,7 +353,7 @@ pub fn main() -> ExitCode {
         }
     };
     let caller = resolve_caller();
-    match run(command, &name, &caller) {
+    match run(command, &caller) {
         Ok(code) => code,
         Err(e) => report(&e),
     }
@@ -356,7 +369,7 @@ fn parse(
     Ok((cli.command, name))
 }
 
-fn run(command: Command, name: &str, caller: &Result<Caller>) -> Result<ExitCode> {
+fn run(command: Command, caller: &Result<Caller>) -> Result<ExitCode> {
     match command {
         Command::Version => version(),
         Command::Check { deck, repo, json } => check(&deck, &repo, json),
@@ -408,7 +421,18 @@ fn run(command: Command, name: &str, caller: &Result<Caller>) -> Result<ExitCode
             plugin_dir,
             json,
         } => crate::launch::launch_line_command(run_dir.as_deref(), plugin_dir.as_deref(), json),
-        _ => Err(Error::msg(format!("not ported yet: {name}"))),
+        Command::Pause { run_dir, json } => {
+            crate::engine::control::pause_command(run_dir.as_deref(), json)
+        }
+        Command::Cancel { run_dir, json } => {
+            crate::engine::control::cancel_command(run_dir.as_deref(), json)
+        }
+        Command::Unpark {
+            run_dir,
+            card,
+            note,
+            json,
+        } => crate::engine::control::unpark_command(run_dir.as_deref(), card, &note, json),
     }
 }
 
@@ -1015,20 +1039,42 @@ mod tests {
     }
 
     #[test]
-    fn unported_commands_say_so_and_exit_1() {
-        // `pause` is ported last (Task 17).
-        let (command, name) = parse_ok(&["pause", "/r"]);
-        let e = run(
-            command,
-            &name,
-            &Ok(Caller {
+    fn the_operators_commands_find_their_run_and_take_json() {
+        // The run is optional (found from the current directory), as for `status`.
+        match parse_ok(&["pause"]).0 {
+            Command::Pause {
                 run_dir: None,
-                run_id: None,
-            }),
-        )
-        .unwrap_err();
-        assert_eq!(e, Error::msg("not ported yet: pause"));
-        assert_eq!(e.exit, 1);
+                json: false,
+            } => {}
+            other => panic!("{other:?}"),
+        }
+        match parse_ok(&["cancel", "--json", "retry-uploads"]).0 {
+            Command::Cancel {
+                run_dir: Some(r),
+                json: true,
+            } => assert_eq!(r, os("retry-uploads")),
+            other => panic!("{other:?}"),
+        }
+        match parse_ok(&["unpark", "--card", "2", "--note", "-", "--json"]).0 {
+            Command::Unpark {
+                run_dir: None,
+                card: 2,
+                note,
+                json: true,
+            } => assert_eq!(note, os("-")),
+            other => panic!("{other:?}"),
+        }
+        // Every command reaches its own handler: `pause` refuses what is not a run directory.
+        let (command, _) = parse_ok(&["pause", "/no/such/run dir"]);
+        let caller = Ok(Caller {
+            run_dir: None,
+            run_id: None,
+        });
+        let e = run(command, &caller).unwrap_err();
+        assert_eq!(
+            (e.message.as_str(), e.exit),
+            ("not a run directory (no run.json): /no/such/run dir", 1)
+        );
     }
 
     #[test]

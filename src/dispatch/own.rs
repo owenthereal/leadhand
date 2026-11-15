@@ -249,6 +249,38 @@ pub enum RunnerState {
     None,
 }
 
+impl RunnerState {
+    /// The Python's name for the state, as `reconciled{runner}` records it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunnerState::Finished => "finished",
+            RunnerState::Running => "running",
+            RunnerState::Hung => "hung",
+            RunnerState::Orphaned => "orphaned",
+            RunnerState::Dead => "dead",
+            RunnerState::None => "none",
+        }
+    }
+}
+
+/// `stop_strays`: stops the recorded Codex processes of a dispatch whose runner is gone (a
+/// SIGKILLed runner leaves Codex's tool and helper processes under init, P14). What is still
+/// alive after `timeout`, empty when everything is stopped. A live runner is left alone: it
+/// stops its own.
+pub fn stop_strays(worker_dir: &Path, timeout: Duration) -> Result<Vec<StoppedProc>> {
+    let wd = worker_dir;
+    if !wd.join(RUNNER).exists() || runner_alive_in(wd)? {
+        return Ok(Vec::new());
+    }
+    let mut tracker = Tracker::load(wd)?;
+    tracker.find_tagged();
+    if tracker.alive().is_empty() {
+        return Ok(Vec::new());
+    }
+    let deadline = Instant::now() + timeout;
+    Ok(super::tracker::stop(&mut tracker, Some(deadline)))
+}
+
 /// `runner_state`: a live runner whose heartbeat is stale is looked at again for `recheck`
 /// (default `HUNG_RECHECK`) before it counts as hung: after a laptop sleep the runner
 /// refreshes it as soon as it runs again.
@@ -513,6 +545,40 @@ mod tests {
             super::runner_state(&wd, None).unwrap(),
             RunnerState::Finished
         );
+    }
+
+    // test_recovery.py::RunnerHelpers::test_stop_strays_stops_what_a_dead_runner_left_and_
+    // leaves_a_live_runner_alone (P14), against real processes.
+    #[test]
+    fn stop_strays_stops_what_a_dead_runner_left_and_leaves_a_live_runner_alone() {
+        let (_tmp, wd) = worker_dir();
+        let timeout = Duration::from_secs(15);
+        assert!(super::stop_strays(&wd, timeout).unwrap().is_empty());
+        let mut tool = python("import time; time.sleep(120)");
+        let mut codex = python("import time; time.sleep(120)");
+        let record = format!(
+            "{{\"runner\": {{\"pid\": 1, \"pgid\": 1, \"start\": \"gone\"}}, \"codex\": {}}}",
+            codex.record()
+        );
+        fs::write(wd.join(RUNNER), record).unwrap();
+        let procs = format!("{{\"descendants\": [{}]}}", tool.record());
+        fs::write(wd.join(PROCS), procs).unwrap();
+        let runner = holding_runner_lock(&wd);
+        // A live runner stops its own.
+        assert!(super::stop_strays(&wd, timeout).unwrap().is_empty());
+        assert!(codex.0.try_wait().unwrap().is_none());
+        assert!(tool.0.try_wait().unwrap().is_none());
+        runner.kill();
+        assert!(super::stop_strays(&wd, timeout).unwrap().is_empty());
+        for kid in [&mut codex, &mut tool] {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while kid.0.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "a stray outlived stop_strays");
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        // Nothing left: a no-op.
+        assert!(super::stop_strays(&wd, timeout).unwrap().is_empty());
     }
 
     #[test]

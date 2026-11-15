@@ -11,7 +11,7 @@ use crate::deck::Card;
 use crate::engine::cards::{
     Dispatch, accepted_cards, final_branch, final_card, is_final, report_copy,
 };
-use crate::engine::protocol::{VIOLATION_CAP, continue_notes, voided_notes};
+use crate::engine::protocol::{VIOLATION_CAP, voided_notes};
 use crate::state::events::{self, given};
 use crate::state::{Blocked, Event};
 use crate::wire::{PyMap, PyStr};
@@ -73,15 +73,7 @@ pub(super) fn after_run_result(
             // Its worker died with an earlier session: the wave's implementer runs again on
             // the final branch as it stands (the fix review covers every commit since the
             // wave's base).
-            let copy = r
-                .files
-                .as_ref()
-                .and_then(|f| f.get(&PyStr::from("brief")))
-                .filter(|b| !b.is_empty())
-                .cloned()
-                .or_else(|| req.brief.clone())
-                .unwrap_or_default();
-            let notes = continue_notes(&d.notes(), d.kind(), d.id(), &copy);
+            let notes = super::interrupted_notes(&d.notes(), d);
             return Ok(Some(rerun(st, d, notes, &accepted)));
         }
         return match r.status.as_deref() {

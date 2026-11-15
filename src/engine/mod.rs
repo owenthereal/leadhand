@@ -19,15 +19,20 @@
 //!   leftovers, found, kept and undone for `decide`;
 //! - `report_text`: what the engine reads out of a worker's report and reply text;
 //! - `record`: a worker's start and result, a ruling, a park, a diff check;
+//! - `recover`: reconciling a relaunched run, the operator's flags recorded, and a stopped or
+//!   interrupted Claude worker's partial work committed (R42);
+//! - `control`: the operator's `pause`, `cancel` and `unpark`;
 //! - `timer`: waiting on a dispatch.
 
 pub mod cards;
+pub mod control;
 pub mod finish;
 pub mod gates;
 pub mod integrate;
 pub mod next;
 pub mod protocol;
 pub mod record;
+pub mod recover;
 pub mod release;
 pub mod report_text;
 pub mod shell;
@@ -35,9 +40,11 @@ pub mod start;
 pub mod timer;
 pub mod violations;
 
+pub use control::{cancel, pause, unpark};
 pub use next::{Decision, Observations, RunState, decide};
 pub use protocol::{Action, RecordOutput};
 pub use record::{RecordFields, record};
+pub use recover::reconcile;
 pub use shell::next_action;
 pub use start::{StartResult, start};
 pub use timer::{Timer, timer};

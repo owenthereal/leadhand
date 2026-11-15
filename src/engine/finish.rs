@@ -39,17 +39,12 @@ use crate::wire::PyStr;
 /// for good is also reported through `open_findings`, `holds` or `verification_failed`. Every
 /// accepted card and fix must still be on the run branch; otherwise the state cannot be
 /// reconciled and the run fails (`unreconciled` names another mismatch). When everything left
-/// needs the operator's decision, the run ends blocked for it (R44).
+/// needs the operator's decision, the run ends blocked for it (R44). `cancelled`: the
+/// operator's cancel, after every worker stopped.
 pub(super) fn end(st: &RunState, ending: &Ending) -> Result<()> {
     let run = st.run;
     if ending.stop_codex {
-        // No detached runner may write, or commit, after the outcome; their results are left
-        // unrecorded (`_stop_codex_runners`).
-        for d in st.log.dispatches() {
-            if d.result.is_none() && d.vendor() == "codex" {
-                cancel_codex(run, &st.cards, &d)?;
-            }
-        }
+        stop_codex_runners(st)?;
     }
     let log = Log::read(&run.paths)?;
     let cards = log.cards(&run.numbers());
@@ -95,7 +90,11 @@ pub(super) fn end(st: &RunState, ending: &Ending) -> Result<()> {
     }
     let mut blocked = ending.blocked;
     let mut why = ending.why.clone();
-    if blocked.is_none() && unreconciled.is_none() && !ending.verification_failed {
+    if blocked.is_none()
+        && !ending.cancelled
+        && unreconciled.is_none()
+        && !ending.verification_failed
+    {
         let waiting = waiting_on_decisions(run, &cards, &log)?;
         if !waiting.is_empty() {
             // R44: everything left needs the operator's decision: the run can continue once
@@ -121,7 +120,7 @@ pub(super) fn end(st: &RunState, ending: &Ending) -> Result<()> {
         holds: ending.holds.clone(),
         gates_current: ending.gates_current,
         verification_failed: ending.verification_failed,
-        cancelled: false,
+        cancelled: ending.cancelled,
         blocked_reason: blocked,
         unreconciled,
     });
@@ -138,6 +137,19 @@ pub(super) fn end(st: &RunState, ending: &Ending) -> Result<()> {
             ..events::Outcome::default()
         }),
     )?;
+    Ok(())
+}
+
+/// Before the run ends on a state that could not be matched: stops every Codex dispatch that
+/// has no result (`dispatch.cancel`, termination confirmed), so no detached runner writes, or
+/// commits, after the outcome (`_stop_codex_runners`). Their results are left unrecorded: the
+/// state they would be recorded against could not be matched.
+pub(super) fn stop_codex_runners(st: &RunState) -> Result<()> {
+    for d in st.log.dispatches() {
+        if d.result.is_none() && d.vendor() == "codex" {
+            cancel_codex(st.run, &st.cards, &d)?;
+        }
+    }
     Ok(())
 }
 

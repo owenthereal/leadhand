@@ -19,11 +19,12 @@
 //! The end of a run is decided in two child modules: `gates` (the commit-bound end-of-run gates,
 //! the fix waves they get, and which outcome the run ends with) and `run_level` (what follows
 //! a gate's or a fix wave's result). Carrying out the outcome, the branch release and the
-//! report is the shell's (`finish`, `release`). Recovery is Task 17's: where the loop reaches
-//! it, `decide` returns `Decision::Unported`, and `next` fails with `not ported yet: …` rather
-//! than guess.
+//! report is the shell's (`finish`, `release`). A third, `recovery`, decides the operator's
+//! cancel and pause and what follows a worker interrupted with an earlier session; reconciling
+//! a relaunched run is the shell's (`recover`), which `decide` asks for before anything else.
 
 mod gates;
+mod recovery;
 mod run_level;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -31,6 +32,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 pub(super) use gates::waiting_on_decisions;
+pub(super) use recovery::{Progress, branch_progress, interrupted_notes};
 
 use super::cards::{
     Dispatch, Log, Run, active, card_branch, heads, is_card, pick, report_copy, short_sha,
@@ -118,6 +120,8 @@ pub struct Observations {
     pub base_guards: HashMap<String, Option<events::Violation>>,
     /// Whether a ref's tip is in a commit's history, by (ref, commit) (`is_ancestor`).
     pub ancestors: HashMap<(PyStr, String), bool>,
+    /// A ref's commit, `None` when there is none (`_ref_sha`), by ref.
+    pub ref_shas: HashMap<PyStr, Option<String>>,
 }
 
 /// One more thing to observe before deciding.
@@ -147,6 +151,8 @@ pub enum Need {
     BaseGuard(String),
     /// Whether this ref's tip is in this commit's history (`is_ancestor(ref, commit)`).
     Ancestor(PyStr, String),
+    /// This ref's commit, if it has one (`_ref_sha`).
+    RefSha(PyStr),
 }
 
 /// A dispatch to request (`engine._request`): the shell checks out the card branch, takes the
@@ -209,6 +215,9 @@ pub struct Ending {
     /// Stop every Codex dispatch without a result first (`_stop_codex_runners`), so no
     /// detached runner commits after the outcome.
     pub stop_codex: bool,
+    /// The operator's cancel, once every worker is stopped: the earlier supervisor sessions
+    /// are charged first (`_cancel_step`'s end).
+    pub cancelled: bool,
 }
 
 /// A run-level dispatch to request (`engine._request_run`): a gate, or a fix wave's
@@ -273,8 +282,10 @@ pub enum Decision {
         dispatch_id: String,
         then: Option<Action>,
     },
-    /// Record a Claude worker reconciliation started, past its deadline, as interrupted.
-    StoreInterrupted { dispatch_id: String },
+    /// Record a worker that died with an earlier supervisor session as interrupted: one
+    /// reconciliation started, past its deadline (charging nothing), or one the cancel found
+    /// gone (charged unless its start was reconciliation's).
+    StoreInterrupted { dispatch_id: String, charge: bool },
     /// Void a check dispatch whose worker changed what it guards (`_void`): record `found`
     /// when given, then keep what the worker changed, put it back and record `restored`,
     /// unless that is recorded.
@@ -316,8 +327,21 @@ pub enum Decision {
         target: String,
         started: bool,
     },
-    /// A step a later task ports.
-    Unported { what: &'static str, task: u8 },
+    /// After a relaunch, before anything new: settle every step a dead session left in flight
+    /// and record `reconciled` (`_reconcile`, the shell's `recover`).
+    Reconcile,
+    /// The operator's cancel flag: record `cancelled` unless it is recorded, then remove the
+    /// flag (`_cancel_requested`). A cancel is never undone.
+    RecordCancel,
+    /// The operator's pause flag: record `paused` unless one is recorded since the latest
+    /// relaunch, then remove the flag (`_pause_requested`).
+    RecordPause,
+    /// The cancel's step (`_cancel_step`): stop these Codex dispatches that never started a
+    /// worker (confirmed, so a late proxy starts nothing), then carry out `then`.
+    Cancel {
+        codex: Vec<String>,
+        then: Box<Decision>,
+    },
     /// The step cannot be taken.
     Fail(Error),
 }
@@ -330,10 +354,6 @@ impl From<Error> for Box<Decision> {
     fn from(e: Error) -> Box<Decision> {
         Box::new(Decision::Fail(e))
     }
-}
-
-fn unported<T>(what: &'static str, task: u8) -> Step<T> {
-    Err(Box::new(Decision::Unported { what, task }))
 }
 
 fn fail<T>(message: String) -> Step<T> {
@@ -355,13 +375,22 @@ fn decide_step(st: &RunState, obs: &Observations) -> Step<Decision> {
         return Ok(Decision::WrapUp);
     }
     if st.log.needs_reconcile() {
-        return unported("reconciling a relaunched run", 17);
+        // After a relaunch, nothing else happens before every in-flight step is reconciled
+        // (it only records what really happened, so a pending cancel ends on true state).
+        return Ok(Decision::Reconcile);
     }
     if st.log.cancelled() || obs.cancel_flag {
-        return unported("the operator's cancel", 17);
+        // A cancel comes before anything new, and a relaunch never undoes it.
+        if obs.cancel_flag {
+            return Ok(Decision::RecordCancel);
+        }
+        return recovery::cancel_step(st);
     }
     if st.log.paused() || obs.pause_flag {
-        return unported("the operator's pause", 17);
+        if obs.pause_flag {
+            return Ok(Decision::RecordPause);
+        }
+        return recovery::pause_step(st, obs);
     }
     if let Some(problem) = &obs.deck_problem {
         return fail(problem.clone());
@@ -828,6 +857,7 @@ fn in_flight(st: &RunState, obs: &Observations, d: &Dispatch) -> Step<Decision> 
     if reconciled {
         return Ok(Decision::StoreInterrupted {
             dispatch_id: d.id().to_string(),
+            charge: false,
         });
     }
     Ok(Decision::Act(Action::StopWorker(StopWorkerAction {
@@ -975,7 +1005,7 @@ fn after_result(st: &RunState, obs: &Observations, c: &CardState, d: &Dispatch) 
         }
     }
     if given(&r.interrupted).copied().unwrap_or(false) {
-        return unported("continuing after an interrupted worker", 17);
+        return recovery::after_interrupted(st, obs, c, d);
     }
     if d.kind() == "verify" {
         return match r.result.as_deref() {

@@ -20,6 +20,7 @@ use super::protocol::{
     Action, IMPLEMENTER_KINDS, REPLY_FILE, RecordOutput, WaitAction, budget_seconds, format_time,
     now, tag,
 };
+use super::recover::{Partial, commit_partial};
 use super::report_text::{Head, head_of, read_text};
 use crate::briefs::{CODEX_AGENT, agent_for, scratch_dir};
 use crate::briefs_write::{ScratchError, read_scratch_file, strip_pystr};
@@ -97,7 +98,7 @@ pub fn command(args: RecordArgs) -> Result<ExitCode> {
 }
 
 /// `sys.stdin.read()`: UTF-8, strictly, as the Python's text stdin decodes it.
-fn read_stdin() -> Result<PyStr> {
+pub(crate) fn read_stdin() -> Result<PyStr> {
     let mut data = Vec::new();
     std::io::stdin().read_to_end(&mut data)?;
     match String::from_utf8(data) {
@@ -490,16 +491,16 @@ pub(crate) fn store_result(
         head.interrupted = false;
     }
     let implementer_side = IMPLEMENTER_KINDS.contains(&d.kind()) || d.kind() == "final_fix";
-    if !codex_vendor
+    let mut partial = Partial::default();
+    if d.vendor() == "claude"
         && implementer_side
         && (stopped || head.interrupted)
         && cancelling(run, &Log::read(&run.paths)?)
     {
-        // R42: a Claude worker the cancel stopped, or found dead, leaves its partial work
-        // committed on its branch.
-        return Err(Error::msg(
-            "not ported yet: committing a cancelled worker's partial work (Task 17)",
-        ));
+        // R42 (cancel): a Claude worker the cancel stopped, or found dead, leaves its partial
+        // work committed on its branch (a Codex runner does this itself, R39). Not for a stop
+        // at the deadline or an interruption found on a relaunch.
+        partial = commit_partial(run, d)?;
     }
     let tip = if IMPLEMENTER_KINDS.contains(&d.kind()) {
         let log = Log::read(&run.paths)?;
@@ -548,6 +549,7 @@ pub(crate) fn store_result(
             reconciled,
             &head,
             &skipped,
+            &partial,
         )
     };
     let Some(charged) = charged else {
@@ -662,6 +664,7 @@ fn result_event(
     reconciled: bool,
     head: &Head,
     skipped: &[PyStr],
+    partial: &Partial,
 ) -> Event {
     let flag = |on: bool| on.then_some(Some(true));
     let mut e = events::ResultRecorded {
@@ -686,6 +689,11 @@ fn result_event(
         interrupted: flag(head.interrupted),
         cross_checked: flag(head.cross_checked),
         files_skipped: (!skipped.is_empty()).then(|| Some(skipped.to_vec())),
+        // R42's fields, as `_commit_partial` returns them.
+        partial_commit: partial.commit.clone().map(Some),
+        partial_commit_error: partial.error.clone().map(Some),
+        partial_gitlinks_skipped: (!partial.gitlinks.is_empty())
+            .then(|| Some(partial.gitlinks.clone())),
         ..events::ResultRecorded::default()
     };
     // A Codex route's result carries the runner's commit outcome (`dsp.load_commit`: each

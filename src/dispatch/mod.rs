@@ -54,7 +54,7 @@ pub use env::{
     ASKPASS_RESET, BLOCKING_ENV, CREDENTIAL_HELPER_RESET, CREDENTIAL_VARS, Env, TAG_VAR,
     blocking_env, codex_overrides, worker_env,
 };
-pub use own::{RunnerState, runner_alive, runner_state};
+pub use own::{RunnerState, runner_alive, runner_state, stop_strays};
 pub use request::{
     BlockedBy, DispatchRequest, DispatchResult, ExitReason, Status, StoppedProc, load_result,
     read_request, thread_id,

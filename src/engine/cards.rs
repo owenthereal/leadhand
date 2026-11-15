@@ -506,6 +506,29 @@ impl Log {
             })
     }
 
+    /// The dispatches the run waits on (`_open_dispatches`): each card's current dispatch while
+    /// the card has work open and the dispatch no result, and the latest run-level one while it
+    /// has no result; by request.
+    pub fn open_dispatches(&self, cards: &BTreeMap<u32, CardState>) -> Vec<Dispatch<'_>> {
+        let mut out: Vec<Dispatch> = cards
+            .values()
+            .filter(|c| active(c.state))
+            .filter_map(|c| {
+                c.dispatch_id
+                    .as_deref()
+                    .and_then(|id| self.dispatch(Some(id)))
+            })
+            .filter(|d| d.result.is_none())
+            .collect();
+        if let Some(last) = self.run_dispatches().pop()
+            && last.result.is_none()
+        {
+            out.push(last);
+        }
+        out.sort_by_key(Dispatch::seq);
+        out
+    }
+
     /// Whether the operator's cancel is recorded (`cancelled`).
     pub fn cancelled(&self) -> bool {
         self.events.iter().any(|e| matches!(e, Event::Cancelled(_)))

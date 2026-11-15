@@ -77,8 +77,24 @@ fn is_run_id(text: &str) -> bool {
 /// The sketch's `select_run(arg, cwd)` takes `command` too, so the candidates it lists are
 /// each that command's own line.
 pub fn select_run(command: &str, arg: Option<&OsStr>, cwd: &Path) -> Result<PathBuf> {
+    select_run_with(command, &[], arg, cwd)
+}
+
+/// `select_run` for a command whose candidates' lines need the rest of what was typed:
+/// each candidate's command is `<cli> <command> <run dir> <after…>` (`unpark`'s `--card` and
+/// `--note`), so it works as printed.
+pub fn select_run_with(
+    command: &str,
+    after: &[OsString],
+    arg: Option<&OsStr>,
+    cwd: &Path,
+) -> Result<PathBuf> {
+    let command = Command {
+        name: command,
+        after,
+    };
     let Some(arg) = arg else {
-        return from_cwd(command, cwd);
+        return from_cwd(&command, cwd);
     };
     match RunArg::parse(arg, cwd) {
         RunArg::Dir(dir) => Ok(dir),
@@ -92,7 +108,7 @@ pub fn select_run(command: &str, arg: Option<&OsStr>, cwd: &Path) -> Result<Path
                 .into_iter()
                 .filter(|r| r.meta.as_ref().and_then(|m| m.run_id.as_deref()) == Some(&id))
                 .collect();
-            one_named(command, arg, &runs, found)
+            one_named(&command, arg, &runs, found)
         }
         RunArg::Name(name) => {
             let runs = runs_dir_for(cwd, arg)?;
@@ -115,13 +131,27 @@ pub fn select_run(command: &str, arg: Option<&OsStr>, cwd: &Path) -> Result<Path
             } else {
                 by_dir
             };
-            one_named(command, arg, &runs, found)
+            one_named(&command, arg, &runs, found)
         }
     }
 }
 
+/// The command a candidate's line runs: its name, then the run, then what follows it.
+struct Command<'a> {
+    name: &'a str,
+    after: &'a [OsString],
+}
+
+#[cfg(test)]
+impl Command<'_> {
+    /// The command `name`, with nothing after the run.
+    fn named(name: &str) -> Command<'_> {
+        Command { name, after: &[] }
+    }
+}
+
 /// The one run that matched a name: the only one, else the only unfinished one.
-fn one_named(command: &str, arg: &OsStr, runs: &Path, found: Vec<Run>) -> Result<PathBuf> {
+fn one_named(command: &Command, arg: &OsStr, runs: &Path, found: Vec<Run>) -> Result<PathBuf> {
     if found.is_empty() {
         return Err(Error::msg(format!(
             "no run named {} under {}",
@@ -167,7 +197,7 @@ fn runs_dir(top: &Path) -> Result<PathBuf> {
     Ok(config::docs_dir_for(&config, top).join("runs"))
 }
 
-fn from_cwd(command: &str, cwd: &Path) -> Result<PathBuf> {
+fn from_cwd(command: &Command, cwd: &Path) -> Result<PathBuf> {
     let not_in_repo = || {
         Error::msg(format!(
             "no run found from {}: it is not in a Git repository (name the run directory)",
@@ -244,7 +274,7 @@ fn base_worktree_path(dir: &Path, meta: &RunMeta) -> Option<PathBuf> {
 
 /// The run among `runs` whose worktree is `wt`, if any: the only one, else the only
 /// unfinished one; several unfinished ones are listed.
-fn worktree_run(command: &str, wt: &LinkedWorktree, runs: &[Run]) -> Result<Option<PathBuf>> {
+fn worktree_run(command: &Command, wt: &LinkedWorktree, runs: &[Run]) -> Result<Option<PathBuf>> {
     let mine: Vec<&Run> = runs
         .iter()
         .filter(|r| {
@@ -274,7 +304,7 @@ fn worktree_run(command: &str, wt: &LinkedWorktree, runs: &[Run]) -> Result<Opti
 }
 
 /// The only unfinished run of the repository whose main working tree is `top`.
-fn repo_run(command: &str, top: &Path, runs_dir: &Path, runs: Vec<Run>) -> Result<PathBuf> {
+fn repo_run(command: &Command, top: &Path, runs_dir: &Path, runs: Vec<Run>) -> Result<PathBuf> {
     let top_real = real_path(top);
     let open: Vec<Run> = runs
         .into_iter()
@@ -308,14 +338,19 @@ fn repo_run(command: &str, top: &Path, runs_dir: &Path, runs: Vec<Run>) -> Resul
 
 /// An error listing the run directories `dirs`, each with its command, one per line after
 /// the error line.
-fn candidates<'a>(head: &str, command: &str, dirs: impl IntoIterator<Item = &'a Path>) -> Error {
+fn candidates<'a>(
+    head: &str,
+    command: &Command,
+    dirs: impl IntoIterator<Item = &'a Path>,
+) -> Error {
     let mut message = head.to_string();
     for dir in dirs {
-        let argv = [
+        let mut argv = vec![
             testing::self_path().into_os_string(),
-            OsString::from(command),
+            OsString::from(command.name),
             dir.as_os_str().to_os_string(),
         ];
+        argv.extend_from_slice(command.after);
         message.push('\n');
         message.push_str(&human::command_line(&argv).to_string_lossy());
     }
@@ -467,18 +502,18 @@ mod tests {
             OPEN,
         );
         assert!(
-            repo_run("status", &repo, &runs, list_runs(&runs))
+            repo_run(&Command::named("status"), &repo, &runs, list_runs(&runs))
                 .unwrap_err()
                 .message
                 .starts_with("no unfinished run of ")
         );
         let live = make_run(&runs, "2026-01-02-live", &repo, &ws, OPEN);
         assert_eq!(
-            repo_run("status", &repo, &runs, list_runs(&runs)).unwrap(),
+            repo_run(&Command::named("status"), &repo, &runs, list_runs(&runs)).unwrap(),
             live
         );
         let second = make_run(&runs, "2026-01-04-live", &repo, &ws, BLOCKED);
-        let e = repo_run("report", &repo, &runs, list_runs(&runs)).unwrap_err();
+        let e = repo_run(&Command::named("report"), &repo, &runs, list_runs(&runs)).unwrap_err();
         let lines: Vec<&str> = e.message.lines().collect();
         assert!(lines[0].starts_with("2 unfinished runs of "), "{lines:?}");
         let cli = human::shell_quote(testing::self_path().as_os_str());
@@ -527,7 +562,7 @@ mod tests {
             let wt = git::linked_worktree(dir).unwrap().unwrap();
             assert_eq!(recorded_run(&wt), None);
             assert_eq!(
-                worktree_run("status", &wt, &list_runs(&runs)).unwrap(),
+                worktree_run(&Command::named("status"), &wt, &list_runs(&runs)).unwrap(),
                 Some(mine.clone()),
                 "{dir:?}"
             );

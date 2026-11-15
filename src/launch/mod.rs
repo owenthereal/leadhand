@@ -508,6 +508,18 @@ fn in_place_refusal(meta: &Meta, cli: &Path) -> Option<Vec<u8>> {
     Some(fix_refusal(&head, &start_command(meta, cli)))
 }
 
+/// The refusal `error: <head>` of a run that cannot continue, with the command that starts a
+/// new run of its deck alone on the last line (`unpark` on an ended run): `meta` is the run's
+/// `run.json` entries.
+pub(crate) fn new_run_refusal(head: &str, meta: &PyMap<Box<RawValue>>) -> Error {
+    let meta = Meta {
+        map: meta.clone(),
+        run_id: PyStr::default(),
+    };
+    let start = start_command(&meta, &testing::self_path());
+    Error::printed(fix_refusal(head.as_bytes(), &start))
+}
+
 /// Refuses an in-place run for the engine commands that act on its workspace (S2-R44), as
 /// `run` refuses it, with the same text: `meta` is the `run.json` entries the command loaded.
 /// A worktree run passes.

@@ -8,6 +8,7 @@ a command it doesn't list (`statu`, an unported command's `--help`) to the Pytho
 import os
 import signal
 import subprocess
+import time
 import unittest
 from pathlib import Path
 
@@ -146,6 +147,101 @@ class ReleaseBuild(unittest.TestCase):
                          hooked)
         self.assertFalse((self.tmp / "crash log").exists())
         self.assertFalse((self.tmp / "crash counter").exists())
+        self.assertIsNone(self.decoy.poll(), "the release build signalled LEADHAND_CRASH_KILL_PGID's group")
+        self.release_next_ignores_every_crash_point()
+
+    # The crash points `next` itself passes: the rest are a runner's (before/after_worker_launch)
+    # and the harness's workers' (before/after_commit).
+    NEXT_POINTS = {"before_rebase", "after_rebase", "before_fast_forward", "after_fast_forward",
+                   "before_result_record", "after_result_files", "after_charge_before_attempt",
+                   "after_cancel_request", "before_gate_record"}
+
+    def release_next_ignores_every_crash_point(self):
+        """`next` (Task 17): a whole run driven twice from the same deck with fixed commit dates,
+        as the crash matrix drives it (contract_recovery.StableSupervisor: a parked card unparked
+        and integrated, a Codex card with a fix round, an escalation, the end-of-run gates), and a
+        relaunch while a Codex dispatch was handed out but never run, so `next` reconciles it.
+
+        The reference run is the testing build, with no hook beyond the world's own; each `next`
+        logs the crash points it passes (LEADHAND_CRASH_LOG). The release run's every `next` gets
+        every hook set, with LEADHAND_CRASH_AT naming a point the same call of the reference run
+        passed, until each such point is named: it must never crash, log, count or signal, and
+        must reach the same final state."""
+        from unittest import mock
+        from contract_recovery import FIXED_DATE, StableSupervisor, resume
+        dates = mock.patch.dict(os.environ, {"GIT_AUTHOR_DATE": FIXED_DATE, "GIT_COMMITTER_DATE": FIXED_DATE})
+        dates.start()
+        self.addCleanup(dates.stop)
+        points = ("before_worker_launch", "after_worker_launch", *sorted(self.NEXT_POINTS),
+                  "before_commit", "after_commit")
+
+        def drive(w, next_action, until=lambda: False):
+            """The world's drive, with the relaunch, to its end or until `until()`; the actions
+            `next` returned, by call."""
+            w.session("supervisor-1")
+            w.start()
+            actions, relaunched = [], False
+            for _ in range(200):
+                w.operator()
+                a = next_action(w, len(actions))
+                actions.append(a)
+                if a["action"] == "done" or until():
+                    return actions
+                if a["action"] == "wait":
+                    time.sleep(0.1)
+                elif not relaunched and a["action"] == "dispatch" and a["agent"] == "leadhand:codex":
+                    relaunched = True
+                    resume(w)                    # the session died before its proxy ran
+                else:
+                    w.act(a)
+            self.fail("the run did not finish")
+
+        passed: list[list[str]] = []
+
+        def reference_next(w, i):
+            log = w.tmp / f"crash log {i}"
+            r = run_cli("next", w.run_dir, env=dict(w._env(), LEADHAND_CRASH_LOG=str(log)), cwd=w.tmp).ok()
+            passed.append(log.read_text(encoding="utf-8").split() if log.exists() else [])
+            return r.json()
+
+        ref = StableSupervisor(self)
+        reference = drive(ref, reference_next)
+        expected = ref.final_state()
+        self.assertEqual(expected["outcome"], ("complete", ""))
+        on_path = {p for call in passed for p in call}
+        self.assertEqual(on_path, self.NEXT_POINTS)
+
+        named: set[str] = set()
+        crash_files = (self.tmp / "next crash log", self.tmp / "next crash counter")
+
+        def release_next(w, i):
+            call = passed[i] if i < len(passed) else []
+            point = next((p for p in call if p not in named), call[0] if call else points[i % len(points)])
+            if point in call:
+                named.add(point)
+            env = dict(w._env(), PATH=f"{harness.FAKES}{os.pathsep}{w.env['PATH']}")
+            env.update({k: v for k, v in self.hooked.items() if k in self.HOOKS})
+            env.update(LEADHAND_CRASH_AT=point, LEADHAND_CRASH_LOG=str(crash_files[0]),
+                       LEADHAND_CRASH_COUNTER=str(crash_files[1]), LEADHAND_INSTALLED_VENDORS="claude")
+            r = self.run_release("next", str(w.run_dir), env=env)
+            self.assertEqual(r.code, 0, f"{point}: {r}")
+            return r.json()
+
+        w = StableSupervisor(self)
+        actions = drive(w, release_next)
+        self.assertEqual([(a["action"], a.get("dispatch_id")) for a in actions],
+                         [(a["action"], a.get("dispatch_id")) for a in reference])
+        self.assertEqual(w.final_state(), expected)
+        self.assertTrue(w.events("reconciled"))
+        # One call passes several points (the reconciling one passes four), and one `next` names
+        # one: the same run again, as far as it takes to name the rest.
+        for _ in range(4):
+            if named == self.NEXT_POINTS:
+                break
+            drive(StableSupervisor(self), release_next, until=lambda: named == self.NEXT_POINTS)
+        self.assertEqual(named, self.NEXT_POINTS)
+        for path in crash_files:
+            self.assertFalse(path.exists(), path)
         self.assertIsNone(self.decoy.poll(), "the release build signalled LEADHAND_CRASH_KILL_PGID's group")
 
 
