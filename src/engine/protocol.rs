@@ -85,10 +85,75 @@ pub fn voided_notes(notes: &PyStr) -> PyStr {
     out
 }
 
+/// The heading of the note a step that carries on from an interrupted dispatch gets in its
+/// brief (`engine.CONTINUE_NOTE`).
+pub const CONTINUE_NOTE: &str = "## The interrupted step";
+
+/// The brief notes for the step that carries on from interrupted dispatch `d`, added once
+/// (`engine._continue_notes`): `brief` is the run folder's copy of its brief, else the brief
+/// it was given.
+pub fn continue_notes(notes: &PyStr, kind: &str, dispatch_id: &str, brief: &PyStr) -> PyStr {
+    if notes.contains(CONTINUE_NOTE) {
+        return notes.clone();
+    }
+    let mut out = if notes.is_empty() {
+        PyStr::default()
+    } else {
+        let mut kept = notes.strip_ascii(b"\n", false);
+        kept.push_str("\n\n");
+        kept
+    };
+    out.push_str(&format!(
+        "{CONTINUE_NOTE}\n\nThis carries on from {kind} dispatch {dispatch_id}, whose worker \
+         stopped before it reported (its supervisor session ended). Its brief: "
+    ));
+    out.push(brief);
+    out.push_str(
+        ". Keep its commits; continue from the branch as it stands and write your report.",
+    );
+    out
+}
+
 /// A card dispatch's ID: `c<card>-a<attempt>-<kind>-<n>`, `n` counting that kind within the
 /// card's attempt (contract item 8).
 pub fn card_dispatch_id(card: u32, attempt: i64, kind: &str, n: usize) -> String {
     format!("c{card}-a{attempt}-{kind}-{n}")
+}
+
+/// A run-level dispatch's ID: `run-<kind>-<n>`, or `run-w<wave>-<kind>-<n>` in a fix wave, `n`
+/// counting that kind within the wave (contract item 8).
+pub fn run_dispatch_id(kind: &str, wave: Option<i64>, n: usize) -> String {
+    match wave {
+        None => format!("run-{kind}-{n}"),
+        Some(w) => format!("run-w{w}-{kind}-{n}"),
+    }
+}
+
+// --------------------------------------------------------------------------
+// The end of a run
+
+/// The commit-bound end-of-run gates, in the order they run (`engine.GATES`).
+pub const GATES: [&str; 4] = ["final_review", "evidence", "security", "verify"];
+/// The gates whose failure leaves open review findings (`engine.REVIEW_GATES`).
+pub const REVIEW_GATES: [&str; 2] = ["final_review", "security"];
+/// The run-level kinds that may build but must leave the workspace and the run's refs alone
+/// (`engine.RUN_CHECK_KINDS`).
+pub const RUN_CHECK_KINDS: [&str; 4] = ["final_review", "evidence", "security", "verify"];
+/// Fix waves per run (`engine.MAX_FINAL_FIX_WAVES`).
+pub const MAX_FINAL_FIX_WAVES: usize = 2;
+/// The fix waves' card branch suffix, and the `card` of their events (`engine.FINAL`).
+pub const FINAL: &str = "final";
+/// The risks, lowest first (`engine.RISKS`).
+pub const RISKS: [&str; 3] = ["low", "medium", "high"];
+
+/// The role a gate is resolved for, and whether it is the security review, which resolves to
+/// `reviewer_hard` (`engine.GATE_ROLES`).
+pub fn gate_role(gate: &str) -> (&'static str, bool) {
+    match gate {
+        "final_review" => ("final_reviewer", false),
+        "security" => ("reviewer", true),
+        _ => ("verifier", false),
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -559,5 +624,35 @@ mod tests {
         // Again on its own result: unchanged.
         assert_eq!(voided_notes(&ours[1]), ours[1]);
         assert_eq!(VIOLATION_CAP, 2);
+    }
+
+    #[test]
+    fn continue_notes_add_the_note_once_as_the_python_does() {
+        let code = "import json, sys\nfrom leadhand import engine\n\
+                    class D:\n\
+                    \x20   kind = 'final_fix'\n\
+                    \x20   id = 'run-w1-final_fix-1'\n\
+                    \x20   result = {'files': {'brief': '/run/cards/run/run-w1-final_fix-1/brief.md'}}\n\
+                    \x20   req = {'brief': '/ws/brief.md'}\n\
+                    print(json.dumps([engine._continue_notes(n, D()) for n in sys.argv[1:]]))";
+        let notes = [
+            "",
+            "## Fix wave\n\nkeep\n\n",
+            "caf\u{e9}",
+            "x\n\n## The interrupted step\n",
+        ];
+        let args: Vec<&std::ffi::OsStr> = notes.iter().map(std::ffi::OsStr::new).collect();
+        let theirs: Vec<PyStr> = serde_json::from_slice(&python(code, &args)).unwrap();
+        let brief = PyStr::from("/run/cards/run/run-w1-final_fix-1/brief.md");
+        let ours: Vec<PyStr> = notes
+            .iter()
+            .map(|n| continue_notes(&(*n).into(), "final_fix", "run-w1-final_fix-1", &brief))
+            .collect();
+        assert_eq!(ours, theirs);
+        assert_eq!(run_dispatch_id("evidence", None, 2), "run-evidence-2");
+        assert_eq!(
+            run_dispatch_id("final_fix", Some(1), 1),
+            "run-w1-final_fix-1"
+        );
     }
 }

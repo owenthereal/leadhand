@@ -13,33 +13,24 @@
 //! Crash points sit at the Python's positions (S2-R34): `before_rebase` after the `keep` ref
 //! is written, `after_rebase` before `rebased` or `conflict` is recorded.
 
-use std::ffi::OsStr;
-
-use super::cards::{Log, Run, is_card};
+use super::cards::{Log, Run, card_branch, is_card, os};
 use super::violations::{ensure_clean, run_id};
 use crate::error::{Error, Result};
-use crate::git::cards::{branch_ref, card_branch_name, is_ancestor, rebase_onto};
+use crate::git::cards::{branch_ref, is_ancestor, rebase_onto};
 use crate::git::workspace::head;
 use crate::state::events::{self, IntegrationStarted};
 use crate::state::{CardRef, Event, append_event};
 use crate::testing::crash_point;
 use crate::wire::PyStr;
 
-fn os(s: &str) -> &OsStr {
-    OsStr::new(s)
-}
-
 /// The card's branch as the run records it, else the name it is cut under.
-fn card_branch(run: &Run, log: &Log, card: u32) -> Result<PyStr> {
+fn branch_of(run: &Run, log: &Log, card: u32) -> Result<PyStr> {
     let cards = log.cards(&run.numbers());
     // `fold_cards(events, ctx.numbers)[card]`.
     let c = cards
         .get(&card)
         .ok_or_else(|| Error::msg(format!("KeyError: {card}")))?;
-    Ok(c.branch
-        .clone()
-        .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| card_branch_name(&run.branch, &card.to_string())))
+    Ok(card_branch(run, c))
 }
 
 /// Integrates a card whose branch does not contain the run tip (`_accept`'s first branch):
@@ -47,7 +38,7 @@ fn card_branch(run: &Run, log: &Log, card: u32) -> Result<PyStr> {
 /// that keeps it, then rebases.
 pub(super) fn integrate(run: &Run, card: u32) -> Result<()> {
     let log = Log::read(&run.paths)?;
-    let branch = card_branch(run, &log, card)?;
+    let branch = branch_of(run, &log, card)?;
     let git = run.git()?;
     let k = 1 + log
         .events
@@ -77,7 +68,7 @@ pub(super) fn integrate(run: &Run, card: u32) -> Result<()> {
 /// after a crash between the intent and its outcome).
 pub(super) fn rebase_again(run: &Run, card: u32) -> Result<()> {
     let log = Log::read(&run.paths)?;
-    let branch = card_branch(run, &log, card)?;
+    let branch = branch_of(run, &log, card)?;
     let integ = log
         .events
         .iter()

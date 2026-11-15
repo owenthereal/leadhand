@@ -39,7 +39,7 @@ use crate::wire::PyStr;
 /// `hidden_index_entries`: the tracked paths, in the whole checkout and named from its top,
 /// whose index entry hides an edit from `status` and `diff`: assume-unchanged (a lowercase
 /// `git ls-files -v` tag) or skip-worktree (`S`).
-fn hidden_index_entries(git: &Git) -> Result<Vec<Vec<u8>>> {
+pub fn hidden_index_entries(git: &Git) -> Result<Vec<Vec<u8>>> {
     let out = git.run(&[
         os("ls-files"),
         os("-v"),
@@ -501,7 +501,7 @@ fn sha_of(out: &[u8]) -> String {
 }
 
 /// `os.path.lexists`: whether anything, a dangling symlink included, is at `path`.
-fn lexists(path: &Path) -> bool {
+pub fn lexists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 

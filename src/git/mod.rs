@@ -2,12 +2,14 @@
 //! directory belongs to (spec, "Which repository and run a directory belongs to"), and what a
 //! worker changed and how its work is staged for the runner's commit (`stage`), a run's base
 //! and worktree (`workspace`), its card branches, integration and acceptance (`cards`), and a
-//! worker's changes found, kept and undone (`preserve`).
+//! worker's changes found, kept and undone (`preserve`), and the evidence base worktree
+//! (`base_worktree`).
 //!
 //! Nothing outside this module starts a `git` process: later modules call `Git` only. The
 //! one other place that runs `git` is the unit tests' fixture below, which plays the operator
 //! and the workers (the Python's `tests/gitfixture.py`), and exists only under `cfg(test)`.
 
+pub mod base_worktree;
 pub mod cards;
 pub mod preserve;
 mod repo;

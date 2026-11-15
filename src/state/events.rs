@@ -392,16 +392,20 @@ event!(
     }
 );
 
-event!(VerdictRecorded {
-    card: Option<CardRef>,
-    #[serde(deserialize_with = "wire::present", skip_serializing_if = "Option::is_none")]
-    wave: Opt<i64>,
-    verdict: Option<String>,
-    findings: Option<PyStr>,
-    dispatch_id: Option<String>,
-    #[serde(deserialize_with = "wire::present", skip_serializing_if = "Option::is_none")]
-    reason: Opt<PyStr>,
-});
+event!(
+    /// A review's verdict; a fix wave's implementer that spent its wave records `spent` with
+    /// its `reason`, which comes right after the verdict, as the Python writes it.
+    VerdictRecorded {
+        card: Option<CardRef>,
+        #[serde(deserialize_with = "wire::present", skip_serializing_if = "Option::is_none")]
+        wave: Opt<i64>,
+        verdict: Option<String>,
+        #[serde(deserialize_with = "wire::present", skip_serializing_if = "Option::is_none")]
+        reason: Opt<PyStr>,
+        findings: Option<PyStr>,
+        dispatch_id: Option<String>,
+    }
+);
 
 event!(FixRound {
     card: Option<CardRef>,
@@ -542,13 +546,17 @@ event!(GateStarted {
     dispatch_id: Option<String>,
 });
 
-event!(GateResult {
-    gate: Option<String>,
-    examined_sha: Option<String>,
-    passed: Option<bool>,
-    findings: Option<PyStr>,
-    dispatch_id: Option<String>,
-});
+event!(
+    /// A gate's result on the commit it examined, in the Python's field order (`dispatch_id`
+    /// before `findings`).
+    GateResult {
+        gate: Option<String>,
+        examined_sha: Option<String>,
+        passed: Option<bool>,
+        dispatch_id: Option<String>,
+        findings: Option<PyStr>,
+    }
+);
 
 event!(Outcome {
     outcome: Option<String>,
@@ -914,6 +922,49 @@ mod tests {
         assert_eq!(events.len(), 6);
         for ((event, _), line) in events.iter().zip(&lines) {
             // The lines are ASCII JSON.
+            assert_eq!(
+                wire::to_line(event).unwrap(),
+                String::from_utf8(line.to_vec()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn every_end_of_run_record_the_python_writes_is_written_back_byte_for_byte() {
+        // The records of the end of a run, with the fields in the order the engine's calls
+        // give them (`_request_run`, `_after_run_result`, `_settle_spent`, `_start_wave`,
+        // `_recut_final`, `_end`, `_wrap_up`, `_base_worktree`).
+        let dir = run_dir();
+        let paths = run_paths(dir.path());
+        let write = "import sys\nfrom pathlib import Path\nfrom leadhand import state\n\
+                     paths = state.run_paths(Path(sys.argv[1]))\n\
+                     a = state.append_event\n\
+                     h = 'e' * 40\n\
+                     a(paths, 'gate_started', gate='evidence', examined_sha=h, dispatch_id='run-evidence-1')\n\
+                     a(paths, 'gate_result', gate='evidence', examined_sha=h, passed=False,\n\
+                     \x20 dispatch_id='run-evidence-1', findings='/r/cards/run/run-evidence-1/report.md')\n\
+                     a(paths, 'card_cut', card='final', branch='leadhand/r--card-final', base=h, wave=1)\n\
+                     a(paths, 'card_cut', card='final', branch='leadhand/r--card-final', base=h, wave=1,\n\
+                     \x20 recut_after='run-w1-final_fix-1')\n\
+                     a(paths, 'verdict_recorded', card='final', wave=1, verdict='spent', reason='changed nothing',\n\
+                     \x20 findings='/r/x.md', dispatch_id='run-w1-final_fix-1')\n\
+                     a(paths, 'verdict_recorded', card='final', wave=1, verdict='clean', findings='/r/y.md',\n\
+                     \x20 dispatch_id='run-w1-final_review-1')\n\
+                     a(paths, 'accept_started', card='final', wave=1, target=h, dispatch_id='run-w1-final_review-1')\n\
+                     a(paths, 'accepted', card='final', wave=1, sha=h, dispatch_id='run-w1-final_review-1')\n\
+                     a(paths, 'outcome', outcome='complete', qualifier='', reasons=[], next_step='none', head=h)\n\
+                     a(paths, 'report_written', report='/r/report.md', outcome='complete', outcome_seq=10)\n\
+                     a(paths, 'base_worktree_added', path='/w/b--base')\n\
+                     a(paths, 'base_worktree_ready', path='/w/b--base')\n";
+        python(write, &[dir.path().as_os_str()]);
+        let file = fs::read(&paths.events).unwrap();
+        let events = read_events(&paths).unwrap();
+        let lines: Vec<&[u8]> = file
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(events.len(), 12);
+        for ((event, _), line) in events.iter().zip(&lines) {
             assert_eq!(
                 wire::to_line(event).unwrap(),
                 String::from_utf8(line.to_vec()).unwrap()

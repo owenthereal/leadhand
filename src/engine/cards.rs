@@ -9,12 +9,13 @@
 //! The steps the shell carries out are `shell`'s; the pure decisions `next`'s.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
-use super::protocol::{ACTIVE_STATES, CardRow};
+use super::protocol::{ACTIVE_STATES, CardRow, FINAL};
 use crate::briefs_write::strip_pystr;
 use crate::config::{Config, Route, load_run_config};
 use crate::deck::{Card, Deck, dependency_order, parse_deck};
@@ -653,21 +654,71 @@ pub(crate) fn current_session(run: &Run) -> Option<PyStr> {
     crate::dispatch::field::<Vec<PyStr>>(&meta, "supervisor_sessions")?.pop()
 }
 
-/// The branch a dispatch works on: its card branch (`_work_branch`); the Codex runner commits
-/// implementer work there (R39).
+/// The branch a dispatch works on (`_work_branch`): its card branch, the final fix branch for
+/// a fix wave's implementer, else the run branch. The Codex runner commits implementer work
+/// there (R39).
 pub(crate) fn work_branch(
     run: &Run,
     cards: &BTreeMap<u32, CardState>,
     d: &Dispatch,
 ) -> Result<PyStr> {
     let Some(card) = &d.req.card else {
-        return Ok(run.branch.clone());
+        return Ok(if d.kind() == "final_fix" {
+            final_branch(run)
+        } else {
+            run.branch.clone()
+        });
     };
     let c = card_state(cards, Some(card))?;
     Ok(c.branch
         .clone()
         .filter(|b| !b.is_empty())
         .unwrap_or_else(|| card_branch_name(&run.branch, &card.text().lossy())))
+}
+
+/// `refs/heads/<branch>`.
+pub fn heads(branch: &PyStr) -> PyStr {
+    let mut name = PyStr::from("refs/heads/");
+    name.push(branch);
+    name
+}
+
+/// `OsStr::new`, for the words of a command line.
+pub(super) fn os(s: &str) -> &OsStr {
+    OsStr::new(s)
+}
+
+/// The card's branch as the run records it, else the name it is cut under
+/// (`c.branch or card_branch_name(ctx.branch, n)`).
+pub fn card_branch(run: &Run, c: &CardState) -> PyStr {
+    c.branch
+        .clone()
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| card_branch_name(&run.branch, &c.number.to_string()))
+}
+
+/// The fix waves' branch, `<run branch>--card-final` (`_final_branch`).
+pub fn final_branch(run: &Run) -> PyStr {
+    card_branch_name(&run.branch, FINAL)
+}
+
+/// Whether an event's `card` is the fix waves' (`e.get("card") == FINAL`).
+pub fn is_final(card: Option<&CardRef>) -> bool {
+    matches!(card, Some(CardRef::Text(t)) if t.as_wtf8() == FINAL.as_bytes())
+}
+
+/// The accepted deck cards, in dependency order (`_accepted_cards`).
+pub fn accepted_cards<'r>(run: &'r Run, cards: &BTreeMap<u32, CardState>) -> Result<Vec<&'r Card>> {
+    let mut out = Vec::new();
+    for n in dependency_order(&run.deck)? {
+        if cards
+            .get(&n)
+            .is_some_and(|c| c.state == CardStage::Accepted)
+        {
+            out.push(run.card(n)?);
+        }
+    }
+    Ok(out)
 }
 
 /// The state of the card an event or command names (`engine._card_state`).

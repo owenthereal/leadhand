@@ -14,7 +14,6 @@ use serde::Serialize;
 use serde_json::value::RawValue;
 
 use super::cards::{Dispatch, Log, Run, current_session, session_env};
-use super::integrate;
 use super::next::{Decision, DiffCheck, Need, Observations, Request, RunState, decide};
 use super::protocol::{
     Action, CHECK_KINDS, CheckDiffAction, IMPLEMENTER_KINDS, MAX_STEPS, REPLY_FILE, now, tag,
@@ -22,8 +21,9 @@ use super::protocol::{
 use super::record::{cancel_codex, store_result};
 use super::report_text::read_text;
 use super::violations::{self, ensure_clean, find_violation};
+use super::{finish, gates, integrate};
 use crate::briefs_write::{BriefSpec, remove_scratch_file, write_brief};
-use crate::config::limits_key;
+use crate::config::{Route, limits_key};
 use crate::dispatch::{DispatchResult, ExitReason, load_result};
 use crate::error::{Error, Result};
 use crate::git::cards::{
@@ -161,6 +161,15 @@ fn gather(st: &RunState, obs: &mut Observations, need: Need) -> Result<()> {
             let tip = head(&run.git()?, &branch_ref(&branch)?)?;
             obs.tips.insert(branch, tip);
         }
+        Need::BaseGuard(id) => {
+            let d = dispatch_of(st, &id)?;
+            let found = violations::base_violation(run, &st.log, &d)?;
+            obs.base_guards.insert(id, found);
+        }
+        Need::Ancestor(name, sha) => {
+            let yes = is_ancestor(&run.git()?, &name.to_os()?, OsStr::new(&sha))?;
+            obs.ancestors.insert((name, sha), yes);
+        }
     }
     Ok(())
 }
@@ -217,14 +226,18 @@ fn execute(st: &RunState, obs: &Observations, decision: Decision) -> Result<Opti
         }
         Decision::Integrate { card } => integrate::integrate(run, card).map(|()| None),
         Decision::Rebase { card } => integrate::rebase_again(run, card).map(|()| None),
-        Decision::End(ending) => Err(Error::msg(format!(
-            "not ported yet: ending the run{} (Task 16)",
-            match (&ending.blocked, &ending.unreconciled) {
-                (Some(b), _) => format!(" blocked ({})", b.as_str()),
-                (None, Some(why)) => format!(" failed: {why}"),
-                (None, None) => String::new(),
-            }
-        ))),
+        Decision::End(ending) => finish::end(st, &ending).map(|()| None),
+        Decision::WrapUp => finish::wrap_up(run).map(Some),
+        Decision::RunRequest(r) => gates::request_run(st, &r).map(|()| None),
+        Decision::CutFinal { wave, head } => gates::cut_final(st, wave, &head).map(|()| None),
+        Decision::RecutFinal { dispatch_id } => gates::recut_final(st, &dispatch_id).map(|()| None),
+        Decision::RecordGate(event) => gates::record_gate(run, *event).map(|()| None),
+        Decision::AcceptFix {
+            dispatch_id,
+            wave,
+            target,
+            started,
+        } => gates::accept_fix(run, &dispatch_id, wave, &target, started).map(|()| None),
         Decision::Unported { what, task } => {
             Err(Error::msg(format!("not ported yet: {what} (Task {task})")))
         }
@@ -262,15 +275,16 @@ fn store_codex(st: &RunState, d: &Dispatch, result: &DispatchResult) -> Result<(
     Ok(())
 }
 
-/// Refuses to touch the workspace for `card` while another card's worker, or a run-level
-/// worker, may be using it (`_no_open_dispatch`).
-fn no_open_dispatch(st: &RunState, card: u32) -> Result<()> {
+/// Refuses to touch the workspace for `card` (`None`: for the run) while another card's
+/// worker, or for a card a run-level worker, may be using it (`_no_open_dispatch`).
+pub(super) fn no_open_dispatch(st: &RunState, card: Option<u32>) -> Result<()> {
+    let shown = card.map_or_else(|| "None".to_string(), |c| c.to_string());
     for d in st.log.dispatches() {
         if d.result.is_some() {
             continue;
         }
         match &d.req.card {
-            Some(CardRef::Number(other)) if *other != i64::from(card) => {
+            Some(CardRef::Number(other)) if card.is_none_or(|c| *other != i64::from(c)) => {
                 let open = u32::try_from(*other)
                     .ok()
                     .and_then(|o| st.cards.get(&o))
@@ -280,14 +294,14 @@ fn no_open_dispatch(st: &RunState, card: u32) -> Result<()> {
                     });
                 if open {
                     return Err(Error::msg(format!(
-                        "card {other} has dispatch {} open; card {card} must wait for it",
+                        "card {other} has dispatch {} open; card {shown} must wait for it",
                         d.id()
                     )));
                 }
             }
-            None => {
+            None if card.is_some() => {
                 return Err(Error::msg(format!(
-                    "the run's dispatch {} is open; card {card} must wait for it",
+                    "the run's dispatch {} is open; card {shown} must wait for it",
                     d.id()
                 )));
             }
@@ -297,10 +311,10 @@ fn no_open_dispatch(st: &RunState, card: u32) -> Result<()> {
     Ok(())
 }
 
-/// Puts the workspace on the card branch when HEAD is on another one (`_check_out`): never
-/// while another card has a dispatch open; leftovers in the way are kept and cleared first
-/// (R30). Never creates the branch.
-fn check_out(st: &RunState, card: u32, branch: &PyStr) -> Result<()> {
+/// Puts the workspace on `branch` (the card's, or for the run the run or final branch) when
+/// HEAD is on another one (`_check_out`): never while another card has a dispatch open;
+/// leftovers in the way are kept and cleared first (R30). Never creates the branch.
+pub(super) fn check_out(st: &RunState, card: Option<u32>, branch: &PyStr) -> Result<()> {
     let git = st.run.git()?;
     let current = current_branch(&git);
     if current.as_ref() == Some(branch) {
@@ -332,7 +346,7 @@ fn check_out(st: &RunState, card: u32, branch: &PyStr) -> Result<()> {
 /// in the workspace are kept and cleared instead, and the cut is the next step's.
 fn cut_card(st: &RunState, n: u32) -> Result<()> {
     let run = st.run;
-    no_open_dispatch(st, n)?;
+    no_open_dispatch(st, Some(n))?;
     let git = run.git()?;
     let current = current_branch(&git);
     let why = PyStr::from(format!("before cutting card {n}"));
@@ -367,14 +381,31 @@ fn cut_card(st: &RunState, n: u32) -> Result<()> {
 
 /// The guard a dispatch records: what its worker must leave as it found it.
 #[derive(Default)]
-struct Guard {
-    expected_branch: Opt<PyStr>,
-    expected_head: Opt<String>,
-    refs: Opt<PyMap<Option<String>>>,
-    ref_scope: Opt<Vec<PyStr>>,
-    start_tip: Opt<String>,
-    untracked: Opt<Vec<PyStr>>,
-    continues: Opt<String>,
+pub(super) struct Guard {
+    pub expected_branch: Opt<PyStr>,
+    pub expected_head: Opt<String>,
+    pub refs: Opt<PyMap<Option<String>>>,
+    pub ref_scope: Opt<Vec<PyStr>>,
+    pub start_tip: Opt<String>,
+    pub untracked: Opt<Vec<PyStr>>,
+    pub continues: Opt<String>,
+}
+
+/// What `dispatch_requested` records of a dispatch, beside its guard: a card's, or a
+/// run-level one's (`card` `None`, with its `gate` and `wave`).
+pub(super) struct NewDispatch<'a> {
+    pub dispatch_id: &'a str,
+    pub card: Option<u32>,
+    pub attempt: i64,
+    pub kind: &'a str,
+    pub role: &'a str,
+    pub route: &'a Route,
+    pub extra: &'a PyMap<Option<PyStr>>,
+    pub notes: &'a PyStr,
+    /// The dispatch whose worker this one resumes.
+    pub resume: Option<&'a str>,
+    pub gate: Opt<String>,
+    pub wave: Opt<i64>,
 }
 
 /// Writes the brief and appends `dispatch_requested` (`_request`, `_append_request`).
@@ -399,7 +430,7 @@ fn request_dispatch(st: &RunState, r: &Request) -> Result<()> {
     }
     let mut guard = Guard::default();
     if let Some(branch) = c.branch.as_ref().filter(|b| !b.is_empty()) {
-        check_out(st, r.card, branch)?;
+        check_out(st, Some(r.card), branch)?;
         let git = run.git()?;
         let card_ref = branch_ref(branch)?;
         if CHECK_KINDS.contains(&r.kind.as_str()) {
@@ -454,13 +485,26 @@ fn request_dispatch(st: &RunState, r: &Request) -> Result<()> {
         extra: &full,
         notes: &r.notes,
     })?;
-    append_request(st, r, &brief, &report, guard)
+    let new = NewDispatch {
+        dispatch_id: &r.dispatch_id,
+        card: Some(r.card),
+        attempt: r.attempt,
+        kind: &r.kind,
+        role: &r.role,
+        route: &r.route,
+        extra: &r.extra,
+        notes: &r.notes,
+        resume: r.resume.as_deref(),
+        gate: None,
+        wave: None,
+    };
+    append_request(st, &new, &brief, &report, guard)
 }
 
 /// Appends `dispatch_requested` for a brief already written (`_append_request`).
-fn append_request(
+pub(super) fn append_request(
     st: &RunState,
-    r: &Request,
+    r: &NewDispatch,
     brief: &Path,
     report: &Path,
     guard: Guard,
@@ -473,9 +517,9 @@ fn append_request(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     for name in [report_name.as_str(), REPLY_FILE] {
-        remove_scratch_file(&run.ws, Some(r.card.into()), &r.dispatch_id, name)?;
+        remove_scratch_file(&run.ws, r.card.map(i64::from), r.dispatch_id, name)?;
     }
-    let resume = r.resume.as_deref().and_then(|id| st.log.dispatch(Some(id)));
+    let resume = r.resume.and_then(|id| st.log.dispatch(Some(id)));
     let (mut resume_worker, mut resume_session) = (None, None);
     if let Some(resume) = &resume {
         if r.route.vendor == "claude" {
@@ -489,7 +533,7 @@ fn append_request(
             resume_session = resume.result.and_then(|res| res.session_id.clone());
         }
     }
-    let key = limits_key(&r.role);
+    let key = limits_key(r.role);
     let Some(limits) = run.config.limits_for(key) else {
         return Err(Error::msg(format!(
             "limits.{key}: not configured (role {})",
@@ -499,11 +543,11 @@ fn append_request(
     append_event(
         &run.paths,
         Event::DispatchRequested(events::DispatchRequested {
-            dispatch_id: Some(r.dispatch_id.clone()),
-            card: Some(CardRef::Number(r.card.into())),
+            dispatch_id: Some(r.dispatch_id.to_string()),
+            card: r.card.map(|c| CardRef::Number(c.into())),
             attempt: Some(r.attempt),
-            dispatch_kind: Some(r.kind.clone()),
-            role: Some(r.role.clone()),
+            dispatch_kind: Some(r.kind.to_string()),
+            role: Some(r.role.to_string()),
             vendor: Some(r.route.vendor.clone()),
             model: Some(r.route.model.clone()),
             effort: Some(r.route.effort.clone()),
@@ -515,6 +559,8 @@ fn append_request(
             resume_worker,
             resume_session,
             minutes: Some(limits.minutes),
+            gate: r.gate.clone(),
+            wave: r.wave,
             expected_branch: guard.expected_branch,
             expected_head: guard.expected_head,
             refs: guard.refs,

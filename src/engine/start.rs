@@ -352,7 +352,7 @@ fn new_run(
 
 /// Today's local date as `YYYY-MM-DD` (Python's `date.today().isoformat()`): the real clock,
 /// as the Python's.
-fn today() -> Result<String> {
+pub(crate) fn today() -> Result<String> {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());

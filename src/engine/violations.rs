@@ -15,19 +15,27 @@
 //!   `refs/leadhand/<run id>/leftovers/<n>` and cleared, as `violation{by: implementer}`. It
 //!   voids nothing.
 //!
-//! Every Git call runs in the run's worktree (`Run::git`), never in the operator's checkout.
-//! Deciding what follows a void (a re-run, or the card parked at the cap) is `next`'s.
+//! - After an evidence result, the evidence base worktree must still be at the base commit with
+//!   no tracked change; otherwise the result is void too (`violation{base_worktree}`), its moved
+//!   HEAD kept on `refs/leadhand/<run id>/violations/<n>-base` and the base worktree put back.
+//!
+//! Every Git call runs in the run's worktree (`Run::git`), or in the run's evidence base
+//! worktree, never in the operator's checkout. Deciding what follows a void (a re-run, the card
+//! parked at the cap, or the run ended blocked at a run-level cap) is `next`'s.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::ffi::OsStr;
+use std::path::Path;
 
-use super::cards::{Dispatch, Log, Run, by};
+use super::cards::{Dispatch, Log, Run, by, heads, os};
 use crate::dispatch::untracked_to_take;
 use crate::error::{Error, Result};
 use crate::git::cards::{branch_ref, card_branch_name, operation, ref_snapshot};
-use crate::git::preserve::{checkout_top, detect_violation, preserve_and_restore, violation_paths};
+use crate::git::preserve::{
+    checkout_top, detect_violation, lexists, preserve_and_restore, violation_paths,
+};
 use crate::git::workspace::head;
-use crate::git::{GIT_TIMEOUT, untracked_files};
+use crate::git::{GIT_TIMEOUT, Git, untracked_files};
+use crate::pytext::path_text;
 use crate::state::events::{self, RefMove, given};
 use crate::state::{Event, append_event};
 use crate::wire::{PyMap, PyStr};
@@ -42,10 +50,6 @@ pub(super) fn run_id(run: &Run) -> Result<&str> {
 /// The Python's `KeyError` on a field a record lacks, as an error line (S2-R43).
 fn key_error(field: &str) -> Error {
     Error::msg(format!("KeyError: '{field}'"))
-}
-
-fn os(s: &str) -> &OsStr {
-    OsStr::new(s)
 }
 
 // --------------------------------------------------------------------------
@@ -193,11 +197,6 @@ fn engine_writes(
 ) -> (HashMap<PyStr, Option<String>>, HashSet<PyStr>) {
     let mut latest: HashMap<PyStr, Option<String>> = HashMap::new();
     let mut owned: HashSet<PyStr> = HashSet::new();
-    let heads = |branch: &PyStr| {
-        let mut name = PyStr::from("refs/heads/");
-        name.push(branch);
-        name
-    };
     for e in log.events.iter().filter(|e| e.seq() > after) {
         match e {
             Event::Accepted(a) => {
@@ -268,10 +267,8 @@ pub(super) fn void(run: &Run, dispatch_id: &str, found: Option<events::Violation
         return Ok(());
     }
     if found.base_worktree.is_some() {
-        // An evidence worker that changed the base worktree (`_restore_base`).
-        return Err(Error::msg(
-            "not ported yet: restoring the evidence base worktree (Task 16)",
-        ));
+        // An evidence worker that changed the base worktree.
+        return restore_base(run, found);
     }
     let preserved = given(&found.preserved)
         .cloned()
@@ -381,6 +378,113 @@ fn restore_violation(
     Ok((saved, siblings))
 }
 
+// --------------------------------------------------------------------------
+// The evidence base worktree
+
+/// After an evidence result, whether the base worktree is still at the base commit with no
+/// tracked change (`_base_violation`'s check): the `found` record to void the result with when
+/// it is not, else `None`. Nothing is recorded here; an edit hidden behind an index flag shows
+/// again (the flag is cleared), as every check does. A moved HEAD is to be kept on
+/// `refs/leadhand/<run id>/violations/<n>-base`.
+pub(super) fn base_violation(
+    run: &Run,
+    log: &Log,
+    d: &Dispatch,
+) -> Result<Option<events::Violation>> {
+    let req = d.req;
+    let path = super::gates::base_worktree_at(run, d);
+    let base = &run.base_sha;
+    // A worktree Git cannot read counts as moved, with nothing to keep.
+    let (hidden, now, dirty) = base_state(&path).unwrap_or_default();
+    if now.as_deref() == Some(base.as_str()) && dirty.is_empty() && hidden.is_empty() {
+        return Ok(None);
+    }
+    let n = 1 + log
+        .check_violations()
+        .filter(|e| e.stage.as_deref() == Some("found"))
+        .count();
+    let keep = PyStr::from(format!(
+        "refs/leadhand/{}/violations/{n}-base",
+        run_id(run)?
+    ));
+    let moved = now.as_deref() != Some(base.as_str());
+    let mut preserved = PyMap::default();
+    if now.is_some() && moved {
+        preserved.0.push((PyStr::from("base"), keep));
+    }
+    Ok(Some(events::Violation {
+        stage: Some("found".into()),
+        by: Some("check".into()),
+        dispatch_id: Some(Some(d.id().to_string())),
+        card: Some(None),
+        dispatch_kind: Some(Some(d.kind().to_string())),
+        n: Some(i64::try_from(n).unwrap_or(i64::MAX)),
+        r#ref: None,
+        base_worktree: Some(Some(path_text(&path))),
+        base_head: Some(now),
+        paths: Some(Some(dirty)),
+        head_moved: Some(Some(moved)),
+        index_dirty: Some(Some(false)),
+        expected_head: Some(given(&req.expected_head).cloned()),
+        expected_branch: Some(given(&req.expected_branch).cloned()),
+        refs: Some(Some(PyMap::default())),
+        preserved: Some(Some(preserved)),
+        ..events::Violation::default()
+    }))
+}
+
+/// The base worktree's hidden entries (now cleared), HEAD and changed tracked paths, as
+/// `_base_violation` reads them (`status --porcelain` lines from their fourth character on,
+/// sorted).
+fn base_state(path: &Path) -> Result<(Vec<PyStr>, Option<String>, Vec<PyStr>)> {
+    let git = Git::at(path)?;
+    let hidden = crate::git::unhide_index_entries(&git)?;
+    let (now, dirty) = crate::git::base_worktree::head_and_status(&git)?;
+    Ok((hidden, Some(now), dirty))
+}
+
+/// Keeps the base HEAD an evidence worker moved on its ref, puts the base worktree back and
+/// records `restored` (`_restore_base`). Repeat-safe: after a crash in between, `void` calls it
+/// again.
+fn restore_base(run: &Run, found: &events::Violation) -> Result<()> {
+    let preserved = given(&found.preserved).cloned().unwrap_or_default();
+    let base_head = given(&found.base_head).cloned();
+    if let (Some(keep), Some(head)) = (
+        preserved
+            .get(&PyStr::from("base"))
+            .filter(|k| !k.is_empty()),
+        base_head.as_ref().filter(|h| !h.is_empty()),
+    ) {
+        run.git()?.run(&[
+            os("update-ref"),
+            os("-m"),
+            os("leadhand: keep a base worktree a verifier moved"),
+            &keep.to_os()?,
+            os(head),
+        ])?;
+    }
+    super::gates::base_worktree(run)?;
+    let preserved = given(&found.preserved)
+        .cloned()
+        .ok_or_else(|| key_error("preserved"))?;
+    append_event(
+        &run.paths,
+        Event::Violation(events::Violation {
+            stage: Some("restored".into()),
+            by: Some("check".into()),
+            dispatch_id: Some(given(&found.dispatch_id).cloned()),
+            card: Some(None),
+            n: found.n,
+            r#ref: None,
+            saved: Some(base_head),
+            siblings: Some(Some(Vec::new())),
+            preserved: Some(Some(preserved)),
+            ..events::Violation::default()
+        }),
+    )?;
+    Ok(())
+}
+
 /// The siblings of `saved_ref` the snapshot lists: `<ref>-branch`, `<ref>-autostash`.
 fn present_siblings(saved_ref: &PyStr, now: &PyMap<String>) -> Vec<PyStr> {
     ["-branch", "-autostash"]
@@ -474,10 +578,7 @@ pub(super) fn finish_leftovers(run: &Run, pending: &[&events::Violation]) -> Res
             .map(Vec::as_slice)
             .unwrap_or_default()
             .iter()
-            .filter(|p| {
-                p.to_os()
-                    .is_ok_and(|rel| std::fs::symlink_metadata(top.join(rel)).is_ok())
-            })
+            .filter(|p| p.to_os().is_ok_and(|rel| lexists(&top.join(rel))))
             .cloned()
             .collect();
         let saved_ref = f.r#ref.clone().ok_or_else(|| key_error("ref"))?;

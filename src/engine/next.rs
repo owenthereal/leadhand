@@ -16,21 +16,29 @@
 //! steps here: the I/O first (recording a violation and restoring it, clearing leftovers),
 //! then, on the next step, what follows from what it recorded.
 //!
-//! The end-of-run gates and the outcome, and recovery, are Tasks 16–17: where the loop reaches
-//! one of them, `decide` returns `Decision::Unported` (or `Decision::End`, the outcome's seam),
-//! and `next` fails with `not ported yet: …` rather than guess.
+//! The end of a run is decided in two child modules: `gates` (the commit-bound end-of-run gates,
+//! the fix waves they get, and which outcome the run ends with) and `run_level` (what follows
+//! a gate's or a fix wave's result). Carrying out the outcome, the branch release and the
+//! report is the shell's (`finish`, `release`). Recovery is Task 17's: where the loop reaches
+//! it, `decide` returns `Decision::Unported`, and `next` fails with `not ported yet: …` rather
+//! than guess.
+
+mod gates;
+mod run_level;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+pub(super) use gates::waiting_on_decisions;
+
 use super::cards::{
-    Dispatch, Log, Run, active, card_summary, is_card, pick, report_copy, work_branch,
+    Dispatch, Log, Run, active, card_branch, heads, is_card, pick, report_copy, work_branch,
 };
 use super::protocol::{
-    Action, AnswerAction, DispatchAction, DoneAction, IMPLEMENTER_KINDS, REPLY_FILE, REVIEW_KINDS,
-    Resume, RouteView, StopWorkerAction, VIOLATION_CAP, WaitAction, budget_seconds,
-    card_dispatch_id, format_time, parse_time, tag, voided_notes,
+    Action, AnswerAction, DispatchAction, IMPLEMENTER_KINDS, REPLY_FILE, REVIEW_KINDS, Resume,
+    RouteView, StopWorkerAction, VIOLATION_CAP, WaitAction, budget_seconds, card_dispatch_id,
+    format_time, parse_time, tag, voided_notes,
 };
 use super::report_text::question;
 use crate::briefs::{CODEX_AGENT, agent_for, scratch_dir};
@@ -38,7 +46,7 @@ use crate::briefs_write::dispatch_message;
 use crate::config::Route;
 use crate::dispatch::DispatchResult;
 use crate::error::Error;
-use crate::git::cards::{card_branch_name, is_test_or_doc_path};
+use crate::git::cards::is_test_or_doc_path;
 use crate::pytext::path_text;
 use crate::route::{RouteError, RouteRequest, resolve};
 use crate::state::events::{self, given};
@@ -104,6 +112,11 @@ pub struct Observations {
     pub merge_bases: HashMap<(PyStr, PyStr), String>,
     /// A branch's tip, by branch.
     pub tips: HashMap<PyStr, String>,
+    /// An evidence dispatch's base worktree checked, by dispatch ID: the `found` violation to
+    /// record when its worker changed the base worktree, `None` when it left it as it was.
+    pub base_guards: HashMap<String, Option<events::Violation>>,
+    /// Whether a ref's tip is in a commit's history, by (ref, commit) (`is_ancestor`).
+    pub ancestors: HashMap<(PyStr, String), bool>,
 }
 
 /// One more thing to observe before deciding.
@@ -128,6 +141,11 @@ pub enum Need {
     MergeBase(PyStr, PyStr),
     /// This branch's tip.
     Tip(PyStr),
+    /// Whether an evidence dispatch's worker left the evidence base worktree at the base
+    /// commit with no tracked change (`_base_violation`'s check).
+    BaseGuard(String),
+    /// Whether this ref's tip is in this commit's history (`is_ancestor(ref, commit)`).
+    Ancestor(PyStr, String),
 }
 
 /// A dispatch to request (`engine._request`): the shell checks out the card branch, takes the
@@ -171,13 +189,46 @@ impl Request {
     }
 }
 
-/// How the run ends (`engine._end`'s arguments): the outcome is Task 16's.
+/// How the run ends (`engine._end`'s arguments); the shell decides the outcome from them and
+/// from what Git shows of the run branch (`finish::end`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Ending {
     pub blocked: Option<Blocked>,
     pub why: Vec<PyStr>,
     /// A mismatch between the run branch and what the run accepted.
     pub unreconciled: Option<String>,
+    /// A review gate failed on the run head for good.
+    pub open_findings: bool,
+    /// The evidence gaps the run holds (`evidence = "record"`).
+    pub holds: Vec<PyStr>,
+    /// Every required gate passed on the run head.
+    pub gates_current: bool,
+    /// The verify gate failed on the run head for good.
+    pub verification_failed: bool,
+    /// Stop every Codex dispatch without a result first (`_stop_codex_runners`), so no
+    /// detached runner commits after the outcome.
+    pub stop_codex: bool,
+}
+
+/// A run-level dispatch to request (`engine._request_run`): a gate, or a fix wave's
+/// implementer or review. The shell checks out the run branch (a gate) or the final branch (a
+/// wave), takes the dispatch's guard, prepares the evidence base worktree for an evidence
+/// gate, records `gate_started` for a gate, writes the brief and appends `dispatch_requested`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunRequest {
+    /// `run-<kind>-<n>`, or `run-w<wave>-<kind>-<n>`: deterministic, as a card's.
+    pub dispatch_id: String,
+    pub kind: String,
+    pub gate: Option<String>,
+    pub wave: Option<i64>,
+    pub attempt: i64,
+    pub role: String,
+    pub route: Route,
+    /// The kind's brief values; recorded in the event.
+    pub extra: PyMap<Option<PyStr>>,
+    pub notes: PyStr,
+    /// The accepted cards, in dependency order: the brief's `cards`.
+    pub cards: Vec<u32>,
 }
 
 /// A test-only fix's diff check: the shell writes `fix.diff` and returns `check_diff`.
@@ -241,8 +292,29 @@ pub enum Decision {
     /// Rebase the integrating card again from its latest `integration_started`
     /// (`_integration_step` after a crash).
     Rebase { card: u32 },
-    /// End the run (Task 16).
+    /// End the run: decide its outcome and record it (`_end`).
     End(Ending),
+    /// The run has an outcome: release its branch (a terminal outcome), write the handoff, the
+    /// report and the `runs.md` line once, then return `done` (`_wrap_up`, `_done_action`).
+    WrapUp,
+    /// Request a run-level dispatch.
+    RunRequest(Box<RunRequest>),
+    /// Cut the final branch for fix wave `wave` at the run head `head`, keeping an earlier
+    /// wave's unaccepted commits (`_start_wave`'s cut).
+    CutFinal { wave: i64, head: String },
+    /// Move the final branch back to the run head for the fresh re-run of a voided fix wave
+    /// implementer (`_recut_final`, R36).
+    RecutFinal { dispatch_id: String },
+    /// Record a gate's result (`gate_result`), past the crash point `before_gate_record`.
+    RecordGate(Box<Event>),
+    /// Fast-forward the run branch to a fix wave's reviewed tip: intent (unless `started`),
+    /// move, completion (`_after_run_result`'s acceptance).
+    AcceptFix {
+        dispatch_id: String,
+        wave: Option<i64>,
+        target: String,
+        started: bool,
+    },
     /// A step a later task ports.
     Unported { what: &'static str, task: u8 },
     /// The step cannot be taken.
@@ -279,7 +351,7 @@ pub fn decide(st: &RunState, obs: &Observations) -> Decision {
 
 fn decide_step(st: &RunState, obs: &Observations) -> Step<Decision> {
     if st.log.ended().is_some() {
-        return unported("the wrap-up and the done action of a run that ended", 16);
+        return Ok(Decision::WrapUp);
     }
     if st.log.needs_reconcile() {
         return unported("reconciling a relaunched run", 17);
@@ -304,20 +376,27 @@ fn step(st: &RunState, obs: &Observations) -> Step<Decision> {
         // The run branch moved with no acceptance and no worker guard to explain it (I4).
         return Ok(Decision::End(Ending {
             unreconciled: Some(problem),
+            stop_codex: true,
             ..Ending::default()
         }));
     }
     if !st.log.pending_leftovers().is_empty() {
         return Ok(Decision::FinishLeftovers);
     }
-    if !st.log.run_dispatches().is_empty() {
-        return unported(
-            "the run-level dispatches (end-of-run gates and fix waves)",
-            16,
-        );
+    if let Some(last) = st.log.run_dispatches().last() {
+        if last.result.is_none() {
+            // A gate or fix wave worker is using the workspace (a card unparked meanwhile
+            // waits).
+            return in_flight(st, obs, last);
+        }
+        // Its result is acted on before any card moves the workspace or the run branch, so
+        // its guard is checked against what the worker saw.
+        if let Some(decision) = run_level::after_run_result(st, obs, last)? {
+            return Ok(decision);
+        }
     }
     let Some(n) = pick(st.run, &st.log, &st.cards)? else {
-        return end_of_run(st, obs);
+        return gates::end_of_run(st, obs);
     };
     let c = &st.cards[&n];
     match c.state {
@@ -354,12 +433,17 @@ fn step(st: &RunState, obs: &Observations) -> Step<Decision> {
 /// (`engine._run_head_problem`). An acceptance whose fast-forward happened but is not
 /// recorded yet is not a problem.
 fn run_head_problem(st: &RunState, obs: &Observations) -> Option<String> {
-    let branch = st.run.branch.shown();
-    let Some(now) = &obs.run_tip else {
+    head_problem(st.run, &st.log, obs.run_tip.as_deref())
+}
+
+/// `_run_head_problem` for the run tip `run_tip` (`None`: the workspace or the branch is
+/// missing).
+pub(super) fn head_problem(run: &Run, log: &Log, run_tip: Option<&str>) -> Option<String> {
+    let branch = run.branch.shown();
+    let Some(now) = run_tip else {
         return Some(format!("the run branch {branch} is missing"));
     };
-    let accepted: Vec<&events::Accepted> = st
-        .log
+    let accepted: Vec<&events::Accepted> = log
         .events
         .iter()
         .filter_map(|e| match e {
@@ -370,12 +454,12 @@ fn run_head_problem(st: &RunState, obs: &Observations) -> Option<String> {
     let expected = accepted
         .last()
         .and_then(|a| a.sha.clone())
-        .unwrap_or_else(|| st.run.base_sha.clone());
-    if *now == expected {
+        .unwrap_or_else(|| run.base_sha.clone());
+    if now == expected {
         return None;
     }
     let after = accepted.last().map_or(0, |a| a.seq);
-    let accepting = st.log.events.iter().any(|e| {
+    let accepting = log.events.iter().any(|e| {
         matches!(e, Event::AcceptStarted(a) if a.seq > after && a.target.as_deref() == Some(now))
     });
     if accepting {
@@ -445,32 +529,6 @@ fn run_ref_guarded(st: &RunState) -> bool {
         }
     }
     false
-}
-
-/// Every card is accepted, parked, or waits on a parked card (`engine._end_of_run`). The
-/// card-loop-only test mode stops here; the gates and the outcome are Task 16's.
-fn end_of_run(st: &RunState, obs: &Observations) -> Step<Decision> {
-    if !obs.card_loop_only {
-        return unported("the end-of-run gates and the outcome", 16);
-    }
-    let cards = card_summary(st.run, &st.cards)?;
-    let reasons = cards
-        .iter()
-        .filter(|row| !row.reason.is_empty())
-        .map(|row| {
-            let mut text = PyStr::from(format!("card {} {}: ", row.card, row.state));
-            text.push(&row.reason);
-            text
-        })
-        .collect();
-    Ok(Decision::Act(Action::Done(DoneAction {
-        outcome: None,
-        qualifier: String::new(),
-        reasons,
-        report: None,
-        cards,
-        card_loop_only: true,
-    })))
 }
 
 // -- dispatching -------------------------------------------------------------
@@ -543,22 +601,6 @@ fn card_base(st: &RunState, obs: &Observations, c: &CardState) -> Step<String> {
         };
     }
     Ok(c.base.clone().unwrap_or_default())
-}
-
-/// `refs/heads/<branch>`.
-fn heads(branch: &PyStr) -> PyStr {
-    let mut name = PyStr::from("refs/heads/");
-    name.push(branch);
-    name
-}
-
-/// The card's branch as the run records it, else the name it is cut under
-/// (`c.branch or card_branch_name(ctx.branch, n)`).
-fn card_branch(st: &RunState, c: &CardState) -> PyStr {
-    c.branch
-        .clone()
-        .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| card_branch_name(&st.run.branch, &c.number.to_string()))
 }
 
 /// Whether the card was ever integrated (an `integration_started` for it).
@@ -1393,7 +1435,7 @@ fn accept(st: &RunState, obs: &Observations, card: u32, target: Option<String>) 
     let Some(c) = st.cards.get(&card) else {
         return fail(format!("KeyError: {card}"));
     };
-    let branch = card_branch(st, c);
+    let branch = card_branch(st.run, c);
     match obs.needs_integration.get(&branch) {
         None => return need(Need::NeedsIntegration(branch)),
         Some(true) => return Ok(Decision::Integrate { card }),
@@ -1645,7 +1687,7 @@ fn after_integrate(
     }) else {
         return fail("list index out of range".into());
     };
-    let branch = card_branch(st, c);
+    let branch = card_branch(st.run, c);
     let onto = integ.onto.clone().unwrap_or_default();
     let mut kept = PyStr::default();
     if let Some(keep) = integ.keep.as_ref().filter(|k| !k.is_empty()) {
@@ -1809,12 +1851,12 @@ mod tests {
 
     /// A run of `DECK` with the given configuration, built without Git: the pure core never
     /// reaches the workspace.
-    struct World {
+    pub(super) struct World {
         _dir: tempfile::TempDir,
-        run: Run,
+        pub(super) run: Run,
     }
 
-    fn world(config_text: &str) -> World {
+    pub(super) fn world(config_text: &str) -> World {
         let dir = tempfile::Builder::new()
             .prefix("lh core ")
             .tempdir()
@@ -1844,7 +1886,7 @@ mod tests {
     }
 
     /// The events, each from `(kind, fields)`, numbered from 1.
-    fn log(lines: &[(&str, &str)]) -> Log {
+    pub(super) fn log(lines: &[(&str, &str)]) -> Log {
         let lines = lines
             .iter()
             .enumerate()
@@ -1860,7 +1902,7 @@ mod tests {
         Log::new(lines)
     }
 
-    fn obs(installed: &[&str]) -> Observations {
+    pub(super) fn obs(installed: &[&str]) -> Observations {
         Observations {
             now: 1_794_268_800.0,
             minute_seconds: 60.0,

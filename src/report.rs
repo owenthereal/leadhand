@@ -8,6 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::engine::release;
 use crate::error::{Error, Result};
 use crate::pytext::{pure_path, py_fixed};
 use crate::runsel;
@@ -113,7 +114,30 @@ fn result(snap: &Snapshot) -> Vec<PyStr> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "none".into());
     out.push(format!("- Next step: {next}").into());
+    out.extend(branch_line(snap));
     out
+}
+
+/// The branch release's line (deliberate change 2), for a run that ended complete, incomplete
+/// or failed: what `git worktree list` shows of the run branch now, not what the release did.
+/// A run directory whose repository Git cannot read gets a line that says so.
+fn branch_line(snap: &Snapshot) -> Option<PyStr> {
+    let terminal = snap
+        .outcome()
+        .and_then(|o| o.outcome.as_deref())
+        .is_some_and(|o| matches!(o, "complete" | "incomplete" | "failed"));
+    let meta = &snap.meta;
+    let branch = meta.branch.clone().flatten().filter(|b| !b.is_empty())?;
+    if !terminal {
+        return None;
+    }
+    let path = |p: &Option<PyStr>| p.as_ref().map(|p| PathBuf::from(p.to_os_lossy()));
+    let ws = path(&meta.workspace.clone().flatten()).unwrap_or_default();
+    let status = match path(&meta.repo) {
+        Some(repo) => release::branch_status(&repo, &ws, &branch),
+        None => Err(Error::msg("run.json names no repository")),
+    };
+    release::report_line(&branch, &ws, &status)
 }
 
 /// The run branch tip as recorded: the last accepted commit, else the base.

@@ -14,6 +14,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use super::preserve::lexists;
 use super::{FETCH_TIMEOUT, Git, RepoIdentity, linked_worktree};
 use crate::error::{Error, Result};
 use crate::pytext::{
@@ -347,7 +348,7 @@ pub fn prepare_worktree(
 /// beside Git's own files: its path's bytes and a newline (spec, "Which repository and run a
 /// directory belongs to"). A file of its own: the evidence base worktree's ownership marker,
 /// `leadhand-run`, is never written or read here.
-fn write_run_record(ws: &Path, run_dir: &Path) -> Result<()> {
+pub(super) fn write_run_record(ws: &Path, run_dir: &Path) -> Result<()> {
     let Some(wt) = linked_worktree(ws)? else {
         return Err(Error::msg(format!(
             "{} is not a linked worktree",
@@ -357,11 +358,6 @@ fn write_run_record(ws: &Path, run_dir: &Path) -> Result<()> {
     let mut data = run_dir.as_os_str().as_bytes().to_vec();
     data.push(b'\n');
     write_file_atomic_mode(&wt.git_dir.join(RUN_RECORD), &data, 0o644)
-}
-
-/// `os.path.lexists`: whether anything, a dangling symlink included, is at `path`.
-fn lexists(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok()
 }
 
 fn args<'a>(words: &[&'a str]) -> Vec<&'a OsStr> {

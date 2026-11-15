@@ -10,6 +10,11 @@
 //! - `shell`: the engine shell around it, which gathers what `decide` asks for and carries
 //!   out its steps;
 //! - `integrate`: rebasing a card onto the run tip, which the shell does for `decide`;
+//! - `gates`: the end-of-run gates' requests, the fix waves' final branch and acceptance, and
+//!   the evidence base worktree, which the shell does for `decide`;
+//! - `finish`: the outcome, then the wrap-up (the handoff, the report, the `runs.md` line) and
+//!   the `done` action;
+//! - `release`: the branch release after a terminal outcome, and the report's branch line;
 //! - `violations`: a worker's change to what its dispatch guards, and an implementer's
 //!   leftovers, found, kept and undone for `decide`;
 //! - `report_text`: what the engine reads out of a worker's report and reply text;
@@ -17,10 +22,13 @@
 //! - `timer`: waiting on a dispatch.
 
 pub mod cards;
+pub mod finish;
+pub mod gates;
 pub mod integrate;
 pub mod next;
 pub mod protocol;
 pub mod record;
+pub mod release;
 pub mod report_text;
 pub mod shell;
 pub mod start;

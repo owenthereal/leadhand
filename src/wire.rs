@@ -190,6 +190,11 @@ impl PyStr {
         out
     }
 
+    /// The text's code points, a surrogate escape as its lone surrogate (`for c in s`).
+    pub fn code_points(&self) -> impl Iterator<Item = u32> + Clone + '_ {
+        code_points(&self.0)
+    }
+
     /// Python's `str.startswith` for valid text.
     pub fn starts_with(&self, prefix: &str) -> bool {
         self.0.starts_with(prefix.as_bytes())
