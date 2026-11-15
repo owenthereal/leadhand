@@ -1,5 +1,8 @@
 //! `timer` (`engine.timer`): waits until a dispatch has a result, its deadline passes, or the
 //! operator asks to pause or cancel the run, whichever comes first, and says which.
+//!
+//! It reads only the run folder, never the workspace, so unlike `next` and `record result`
+//! it has no in-place run to refuse (S2-R44).
 
 use std::ffi::OsStr;
 use std::io::Write;

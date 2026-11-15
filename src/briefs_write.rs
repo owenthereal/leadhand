@@ -668,7 +668,9 @@ pub fn write_brief(spec: &BriefSpec) -> Result<(PathBuf, PathBuf)> {
     let card_number = spec.card.map(|c| i64::from(c.number));
     let folder = scratch_dir(spec.ws, card_number, spec.dispatch_id)?;
     let (brief, report) = (folder.join("brief.md"), folder.join("report.md"));
-    let cards = selected_cards(spec.deck, value(extra, "cards").as_ref())?;
+    // `extra.get("cards")`: a `null` is no selection, so every card.
+    let selection = extra.get(&PyStr::from("cards")).cloned().flatten();
+    let cards = selected_cards(spec.deck, selection.as_ref())?;
     let mut values: Vec<(String, PyStr)> = extra
         .0
         .iter()
@@ -948,6 +950,30 @@ mod tests {
             .unwrap_err();
         assert!(e.message.contains("cards"), "{e}");
         assert_eq!(e.message, "evidence brief needs cards");
+    }
+
+    // `_selected_cards(deck, extra.get("cards"))`: a `null` selection is every card, not a
+    // card named `None`.
+    #[test]
+    fn a_null_card_selection_is_every_card() {
+        let mut w = world();
+        let mut second = card();
+        second.number = 4;
+        second.title = "Render the widget".into();
+        w.deck.cards.push(second);
+        let brief = |kind: &str, cards: Option<&str>| {
+            let mut map = extra(&kind_extra(kind));
+            *map.entry(&PyStr::from("cards"), || None) = cards.map(PyStr::from);
+            fs::read_to_string(w.brief(kind, false, &map).unwrap()).unwrap()
+        };
+        for kind in ["final_review", "evidence"] {
+            let every = brief(kind, None);
+            assert!(
+                every.contains("- Card 4: Render the widget"),
+                "{kind}: {every}"
+            );
+            assert_eq!(every, brief(kind, Some("3, 4")), "{kind}");
+        }
     }
 
     // CATALOG: test_briefs.py::BriefTests::test_verify_says_skip_for_empty_commands

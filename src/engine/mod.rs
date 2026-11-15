@@ -8,7 +8,7 @@
 //! - `next`: the pure `decide` core, which reads the run and its observations and names
 //!   the next step;
 //! - `shell`: the engine shell around it, which gathers what `decide` asks for and carries
-//!   out its steps under the run's lock;
+//!   out its steps;
 //! - `report_text`: what the engine reads out of a worker's report and reply text;
 //! - `record`: a worker's start and result, a ruling, a park, a diff check;
 //! - `timer`: waiting on a dispatch.

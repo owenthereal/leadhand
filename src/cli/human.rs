@@ -33,8 +33,12 @@ pub fn fail_with_fix(e: Error) -> ExitCode {
     ExitCode::from(e.exit)
 }
 
-/// `e` as the commands a person types print it.
+/// `e` as the commands a person types print it: its printed text when it has one.
 pub fn render_error(e: &Error, out: &mut dyn Write) -> std::io::Result<()> {
+    if let Some(text) = &e.printed {
+        out.write_all(text)?;
+        return out.flush();
+    }
     writeln!(out, "error: {}", e.message)?;
     if let Some(fix) = &e.fix {
         writeln!(out, "{fix}")?;
@@ -100,6 +104,22 @@ mod tests {
             ]
         );
         assert!(text.ends_with("disable\n"));
+    }
+
+    #[test]
+    fn a_printed_error_keeps_its_bytes() {
+        let text = b"error: the checkout /r/\xff itself; with:\nleadhand start '/r/\xff/d.md'\n";
+        let e = Error::printed(text.to_vec());
+        let mut out = Vec::new();
+        render_error(&e, &mut out).unwrap();
+        assert_eq!(out, text);
+        assert_eq!(
+            (e.message.as_str(), e.exit),
+            (
+                "the checkout /r/\u{fffd} itself; with:\nleadhand start '/r/\u{fffd}/d.md'",
+                1
+            )
+        );
     }
 
     #[test]

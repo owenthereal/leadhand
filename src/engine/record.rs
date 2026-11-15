@@ -223,6 +223,9 @@ fn record_started(run: &Run, f: &RecordFields) -> Result<RecordOutput> {
 /// `record result`: the worker's reply, or for a Codex route the runner's result
 /// (`_record_result`).
 fn record_result(run: &Run, f: &RecordFields) -> Result<RecordOutput> {
+    // A result is read from the workspace's scratch files, and a Codex one may stop its
+    // runner there, so an in-place run is refused first. The other kinds only append events.
+    crate::launch::refuse_in_place(&run.meta)?;
     let reply = f.reply.clone().unwrap_or_default();
     if f.reply_file.is_some() && !reply.is_empty() {
         return Err(Error::msg(
@@ -558,17 +561,14 @@ pub(crate) fn store_result(
     };
 
     let ended_at = utc_now();
-    // A Claude worker's model and effort are the route's (a Codex proxy has none of its own);
-    // its cost is priced with the route's model (two prices per Claude attempt: status.json
+    // The cost is priced with the route's model (two prices per Claude attempt: status.json
     // prices the same charge with the transcript's).
-    let model = (!codex_vendor).then(|| PyStr::from(req.model.clone().unwrap_or_default()));
-    let priced = model.as_ref().filter(|m| !m.is_empty());
+    let (model, effort) = attempt_route(d);
     let known = charged.usage.known;
-    let cost = match priced {
+    let cost = match model.as_ref().filter(|m| !m.is_empty()) {
         Some(m) if known => estimate_cost(&charged.usage, Some(m), &run.config.prices),
         _ => None,
     };
-    let effort = priced.map(|_| PyStr::from(req.effort.clone().unwrap_or_default()));
     let agent = if codex_vendor {
         CODEX_AGENT
     } else {
@@ -618,6 +618,21 @@ pub(crate) fn store_result(
     }
     let (written, _) = append_event(&run.paths, event(vec![charge_id], interrupted))?;
     Ok(RecordOutput::Event(Box::new(written)))
+}
+
+/// A Claude worker's model and effort in its attempt record, the route's as requested
+/// (`req["model"] if req["vendor"] == "claude" else None`, and `req["effort"] if model`): a
+/// Codex proxy has none of its own, and a route's `null` stays `null`.
+fn attempt_route(d: &Dispatch) -> (Option<PyStr>, Option<PyStr>) {
+    if d.vendor() != "claude" {
+        return (None, None);
+    }
+    let model = d.req.model.clone().map(PyStr::from);
+    let effort = model
+        .as_ref()
+        .filter(|m| !m.is_empty())
+        .and_then(|_| d.req.effort.clone().map(PyStr::from));
+    (model, effort)
 }
 
 /// The commit a branch is at.
@@ -872,24 +887,37 @@ mod tests {
         - Depends on: none\n- Allowed paths: src/, tests/\n\
         - Done when: the card's file exists and the tests pass\n- Stop if: the design has to change\n";
 
-    /// A run directory whose card 1 has a started review, `c1-a1-review-1`, in `ws` (the
-    /// fixture repository itself), with the configuration snapshotted from an empty user file.
-    fn started_review(f: &Fixture) -> (PathBuf, PathBuf) {
-        let ws = f.make_repo("work space");
-        let base = f.git(&ws, &["rev-parse", "HEAD"]);
+    /// A run directory whose card 1 has a started review, `c1-a1-review-1`, with the
+    /// configuration snapshotted from an empty user file: its workspace `ws` a worktree of the
+    /// fixture repository, or with `in_place` the repository's checkout itself. The run folder
+    /// and the review's scratch folder.
+    fn started_review(f: &Fixture, in_place: bool) -> (PathBuf, PathBuf) {
+        let repo = f.make_repo("repo");
+        let ws = if in_place {
+            repo.clone()
+        } else {
+            let ws = f.root().join("work space");
+            let ws_arg = ws.to_str().unwrap();
+            f.git(
+                &repo,
+                &["worktree", "add", "-q", "-b", "leadhand/demo", ws_arg],
+            );
+            ws
+        };
+        let base = f.git(&repo, &["rev-parse", "HEAD"]);
         let root = f.root().join("docs dir/runs/2026-11-14-demo-deck");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("deck.md"), DECK.replace("BASE", &base)).unwrap();
         let user = f.root().join("user.toml");
         std::fs::write(&user, "").unwrap();
-        let config = crate::config::load_config_from(&ws, &user).unwrap();
+        let config = crate::config::load_config_from(&repo, &user).unwrap();
         crate::store::write_json_atomic(
             &root.join(crate::config::SNAPSHOT),
             &crate::config::ConfigSnapshot(&config),
         )
         .unwrap();
         let meta = serde_json::json!({
-            "run_id": "abc123abc123", "repo": ws, "deck_source": root.join("deck.md"),
+            "run_id": "abc123abc123", "repo": repo, "deck_source": root.join("deck.md"),
             "deck_digest": "0", "base_ref": "main", "base_sha": base, "branch": "leadhand/demo",
             "branch_requested": "leadhand/demo", "workspace": ws, "slug": "demo-deck",
             "created_at": "2026-11-14T00:00:00.000Z", "supervisor_sessions": [],
@@ -917,7 +945,7 @@ mod tests {
     #[test]
     fn crafted_report_head_fails_record_as_the_python_does() {
         let f = Fixture::new();
-        let (root, scratch) = started_review(&f);
+        let (root, scratch) = started_review(&f, false);
         std::fs::write(scratch.join("report.md"), "re\u{17f}ult: pass\n").unwrap();
         let fields = RecordFields {
             dispatch: Some("c1-a1-review-1".into()),
@@ -952,5 +980,77 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    // S2-R44: `record result` refuses an in-place run as `run` does (S2-R41), with the same
+    // text, before it reads the workspace: nothing is copied, charged or recorded.
+    #[test]
+    fn record_result_refuses_an_in_place_run() {
+        let f = Fixture::new();
+        let (root, scratch) = started_review(&f, true);
+        std::fs::write(scratch.join("report.md"), "Verdict: clean\n").unwrap();
+        let repo = f.root().join("repo");
+        let fields = RecordFields {
+            dispatch: Some("c1-a1-review-1".into()),
+            worker: Some("agent0001".into()),
+            reply: Some("Verdict: clean".into()),
+            ..RecordFields::default()
+        };
+        let run = Run::load(&root).unwrap();
+        let e = record_result(&run, &fields).unwrap_err();
+        let start = crate::cli::human::command_line(&[
+            crate::testing::self_path().into_os_string(),
+            "start".into(),
+            root.join("deck.md").into_os_string(),
+            "--repo".into(),
+            repo.clone().into_os_string(),
+        ]);
+        let mut want = format!(
+            "error: not supported in this version: run.worktree = false (this run works in the \
+             checkout {} itself); start a new run of the deck, which works in a worktree, with:\n",
+            repo.display()
+        )
+        .into_bytes();
+        want.extend_from_slice(start.as_encoded_bytes());
+        want.push(b'\n');
+        assert_eq!(e.printed.as_deref(), Some(&want[..]));
+        assert_eq!(e.exit, 1);
+        let paths = crate::state::run_paths(&root);
+        assert!(!root.join("cards").exists());
+        assert!(!paths.charges.exists());
+        assert!(!paths.attempts.exists());
+        let log = Log::read(&paths).unwrap();
+        assert!(
+            log.dispatch(Some("c1-a1-review-1"))
+                .unwrap()
+                .result
+                .is_none()
+        );
+    }
+
+    // `req["model"] if req["vendor"] == "claude" else None`, then `req["effort"] if model`.
+    #[test]
+    fn an_attempt_keeps_the_routes_null_model_and_effort() {
+        let route = |vendor: &str, model: &str, effort: &str| {
+            let line = format!(
+                r#"{{"seq":1,"ts":"t","kind":"dispatch_requested","dispatch_id":"c1-a1-review-1","card":1,"attempt":1,"dispatch_kind":"review","role":"reviewer","vendor":"{vendor}","model":{model},"effort":{effort}}}"#
+            );
+            let event = crate::state::decode_event(serde_json::from_str(&line).unwrap()).unwrap();
+            let log = Log::new(vec![event]);
+            let d = log.dispatch(Some("c1-a1-review-1")).unwrap();
+            attempt_route(&d)
+        };
+        let text = |s: &str| Some(PyStr::from(s));
+        assert_eq!(
+            route("claude", r#""sonnet""#, r#""medium""#),
+            (text("sonnet"), text("medium"))
+        );
+        assert_eq!(route("claude", "null", r#""medium""#), (None, None));
+        assert_eq!(route("claude", r#""""#, r#""medium""#), (text(""), None));
+        assert_eq!(
+            route("claude", r#""sonnet""#, "null"),
+            (text("sonnet"), None)
+        );
+        assert_eq!(route("codex", r#""gpt-6""#, r#""high""#), (None, None));
     }
 }

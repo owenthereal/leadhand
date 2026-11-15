@@ -508,6 +508,21 @@ fn in_place_refusal(meta: &Meta, cli: &Path) -> Option<Vec<u8>> {
     Some(fix_refusal(&head, &start_command(meta, cli)))
 }
 
+/// Refuses an in-place run for the engine commands that act on its workspace (S2-R44), as
+/// `run` refuses it, with the same text: `meta` is the `run.json` entries the command loaded.
+/// A worktree run passes.
+pub(crate) fn refuse_in_place(meta: &PyMap<Box<RawValue>>) -> Result<()> {
+    // The refusal reads only the entries; the run ID is a launch's.
+    let meta = Meta {
+        map: meta.clone(),
+        run_id: PyStr::default(),
+    };
+    match in_place_refusal(&meta, &testing::self_path()) {
+        Some(text) => Err(Error::printed(text)),
+        None => Ok(()),
+    }
+}
+
 /// The attended-use warning, and R28's when the CLI's path holds whitespace.
 fn warn(cli: &Path) -> Result<()> {
     let cli = cli.as_os_str().as_bytes();

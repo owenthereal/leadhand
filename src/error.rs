@@ -19,6 +19,9 @@ pub struct Error {
     /// The one command that fixes it, for the commands a person types: printed alone as the
     /// last line, ready to copy.
     pub fix: Option<String>,
+    /// The whole text to print instead, bytes kept, for a refusal whose paths must survive as
+    /// they are (`Error::printed`).
+    pub printed: Option<Vec<u8>>,
     pub exit: u8,
 }
 
@@ -33,7 +36,20 @@ impl Error {
         Error {
             message: message.into(),
             fix: None,
+            printed: None,
             exit,
+        }
+    }
+
+    /// A refusal printed as `text` is, bytes kept (`error: <head>`, then the fixing command
+    /// alone on the last line), exit 1. Its message is the same text, shown lossily.
+    pub fn printed(text: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&text);
+        let message = shown.strip_prefix("error: ").unwrap_or(&shown);
+        let message = message.trim_end_matches('\n').to_string();
+        Error {
+            printed: Some(text),
+            ..Self::msg(message)
         }
     }
 

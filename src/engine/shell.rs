@@ -58,6 +58,8 @@ pub fn next_action(run_dir: &Path) -> Result<Action> {
 
 fn next_action_steps(run_dir: &Path) -> Result<Action> {
     let run = Run::load(run_dir)?;
+    // Every step acts on the workspace, so an in-place run is refused before the first.
+    crate::launch::refuse_in_place(&run.meta)?;
     let deck_problem = run.deck_problem();
     charge_supervisor(&run)?;
     let session = current_session(&run);
@@ -351,7 +353,7 @@ struct Guard {
 /// and rewrites the same brief.
 fn request_dispatch(st: &RunState, r: &Request) -> Result<()> {
     let run = st.run;
-    let c = &st.cards[&r.card];
+    let c = st.cards.get(&r.card).ok_or_else(|| key_error(r.card))?;
     let mut full = PyMap(vec![
         (PyStr::from("base"), Some(PyStr::from(r.base.as_str()))),
         (
@@ -496,6 +498,12 @@ fn append_request(
     Ok(())
 }
 
+/// The Python's `KeyError` on a card the fold does not have, as its uncaught exception names
+/// it (`KeyError: 3`), printed as an error line (S2-R43).
+fn key_error(card: u32) -> Error {
+    Error::msg(format!("KeyError: {card}"))
+}
+
 /// Accepts a card: fast-forwards the run branch to its tip, as intent, move and completion
 /// (`_accept`). A card branch that does not contain the run tip is integrated first, and an
 /// integrated card is accepted only at a tip a verify passed on: Task 15's.
@@ -505,7 +513,8 @@ fn accept(run: &Run, card: u32, target: Option<String>) -> Result<()> {
     };
     let log = Log::read(&run.paths)?;
     let cards = log.cards(&run.numbers());
-    let c = &cards[&card];
+    // `fold_cards(events, ctx.numbers)[card]`.
+    let c = cards.get(&card).ok_or_else(|| key_error(card))?;
     let branch = c
         .branch
         .clone()
@@ -598,7 +607,8 @@ fn guard_moved(st: &RunState, d: &Dispatch) -> Result<bool> {
     let run = st.run;
     let req = d.req;
     let git = run.git()?;
-    let changed_workspace = match given(&req.expected_head) {
+    // `if req.get("expected_head")`: an empty head is none, as the Python's truthiness reads it.
+    let changed_workspace = match given(&req.expected_head).filter(|h| !h.is_empty()) {
         Some(expected) => {
             let branch = given(&req.expected_branch).cloned().unwrap_or_default();
             detect_violation(&git, expected, &branch)?.is_some()
@@ -795,4 +805,150 @@ pub(crate) fn charge_session(run: &Run, sid: &PyStr) -> Result<()> {
         false,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::git::fixture::Fixture;
+
+    const DECK: &str = "# Deck: Demo deck\nSource: docs/plan.md\nBase: main @ BASE\n\
+        Branch: leadhand/demo\nBuild: true\nTest: true\n\n\
+        ## Card 1: Card number 1\n- Role: implementer\n- Hard: no\n- Risk: low\n\
+        - Depends on: none\n- Allowed paths: src/, tests/\n\
+        - Done when: the card's file exists and the tests pass\n- Stop if: the design has to change\n";
+
+    /// A run directory of `DECK` with the configuration snapshotted from an empty user file,
+    /// and no events: its workspace a worktree of the fixture repository on the run branch,
+    /// or with `in_place` the repository's checkout itself. The run folder, the repository
+    /// and the workspace.
+    fn run_dir(f: &Fixture, in_place: bool) -> (PathBuf, PathBuf, PathBuf) {
+        let repo = f.make_repo("repo");
+        let ws = if in_place {
+            repo.clone()
+        } else {
+            let ws = f.root().join("work space");
+            let ws_arg = ws.to_str().unwrap();
+            f.git(
+                &repo,
+                &["worktree", "add", "-q", "-b", "leadhand/demo", ws_arg],
+            );
+            ws
+        };
+        let base = f.git(&repo, &["rev-parse", "HEAD"]);
+        let root = f.root().join("docs dir/runs/2026-11-14-demo-deck");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("deck.md"), DECK.replace("BASE", &base)).unwrap();
+        let user = f.root().join("user.toml");
+        std::fs::write(&user, "").unwrap();
+        let config = crate::config::load_config_from(&repo, &user).unwrap();
+        write_json_atomic(
+            &root.join(crate::config::SNAPSHOT),
+            &crate::config::ConfigSnapshot(&config),
+        )
+        .unwrap();
+        let meta = serde_json::json!({
+            "run_id": "abc123abc123", "repo": repo, "deck_source": root.join("deck.md"),
+            "deck_digest": "0", "base_ref": "main", "base_sha": base, "branch": "leadhand/demo",
+            "branch_requested": "leadhand/demo", "workspace": ws, "slug": "demo-deck",
+            "created_at": "2026-11-14T00:00:00.000Z", "supervisor_sessions": [],
+        });
+        std::fs::write(root.join("run.json"), meta.to_string()).unwrap();
+        (root, repo, ws)
+    }
+
+    // S2-R44: `next` refuses an in-place run as `run` does (S2-R41), with the same text, before
+    // its first step: nothing is charged, cut or appended.
+    #[test]
+    fn next_refuses_an_in_place_run_before_any_step() {
+        let f = Fixture::new();
+        let (root, repo, _) = run_dir(&f, true);
+        // `next_action`'s body, without its status.json checkpoint (which reads the Codex meter
+        // from the operator's home).
+        let e = next_action_steps(&root).unwrap_err();
+        let start = crate::cli::human::command_line(&[
+            crate::testing::self_path().into_os_string(),
+            "start".into(),
+            root.join("deck.md").into_os_string(),
+            "--repo".into(),
+            repo.clone().into_os_string(),
+        ]);
+        let mut want = format!(
+            "error: not supported in this version: run.worktree = false (this run works in the \
+             checkout {} itself); start a new run of the deck, which works in a worktree, with:\n",
+            repo.display()
+        )
+        .into_bytes();
+        want.extend_from_slice(start.as_encoded_bytes());
+        want.push(b'\n');
+        assert_eq!(e.printed.as_deref(), Some(&want[..]));
+        assert_eq!(e.exit, 1);
+        let paths = crate::state::run_paths(&root);
+        assert!(!paths.events.exists());
+        assert!(!paths.charges.exists());
+        assert_eq!(f.git(&repo, &["branch", "--list", "leadhand/*"]), "");
+        // A worktree run of the same deck is not refused.
+        let f = Fixture::new();
+        let (root, _, _) = run_dir(&f, false);
+        let run = Run::load(&root).unwrap();
+        assert_eq!(crate::launch::refuse_in_place(&run.meta), Ok(()));
+    }
+
+    // `_find_violation`'s `if req.get("expected_head")`: an empty expected head is none to
+    // check, so only the refs decide; a given one is checked.
+    #[test]
+    fn an_empty_expected_head_is_no_head_to_check() {
+        let f = Fixture::new();
+        let (root, _, ws) = run_dir(&f, false);
+        let sha = f.git(&ws, &["rev-parse", "HEAD"]);
+        let paths = crate::state::run_paths(&root);
+        let run = Run::load(&root).unwrap();
+        let guarded = |expected_head: &str| {
+            let line = format!(
+                r#"{{"seq":1,"ts":"2026-11-14T00:00:00.000Z","kind":"dispatch_requested","dispatch_id":"c1-a1-review-1","card":1,"attempt":1,"dispatch_kind":"review","role":"reviewer","vendor":"claude","model":"sonnet","effort":"medium","brief":"/b","report":"/r","extra":{{}},"notes":"","resumes":null,"resume_worker":null,"resume_session":null,"minutes":60,"expected_branch":"leadhand/demo","expected_head":"{expected_head}","refs":{{"refs/heads/leadhand/demo":"{sha}"}},"ref_scope":["refs/heads/leadhand/demo"]}}
+"#
+            );
+            std::fs::write(&paths.events, line).unwrap();
+            let st = RunState::new(&run, Log::read(&paths).unwrap());
+            let d = st.log.dispatch(Some("c1-a1-review-1")).unwrap();
+            guard_moved(&st, &d).unwrap()
+        };
+        assert!(!guarded(""));
+        assert!(!guarded(&sha));
+        assert!(guarded(&"0".repeat(40)));
+    }
+
+    // `fold_cards(events, ctx.numbers)[card]`: a card the fold does not have is the Python's
+    // `KeyError`, an error line (S2-R43), not a panic.
+    #[test]
+    fn a_card_the_fold_does_not_have_is_a_key_error() {
+        let f = Fixture::new();
+        let (root, _, _) = run_dir(&f, false);
+        let run = Run::load(&root).unwrap();
+        let e = accept(&run, 9, Some("a".repeat(40))).unwrap_err();
+        assert_eq!((e.message.as_str(), e.exit), ("KeyError: 9", 1));
+        let st = RunState::new(&run, Log::read(&run.paths).unwrap());
+        let request = Request {
+            card: 9,
+            dispatch_id: "c9-a1-implement-1".into(),
+            kind: "implement".into(),
+            attempt: 1,
+            role: "implementer".into(),
+            route: crate::config::Route {
+                vendor: "claude".into(),
+                model: "sonnet".into(),
+                effort: "medium".into(),
+            },
+            extra: PyMap::default(),
+            base: "b".repeat(40),
+            resume: None,
+            notes: PyStr::default(),
+            continues: None,
+        };
+        let e = request_dispatch(&st, &request).unwrap_err();
+        assert_eq!((e.message.as_str(), e.exit), ("KeyError: 9", 1));
+        assert!(!run.paths.events.exists());
+    }
 }
