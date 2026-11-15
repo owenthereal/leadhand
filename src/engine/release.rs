@@ -19,9 +19,12 @@
 //!
 //! The release never prunes worktree records: pruning is repository-wide, and the records it
 //! would remove may not be the run's. Blocked runs skip it: they resume on the branch. Steps 2
-//! to 4 are a two-phase step with the crash points `before_branch_release` and
-//! `after_branch_release`; after a crash between the outcome and the report, the next `next`
-//! finishes the release (from its recorded intent), then writes the report.
+//! to 4 are a two-phase step, intent and completion appended with `append_event` (the helper
+//! `two_phase` appends through), but with no named crash points (ruling S2-R48: S2-R34's points
+//! are the Python's, and the release has no Python counterpart; a point after the outcome could
+//! not be recovered by `run`, which refuses to reopen a terminal run, as the Python's does).
+//! After a crash between the outcome and the report, the next `next` finishes the release from
+//! its recorded intent (the detach is idempotent), then writes the report.
 //!
 //! The only write is the detach, in the run's own worktree, which leaves HEAD at the same
 //! commit and the files as they are (bug class 1: never the operator's checkout; bug class 4:
@@ -40,7 +43,7 @@ use crate::git::cards::checked_out_branch;
 use crate::git::workspace::{WorktreeEntry, head, worktrees};
 use crate::pytext::{path_text, real_path};
 use crate::state::events::{self, Outcome};
-use crate::state::{Event, two_phase, two_phase_resume};
+use crate::state::{Event, append_event};
 use crate::wire::PyStr;
 
 /// What Git shows of the run branch after the release (step 5), or that the run skips it.
@@ -101,19 +104,9 @@ pub(super) fn release(run: &Run, log: &Log, ended: &Outcome) -> Result<()> {
             Event::BranchReleaseStarted(s) => Some(s.clone()),
             _ => None,
         });
-        match started {
-            Some(intent) => {
-                // A crash came between the intent and its completion: finish from the intent.
-                let ws = PathBuf::from(intent.worktree.clone().unwrap_or_default().to_os()?);
-                let branch = intent.branch.clone().unwrap_or_default();
-                let sha = intent.sha.clone();
-                two_phase_resume(
-                    &run.paths,
-                    || Ok(detach(&ws, &branch, sha.as_deref())),
-                    "after_branch_release",
-                    |skipped| released_event(&intent, skipped.as_ref()),
-                )?;
-            }
+        let intent = match started {
+            // A crash came between the intent and its completion: finish from the intent.
+            Some(intent) => intent,
             None => {
                 let intent = events::BranchReleaseStarted {
                     worktree: Some(path_text(&run.ws)),
@@ -121,17 +114,14 @@ pub(super) fn release(run: &Run, log: &Log, ended: &Outcome) -> Result<()> {
                     sha: ended.head.clone(),
                     ..events::BranchReleaseStarted::default()
                 };
-                let sha = ended.head.clone();
-                two_phase(
-                    &run.paths,
-                    Event::BranchReleaseStarted(intent.clone()),
-                    "before_branch_release",
-                    || Ok(detach(&run.ws, &run.branch, sha.as_deref())),
-                    "after_branch_release",
-                    |skipped| released_event(&intent, skipped.as_ref()),
-                )?;
+                append_event(&run.paths, Event::BranchReleaseStarted(intent.clone()))?;
+                intent
             }
-        }
+        };
+        let ws = PathBuf::from(intent.worktree.clone().unwrap_or_default().to_os()?);
+        let branch = intent.branch.clone().unwrap_or_default();
+        let skipped = detach(&ws, &branch, intent.sha.as_deref());
+        append_event(&run.paths, released_event(&intent, skipped.as_ref()))?;
     }
     Ok(())
 }

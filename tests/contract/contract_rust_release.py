@@ -24,6 +24,7 @@ from pathlib import Path
 from contract_finish import base_wt, to_last_step
 from gitfixture import run_git
 from harness import rust_only
+from rundir import append_event
 from supervisor import FakeSupervisor, card
 
 RUN = "leadhand/demo"
@@ -197,18 +198,27 @@ class BranchRelease(unittest.TestCase):
         self.assertIn(str(base_wt(w)), run_git(w.repo, "worktree", "list", "--porcelain"))
 
     def test_crash_between_outcome_and_report_finishes_release_first(self):
-        for point in ("before_branch_release", "after_branch_release"):
-            with self.subTest(point=point):
+        # The state a crash between the outcome and the report leaves, rebuilt as stage 1's
+        # interrupted-start test rebuilds one: the run is driven to its end, its log cut back to
+        # the `outcome`, `report.md` removed, then the release's intent appended in its exact
+        # shape, with the worktree still on the run branch (the crash came before the detach)
+        # or already detached (after it). The release has no named crash points (S2-R48).
+        for detached_before in (False, True):
+            with self.subTest(detached_before=detached_before):
                 w = FakeSupervisor(self, [card(1)], gates=True)
                 w.start()
-                to_last_step(w)
-                ws = w.workspace()
-                r = w.cli("next", w.run_dir, crash=point)
-                self.assertEqual(r.code, 97, r)
+                self.assertEqual(w.run()[-1]["outcome"], "complete")
+                ws, head = w.workspace(), w.branch_tip(RUN)
+                lines = w.paths.events.read_text(encoding="utf-8").splitlines(keepends=True)
+                (at,) = [i for i, ln in enumerate(lines) if json.loads(ln)["kind"] == "outcome"]
+                w.paths.events.write_text("".join(lines[:at + 1]), encoding="utf-8")
+                w.paths.report.unlink()
+                if not detached_before:
+                    run_git(ws, "switch", "--quiet", RUN)
+                append_event(w.run_dir, "branch_release_started", worktree=str(ws), branch=RUN, sha=head)
                 self.assertEqual(kinds(w, "outcome", "branch_release_started", "branch_released",
                                        "report_written"), ["outcome", "branch_release_started"])
-                self.assertEqual(detached(ws), point == "after_branch_release")
-                self.assertFalse(w.paths.report.exists())
+                self.assertEqual(detached(ws), detached_before)
 
                 done = w.next()
                 self.assertEqual((done["action"], done["outcome"]), ("done", "complete"))
@@ -217,10 +227,11 @@ class BranchRelease(unittest.TestCase):
                                        "report_written"),
                                  ["outcome", "branch_release_started", "branch_released", "report_written"])
                 self.assertLess(seq(w, "branch_released"), seq(w, "report_written"))
+                (released,) = w.events("branch_released")
+                self.assertFalse(released.get("skipped"), released)
                 self.assertTrue(detached(ws))
-                self.assertEqual(run_git(ws, "rev-parse", "HEAD"), w.branch_tip(RUN))
+                self.assertEqual(run_git(ws, "rev-parse", "HEAD"), head)
                 self.assertTrue(any(ln.startswith(FREE) for ln in result_lines(w)), result_lines(w))
-
 
 if __name__ == "__main__":
     unittest.main()
