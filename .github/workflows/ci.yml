@@ -94,9 +94,10 @@ jobs:
       # Without the feature: checks that the test hooks are compiled out.
       - run: cargo test --locked --lib
       # The suites run one after another in this job, the three contract configurations included,
-      # so that each platform builds once. On a Mac the unit suite takes about a quarter of an hour
-      # and a contract suite about half an hour. Each suite's cap bounds a hang; the caps and the
-      # builds fit the job's.
+      # so that each platform builds once. Measured locally on a developer Mac, running two suites
+      # at a time, the unit suite took about a quarter of an hour and a contract suite about half
+      # an hour; update these figures after the first hosted run. Each suite's cap bounds a hang;
+      # the caps and the builds fit the job's.
       - name: Python unit suite
         timeout-minutes: 45
         run: |

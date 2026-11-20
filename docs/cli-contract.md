@@ -259,8 +259,10 @@ Configuration sources, merged in this order: the preset, the user file, then the
 
 ### Timing that parity tests depend on
 
-Contract tests wait on these, so a Rust binary keeps the same values. The foreground wait
-(540 s) and the heartbeat (touched every second, stale after 60 s) are given above.
+Contract tests wait on these, so a Rust binary keeps the same values. The heartbeat (touched
+every second, stale after 60 s) is given above. So is the foreground wait (540 s), which no
+contract test waits out: unit tests pin the 540 s default, and the contract suite shortens it
+with `LEADHAND_TEST_FOREGROUND_WAIT`.
 
 | Name in the Python | Value | What it times |
 |---|---|---|

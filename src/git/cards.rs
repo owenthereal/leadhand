@@ -522,6 +522,26 @@ mod tests {
         assert_eq!(f.git(&ws, &["symbolic-ref", "--short", "HEAD"]), a.lossy());
     }
 
+    // The rebase never moves another branch, whatever the repository's `rebase.updateRefs`
+    // says: a branch at a commit inside the rebased range stays where it was.
+    #[test]
+    fn rebase_onto_never_moves_a_branch_inside_the_rebased_range() {
+        let f = Fixture::new();
+        let (repo, ws, _) = workspace(&f);
+        let git = Git::at(&ws).unwrap();
+        let (a, _, first) = card(&f, &ws, 1, &[("a.txt", "a\n")]);
+        let second = f.commit(&ws, &[("a2.txt", "a2\n")], "card 1, second commit");
+        f.git(&ws, &["branch", "inside", &first]);
+        let (_, _, tip_b) = card(&f, &ws, 2, &[("b.txt", "b\n")]);
+        fast_forward(&git, &RUN.into(), &tip_b).unwrap();
+        f.git(&repo, &["config", "rebase.updateRefs", "true"]);
+        assert_eq!(rebase_onto(&git, &a, RUN).unwrap(), Vec::<PyStr>::new());
+        let tip_a = f.git(&ws, &["rev-parse", &format!("refs/heads/{}", a.lossy())]);
+        assert_ne!(tip_a, second, "card 1 was rebased");
+        assert_eq!(f.git(&ws, &["rev-parse", &format!("{tip_a}~2")]), tip_b);
+        assert_eq!(f.git(&ws, &["rev-parse", "refs/heads/inside"]), first);
+    }
+
     #[test]
     fn rebase_onto_a_conflict_returns_the_paths_and_leaves_the_branch_unchanged() {
         let f = Fixture::new();

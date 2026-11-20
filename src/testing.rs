@@ -276,23 +276,41 @@ fn count_pass(counter: &OsStr) -> Result<i64> {
 /// Kills `LEADHAND_CRASH_KILL_PGID`'s group if named (errors ignored), then exits 97 with no
 /// cleanup: no destructor runs.
 fn crash(env: Env) -> ! {
-    let group = hook_set(env, "LEADHAND_CRASH_KILL_PGID")
-        .and_then(|v| integer("LEADHAND_CRASH_KILL_PGID", &v).ok());
-    match group {
-        Some(0) => {
+    match crash_group(env) {
+        Some(CrashGroup::Own) => {
             let _ = rustix::process::kill_current_process_group(rustix::process::Signal::KILL);
         }
-        Some(pgid) if pgid > 0 => {
-            if let Some(pid) = i32::try_from(pgid)
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-            {
-                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-            }
+        Some(CrashGroup::Of(pid)) => {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
         }
-        _ => {}
+        None => {}
     }
     std::process::exit(CRASH_EXIT)
+}
+
+/// The process group a crash kills first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrashGroup {
+    /// The crashing process's own (`LEADHAND_CRASH_KILL_PGID=0`, as `os.killpg(0, …)`).
+    Own,
+    /// The group this pid leads.
+    Of(rustix::process::Pid),
+}
+
+/// The group `LEADHAND_CRASH_KILL_PGID` names, `None` when it names none: unset, empty, not a
+/// whole number, out of a pid's range, negative, or 1, which `kill_process_group` would send
+/// to every process the user owns (`kill(-1, …)`).
+fn crash_group(env: Env) -> Option<CrashGroup> {
+    let pgid = hook_set(env, "LEADHAND_CRASH_KILL_PGID")
+        .and_then(|v| integer("LEADHAND_CRASH_KILL_PGID", &v).ok())?;
+    match pgid {
+        0 => Some(CrashGroup::Own),
+        pgid if pgid > 1 => i32::try_from(pgid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .map(CrashGroup::Of),
+        _ => None,
+    }
 }
 
 fn fail_loudly(e: Error) -> ! {
@@ -541,6 +559,29 @@ mod tests {
             ("LEADHAND_TESTING", "0"),
         ]);
         assert!(!crash_due(&lookup(&off), "after_start").unwrap());
+    }
+
+    // `LEADHAND_CRASH_KILL_PGID=1` would be `kill(-1, SIGKILL)`, every process the user owns,
+    // and a negative value no group at all: neither reaches `kill_process_group`. 0 keeps its
+    // meaning, the crashing process's own group (`os.killpg(0, 9)`).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn crash_kill_pgid_never_names_every_process() {
+        let group =
+            |value: &str| crash_group(&lookup(&hooked(&[("LEADHAND_CRASH_KILL_PGID", value)])));
+        let pid = |n: i32| rustix::process::Pid::from_raw(n).map(CrashGroup::Of);
+        assert_eq!(group("0"), Some(CrashGroup::Own));
+        assert_eq!(group("4242"), pid(4242));
+        assert_eq!(group(" 4242\n"), pid(4242));
+        assert_eq!(group("2"), pid(2));
+        for none in ["1", " 1 ", "-1", "-4242", "", "x", "99999999999"] {
+            assert_eq!(group(none), None, "{none:?}");
+        }
+        let off = hooked(&[
+            ("LEADHAND_CRASH_KILL_PGID", "4242"),
+            ("LEADHAND_TESTING", "0"),
+        ]);
+        assert_eq!(crash_group(&lookup(&off)), None);
     }
 
     #[cfg(feature = "testing")]
