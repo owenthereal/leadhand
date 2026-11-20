@@ -435,9 +435,17 @@ pub(super) fn base_violation(
 
 /// The base worktree's hidden entries (now cleared), HEAD and changed tracked paths, as
 /// `_base_violation` reads them (`status --porcelain` lines from their fourth character on,
-/// sorted).
+/// sorted). An error, with nothing read or unhidden, unless the folder is its own Git top
+/// (S2-R54): one whose `.git` is gone lies inside the operator's checkout, whose index
+/// entries Git would unhide.
 fn base_state(path: &Path) -> Result<(Vec<PyStr>, Option<String>, Vec<PyStr>)> {
     let git = Git::at(path)?;
+    if !crate::git::workspace::is_own_top(path) {
+        return Err(Error::msg(format!(
+            "the evidence base worktree {} is not a worktree top",
+            path.display()
+        )));
+    }
     let hidden = crate::git::unhide_index_entries(&git)?;
     let (now, dirty) = crate::git::base_worktree::head_and_status(&git)?;
     Ok((hidden, Some(now), dirty))
@@ -618,6 +626,45 @@ pub(super) fn finish_leftovers(run: &Run, pending: &[&events::Violation]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // S2-R54, bug class 1: an evidence base worktree folder whose `.git` file is gone lies
+    // inside the operator's checkout, where unhiding index entries would clear the operator's
+    // own flags. `base_state` reads nothing there unless Git's top is the folder itself.
+    #[test]
+    fn base_state_reads_only_a_folder_that_is_its_own_git_top() {
+        let f = crate::git::fixture::Fixture::new();
+        let repo = f.make_repo("repo");
+        std::fs::write(repo.join(".git/info/exclude"), ".worktrees/\n").unwrap();
+        let base = repo.join(".worktrees").join("demo--base");
+        let sha = f.git(&repo, &["rev-parse", "HEAD"]);
+        f.git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                base.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        assert_eq!(
+            base_state(&base),
+            Ok((Vec::new(), Some(sha.clone()), Vec::new()))
+        );
+        // A genuine one reached through a symlink reads too.
+        let link = f.root().join("base link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        assert_eq!(base_state(&link), Ok((Vec::new(), Some(sha), Vec::new())));
+        std::fs::remove_file(base.join(".git")).unwrap();
+        // The operator hides an edit of their own behind assume-unchanged.
+        f.write(&repo, &[("README.md", "the operator's edit\n")]);
+        f.git(&repo, &["update-index", "--assume-unchanged", "README.md"]);
+        let before = f.checkout_state(&repo);
+        let e = base_state(&base).unwrap_err();
+        assert!(e.message.contains("is not a worktree top"), "{e}");
+        assert_eq!(f.checkout_state(&repo), before);
+    }
 
     #[test]
     fn keep_ref_suffixes_are_named_as_the_python_names_them() {

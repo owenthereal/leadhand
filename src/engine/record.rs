@@ -225,8 +225,9 @@ fn record_started(run: &Run, f: &RecordFields) -> Result<RecordOutput> {
 /// (`_record_result`).
 fn record_result(run: &Run, f: &RecordFields) -> Result<RecordOutput> {
     // A result is read from the workspace's scratch files, and a Codex one may stop its
-    // runner there, so an in-place run is refused first. The other kinds only append events.
-    crate::launch::refuse_in_place(&run.meta)?;
+    // runner there, so an in-place run, or a workspace that is not the run's own worktree
+    // (S2-R54), is refused first. The other kinds only append events.
+    run.check_worktree()?;
     let reply = f.reply.clone().unwrap_or_default();
     if f.reply_file.is_some() && !reply.is_empty() {
         return Err(Error::msg(
@@ -900,18 +901,27 @@ mod tests {
     /// fixture repository, or with `in_place` the repository's checkout itself. The run folder
     /// and the review's scratch folder.
     fn started_review(f: &Fixture, in_place: bool) -> (PathBuf, PathBuf) {
+        started_review_with(f, |repo| {
+            if in_place {
+                repo.to_path_buf()
+            } else {
+                f.root().join("work space")
+            }
+        })
+    }
+
+    /// As `started_review`, the workspace at `ws(repo)`: a worktree added there on the run
+    /// branch, unless it is the repository's checkout itself.
+    fn started_review_with(f: &Fixture, ws: impl FnOnce(&Path) -> PathBuf) -> (PathBuf, PathBuf) {
         let repo = f.make_repo("repo");
-        let ws = if in_place {
-            repo.clone()
-        } else {
-            let ws = f.root().join("work space");
+        let ws = ws(&repo);
+        if ws != repo {
             let ws_arg = ws.to_str().unwrap();
             f.git(
                 &repo,
                 &["worktree", "add", "-q", "-b", "leadhand/demo", ws_arg],
             );
-            ws
-        };
+        }
         let base = f.git(&repo, &["rev-parse", "HEAD"]);
         let root = f.root().join("docs dir/runs/2026-11-14-demo-deck");
         std::fs::create_dir_all(&root).unwrap();
@@ -1034,6 +1044,64 @@ mod tests {
                 .result
                 .is_none()
         );
+    }
+
+    // S2-R54, bug classes 1 and 4: `record result` refuses a run worktree whose `.git` file is
+    // gone (Git there would act on the operator's checkout, which encloses it) before it reads
+    // the workspace, naming the folder and Git's top there: nothing is copied, charged or
+    // recorded, and the operator's checkout is as it was.
+    #[test]
+    fn record_result_refuses_a_run_worktree_whose_git_file_is_gone() {
+        let f = Fixture::new();
+        let (root, scratch) = started_review_with(&f, |repo| repo.join(".worktrees").join("demo"));
+        let repo = f.root().join("repo");
+        let ws = repo.join(".worktrees").join("demo");
+        std::fs::write(repo.join(".git/info/exclude"), ".worktrees/\n").unwrap();
+        std::fs::write(scratch.join("report.md"), "Verdict: clean\n").unwrap();
+        f.write(&repo, &[("README.md", "the operator's edit\n")]);
+        std::fs::remove_file(ws.join(".git")).unwrap();
+        let before = f.checkout_state(&repo);
+        let fields = RecordFields {
+            dispatch: Some("c1-a1-review-1".into()),
+            worker: Some("agent0001".into()),
+            reply: Some("Verdict: clean".into()),
+            ..RecordFields::default()
+        };
+        let run = Run::load(&root).unwrap();
+        let e = record_result(&run, &fields).unwrap_err();
+        let repair = crate::cli::human::command_line(&[
+            "git".into(),
+            "-C".into(),
+            repo.clone().into_os_string(),
+            "worktree".into(),
+            "repair".into(),
+        ]);
+        let mut want = format!(
+            "error: the run worktree {} is not a worktree top (Git's top there is {}); leadhand \
+             will not run Git there. Restore its .git file with:\n",
+            ws.display(),
+            repo.display()
+        )
+        .into_bytes();
+        want.extend_from_slice(repair.as_encoded_bytes());
+        want.push(b'\n');
+        assert_eq!(
+            String::from_utf8_lossy(e.printed.as_deref().unwrap_or_default()),
+            String::from_utf8_lossy(&want)
+        );
+        assert_eq!(e.exit, 1);
+        let paths = crate::state::run_paths(&root);
+        assert!(!root.join("cards").exists());
+        assert!(!paths.charges.exists());
+        assert!(!paths.attempts.exists());
+        let log = Log::read(&paths).unwrap();
+        assert!(
+            log.dispatch(Some("c1-a1-review-1"))
+                .unwrap()
+                .result
+                .is_none()
+        );
+        assert_eq!(f.checkout_state(&repo), before);
     }
 
     // `req["model"] if req["vendor"] == "claude" else None`, then `req["effort"] if model`.

@@ -55,10 +55,11 @@ use crate::wire::PyStr;
 /// Reconciles the run in `run_dir` after a relaunch: the summary `reconciled` event appended,
 /// or `None` when no relaunch waits on reconciliation (the Python reconciles only from `next`,
 /// which asks first; once it does, it always records a summary, "nothing was in flight"
-/// included). An in-place run is refused, as `next` refuses it.
+/// included). An in-place run, or a workspace that is not the run's own worktree (S2-R54), is
+/// refused, as `next` refuses it.
 pub fn reconcile(run_dir: &Path) -> Result<Option<Event>> {
     let run = Run::load(run_dir)?;
-    crate::launch::refuse_in_place(&run.meta)?;
+    run.check_worktree()?;
     let st = RunState::new(&run, Log::read(&run.paths)?);
     if !st.log.needs_reconcile() {
         return Ok(None);
@@ -616,8 +617,13 @@ mod tests {
     /// started; `before.txt` was untracked there when it was requested. The run folder and the
     /// workspace.
     fn cut_run(f: &Fixture) -> (PathBuf, PathBuf, String) {
+        cut_run_with(f, |_| f.root().join("work space"))
+    }
+
+    /// As `cut_run`, the run's worktree at `ws(repo)`.
+    fn cut_run_with(f: &Fixture, ws: impl FnOnce(&Path) -> PathBuf) -> (PathBuf, PathBuf, String) {
         let repo = f.make_repo("repo");
-        let ws = f.root().join("work space");
+        let ws = ws(&repo);
         f.git(
             &repo,
             &[
@@ -735,6 +741,50 @@ mod tests {
         f.git(&ws, &["checkout", "-q", "--detach"]);
         assert_eq!(commit_partial(&run, &d).unwrap(), Partial::default());
         assert_eq!(intents(&run).len(), 1);
+    }
+
+    // S2-R54, bug classes 1 and 4: recovery runs Git in the run worktree only once it has
+    // passed the identity check. With its `.git` file gone and its record pruned, Git run there
+    // finds the operator's checkout, here on the card branch with an edit of the operator's
+    // own. The reconciliation refuses before it reads the log, naming the folder and Git's top
+    // there; a partial commit, which reaches the workspace through `Run::git`, commits nothing.
+    // The operator's checkout is as it was.
+    #[test]
+    fn recovery_refuses_a_run_worktree_whose_git_file_is_gone() {
+        let f = Fixture::new();
+        let (root, ws, _) = cut_run_with(&f, |repo| repo.join(".worktrees").join("demo"));
+        let repo = f.root().join("repo");
+        std::fs::write(repo.join(".git/info/exclude"), ".worktrees/\n").unwrap();
+        std::fs::remove_file(ws.join(".git")).unwrap();
+        f.git(&repo, &["worktree", "prune"]);
+        f.git(&repo, &["switch", "-q", "leadhand/demo--card-1"]);
+        f.write(&repo, &[("README.md", "the operator's edit\n")]);
+        let before = f.checkout_state(&repo);
+        let e = reconcile(&root).unwrap_err();
+        let text = String::from_utf8_lossy(e.printed.as_deref().unwrap_or_default()).into_owned();
+        let head = format!(
+            "error: the run worktree {} is not a worktree top (Git's top there is {}); leadhand \
+             will not run Git there. Start a new run of the deck with:\n",
+            ws.display(),
+            repo.display()
+        );
+        assert!(text.starts_with(&head), "{text}");
+        assert_eq!(e.exit, 1);
+        let run = Run::load(&root).unwrap();
+        assert!(intents(&run).is_empty());
+        let log = Log::read(&run.paths).unwrap();
+        let d = log.dispatch(Some(ID)).unwrap();
+        let partial = commit_partial(&run, &d).unwrap();
+        assert_eq!(partial.commit, None, "{partial:?}");
+        assert!(
+            partial
+                .error
+                .as_ref()
+                .is_some_and(|e| e.contains("is not a worktree top")),
+            "{partial:?}"
+        );
+        assert!(intents(&run).is_empty());
+        assert_eq!(f.checkout_state(&repo), before);
     }
 
     // `_cancel_requested`, `_pause_requested`: the flag is recorded once and removed.

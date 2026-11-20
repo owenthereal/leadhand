@@ -24,7 +24,6 @@ use super::protocol::RUN_CHECK_KINDS;
 use super::shell::{Guard, NewDispatch, append_request, check_out};
 use super::violations::{ensure_clean, run_id};
 use crate::briefs_write::{BriefSpec, write_brief};
-use crate::dispatch::base_worktree_path as dispatch_base_path;
 use crate::error::{Error, Result};
 use crate::git::Git;
 use crate::git::base_worktree::{BaseWorktree, Record, prepare};
@@ -335,7 +334,7 @@ pub(super) fn accept_fix(
 /// (`_base_worktree_path`).
 pub(crate) fn base_worktree_path(run: &Run) -> PathBuf {
     let name = run.root.file_name().unwrap_or_default();
-    dispatch_base_path(&run.repo, &run.ws, name)
+    crate::git::workspace::base_worktree_path(&run.repo, &run.ws, name)
 }
 
 /// The base worktree an evidence dispatch recorded (its `extra`'s `base_worktree`), else the

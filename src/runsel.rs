@@ -249,9 +249,8 @@ fn names_worktree(dir: &Path, meta: &RunMeta, worktree: &Path) -> bool {
     base_worktree_path(dir, meta).is_some_and(|base| real_path(&base) == worktree)
 }
 
-/// The run's evidence base worktree (`dispatch.base_worktree_path`):
-/// `<repo>/.worktrees/<workspace name>--base` when the workspace is a worktree there, else
-/// `<repo>/.worktrees/<run dir name>--base`.
+/// The evidence base worktree of the run at `dir` (`git::workspace::base_worktree_path`), when
+/// its run.json names its repository.
 fn base_worktree_path(dir: &Path, meta: &RunMeta) -> Option<PathBuf> {
     let repo = PathBuf::from(meta.repo.as_ref()?.to_os().ok()?);
     let workspace = meta
@@ -261,15 +260,11 @@ fn base_worktree_path(dir: &Path, meta: &RunMeta) -> Option<PathBuf> {
         .and_then(|w| w.to_os().ok())
         .map(PathBuf::from)
         .unwrap_or_default();
-    let worktrees = repo.join(".worktrees");
-    let name = if workspace.parent() == Some(worktrees.as_path()) {
-        workspace.file_name()?.to_os_string()
-    } else {
-        dir.file_name()?.to_os_string()
-    };
-    let mut base = name;
-    base.push("--base");
-    Some(worktrees.join(base))
+    Some(git::workspace::base_worktree_path(
+        &repo,
+        &workspace,
+        dir.file_name()?,
+    ))
 }
 
 /// The run among `runs` whose worktree is `wt`, if any: the only one, else the only

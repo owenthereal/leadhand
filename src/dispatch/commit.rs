@@ -24,7 +24,9 @@ use super::own::COMMIT_INTENT;
 use super::{DispatchRequest, UNTRACKED, field, read_json_object};
 use crate::briefs::{SCRATCH, scratch_dir};
 use crate::error::{Error, Result};
-use crate::git::{Git, stage_work, status_entries, top_and_prefix, unhide_index_entries};
+use crate::git::{
+    Git, stage_work, status_entries, top_and_prefix, unhide_index_entries, workspace,
+};
 use crate::pytext::{pure_path, py_isspace, py_splitlines, py_strip, real_path};
 use crate::safedir::SafeDir;
 use crate::state::{run_paths, utc_now};
@@ -96,6 +98,16 @@ fn commit_work_with(
             ..CommitOutcome::default()
         };
     }
+    // Nor in a workspace that is not the run's own worktree (S2-R54): one whose `.git` is gone
+    // lies inside the operator's checkout, where Git would unhide, stage and commit the
+    // operator's work. Refused the same way, before anything is unhidden or staged.
+    if let Some(why) = not_the_runs_worktree(req) {
+        return CommitOutcome {
+            changes: true,
+            commit_error: Some(why),
+            ..CommitOutcome::default()
+        };
+    }
     let mut changes = false;
     let calls = Calls {
         ws: &req.cwd,
@@ -127,6 +139,26 @@ fn check_in_run(req: &DispatchRequest) -> Result<()> {
         },
     };
     check_request(req, &anchor)
+}
+
+/// `refused: <why>` when the workspace `req.cwd` is a folder that fails the run worktree's
+/// identity check against run.json's `repo` (`git::workspace::not_a_run_worktree`), or when
+/// run.json names no repository; `None` when it passes, or when the folder is gone (the
+/// commit's own Git calls then fail as before).
+fn not_the_runs_worktree(req: &DispatchRequest) -> Option<PyStr> {
+    if !req.cwd.is_dir() {
+        return None;
+    }
+    let meta = read_json_object(&run_paths(&req.run_dir).run_json)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let mut why = PyStr::from("refused: ");
+    match workspace::meta_path(&meta, "repo") {
+        Some(repo) => why.push(&workspace::not_a_run_worktree(&repo, &req.cwd)?.problem),
+        None => why.push_str("run.json names no repository"),
+    }
+    Some(why)
 }
 
 /// The commit's own Git calls, bounded by the cancel's deadline.
@@ -509,11 +541,13 @@ mod tests {
 
     const CARD_BRANCH: &str = "leadhand/demo--card-1";
 
-    /// A run (outside the repository) whose workspace is a repository on the card branch, with
-    /// `.leadhand/` excluded, and an implement dispatch `d1`'s worker folder.
+    /// A run (outside the repository) whose workspace `ws` is a worktree of the repository
+    /// `repo` at `<repo>/.worktrees/ws` on the card branch, as `start` puts it, with
+    /// `.leadhand/` and `.worktrees/` excluded, and an implement dispatch `d1`'s worker folder.
     struct World {
         f: Fixture,
         repo: PathBuf,
+        ws: PathBuf,
         run_dir: PathBuf,
         base: String,
     }
@@ -522,19 +556,32 @@ mod tests {
         fn new() -> World {
             let f = Fixture::new();
             let repo = f.make_repo("repo");
-            f.git(&repo, &["checkout", "--quiet", "-b", CARD_BRANCH]);
-            let base = f.git(&repo, &["rev-parse", "HEAD"]);
-            fs::write(repo.join(".git/info/exclude"), ".leadhand/\n").unwrap();
+            let ws = repo.join(".worktrees").join("ws");
+            f.git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    CARD_BRANCH,
+                    ws.to_str().unwrap(),
+                ],
+            );
+            let base = f.git(&ws, &["rev-parse", "HEAD"]);
+            fs::write(repo.join(".git/info/exclude"), ".leadhand/\n.worktrees/\n").unwrap();
             let run_dir = f.root().join("runs").join("r1");
             fs::create_dir_all(run_dir.join("workers").join("d1")).unwrap();
             let meta = format!(
-                "{{\"run_id\": \"r1\", \"repo\": {repo:?}, \"workspace\": {repo:?}}}",
-                repo = repo.to_str().unwrap()
+                "{{\"run_id\": \"r1\", \"repo\": {repo:?}, \"workspace\": {ws:?}}}",
+                repo = repo.to_str().unwrap(),
+                ws = ws.to_str().unwrap()
             );
             fs::write(run_dir.join("run.json"), meta).unwrap();
             World {
                 f,
                 repo,
+                ws,
                 run_dir,
                 base,
             }
@@ -545,7 +592,7 @@ mod tests {
         }
 
         fn request(&self) -> DispatchRequest {
-            let folder = self.repo.join(".leadhand").join("1").join("d1");
+            let folder = self.ws.join(".leadhand").join("1").join("d1");
             fs::create_dir_all(&folder).unwrap();
             fs::write(
                 folder.join("brief.md"),
@@ -558,7 +605,7 @@ mod tests {
                 role: "implementer".into(),
                 brief: folder.join("brief.md"),
                 report: folder.join("report.md"),
-                cwd: self.repo.clone(),
+                cwd: self.ws.clone(),
                 run_dir: self.run_dir.clone(),
                 card: Some(1),
                 attempt: 1,
@@ -574,7 +621,7 @@ mod tests {
         }
 
         fn head(&self) -> String {
-            self.f.git(&self.repo, &["rev-parse", "HEAD"])
+            self.f.git(&self.ws, &["rev-parse", "HEAD"])
         }
     }
 
@@ -593,7 +640,7 @@ mod tests {
     fn unlocatable_git_path_is_an_error_not_an_operation() {
         let w = World::new();
         let req = w.request();
-        w.f.write(&w.repo, &[("src/widget.py", "WIDGET = 1\n")]);
+        w.f.write(&w.ws, &[("src/widget.py", "WIDGET = 1\n")]);
         let failing = |git: &Git, args: &[&OsStr]| -> Result<Option<Output>> {
             if args.contains(&OsStr::new("--git-path")) {
                 return Ok(Some(Output {
@@ -620,13 +667,13 @@ mod tests {
     fn commits_the_work_with_the_trailer_once() {
         let w = World::new();
         let req = w.request();
-        w.f.write(&w.repo, &[("src/widget.py", "WIDGET = 1\n")]);
+        w.f.write(&w.ws, &[("src/widget.py", "WIDGET = 1\n")]);
         let first = commit_work(&w.wd(), &req, None);
         let sha = w.head();
         assert_eq!(first.committed.as_deref(), Some(sha.as_str()), "{first:?}");
         assert!(w.wd().join(COMMIT_INTENT).exists());
         assert_eq!(
-            w.f.git(&w.repo, &["log", "-1", "--format=%s%n%b"]),
+            w.f.git(&w.ws, &["log", "-1", "--format=%s%n%b"]),
             "implement card 1: Widget card\nLeadhand-Dispatch: d1"
         );
         // A restart after the commit (intent there, HEAD carries the trailer): nothing new.
@@ -634,11 +681,11 @@ mod tests {
         assert_eq!(again.committed.as_deref(), Some(sha.as_str()));
         assert_eq!(w.head(), sha);
         // A restart after the intent but before the commit: it commits.
-        w.f.git(&w.repo, &["reset", "--quiet", "--soft", &w.base]);
+        w.f.git(&w.ws, &["reset", "--quiet", "--soft", &w.base]);
         let late = commit_work(&w.wd(), &req, None);
         assert_ne!(late.committed.as_deref(), Some(w.base.as_str()));
         let count = w.f.git(
-            &w.repo,
+            &w.ws,
             &["rev-list", "--count", &format!("{}..HEAD", w.base)],
         );
         assert_eq!(count, "1");
@@ -648,7 +695,7 @@ mod tests {
     fn no_time_left_commits_nothing() {
         let w = World::new();
         let req = w.request();
-        w.f.write(&w.repo, &[("src/widget.py", "WIDGET = 1\n")]);
+        w.f.write(&w.ws, &[("src/widget.py", "WIDGET = 1\n")]);
         let past = Instant::now() - Duration::from_secs(1);
         let out = commit_work(&w.wd(), &req, Some(past));
         assert_eq!(out.committed, None);
@@ -675,6 +722,105 @@ mod tests {
         assert!(error.contains("(/nonexistent run.json)"), "{error:?}");
     }
 
+    // S2-R54, bug classes 1 and 4 (deferred minor 285's write half): the commit runs Git in
+    // the workspace only once Git's top there is the workspace itself and the run's repository
+    // lists it as a linked worktree. A workspace whose `.git` file is gone lies inside the
+    // operator's checkout, so Git there would unhide, stage and commit the operator's own work:
+    // refused as uncommitted changes, before anything is unhidden, staged or committed.
+    #[test]
+    fn a_workspace_that_is_not_the_runs_own_worktree_is_refused_as_changes() {
+        let w = World::new();
+        let req = w.request();
+        w.f.write(&w.ws, &[("src/widget.py", "WIDGET = 1\n")]);
+        fs::remove_file(w.ws.join(".git")).unwrap();
+        let refused = |w: &World| {
+            let out = commit_work(&w.wd(), &req, None);
+            assert!(out.changes, "{out:?}");
+            assert_eq!(
+                (out.committed.clone(), out.commit_skipped.clone()),
+                (None, None)
+            );
+            assert!(!w.wd().join(COMMIT_INTENT).exists());
+            out.commit_error.expect("a refusal").lossy().into_owned()
+        };
+        // Its record kept: the operator hides an edit of their own behind assume-unchanged.
+        w.f.write(&w.repo, &[("README.md", "the operator's edit\n")]);
+        w.f.git(
+            &w.repo,
+            &["update-index", "--assume-unchanged", "README.md"],
+        );
+        let before = w.f.checkout_state(&w.repo);
+        assert_eq!(
+            refused(&w),
+            format!(
+                "refused: the run worktree {} is not a worktree top (Git's top there is {})",
+                w.ws.display(),
+                w.repo.display()
+            )
+        );
+        assert_eq!(w.f.checkout_state(&w.repo), before);
+        // Its record pruned, and the operator's checkout on the card branch with their edit:
+        // nothing is staged or committed there.
+        w.f.git(
+            &w.repo,
+            &["update-index", "--no-assume-unchanged", "README.md"],
+        );
+        w.f.git(&w.repo, &["worktree", "prune"]);
+        w.f.git(&w.repo, &["switch", "-q", CARD_BRANCH]);
+        let before = w.f.checkout_state(&w.repo);
+        assert!(refused(&w).contains("is not a worktree top"));
+        assert_eq!(w.f.checkout_state(&w.repo), before);
+        // The repository's main working tree is never the run's worktree either.
+        let meta = format!(
+            "{{\"run_id\": \"r1\", \"repo\": {repo:?}, \"workspace\": {repo:?}}}",
+            repo = w.repo.to_str().unwrap()
+        );
+        fs::write(w.run_dir.join("run.json"), meta).unwrap();
+        let req = DispatchRequest {
+            cwd: w.repo.clone(),
+            brief: w.repo.join(".leadhand/1/d1/brief.md"),
+            report: w.repo.join(".leadhand/1/d1/report.md"),
+            ..w.request()
+        };
+        w.f.write(&w.repo, &[(".leadhand/1/d1/brief.md", "# Brief\n")]);
+        let out = commit_work(&w.wd(), &req, None);
+        assert!(out.changes, "{out:?}");
+        assert_eq!(
+            out.commit_error.map(|e| e.lossy().into_owned()),
+            Some(format!(
+                "refused: the run worktree {} is the repository's main working tree",
+                w.repo.display()
+            ))
+        );
+        assert_eq!(w.f.checkout_state(&w.repo), before);
+    }
+
+    // S2-R54: the run's own worktree passes the identity check however the request spells it,
+    // here through a symlink, and the work is committed there.
+    #[test]
+    fn a_workspace_reached_through_a_symlink_is_committed() {
+        let w = World::new();
+        let link = w.f.root().join("ws link");
+        std::os::unix::fs::symlink(&w.ws, &link).unwrap();
+        let req = w.request();
+        let req = DispatchRequest {
+            cwd: link.clone(),
+            brief: link.join(".leadhand/1/d1/brief.md"),
+            report: link.join(".leadhand/1/d1/report.md"),
+            ..req
+        };
+        w.f.write(&w.ws, &[("src/widget.py", "WIDGET = 1\n")]);
+        let operator = |w: &World| {
+            let at = |args: &[&str]| w.f.git(&w.repo, args);
+            (at(&["symbolic-ref", "HEAD"]), at(&["rev-parse", "HEAD"]))
+        };
+        let before = operator(&w);
+        let out = commit_work(&w.wd(), &req, None);
+        assert_eq!(out.committed, Some(w.head()), "{out:?}");
+        assert_ne!(w.head(), w.base);
+        assert_eq!(operator(&w), before);
+    }
+
     #[test]
     fn subject_from_the_summary_else_the_card_title_truncated() {
         let w = World::new();
@@ -695,7 +841,7 @@ mod tests {
         assert!(subject.ends_with('…'));
         // A report that is not a regular file is no report.
         fs::remove_file(&req.report).unwrap();
-        std::os::unix::fs::symlink(w.repo.join("README.md"), &req.report).unwrap();
+        std::os::unix::fs::symlink(w.ws.join("README.md"), &req.report).unwrap();
         assert_eq!(commit_subject(&req), "implement card 1: Widget card");
         assert_eq!(
             card_title("## Card \u{663}: Arabic three\n"),
@@ -711,13 +857,9 @@ mod tests {
     #[test]
     fn untracked_to_take_fences_the_run_folder_from_the_checkout_top() {
         let w = World::new();
-        let sub = w.repo.join("src");
+        let sub = w.ws.join("src");
         fs::create_dir(&sub).unwrap();
-        let run_dir = w
-            .repo
-            .join("notes")
-            .join("runs")
-            .join("2026-11-10-demo run");
+        let run_dir = w.ws.join("notes").join("runs").join("2026-11-10-demo run");
         fs::create_dir_all(&run_dir).unwrap();
         let paths: Vec<PyStr> = [
             "notes/runs/2026-11-10-demo run/run.json",
@@ -743,7 +885,7 @@ mod tests {
             vec![PyStr::from("src/new.py"), PyStr::from("src/pkg/deep.py")]
         );
         assert_eq!(
-            untracked_to_take(&w.run_dir, &w.repo, &paths, COMMIT_TIMEOUT).unwrap(),
+            untracked_to_take(&w.run_dir, &w.ws, &paths, COMMIT_TIMEOUT).unwrap(),
             paths
         );
     }

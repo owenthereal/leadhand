@@ -44,8 +44,8 @@ use crate::wire::{PyMap, PyStr};
 
 pub use argv::{codex_argv, codex_argv_parts, toml_string};
 pub use caller::{
-    Anchor, anchored_run, anchored_worker, base_worktree_path, check_caller, check_dispatch_id,
-    check_request, evidence_dirs, runner_worker, worker_dir,
+    Anchor, anchored_run, anchored_worker, check_caller, check_dispatch_id, check_request,
+    evidence_dirs, runner_worker, worker_dir,
 };
 pub use cancel::cancel;
 pub use cmd::{dispatch, request_for};

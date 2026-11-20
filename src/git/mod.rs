@@ -214,6 +214,28 @@ pub(crate) mod fixture {
             self.commit(&repo, &[("README.md", "hello\n")], "initial");
             repo
         }
+
+        /// What the checkout `repo` looks like to its operator: its branch, HEAD, index (its
+        /// flags included), status, every ref, and each tracked file's bytes. Equal before and
+        /// after only when nothing was checked out, reset, staged, committed or moved there.
+        pub(crate) fn checkout_state(&self, repo: &Path) -> Vec<String> {
+            let mut state: Vec<String> = [
+                &["symbolic-ref", "HEAD"][..],
+                &["rev-parse", "HEAD"],
+                &["ls-files", "--stage"],
+                &["ls-files", "-v"],
+                &["status", "--porcelain", "--untracked-files=all"],
+                &["for-each-ref", "--format=%(refname) %(objectname)"],
+            ]
+            .iter()
+            .map(|args| self.git(repo, args))
+            .collect();
+            for path in self.git(repo, &["ls-files"]).lines() {
+                let bytes = std::fs::read(repo.join(path)).unwrap_or_default();
+                state.push(format!("{path}: {}", String::from_utf8_lossy(&bytes)));
+            }
+            state
+        }
     }
 
     impl Drop for Fixture {

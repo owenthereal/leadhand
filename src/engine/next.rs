@@ -1911,6 +1911,7 @@ mod tests {
             base_sha: base,
             deck,
             config,
+            worktree: Default::default(),
         };
         World { _dir: dir, run }
     }

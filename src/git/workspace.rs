@@ -1,5 +1,7 @@
 //! A run's base and its worktree (`gitops`: `default_base`, `ensure_excluded`,
-//! `resolves_in_place`, `prepare_workspace` in worktree mode, `_worktrees`).
+//! `resolves_in_place`, `prepare_workspace` in worktree mode, `_worktrees`;
+//! `dispatch.base_worktree_path`), and the run worktree's identity: the check every command
+//! makes before it runs Git there, and the refusal of a run whose workspace fails it.
 //!
 //! What this writes in the operator's repository (spec, bug class 1) is only: the run branch,
 //! created only when missing (`update-ref` with an empty old value, so a branch made meanwhile
@@ -10,12 +12,17 @@
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use serde_json::value::RawValue;
+
 use super::preserve::lexists;
 use super::{FETCH_TIMEOUT, Git, RepoIdentity, linked_worktree};
+use crate::cli::human::command_line;
+use crate::dispatch::caller::{py_join, py_name, py_parent, py_str_of};
+use crate::dispatch::{field, truthy};
 use crate::error::{Error, Result};
 use crate::pytext::{
     abspath, normpath, py_repr, py_split, py_splitlines, py_splitlines_bytes, py_strip,
@@ -23,6 +30,7 @@ use crate::pytext::{
 };
 use crate::runsel::RUN_RECORD;
 use crate::store::write_file_atomic_mode;
+use crate::wire::{PyMap, PyStr};
 
 /// One entry of `git worktree list --porcelain -z`: each field's value by its name
 /// (`worktree`, `HEAD`, `branch`, `detached`, …), a later field of the same name winning, as
@@ -253,6 +261,22 @@ pub fn resolves_in_place(root: &Path, path: &Path) -> bool {
     real_path(path) == normpath(real_path(root).join(rel).as_os_str())
 }
 
+/// The run's evidence base worktree (`dispatch.base_worktree_path`): `<repo>/.worktrees/
+/// <workspace name>--base` when the workspace is a worktree there, else `<repo>/.worktrees/
+/// <run dir name>--base` (an in-place run).
+pub fn base_worktree_path(repo: &Path, workspace: &Path, run_name: &OsStr) -> PathBuf {
+    let worktrees = py_join(repo, ".worktrees");
+    // `ws.parent == repo / ".worktrees"`: pathlib compares the spellings (`//x` is not `/x`).
+    let name = if py_parent(workspace).as_os_str() == worktrees.as_os_str() {
+        py_name(workspace)
+    } else {
+        run_name.to_os_string()
+    };
+    let mut base = name;
+    base.push("--base");
+    worktrees.join(base)
+}
+
 /// Creates the run branch at `base_sha` when it is missing (an existing one is left as it
 /// is), then the run's worktree at `<top>/.worktrees/<slug>`, and records `run_dir` in the
 /// worktree's admin folder (`gitops.prepare_workspace` in worktree mode, plus the run record).
@@ -358,6 +382,237 @@ pub(super) fn write_run_record(ws: &Path, run_dir: &Path) -> Result<()> {
     let mut data = run_dir.as_os_str().as_bytes().to_vec();
     data.push(b'\n');
     write_file_atomic_mode(&wt.git_dir.join(RUN_RECORD), &data, 0o644)
+}
+
+// --------------------------------------------------------------------------
+// The run worktree, by identity (bug classes 1 and 4; rulings S2-R49, S2-R54)
+//
+// The run worktree `<repo>/.worktrees/<slug>` lies inside the operator's checkout. Once its
+// `.git` file is gone, Git run there finds the operator's repository, so every write meant for
+// the workspace would land in the operator's checkout. Git is run there only once the folder
+// has passed this check, once per command.
+
+/// Why a folder is not a run worktree that Git may be run in (`not_a_run_worktree`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotARunWorktree {
+    /// What the check found, naming the folder, and Git's top there when Git found one.
+    pub problem: PyStr,
+    /// The repository still lists the folder as a linked worktree, but Git no longer finds the
+    /// worktree from there (its `.git` file is gone or broken): `git worktree repair`, run in
+    /// the repository, restores it.
+    pub repairable: bool,
+}
+
+/// The identity check of the run worktree `ws` of the repository `repo`: Git's top for `ws`
+/// must be `ws` itself, and `repo` must list it in `git worktree list --porcelain -z` as a
+/// linked worktree, not as its main working tree. Paths are compared as real paths, byte for
+/// byte. `None` when it passes. Read only, and it reads no record or marker of leadhand's, so a
+/// run the Python started passes too.
+pub fn not_a_run_worktree(repo: &Path, ws: &Path) -> Option<NotARunWorktree> {
+    let real = real_path(ws);
+    let listed = Git::at(repo)
+        .and_then(|git| worktrees(&git))
+        .map(|entries| {
+            entries.iter().position(|e| {
+                e.get(&b"worktree"[..])
+                    .is_some_and(|p| real_path(Path::new(OsStr::from_bytes(p))) == real)
+            })
+        });
+    let folder = |what: &str| {
+        let mut text = PyStr::from_os_parts(&[OsStr::new("the run worktree "), ws.as_os_str()]);
+        text.push_str(what);
+        text
+    };
+    let top_problem = match real_top(ws) {
+        Ok(top) if top == real => None,
+        Ok(top) => {
+            let mut text = folder(" is not a worktree top (Git's top there is ");
+            text.push(&PyStr::from_os(top.as_os_str()));
+            text.push_str(")");
+            Some(text)
+        }
+        Err(why) => {
+            let mut text = PyStr::from_os_parts(&[
+                OsStr::new("git cannot read the run worktree "),
+                ws.as_os_str(),
+                OsStr::new(": "),
+            ]);
+            text.push(&why);
+            Some(text)
+        }
+    };
+    let (problem, repairable) = match (top_problem, listed) {
+        // The first entry is the main working tree.
+        (None, Ok(Some(0))) => (folder(" is the repository's main working tree"), false),
+        (None, Ok(Some(_))) => return None,
+        (None, Ok(None)) => {
+            let mut text = folder(" is not a worktree of ");
+            text.push(&PyStr::from_os(repo.as_os_str()));
+            (text, false)
+        }
+        (None, Err(e)) => {
+            let mut text = PyStr::from_os_parts(&[
+                OsStr::new("git cannot list the worktrees of "),
+                repo.as_os_str(),
+                OsStr::new(": "),
+            ]);
+            text.push_str(&e.message);
+            (text, false)
+        }
+        (Some(text), listed) => (text, matches!(listed, Ok(Some(n)) if n > 0)),
+    };
+    Some(NotARunWorktree {
+        problem,
+        repairable,
+    })
+}
+
+/// Whether Git, run in the folder `path`, takes `path` itself as its top (real paths, compared
+/// byte for byte): false for a folder whose `.git` is gone, where Git finds the enclosing
+/// checkout, and for one Git cannot read. Read only.
+pub fn is_own_top(path: &Path) -> bool {
+    real_top(path).is_ok_and(|top| top == real_path(path))
+}
+
+/// Git's top for the folder `ws` (`rev-parse --show-toplevel`), as a real path; Git's failure,
+/// its text kept, when it finds none.
+fn real_top(ws: &Path) -> std::result::Result<PathBuf, PyStr> {
+    let git = Git::try_at(ws).map_err(|f| f.text)?;
+    let argv = args(&["rev-parse", "--show-toplevel"]);
+    let out = git.try_output(&argv).map_err(|f| f.text)?;
+    if !out.status.success() {
+        return Err(git.failure_text(&argv, &out).text);
+    }
+    let top = out.stdout.strip_suffix(b"\n").unwrap_or(&out.stdout);
+    Ok(real_path(Path::new(OsStr::from_bytes(top))))
+}
+
+// --------------------------------------------------------------------------
+// The refusals of a run whose workspace is not its own worktree
+
+/// The refusal of a run whose workspace leadhand must not run Git in, with the text `run`
+/// prints, or `None` for a run worktree that passes (or whose folder does not exist: the
+/// command's own paths handle a missing one). First an in-place run (deliberate change 1,
+/// S2-R44: `in_place_refusal`), then a folder that fails the identity check (S2-R54:
+/// `worktree_refusal`). `meta` is run.json's entries, `repo` and `ws` its repository and
+/// workspace, `cli` the CLI's path.
+pub fn workspace_refusal(
+    meta: &PyMap<Box<RawValue>>,
+    repo: &Path,
+    ws: &Path,
+    cli: &Path,
+) -> Option<Vec<u8>> {
+    in_place_refusal(meta, cli).or_else(|| worktree_refusal(meta, repo, ws, cli))
+}
+
+/// `workspace_refusal`, as the error the engine commands that act on the workspace (`next`,
+/// `record result`, the reconciliation) return before they write anything.
+pub fn refuse_unless_run_worktree(
+    meta: &PyMap<Box<RawValue>>,
+    repo: &Path,
+    ws: &Path,
+) -> Result<()> {
+    match workspace_refusal(meta, repo, ws, &crate::testing::self_path()) {
+        Some(text) => Err(Error::printed(text)),
+        None => Ok(()),
+    }
+}
+
+/// The refusal of a run whose workspace folder exists but fails the identity check
+/// (`not_a_run_worktree`), or `None`: `error:` and what the check found, then the one command
+/// that fixes it alone on the last line: `git -C <repo> worktree repair` while the repository
+/// still lists the folder (it restores the `.git` file), else the command that starts a new run
+/// of the deck.
+fn worktree_refusal(
+    meta: &PyMap<Box<RawValue>>,
+    repo: &Path,
+    ws: &Path,
+    cli: &Path,
+) -> Option<Vec<u8>> {
+    if !ws.is_dir() {
+        return None;
+    }
+    let found = not_a_run_worktree(repo, ws)?;
+    let mut head = found.problem.to_os_lossy().into_vec();
+    head.extend_from_slice(b"; leadhand will not run Git there. ");
+    let fix = if found.repairable {
+        head.extend_from_slice(b"Restore its .git file with:");
+        command_line(&[
+            "git".into(),
+            "-C".into(),
+            real_path(repo).into_os_string(),
+            "worktree".into(),
+            "repair".into(),
+        ])
+    } else {
+        head.extend_from_slice(b"Start a new run of the deck with:");
+        start_command(meta, cli)
+    };
+    Some(fix_refusal(&head, &fix))
+}
+
+/// The refusal of an in-place run (deliberate change 1: the Python's checkout claim is gone),
+/// with the command that starts a new run of its deck in a worktree; `None` for a worktree
+/// run.
+fn in_place_refusal(meta: &PyMap<Box<RawValue>>, cli: &Path) -> Option<Vec<u8>> {
+    let repo = meta_path(meta, "repo").filter(|_| in_place(meta))?;
+    let mut head = b"not supported in this version: run.worktree = false (this run works in the \
+                     checkout "
+        .to_vec();
+    head.extend_from_slice(repo.as_os_str().as_bytes());
+    head.extend_from_slice(
+        b" itself); start a new run of the deck, which works in a worktree, with:",
+    );
+    Some(fix_refusal(&head, &start_command(meta, cli)))
+}
+
+/// `_in_place`: run.json's workspace is the repository's checkout itself (real paths).
+fn in_place(meta: &PyMap<Box<RawValue>>) -> bool {
+    match (meta_path(meta, "workspace"), meta_path(meta, "repo")) {
+        (Some(ws), Some(repo)) => real_path(&ws) == real_path(&repo),
+        _ => false,
+    }
+}
+
+/// A refusal whose one fixing command a person copies (spec, "Commands you type"): the
+/// `error: <head>` line, then the command alone on the last line, its bytes kept.
+pub fn fix_refusal(head: &[u8], fix: &OsStr) -> Vec<u8> {
+    let mut text = b"error: ".to_vec();
+    text.extend_from_slice(head);
+    text.push(b'\n');
+    text.extend_from_slice(fix.as_bytes());
+    text.push(b'\n');
+    text
+}
+
+/// The operator's command to start a new run of this run's deck (`launch._start_command`),
+/// every word quoted: `meta` is run.json's entries, `cli` the CLI's path.
+pub fn start_command(meta: &PyMap<Box<RawValue>>, cli: &Path) -> OsString {
+    let mut argv = vec![
+        cli.as_os_str().to_os_string(),
+        "start".into(),
+        meta_word(meta, "deck_source").unwrap_or_else(|| "<deck>".into()),
+    ];
+    if let Some(repo) = meta_word(meta, "repo") {
+        argv.push("--repo".into());
+        argv.push(repo);
+    }
+    command_line(&argv)
+}
+
+/// run.json's non-empty string entry `key`, as a path.
+pub fn meta_path(meta: &PyMap<Box<RawValue>>, key: &str) -> Option<PathBuf> {
+    let text = field::<PyStr>(meta, key).filter(|t| !t.is_empty())?;
+    Some(PathBuf::from(text.to_os().ok()?))
+}
+
+/// `str(meta.get(key))` of a true entry, its bytes kept; `None` for a false one.
+fn meta_word(meta: &PyMap<Box<RawValue>>, key: &str) -> Option<OsString> {
+    let raw = meta.get(&PyStr::from(key)).filter(|raw| truthy(raw))?;
+    match serde_json::from_str::<PyStr>(raw.get()) {
+        Ok(text) => Some(text.to_os().unwrap_or_else(|_| text.to_os_lossy())),
+        Err(_) => Some(py_str_of(raw).into()),
+    }
 }
 
 fn args<'a>(words: &[&'a str]) -> Vec<&'a OsStr> {
@@ -585,5 +840,291 @@ mod tests {
         let ours: Vec<bool> = cases.iter().map(|(r, p)| resolves_in_place(r, p)).collect();
         assert_eq!(ours, theirs);
         assert_eq!(ours[..3], [true, false, false]);
+    }
+
+    #[test]
+    fn base_worktree_path_is_named_for_the_workspace_or_the_run() {
+        let repo = Path::new("/repo");
+        assert_eq!(
+            base_worktree_path(repo, Path::new("/repo/.worktrees/ws"), OsStr::new("r1")),
+            Path::new("/repo/.worktrees/ws--base")
+        );
+        assert_eq!(
+            base_worktree_path(repo, Path::new("/repo//.worktrees/ws/"), OsStr::new("r1")),
+            Path::new("/repo/.worktrees/ws--base")
+        );
+        assert_eq!(
+            base_worktree_path(repo, Path::new("/repo"), OsStr::new("r1")),
+            Path::new("/repo/.worktrees/r1--base")
+        );
+        assert_eq!(
+            base_worktree_path(
+                repo,
+                Path::new("/elsewhere/.worktrees/ws"),
+                OsStr::new("r1")
+            ),
+            Path::new("/repo/.worktrees/r1--base")
+        );
+    }
+
+    /// A repository and a worktree of it added with plain Git at `<repo>/.worktrees/<name>`, as
+    /// a run the Python started has it: no run record, no marker. The repository and the
+    /// worktree.
+    fn run_worktree(f: &Fixture, name: &OsStr) -> (PathBuf, PathBuf) {
+        let repo = f.make_repo("my repo");
+        std::fs::write(repo.join(".git/info/exclude"), ".worktrees/\n").unwrap();
+        let ws = repo.join(".worktrees").join(name);
+        let mut add = args(&["worktree", "add", "-q", "-b", RUN]);
+        add.push(ws.as_os_str());
+        Git::at(&repo).unwrap().run(&add).unwrap();
+        (repo, ws)
+    }
+
+    fn problem(found: Option<NotARunWorktree>) -> (String, bool) {
+        let found = found.expect("the check fails");
+        (found.problem.lossy().into_owned(), found.repairable)
+    }
+
+    // S2-R54: a run worktree passes by any spelling of its path (a symlink to it, a folder name
+    // with spaces, and one that is not UTF-8 where the system allows it), with no record or
+    // marker of leadhand's.
+    #[test]
+    fn the_identity_check_passes_a_run_worktree_by_any_spelling() {
+        let f = Fixture::new();
+        // Linux allows a folder name that is not UTF-8; macOS refuses to create one.
+        let odd = OsStr::from_bytes(b"odd-\xff run");
+        let name = if std::fs::create_dir(f.root().join(odd)).is_ok() {
+            odd
+        } else {
+            OsStr::new("caf\u{e9} run")
+        };
+        let (repo, ws) = run_worktree(&f, name);
+        let admin = linked_worktree(&ws).unwrap().unwrap().git_dir;
+        assert!(!admin.join(RUN_RECORD).exists() && !admin.join("leadhand-run").exists());
+        assert_eq!(not_a_run_worktree(&repo, &ws), None);
+        assert!(is_own_top(&ws));
+        let link = f.root().join("link to the worktree");
+        std::os::unix::fs::symlink(&ws, &link).unwrap();
+        assert_eq!(not_a_run_worktree(&repo, &link), None);
+        let repo_link = f.root().join("link to the repo");
+        std::os::unix::fs::symlink(&repo, &repo_link).unwrap();
+        assert_eq!(not_a_run_worktree(&repo_link, &link), None);
+        assert_eq!(
+            not_a_run_worktree(&repo_link, &repo_link.join(".worktrees").join(name)),
+            None
+        );
+    }
+
+    // S2-R54, bug classes 1 and 4: what fails the check, and what it says. A folder whose `.git`
+    // file is gone (or broken) makes Git find the enclosing checkout, the operator's; while the
+    // repository still lists it, `git worktree repair` restores it.
+    #[test]
+    fn a_folder_that_is_not_a_run_worktree_fails_the_identity_check() {
+        let f = Fixture::new();
+        let (repo, ws) = run_worktree(&f, OsStr::new("demo run"));
+        let shown = |p: &Path| p.display().to_string();
+        let top = format!(
+            "the run worktree {} is not a worktree top (Git's top there is {})",
+            shown(&ws),
+            shown(&repo)
+        );
+        std::fs::remove_file(ws.join(".git")).unwrap();
+        assert_eq!(problem(not_a_run_worktree(&repo, &ws)), (top.clone(), true));
+        assert!(!is_own_top(&ws));
+        f.git(&repo, &["worktree", "repair"]);
+        assert_eq!(not_a_run_worktree(&repo, &ws), None);
+        // A broken `.git` file: Git cannot read the folder at all.
+        std::fs::write(ws.join(".git"), "not a gitfile\n").unwrap();
+        let (text, repairable) = problem(not_a_run_worktree(&repo, &ws));
+        assert!(
+            text.starts_with(&format!(
+                "git cannot read the run worktree {}: ",
+                shown(&ws)
+            )),
+            "{text}"
+        );
+        assert!(repairable);
+        f.git(&repo, &["worktree", "repair"]);
+        assert_eq!(not_a_run_worktree(&repo, &ws), None);
+        // The record pruned too: nothing restores it.
+        std::fs::remove_file(ws.join(".git")).unwrap();
+        f.git(&repo, &["worktree", "prune"]);
+        assert_eq!(problem(not_a_run_worktree(&repo, &ws)), (top, false));
+        // The main working tree is never a run worktree.
+        assert_eq!(
+            problem(not_a_run_worktree(&repo, &repo)),
+            (
+                format!(
+                    "the run worktree {} is the repository's main working tree",
+                    shown(&repo)
+                ),
+                false
+            )
+        );
+        // A top of its own that the repository does not list: another repository's.
+        let other = f.make_repo_in(&repo.join(".worktrees"), "other");
+        assert_eq!(
+            problem(not_a_run_worktree(&repo, &other)),
+            (
+                format!(
+                    "the run worktree {} is not a worktree of {}",
+                    shown(&other),
+                    shown(&repo)
+                ),
+                false
+            )
+        );
+        // A folder in no repository at all.
+        let outside = f.root().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let (text, repairable) = problem(not_a_run_worktree(&repo, &outside));
+        assert!(
+            text.starts_with(&format!(
+                "git cannot read the run worktree {}: ",
+                shown(&outside)
+            )),
+            "{text}"
+        );
+        assert!(!repairable);
+        // A repository Git cannot list.
+        let (text, _) = problem(not_a_run_worktree(&outside, &other));
+        assert!(
+            text.starts_with(&format!(
+                "git cannot list the worktrees of {}: ",
+                shown(&outside)
+            )),
+            "{text}"
+        );
+    }
+
+    fn meta(json: &str) -> PyMap<Box<RawValue>> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn json(p: &Path) -> String {
+        serde_json::to_string(p.to_str().unwrap()).unwrap()
+    }
+
+    // S2-R54: the refusal names what the check found and ends with the one command that fixes
+    // it: the repair while the repository lists the worktree (real paths), else a new run.
+    // A missing folder and a run worktree that passes are not refused here.
+    #[test]
+    fn the_worktree_refusal_ends_with_the_fix_that_is_true() {
+        let f = Fixture::new();
+        let (repo, ws) = run_worktree(&f, OsStr::new("demo run"));
+        let link = f.root().join("repo link");
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+        let m = meta(&format!(
+            r#"{{"workspace": {}, "repo": {}, "deck_source": "/d/my deck.md"}}"#,
+            json(&link.join(".worktrees/demo run")),
+            json(&link)
+        ));
+        let cli = Path::new("/opt/lead hand/leadhand");
+        let ws_link = link.join(".worktrees/demo run");
+        assert_eq!(worktree_refusal(&m, &link, &ws_link, cli), None);
+        assert_eq!(workspace_refusal(&m, &link, &ws_link, cli), None);
+        assert_eq!(
+            worktree_refusal(&m, &link, &f.root().join("gone"), cli),
+            None
+        );
+        std::fs::remove_file(ws.join(".git")).unwrap();
+        let text = |t: Option<Vec<u8>>| String::from_utf8(t.expect("a refusal")).unwrap();
+        let head = format!(
+            "error: the run worktree {} is not a worktree top (Git's top there is {}); leadhand \
+             will not run Git there. ",
+            ws_link.display(),
+            repo.display()
+        );
+        assert_eq!(
+            text(worktree_refusal(&m, &link, &ws_link, cli)),
+            format!(
+                "{head}Restore its .git file with:\ngit -C '{}' worktree repair\n",
+                repo.display()
+            )
+        );
+        assert_eq!(
+            text(workspace_refusal(&m, &link, &ws_link, cli)),
+            text(worktree_refusal(&m, &link, &ws_link, cli))
+        );
+        f.git(&repo, &["worktree", "prune"]);
+        assert_eq!(
+            text(worktree_refusal(&m, &link, &ws_link, cli)),
+            format!(
+                "{head}Start a new run of the deck with:\n'/opt/lead hand/leadhand' start \
+                 '/d/my deck.md' --repo '{}'\n",
+                link.display()
+            )
+        );
+    }
+
+    #[test]
+    fn an_in_place_run_is_refused_with_the_start_command_alone_last() {
+        let dir = tempfile::Builder::new()
+            .prefix("in place ")
+            .tempdir()
+            .unwrap();
+        let repo = dir.path().join("my repo");
+        std::fs::create_dir_all(repo.join(".worktrees/run")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+        let of = |workspace: &Path| {
+            meta(&format!(
+                r#"{{"workspace": {}, "repo": {}, "deck_source": "/d/my deck.md"}}"#,
+                json(workspace),
+                json(&repo)
+            ))
+        };
+        let cli = Path::new("/opt/lead hand/leadhand");
+        // The checkout itself, by any spelling: in place.
+        for ws in [repo.clone(), link.clone()] {
+            let m = of(&ws);
+            assert!(in_place(&m), "{ws:?}");
+            let text = String::from_utf8(in_place_refusal(&m, cli).unwrap()).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(
+                lines,
+                [
+                    format!(
+                        "error: not supported in this version: run.worktree = false (this run \
+                         works in the checkout {} itself); start a new run of the deck, which \
+                         works in a worktree, with:",
+                        repo.display()
+                    )
+                    .as_str(),
+                    &format!(
+                        "'/opt/lead hand/leadhand' start '/d/my deck.md' --repo '{}'",
+                        repo.display()
+                    ),
+                ]
+            );
+            assert!(text.ends_with('\n'));
+            // The in-place refusal comes first, as `run` and the engine print it.
+            assert_eq!(
+                workspace_refusal(&m, &repo, &ws, cli),
+                in_place_refusal(&m, cli)
+            );
+        }
+        // A worktree run: not in place, no refusal.
+        let m = of(&repo.join(".worktrees/run"));
+        assert!(!in_place(&m));
+        assert_eq!(in_place_refusal(&m, cli), None);
+        // Without a repo or a workspace: not in place.
+        assert!(!in_place(&meta("{}")));
+    }
+
+    #[test]
+    fn the_start_command_quotes_every_word() {
+        let cli = Path::new("/opt/lead hand/leadhand");
+        assert_eq!(
+            start_command(
+                &meta(r#"{"deck_source": "/d/my deck.md", "repo": "/r"}"#),
+                cli
+            ),
+            "'/opt/lead hand/leadhand' start '/d/my deck.md' --repo /r"
+        );
+        assert_eq!(
+            start_command(&meta(r#"{"deck_source": "", "repo": null}"#), cli),
+            "'/opt/lead hand/leadhand' start '<deck>'"
+        );
     }
 }

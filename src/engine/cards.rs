@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
@@ -57,7 +58,14 @@ pub struct Run {
     pub base_sha: String,
     pub deck: Deck,
     pub config: Config,
+    /// The workspace's identity check, once per command (`check_worktree`).
+    pub worktree: WorktreeCheck,
 }
+
+/// The outcome of the run workspace's identity check (S2-R54), kept for the rest of the
+/// command; only `Run::check_worktree` fills it, so a `Default` one is unchecked.
+#[derive(Debug, Default)]
+pub struct WorktreeCheck(OnceLock<Result<()>>);
 
 impl Run {
     /// The run in `run_dir` (`engine._load(check_digest=False)`).
@@ -100,7 +108,25 @@ impl Run {
             deck,
             config,
             meta,
+            worktree: WorktreeCheck::default(),
         })
+    }
+
+    /// Refuses a run whose workspace leadhand must not run Git in, with the text `run`
+    /// prints: an in-place run (S2-R44), or a workspace folder that is not a worktree top of
+    /// its own listed by the run's repository (S2-R54; bug classes 1 and 4: a folder whose
+    /// `.git` is gone makes Git find the operator's checkout, which encloses it). Checked once
+    /// per command and kept: the commands that act on the workspace call it before they write
+    /// anything, and `git` hands out the workspace's Git only after it. A workspace folder that
+    /// does not exist passes, so the command's own paths for a missing one stay
+    /// (`recover::unmatched`, `finish::end`).
+    pub fn check_worktree(&self) -> Result<()> {
+        self.worktree
+            .0
+            .get_or_init(|| {
+                crate::git::workspace::refuse_unless_run_worktree(&self.meta, &self.repo, &self.ws)
+            })
+            .clone()
     }
 
     /// Why the source deck no longer matches the one the run started from (edited, moved or
@@ -142,8 +168,11 @@ impl Run {
         self.root.join("cards").join(folder).join(dispatch_id)
     }
 
-    /// Git in the run's worktree.
+    /// Git in the run's worktree, handed out only once the workspace has passed the identity
+    /// check (`check_worktree`, run once per command): every Git write the engine makes in the
+    /// workspace goes through it.
     pub fn git(&self) -> Result<Git> {
+        self.check_worktree()?;
         Git::at(&self.ws)
     }
 

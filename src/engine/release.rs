@@ -40,7 +40,7 @@ use crate::cli::human::shell_quote;
 use crate::error::Result;
 use crate::git::Git;
 use crate::git::cards::checked_out_branch;
-use crate::git::workspace::{WorktreeEntry, head, worktrees};
+use crate::git::workspace::{WorktreeEntry, head, not_a_run_worktree, worktrees};
 use crate::pytext::{path_text, real_path};
 use crate::state::events::{self, Outcome};
 use crate::state::{Event, append_event};
@@ -145,7 +145,8 @@ fn released_event(intent: &events::BranchReleaseStarted, skipped: Option<&PyStr>
 /// report says what Git shows.
 ///
 /// Bug class 1: Git is run in `ws` only once it is a worktree top of its own, listed by the
-/// run's repository `repo` and not its main working tree. A folder whose `.git` is gone would
+/// run's repository `repo` and not its main working tree (`git::workspace::not_a_run_worktree`,
+/// the check every command makes of the run worktree). A folder whose `.git` is gone would
 /// otherwise make Git find the enclosing checkout, the operator's, and detach that.
 fn detach(repo: &Path, ws: &Path, branch: &PyStr, sha: Option<&str>) -> Option<PyStr> {
     let why = |text: String| Some(PyStr::from(text));
@@ -155,8 +156,8 @@ fn detach(repo: &Path, ws: &Path, branch: &PyStr, sha: Option<&str>) -> Option<P
     if !ws.is_dir() {
         return why(format!("the run worktree {} is gone", ws.display()));
     }
-    if let Some(problem) = not_a_run_worktree(repo, ws) {
-        return why(problem);
+    if let Some(found) = not_a_run_worktree(repo, ws) {
+        return Some(found.problem);
     }
     let read = |ws: &Path| -> Result<(Git, Option<PyStr>, String)> {
         let git = Git::at(ws)?;
@@ -190,54 +191,6 @@ fn detach(repo: &Path, ws: &Path, branch: &PyStr, sha: Option<&str>) -> Option<P
             short_sha(wanted)
         )),
     }
-}
-
-/// Why `ws` is not a worktree of its own that the release may detach, or `None`: Git's top
-/// for `ws` must be `ws` itself (real paths), and the run's repository must list it as a
-/// linked worktree, not as its main working tree. Read only.
-fn not_a_run_worktree(repo: &Path, ws: &Path) -> Option<String> {
-    let real = real_path(ws);
-    let top = Git::at(ws)
-        .and_then(|git| git.run(&[os("rev-parse"), os("--show-toplevel")]))
-        .map(|out| real_path(&path_of(trim_newline(&out))));
-    match top {
-        Ok(top) if top == real => {}
-        Ok(top) => {
-            return Some(format!(
-                "the run worktree {} is not a worktree top (Git's top there is {})",
-                ws.display(),
-                top.display()
-            ));
-        }
-        Err(e) => return Some(format!("git cannot read the run worktree: {}", e.message)),
-    }
-    let listed = Git::at(repo).and_then(|git| worktrees(&git));
-    match listed {
-        Ok(entries) => {
-            let at = entries.iter().position(|e| {
-                e.get(&b"worktree"[..])
-                    .is_some_and(|p| real_path(&path_of(p)) == real)
-            });
-            match at {
-                // The first entry is the main working tree.
-                Some(0) => Some(format!(
-                    "the run worktree {} is the repository's main working tree",
-                    ws.display()
-                )),
-                Some(_) => None,
-                None => Some(format!(
-                    "the run worktree {} is not a worktree of {}",
-                    ws.display(),
-                    repo.display()
-                )),
-            }
-        }
-        Err(e) => Some(format!("git cannot list the worktrees: {}", e.message)),
-    }
-}
-
-fn trim_newline(out: &[u8]) -> &[u8] {
-    out.strip_suffix(b"\n").unwrap_or(out)
 }
 
 /// What `git worktree list --porcelain` shows of `branch` (step 5): free when no worktree,
@@ -413,6 +366,7 @@ mod tests {
             ws,
             branch: BRANCH.into(),
             base_sha: sha.clone(),
+            worktree: Default::default(),
         };
         (run, sha)
     }
@@ -613,8 +567,8 @@ mod tests {
         );
         assert_eq!(f.git(&run.repo, &["rev-parse", "HEAD"]), sha);
         // The main working tree itself is never the run worktree either.
-        let why = not_a_run_worktree(&run.repo, &run.repo).unwrap();
-        assert!(why.contains("main working tree"), "{why}");
+        let why = not_a_run_worktree(&run.repo, &run.repo).unwrap().problem;
+        assert!(why.contains("main working tree"), "{why:?}");
     }
 
     #[test]

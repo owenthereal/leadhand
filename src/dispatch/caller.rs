@@ -32,10 +32,9 @@ use crate::briefs::SCRATCH;
 use crate::cli::Caller;
 use crate::error::{Error, Result};
 use crate::git::Git;
+use crate::git::workspace::{base_worktree_path, resolves_in_place};
 use crate::procs;
-use crate::pytext::{
-    abspath, normpath, pure_path, py_float, py_repr, py_splitlines_bytes, real_path,
-};
+use crate::pytext::{abspath, pure_path, py_float, py_repr, py_splitlines_bytes, real_path};
 use crate::wire::{PyMap, PyStr};
 
 use super::{DispatchRequest, REQUEST, read_json_object, read_request};
@@ -136,7 +135,7 @@ pub(crate) fn py_parent(p: &Path) -> PathBuf {
 }
 
 /// `Path(base) / name` for a relative `name`, as `pathlib` spells it (`.` drops away).
-fn py_join(base: &Path, name: &str) -> PathBuf {
+pub(crate) fn py_join(base: &Path, name: &str) -> PathBuf {
     let base = pure_path(base.as_os_str());
     if base == Path::new(".") {
         PathBuf::from(name)
@@ -292,22 +291,6 @@ pub(crate) fn py_str_of(raw: &RawValue) -> String {
     }
 }
 
-/// `base_worktree_path`: the run's evidence base worktree, `<repo>/.worktrees/<workspace
-/// name>--base` when the workspace is a worktree there, else `<repo>/.worktrees/<run dir
-/// name>--base` (an in-place run).
-pub fn base_worktree_path(repo: &Path, workspace: &Path, run_name: &OsStr) -> PathBuf {
-    let worktrees = py_join(repo, ".worktrees");
-    // `ws.parent == repo / ".worktrees"`: pathlib compares the spellings (`//x` is not `/x`).
-    let name = if py_parent(workspace).as_os_str() == worktrees.as_os_str() {
-        py_name(workspace)
-    } else {
-        run_name.to_os_string()
-    };
-    let mut base = name;
-    base.push("--base");
-    worktrees.join(base)
-}
-
 /// `_allowed_cwds`: the run's workspace, and its evidence base worktree reached through no
 /// symlink below the repository (real paths).
 fn allowed_cwds(anchor: &Anchor, workspace: &PyStr, run_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -349,7 +332,7 @@ pub fn evidence_dirs(req: &DispatchRequest) -> Result<Vec<PathBuf>> {
         None => PathBuf::new(),
     };
     let path = base_worktree_path(&repo_path, &workspace, &py_name(&req.run_dir));
-    if !resolves_in_place(&repo_path, &path)? {
+    if !resolves_in_place(&repo_path, &path) {
         return Err(refuse(format!(
             "the evidence base worktree {} is a symlink or lies behind one",
             shown(&path)
@@ -369,23 +352,6 @@ pub fn evidence_dirs(req: &DispatchRequest) -> Result<Vec<PathBuf>> {
         )));
     }
     Ok(vec![real])
-}
-
-/// `gitops.resolves_in_place`: whether `path` lies inside `root` and resolves to itself, so
-/// that neither it nor any folder between `root` and it is a symlink (`root`'s own location
-/// may be).
-fn resolves_in_place(root: &Path, path: &Path) -> Result<bool> {
-    let rel = relpath(&absolute(path)?, &absolute(root)?);
-    let rel_bytes = rel.as_os_str().as_bytes();
-    if rel_bytes == b".." || rel_bytes.starts_with(b"../") || rel_bytes.starts_with(b"/") {
-        return Ok(false);
-    }
-    let mut joined = real_path(root).into_os_string().into_vec();
-    if !joined.ends_with(b"/") {
-        joined.push(b'/');
-    }
-    joined.extend_from_slice(rel_bytes);
-    Ok(real_path(path) == normpath(OsStr::from_bytes(&joined)))
 }
 
 /// `os.path.relpath(path, start)` of two absolute, normalized paths.
@@ -1227,31 +1193,6 @@ mod tests {
                 s.expect
             );
         }
-    }
-
-    #[test]
-    fn base_worktree_path_is_named_for_the_workspace_or_the_run() {
-        let repo = Path::new("/repo");
-        assert_eq!(
-            base_worktree_path(repo, Path::new("/repo/.worktrees/ws"), OsStr::new("r1")),
-            Path::new("/repo/.worktrees/ws--base")
-        );
-        assert_eq!(
-            base_worktree_path(repo, Path::new("/repo//.worktrees/ws/"), OsStr::new("r1")),
-            Path::new("/repo/.worktrees/ws--base")
-        );
-        assert_eq!(
-            base_worktree_path(repo, Path::new("/repo"), OsStr::new("r1")),
-            Path::new("/repo/.worktrees/r1--base")
-        );
-        assert_eq!(
-            base_worktree_path(
-                repo,
-                Path::new("/elsewhere/.worktrees/ws"),
-                OsStr::new("r1")
-            ),
-            Path::new("/repo/.worktrees/r1--base")
-        );
     }
 
     #[test]

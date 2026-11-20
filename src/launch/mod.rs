@@ -15,7 +15,9 @@
 //! and SIGTERM are forwarded to it while it runs; the lock is released once it has exited.
 //!
 //! In-place runs are refused (deliberate change 1): the checkout claim the Python takes for
-//! one is gone, so a run whose workspace is the repository's checkout does not launch.
+//! one is gone, so a run whose workspace is the repository's checkout does not launch. Nor
+//! does a run whose workspace folder fails the run worktree's identity check (S2-R54,
+//! `git::workspace::workspace_refusal`).
 //!
 //! `run` and `launch-line` are commands a person types: the run is found as
 //! `runsel::select_run` finds it, and `launch-line` names the binary bare (`leadhand`) when
@@ -40,8 +42,9 @@ use serde_json::value::RawValue;
 
 use crate::cli::human;
 use crate::dispatch::caller::py_str_of;
-use crate::dispatch::{field, truthy};
+use crate::dispatch::field;
 use crate::error::{EXIT_REFUSED, Error, Failure, Result};
+use crate::git::workspace;
 use crate::pytext::{abspath, pure_path, py_isspace, real_path, which};
 use crate::runsel::{self, RunArg};
 use crate::state::events::Resumed;
@@ -222,17 +225,7 @@ impl Meta {
 
     /// A non-empty string entry, as a path.
     fn path(&self, key: &str) -> Option<PathBuf> {
-        let text = field::<PyStr>(&self.map, key).filter(|t| !t.is_empty())?;
-        Some(PathBuf::from(text.to_os().ok()?))
-    }
-
-    /// `str(meta.get(key))` of a true entry, its bytes kept; `None` for a false one.
-    fn word(&self, key: &str) -> Option<OsString> {
-        let raw = self.raw(key).filter(|raw| truthy(raw))?;
-        match serde_json::from_str::<PyStr>(raw.get()) {
-            Ok(text) => Some(text.to_os().unwrap_or_else(|_| text.to_os_lossy())),
-            Err(_) => Some(py_str_of(raw).into()),
-        }
+        workspace::meta_path(&self.map, key)
     }
 
     /// `_workspace`: an existing absolute directory.
@@ -259,29 +252,6 @@ impl Meta {
         self.path("repo")
             .ok_or_else(|| Error::msg("run.json: no repo"))
     }
-
-    /// `_in_place`: the workspace is the repository's checkout itself.
-    fn in_place(&self) -> bool {
-        match (self.path("workspace"), self.path("repo")) {
-            (Some(ws), Some(repo)) => real_path(&ws) == real_path(&repo),
-            _ => false,
-        }
-    }
-}
-
-/// The operator's command to start a new run of this run's deck (`_start_command`), every
-/// word quoted.
-fn start_command(meta: &Meta, cli: &Path) -> OsString {
-    let mut argv = vec![
-        cli.as_os_str().to_os_string(),
-        "start".into(),
-        meta.word("deck_source").unwrap_or_else(|| "<deck>".into()),
-    ];
-    if let Some(repo) = meta.word("repo") {
-        argv.push("--repo".into());
-        argv.push(repo);
-    }
-    human::command_line(&argv)
 }
 
 // --------------------------------------------------------------------------
@@ -404,7 +374,9 @@ fn launch_owned(
         return Err(Error::msg(problem));
     }
     let repo = meta.repo()?;
-    if let Some(text) = in_place_refusal(meta, &cli) {
+    // An in-place run, or a workspace folder that is not the run's own worktree (S2-R54): the
+    // supervisor would run every command there.
+    if let Some(text) = workspace::workspace_refusal(&meta.map, &repo, &workspace, &cli) {
         return refuse(&text);
     }
     // As at start: so a sparse checkout found later is a worker's (R63). A checkout that does
@@ -462,18 +434,7 @@ fn launch_owned(
     supervise(lock, cmd, plugin.as_deref(), supervisor_alive)
 }
 
-/// A refusal whose one fixing command a person copies (spec, "Commands you type"): the
-/// `error: <head>` line, then the command alone on the last line, its bytes kept.
-fn fix_refusal(head: &[u8], fix: &OsStr) -> Vec<u8> {
-    let mut text = b"error: ".to_vec();
-    text.extend_from_slice(head);
-    text.push(b'\n');
-    text.extend_from_slice(fix.as_bytes());
-    text.push(b'\n');
-    text
-}
-
-/// Prints a refusal `fix_refusal` made, and gives exit 1.
+/// Prints a refusal `workspace::fix_refusal` made, and gives exit 1.
 fn refuse(text: &[u8]) -> Result<u8> {
     let mut err = std::io::stderr().lock();
     err.write_all(text)?;
@@ -490,49 +451,15 @@ fn ended_refusal(o: &crate::state::events::Outcome, meta: &Meta, cli: &Path) -> 
         head += &format!(" ({q})");
     }
     head += "; only a blocked or unfinished run continues. Start a new run from the deck with:";
-    fix_refusal(head.as_bytes(), &start_command(meta, cli))
-}
-
-/// The refusal of an in-place run (deliberate change 1: the Python's checkout claim is gone),
-/// with the command that starts a new run of its deck in a worktree; `None` for a worktree
-/// run.
-fn in_place_refusal(meta: &Meta, cli: &Path) -> Option<Vec<u8>> {
-    let repo = meta.path("repo").filter(|_| meta.in_place())?;
-    let mut head = b"not supported in this version: run.worktree = false (this run works in the \
-                     checkout "
-        .to_vec();
-    head.extend_from_slice(repo.as_os_str().as_bytes());
-    head.extend_from_slice(
-        b" itself); start a new run of the deck, which works in a worktree, with:",
-    );
-    Some(fix_refusal(&head, &start_command(meta, cli)))
+    workspace::fix_refusal(head.as_bytes(), &workspace::start_command(&meta.map, cli))
 }
 
 /// The refusal `error: <head>` of a run that cannot continue, with the command that starts a
 /// new run of its deck alone on the last line (`unpark` on an ended run): `meta` is the run's
 /// `run.json` entries.
 pub(crate) fn new_run_refusal(head: &str, meta: &PyMap<Box<RawValue>>) -> Error {
-    let meta = Meta {
-        map: meta.clone(),
-        run_id: PyStr::default(),
-    };
-    let start = start_command(&meta, &testing::self_path());
-    Error::printed(fix_refusal(head.as_bytes(), &start))
-}
-
-/// Refuses an in-place run for the engine commands that act on its workspace (S2-R44), as
-/// `run` refuses it, with the same text: `meta` is the `run.json` entries the command loaded.
-/// A worktree run passes.
-pub(crate) fn refuse_in_place(meta: &PyMap<Box<RawValue>>) -> Result<()> {
-    // The refusal reads only the entries; the run ID is a launch's.
-    let meta = Meta {
-        map: meta.clone(),
-        run_id: PyStr::default(),
-    };
-    match in_place_refusal(&meta, &testing::self_path()) {
-        Some(text) => Err(Error::printed(text)),
-        None => Ok(()),
-    }
+    let start = workspace::start_command(meta, &testing::self_path());
+    Error::printed(workspace::fix_refusal(head.as_bytes(), &start))
 }
 
 /// The attended-use warning, and R28's when the CLI's path holds whitespace.
@@ -733,64 +660,6 @@ mod tests {
     }
 
     #[test]
-    fn an_in_place_run_is_refused_with_the_start_command_alone_last() {
-        let dir = tempfile::Builder::new()
-            .prefix("in place ")
-            .tempdir()
-            .unwrap();
-        let repo = dir.path().join("my repo");
-        fs::create_dir_all(repo.join(".worktrees/run")).unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&repo, &link).unwrap();
-        let meta = |workspace: &Path| {
-            let json = format!(
-                r#"{{"workspace": {}, "repo": {}, "deck_source": "/d/my deck.md"}}"#,
-                serde_json::to_string(workspace.to_str().unwrap()).unwrap(),
-                serde_json::to_string(repo.to_str().unwrap()).unwrap()
-            );
-            Meta {
-                map: serde_json::from_str(&json).unwrap(),
-                run_id: PyStr::from("abc123"),
-            }
-        };
-        let cli = Path::new("/opt/lead hand/leadhand");
-        // The checkout itself, by any spelling: in place.
-        for ws in [repo.clone(), link.clone()] {
-            let m = meta(&ws);
-            assert!(m.in_place(), "{ws:?}");
-            let text = String::from_utf8(in_place_refusal(&m, cli).unwrap()).unwrap();
-            let lines: Vec<&str> = text.lines().collect();
-            assert_eq!(
-                lines,
-                [
-                    format!(
-                        "error: not supported in this version: run.worktree = false (this run \
-                         works in the checkout {} itself); start a new run of the deck, which \
-                         works in a worktree, with:",
-                        repo.display()
-                    )
-                    .as_str(),
-                    &format!(
-                        "'/opt/lead hand/leadhand' start '/d/my deck.md' --repo '{}'",
-                        repo.display()
-                    ),
-                ]
-            );
-            assert!(text.ends_with('\n'));
-        }
-        // A worktree run: not in place, no refusal.
-        let m = meta(&repo.join(".worktrees/run"));
-        assert!(!m.in_place());
-        assert_eq!(in_place_refusal(&m, cli), None);
-        // Without a repo or a workspace: not in place.
-        let none = Meta {
-            map: serde_json::from_str("{}").unwrap(),
-            run_id: PyStr::from("abc123"),
-        };
-        assert!(!none.in_place());
-    }
-
-    #[test]
     fn an_ended_run_is_refused_with_the_start_command_alone_last() {
         let meta = Meta {
             map: serde_json::from_str(r#"{"deck_source": "/d/my deck.md", "repo": "/r"}"#).unwrap(),
@@ -860,25 +729,5 @@ mod tests {
         );
         let problem = tools_inside(&ws, &outside, Some(&ws)).unwrap();
         assert!(problem.starts_with("--plugin-dir ("), "{problem}");
-    }
-
-    #[test]
-    fn the_start_command_quotes_every_word() {
-        let meta = |json: &str| Meta {
-            map: serde_json::from_str(json).unwrap(),
-            run_id: PyStr::from("abc123"),
-        };
-        let cli = Path::new("/opt/lead hand/leadhand");
-        assert_eq!(
-            start_command(
-                &meta(r#"{"deck_source": "/d/my deck.md", "repo": "/r"}"#),
-                cli
-            ),
-            "'/opt/lead hand/leadhand' start '/d/my deck.md' --repo /r"
-        );
-        assert_eq!(
-            start_command(&meta(r#"{"deck_source": "", "repo": null}"#), cli),
-            "'/opt/lead hand/leadhand' start '<deck>'"
-        );
     }
 }

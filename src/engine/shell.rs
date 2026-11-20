@@ -60,8 +60,9 @@ pub fn next_action(run_dir: &Path) -> Result<Action> {
 
 fn next_action_steps(run_dir: &Path) -> Result<Action> {
     let run = Run::load(run_dir)?;
-    // Every step acts on the workspace, so an in-place run is refused before the first.
-    crate::launch::refuse_in_place(&run.meta)?;
+    // Every step acts on the workspace, so an in-place run, or a workspace that is not the
+    // run's own worktree (S2-R54), is refused before the first.
+    run.check_worktree()?;
     let deck_problem = run.deck_problem();
     charge_supervisor(&run)?;
     let session = current_session(&run);
@@ -789,18 +790,27 @@ mod tests {
     /// or with `in_place` the repository's checkout itself. The run folder, the repository
     /// and the workspace.
     fn run_dir(f: &Fixture, in_place: bool) -> (PathBuf, PathBuf, PathBuf) {
+        run_dir_with(f, |repo| {
+            if in_place {
+                repo.to_path_buf()
+            } else {
+                f.root().join("work space")
+            }
+        })
+    }
+
+    /// As `run_dir`, the workspace at `ws(repo)`: a worktree added there on the run branch,
+    /// unless it is the repository's checkout itself.
+    fn run_dir_with(f: &Fixture, ws: impl FnOnce(&Path) -> PathBuf) -> (PathBuf, PathBuf, PathBuf) {
         let repo = f.make_repo("repo");
-        let ws = if in_place {
-            repo.clone()
-        } else {
-            let ws = f.root().join("work space");
+        let ws = ws(&repo);
+        if ws != repo {
             let ws_arg = ws.to_str().unwrap();
             f.git(
                 &repo,
                 &["worktree", "add", "-q", "-b", "leadhand/demo", ws_arg],
             );
-            ws
-        };
+        }
         let base = f.git(&repo, &["rev-parse", "HEAD"]);
         let root = f.root().join("docs dir/runs/2026-11-14-demo-deck");
         std::fs::create_dir_all(&root).unwrap();
@@ -857,7 +867,103 @@ mod tests {
         let f = Fixture::new();
         let (root, _, _) = run_dir(&f, false);
         let run = Run::load(&root).unwrap();
-        assert_eq!(crate::launch::refuse_in_place(&run.meta), Ok(()));
+        assert_eq!(run.check_worktree(), Ok(()));
+    }
+
+    // S2-R54, bug classes 1 and 4: the run worktree `<repo>/.worktrees/demo` lies inside the
+    // operator's checkout, so once its `.git` file is gone Git run there finds the operator's
+    // repository. `next` refuses before its first step, naming the folder and Git's top there:
+    // nothing is charged or appended, and nothing is checked out, staged, committed or moved in
+    // the operator's checkout, whose own edits stay. While the repository still lists the
+    // worktree the fix is `git worktree repair`, which restores it; once its record is pruned,
+    // a new run.
+    #[test]
+    fn next_refuses_a_run_worktree_whose_git_file_is_gone() {
+        let f = Fixture::new();
+        let (root, repo, ws) = run_dir_with(&f, |repo| repo.join(".worktrees").join("demo"));
+        std::fs::write(repo.join(".git/info/exclude"), ".worktrees/\n").unwrap();
+        // The operator's own work: an edit to a tracked file, and a new file staged.
+        f.write(&repo, &[("README.md", "the operator's edit\n")]);
+        f.write(&repo, &[("notes.txt", "staged\n")]);
+        f.git(&repo, &["add", "notes.txt"]);
+        std::fs::remove_file(ws.join(".git")).unwrap();
+        let before = f.checkout_state(&repo);
+        let paths = crate::state::run_paths(&root);
+        let refusal = |intro: &str, fix: &OsStr| {
+            let mut text = format!(
+                "error: the run worktree {} is not a worktree top (Git's top there is {}); \
+                 leadhand will not run Git there. {intro}\n",
+                ws.display(),
+                repo.display()
+            )
+            .into_bytes();
+            text.extend_from_slice(fix.as_encoded_bytes());
+            text.push(b'\n');
+            text
+        };
+        let repair = crate::cli::human::command_line(&[
+            "git".into(),
+            "-C".into(),
+            repo.clone().into_os_string(),
+            "worktree".into(),
+            "repair".into(),
+        ]);
+        let e = next_action_steps(&root).unwrap_err();
+        assert_eq!(
+            String::from_utf8_lossy(e.printed.as_deref().unwrap_or_default()),
+            String::from_utf8_lossy(&refusal("Restore its .git file with:", &repair))
+        );
+        assert_eq!(e.exit, 1);
+        assert!(!paths.events.exists());
+        assert!(!paths.charges.exists());
+        assert_eq!(f.checkout_state(&repo), before);
+        // The fix line is true: the repair restores the worktree.
+        f.git(&repo, &["worktree", "repair"]);
+        assert_eq!(
+            f.git(&ws, &["rev-parse", "--show-toplevel"]),
+            ws.to_str().unwrap()
+        );
+        // With the worktree's record pruned too, nothing restores it: a new run.
+        std::fs::remove_file(ws.join(".git")).unwrap();
+        f.git(&repo, &["worktree", "prune"]);
+        let before = f.checkout_state(&repo);
+        let start = crate::cli::human::command_line(&[
+            crate::testing::self_path().into_os_string(),
+            "start".into(),
+            root.join("deck.md").into_os_string(),
+            "--repo".into(),
+            repo.clone().into_os_string(),
+        ]);
+        let e = next_action_steps(&root).unwrap_err();
+        assert_eq!(
+            String::from_utf8_lossy(e.printed.as_deref().unwrap_or_default()),
+            String::from_utf8_lossy(&refusal("Start a new run of the deck with:", &start))
+        );
+        assert!(!paths.events.exists());
+        assert_eq!(f.checkout_state(&repo), before);
+    }
+
+    // S2-R54: a genuine run worktree passes the identity check however run.json spells it, here
+    // through a symlink to the repository, and its Git is handed out.
+    #[test]
+    fn a_run_worktree_reached_through_a_symlink_passes_the_identity_check() {
+        let f = Fixture::new();
+        let (root, repo, _) = run_dir_with(&f, |repo| repo.join(".worktrees").join("demo"));
+        let link = f.root().join("repo link");
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+        let path = root.join("run.json");
+        let mut meta: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        meta.insert("repo".into(), link.to_str().unwrap().into());
+        meta.insert(
+            "workspace".into(),
+            link.join(".worktrees/demo").to_str().unwrap().into(),
+        );
+        std::fs::write(&path, serde_json::Value::Object(meta).to_string()).unwrap();
+        let run = Run::load(&root).unwrap();
+        assert_eq!(run.ws, link.join(".worktrees/demo"));
+        assert_eq!(run.check_worktree(), Ok(()));
+        assert_eq!(run.git().unwrap().cwd(), link.join(".worktrees/demo"));
     }
 
     // `_find_violation`'s `if req.get("expected_head")`: an empty expected head is none to
