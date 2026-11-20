@@ -14,11 +14,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The mixed contract suite's LEADHAND_RUST_COMMANDS: the commands it sends to the Rust binary.
-  # Only `version` is ported so far. It has its own name here because the contract harness reads
-  # LEADHAND_RUST_COMMANDS in every suite: set for the all-Python run, it would skip that run's
-  # reference-only tests.
-  MIXED_RUST_COMMANDS: version
+  # The mixed contract suite's LEADHAND_RUST_COMMANDS: the commands it sends to the Rust binary,
+  # here command group G3 (the rest stay on Python). It has its own name here because the contract
+  # harness reads LEADHAND_RUST_COMMANDS in every suite: set for the all-Python run, it would skip
+  # that run's reference-only tests. The other mixed groups are local commands (see the pull
+  # request).
+  MIXED_RUST_COMMANDS: check,route,version,status,report,dispatch,dispatch-runner,stop-dispatch
 
 jobs:
   test:
@@ -92,12 +93,23 @@ jobs:
       - run: cargo test --locked --features testing
       # Without the feature: checks that the test hooks are compiled out.
       - run: cargo test --locked --lib
+      # The suites run one after another in this job, the three contract configurations included,
+      # so that each platform builds once. On a Mac the unit suite takes about a quarter of an hour
+      # and a contract suite about half an hour. Each suite's cap bounds a hang; the caps and the
+      # builds fit the job's.
       - name: Python unit suite
+        timeout-minutes: 45
         run: |
           PYTHONPATH=scripts/lib python3 -B -m unittest discover -s tests -p 'test_*.py'
       - name: Contract suite, all Python
+        timeout-minutes: 60
         run: |
           LEADHAND_BIN=scripts/leadhand PYTHONPATH=tests python3 -B -m unittest discover -s tests/contract -p 'contract_*.py'
-      - name: Contract suite, mixed (${{ env.MIXED_RUST_COMMANDS }} on Rust)
+      - name: Contract suite, mixed G3 (${{ env.MIXED_RUST_COMMANDS }} on Rust)
+        timeout-minutes: 60
         run: |
           LEADHAND_BIN=tests/contract/router LEADHAND_RUST_BIN=target/testing/debug/leadhand LEADHAND_RUST_COMMANDS="$MIXED_RUST_COMMANDS" LEADHAND_IMPL=mixed PYTHONPATH=tests python3 -B -m unittest discover -s tests/contract -p 'contract_*.py'
+      - name: Contract suite, all Rust
+        timeout-minutes: 60
+        run: |
+          LEADHAND_BIN=tests/contract/router LEADHAND_RUST_BIN=target/testing/debug/leadhand LEADHAND_RUST_COMMANDS=all LEADHAND_IMPL=rust PYTHONPATH=tests python3 -B -m unittest discover -s tests/contract -p 'contract_*.py'
