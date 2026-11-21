@@ -327,22 +327,36 @@ impl Start {
     /// `argv`, as strings.
     #[track_caller]
     pub fn argv(&self) -> Vec<String> {
-        strings(&self.rec["argv"])
+        super::strs(&self.rec["argv"])
     }
 }
 
-/// A JSON list of strings.
-#[track_caller]
-pub fn strings(v: &Json) -> Vec<String> {
-    v.as_array()
-        .unwrap_or_else(|| panic!("not a list: {v}"))
-        .iter()
-        .map(|a| {
-            a.as_str()
-                .unwrap_or_else(|| panic!("not a string: {a}"))
-                .to_string()
-        })
-        .collect()
+/// Python's `skipUnless(sys.platform == "darwin" or sys.platform.startswith("linux"))` on
+/// the keep-awake tests: true (after saying so) when the test skips.
+pub fn keep_awake_unsupported() -> bool {
+    let skip = !(cfg!(target_os = "macos") || cfg!(target_os = "linux"));
+    if skip {
+        println!("skipped: keep-awake runs only on macOS and Linux");
+    }
+    skip
+}
+
+/// This platform's keep-awake tool: `caffeinate` on macOS, else `systemd-inhibit`.
+pub fn keep_awake_tool() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "caffeinate"
+    } else {
+        "systemd-inhibit"
+    }
+}
+
+/// The other platform's keep-awake tool.
+pub fn other_keep_awake_tool() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "systemd-inhibit"
+    } else {
+        "caffeinate"
+    }
 }
 
 /// A lock `hold` took; `World::release` drops it.

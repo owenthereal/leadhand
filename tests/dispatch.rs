@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use common::dispatch_world::{World, alive, at, logged_alive, wait_for, wait_for_with, when};
 use common::json::{self, Json};
 use common::supervisor::truthy;
-use common::{jv, key_set, one, read_json, realpath};
+use common::{jv, key_set, one, read_json, realpath, strs};
 
 const CARD_BRANCH: &str = "leadhand/demo--card-1";
 const CARD_BRIEF: &str = "# Brief\n## Card 1: Widget card\n- Card branch: leadhand/demo--card-1\n";
@@ -84,20 +84,6 @@ fn implementer_prompt((brief, report): (PathBuf, PathBuf)) -> String {
 #[track_caller]
 fn pick(v: &Json, keys: &[&str]) -> Json {
     Json::Arr(keys.iter().map(|k| v[*k].clone()).collect())
-}
-
-/// A JSON list of strings, as text.
-#[track_caller]
-fn strs(v: &Json) -> Vec<String> {
-    v.as_array()
-        .unwrap_or_else(|| panic!("not a list: {v}"))
-        .iter()
-        .map(|s| {
-            s.as_str()
-                .unwrap_or_else(|| panic!("not a string: {s}"))
-                .to_string()
-        })
-        .collect()
 }
 
 /// Python's `list.index`.
@@ -700,7 +686,6 @@ mod runner_lifecycle {
     use super::*;
     use common::dispatch_world::{Req, WAIT};
     use common::{cli, holds};
-    use rustix::fs::{FlockOperation, flock};
     use rustix::process::{Pid, Signal, kill_process_group};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -854,14 +839,7 @@ mod runner_lifecycle {
         ]);
         fs::write(wd.join("runner.json"), json::dumps(&record)).unwrap();
         fs::write(wd.join("heartbeat"), "").unwrap();
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(wd.join("runner.lock"))
-            .unwrap();
-        flock(&lock, FlockOperation::LockExclusive).unwrap();
+        let lock = common::hold_lock(&wd.join("runner.lock"));
         let fg = w.popen("d1");
         wait_for_with("dispatch to write request.json", WAIT, Some(&fg), || {
             when(wd.join("request.json").exists())

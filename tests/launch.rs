@@ -35,7 +35,7 @@ use common::json::Json;
 use common::launch_world::{
     AGENT, FIRST_MESSAGE_END, LOGGING_TOOL, RunOpts, SPACES_WARNING_TAIL, WAIT, World,
 };
-use common::{Out, names_bin, names_bin_between, realpath, shlex_join};
+use common::{names_bin, names_bin_between, os_vec, path_str, realpath, shlex_join, str_vec};
 
 /// The first message names the run and the binary (by resolved file), then the skill.
 fn first_message_ok(text: &str, run_dir: &Path) -> bool {
@@ -72,18 +72,6 @@ fn claude_ok(w: &World, argv0: &str) {
     );
 }
 
-fn s(items: &[&str]) -> Vec<String> {
-    items.iter().map(|x| x.to_string()).collect()
-}
-
-fn os(items: &[&str]) -> Vec<OsString> {
-    items.iter().map(OsString::from).collect()
-}
-
-fn path_str(p: &Path) -> &str {
-    p.to_str().unwrap()
-}
-
 // --------------------------------------------------------------------------
 // argv, settings, first message
 
@@ -102,7 +90,7 @@ mod argv {
         let (settings, last) = (argv[2].as_str(), argv.last().unwrap().as_str());
         assert_eq!(
             argv[1..],
-            s(&[
+            str_vec(&[
                 "--settings",
                 settings,
                 "--agent",
@@ -141,7 +129,7 @@ mod argv {
         let (settings, last) = (argv[2].as_str(), argv.last().unwrap().as_str());
         assert_eq!(
             argv[1..],
-            s(&[
+            str_vec(&[
                 "--settings",
                 settings,
                 "--agent",
@@ -172,7 +160,7 @@ mod argv {
         settings_ok(settings);
         assert_eq!(
             argv[1..],
-            s(&[
+            str_vec(&[
                 "--plugin-dir",
                 path_str(&plugin),
                 "--settings",
@@ -199,7 +187,7 @@ mod argv {
         let (settings, last) = (argv[2].as_str(), argv.last().unwrap().as_str());
         assert_eq!(
             argv[1..],
-            s(&[
+            str_vec(&[
                 "--settings",
                 settings,
                 "--agent",
@@ -414,15 +402,7 @@ mod child {
 
 mod launch_line {
     use super::*;
-
-    /// The one line a `launch-line` printed, without its newline.
-    #[track_caller]
-    fn line(r: Out) -> String {
-        let r = r.ok();
-        let out = r.stdout_text();
-        assert!(out.ends_with('\n') && out.matches('\n').count() == 1, "{r}");
-        out[..out.len() - 1].to_string()
-    }
+    use common::one_line as line;
 
     #[test]
     fn test_launch_line_quotes_paths_with_spaces() {
@@ -436,14 +416,18 @@ mod launch_line {
                 "",
                 &format!(
                     " {}",
-                    shlex_join(&os(&["run", &deck, "--plugin-dir", path_str(&plugin)]))
+                    shlex_join(&os_vec(&["run", &deck, "--plugin-dir", path_str(&plugin)]))
                 )
             ),
             "{l}"
         );
         let l = line(w.launch_line(&os_args![deck]));
         assert!(
-            common::is_bin_command(&l, "", &format!(" {}", shlex_join(&os(&["run", &deck])))),
+            common::is_bin_command(
+                &l,
+                "",
+                &format!(" {}", shlex_join(&os_vec(&["run", &deck])))
+            ),
             "{l}"
         );
     }
@@ -463,7 +447,7 @@ mod launch_line {
                 "",
                 &format!(
                     " {}",
-                    shlex_join(&os(&["run", &deck, "--plugin-dir", path_str(&plugin)]))
+                    shlex_join(&os_vec(&["run", &deck, "--plugin-dir", path_str(&plugin)]))
                 )
             ),
             "{l}"
@@ -476,7 +460,7 @@ mod launch_line {
                 "",
                 &format!(
                     " {}",
-                    shlex_join(&os(&["run", &deck, "--plugin-dir", path_str(&other)]))
+                    shlex_join(&os_vec(&["run", &deck, "--plugin-dir", path_str(&other)]))
                 )
             ),
             "{l}"
@@ -508,7 +492,11 @@ mod self_path_hook {
                 .with("LEADHAND_TEST_CLI", ROUTER);
             let r = common::cli(&os_args!["launch-line", w.run_dir], &env, &w.elsewhere).ok();
             let words = common::shlex_split(&r.stdout_text()).expect("a shell line");
-            assert_eq!(words[1..], s(&["run", &deck]), "testing={testing}: {r}");
+            assert_eq!(
+                words[1..],
+                str_vec(&["run", &deck]),
+                "testing={testing}: {r}"
+            );
             if honoured {
                 assert_eq!(words[0], ROUTER, "testing={testing}: {r}");
             } else {
@@ -521,7 +509,7 @@ mod self_path_hook {
             common::is_bin_command(
                 &line[..line.len() - 1],
                 "",
-                &format!(" {}", shlex_join(&os(&["run", &deck])))
+                &format!(" {}", shlex_join(&os_vec(&["run", &deck])))
             ),
             "{line}"
         );
@@ -680,7 +668,7 @@ mod ownership {
         let mut w = World::new();
         fs::write(&w.paths.lock, "").unwrap(); // stale: nobody holds the flock
         let env = w.env.clone();
-        let live = w.popen(&os(&["sleep", "60"]), &env);
+        let live = w.popen(&os_vec(&["sleep", "60"]), &env);
         let start = wait_for("the live process", None, || started_by(live.pid(), now()));
         w.write_holder(&Json::object([
             ("run_id", Json::from(w.run_id.as_str())),
@@ -787,7 +775,7 @@ mod ownership {
     fn test_busy_lock_with_dead_recorded_supervisor_says_not_running() {
         let mut w = World::new();
         let env = w.env.clone();
-        let gone = w.popen(&os(&["true"]), &env);
+        let gone = w.popen(&os_vec(&["true"]), &env);
         gone.wait(WAIT);
         w.write_holder(&Json::object([
             ("run_id", Json::from(w.run_id.as_str())),
@@ -845,16 +833,9 @@ mod ownership {
 
 mod keep_awake {
     use super::*;
+    use common::launch_world::other_keep_awake_tool;
+    use common::launch_world::{keep_awake_tool, keep_awake_unsupported as unsupported};
     use common::{read_jsonl, started_by};
-
-    /// Python's `skipUnless(darwin or linux)`: true (after saying so) when the test skips.
-    fn unsupported() -> bool {
-        let skip = !(cfg!(target_os = "macos") || cfg!(target_os = "linux"));
-        if skip {
-            println!("skipped: keep-awake runs only on macOS and Linux");
-        }
-        skip
-    }
 
     /// macOS: `caffeinate -i -w <supervisor pid>`; Linux: `systemd-inhibit --what=idle
     /// --why='leadhand run' tail --pid=<supervisor pid> -f /dev/null`. Either is a child of
@@ -866,11 +847,7 @@ mod keep_awake {
         }
         let _serial = common::serial(); // group: keep-awake beside a 1 s supervisor
         let mut w = World::new();
-        let mine = if cfg!(target_os = "macos") {
-            "caffeinate"
-        } else {
-            "systemd-inhibit"
-        };
+        let mine = keep_awake_tool();
         for name in ["caffeinate", "systemd-inhibit"] {
             w.tool(name, LOGGING_TOOL);
         }
@@ -895,13 +872,13 @@ mod keep_awake {
         assert_eq!(names, [mine]);
         let rec = &recs[0];
         assert_eq!(rec["ppid"], i64::from(launcher.pid()));
-        let args = &common::launch_world::strings(&rec["argv"])[1..];
+        let args = &common::strs(&rec["argv"])[1..];
         if cfg!(target_os = "macos") {
-            assert_eq!(args, s(&["-i", "-w", &start.pid.to_string()]));
+            assert_eq!(args, str_vec(&["-i", "-w", &start.pid.to_string()]));
         } else {
             assert_eq!(
                 args,
-                s(&[
+                str_vec(&[
                     "--what=idle",
                     "--why=leadhand run",
                     "tail",
@@ -928,11 +905,7 @@ mod keep_awake {
             return;
         }
         let w = World::new();
-        let other = if cfg!(target_os = "macos") {
-            "systemd-inhibit"
-        } else {
-            "caffeinate"
-        };
+        let other = other_keep_awake_tool();
         w.tool(other, LOGGING_TOOL);
         let r = w.run(&[]);
         assert_eq!(r.code, 0, "{r}");
@@ -1118,7 +1091,8 @@ mod inherited_lock {
         assert_eq!(w.starts().len(), 1);
         launcher.proc.kill();
         launcher.wait(WAIT);
-        let _ = kill_process(Pid::from_raw(sup.pid).unwrap(), Signal::KILL);
+        kill_process(Pid::from_raw(sup.pid).unwrap(), Signal::KILL)
+            .expect("the supervisor exited before the test killed it");
         w.wait_gone(&sup);
         // The supervisor is gone; its CLI child is not, and does not keep the run locked.
         assert!(World::alive(&child), "the CLI child exited early");
@@ -1218,9 +1192,9 @@ mod lock_fd_environment {
             .records("start")
             .into_iter()
             .filter(|r| {
-                let argv = common::launch_world::strings(&r["argv"]);
+                let argv = common::strs(&r["argv"]);
                 argv.len() >= 3
-                    && argv[argv.len() - 3..argv.len() - 1] == s(&["-o", path_str(&last)])
+                    && argv[argv.len() - 3..argv.len() - 1] == str_vec(&["-o", path_str(&last)])
             })
             .collect();
         assert_eq!(starts.len(), 1);

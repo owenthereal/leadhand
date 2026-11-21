@@ -881,6 +881,47 @@ pub fn holds(mut cond: impl FnMut() -> bool, seconds: f64, what: &str) {
     }
 }
 
+/// A JSON list of strings, as strings.
+#[track_caller]
+pub fn strs(v: &Json) -> Vec<String> {
+    v.as_array()
+        .unwrap_or_else(|| panic!("not a list: {v}"))
+        .iter()
+        .map(|s| {
+            s.as_str()
+                .unwrap_or_else(|| panic!("not a string: {s}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// `items` as owned strings (a Python list literal of strings).
+pub fn str_vec(items: &[&str]) -> Vec<String> {
+    items.iter().map(|x| x.to_string()).collect()
+}
+
+/// `items` as OS strings, for `shlex_join`.
+pub fn os_vec(items: &[&str]) -> Vec<OsString> {
+    items.iter().map(OsString::from).collect()
+}
+
+/// A path the tests built from UTF-8 parts, as `&str` (Python's `str(path)`).
+#[track_caller]
+pub fn path_str(p: &Path) -> &str {
+    p.to_str()
+        .unwrap_or_else(|| panic!("not UTF-8: {}", p.display()))
+}
+
+/// The one line a successful command printed, without its newline; panics unless it
+/// printed exactly one line.
+#[track_caller]
+pub fn one_line(r: Out) -> String {
+    let r = r.ok();
+    let out = r.stdout_text();
+    assert!(out.ends_with('\n') && out.matches('\n').count() == 1, "{r}");
+    out[..out.len() - 1].to_string()
+}
+
 /// `path` opened read-write (created, mode 0644, never truncated), for flock.
 #[track_caller]
 pub fn open_lock_file(path: &Path) -> fs::File {

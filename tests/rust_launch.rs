@@ -29,7 +29,9 @@ use std::time::Duration;
 
 use common::json::Json;
 use common::launch_world::{AGENT, FIRST_MESSAGE_END, World};
-use common::{Out, names_bin, shlex_join, shlex_quote, shlex_split};
+use common::{
+    names_bin, one_line, os_vec, path_str, shlex_join, shlex_quote, shlex_split, str_vec,
+};
 
 const ATTENDED: &str = "leadhand: attended use only. Until the Claude-side run guard lands, keep this session \
      in view and run it only on fixture and trial repositories.\n\
@@ -39,14 +41,6 @@ const ATTENDED: &str = "leadhand: attended use only. Until the Claude-side run g
 const SPACES: &str = "leadhand: warning: the leadhand CLI path contains whitespace ({cli}); the sandbox exclusion \
      may not match; install leadhand under a path without spaces.\n";
 
-fn keep_awake() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "caffeinate"
-    } else {
-        "systemd-inhibit"
-    }
-}
-
 /// The path the binary names itself by: the router's link behind the router (ruling S2-R5),
 /// else the binary. With no router in stage 3, the binary.
 fn self_cli(w: &World) -> std::path::PathBuf {
@@ -54,27 +48,6 @@ fn self_cli(w: &World) -> std::path::PathBuf {
         Some(cli) if !cli.is_empty() => cli.into(),
         _ => common::bin(),
     }
-}
-
-/// The one line a command printed, without its newline.
-#[track_caller]
-fn line_of(r: Out) -> String {
-    let r = r.ok();
-    let out = r.stdout_text();
-    assert!(out.ends_with('\n') && out.matches('\n').count() == 1, "{r}");
-    out[..out.len() - 1].to_string()
-}
-
-fn s(items: &[&str]) -> Vec<String> {
-    items.iter().map(|x| x.to_string()).collect()
-}
-
-fn os(items: &[&str]) -> Vec<OsString> {
-    items.iter().map(OsString::from).collect()
-}
-
-fn path_str(p: &Path) -> &str {
-    p.to_str().unwrap()
 }
 
 mod launch_line {
@@ -87,9 +60,13 @@ mod launch_line {
         }
         let mut w = World::new();
         let deck = path_str(&w.paths.deck).to_string();
-        let want = line_of(w.launch_line(&os_args![w.run_dir]));
+        let want = one_line(w.launch_line(&os_args![w.run_dir]));
         assert!(
-            common::is_bin_command(&want, "", &format!(" {}", shlex_join(&os(&["run", &deck])))),
+            common::is_bin_command(
+                &want,
+                "",
+                &format!(" {}", shlex_join(&os_vec(&["run", &deck])))
+            ),
             "{want}"
         );
         // From inside the run's worktree (its top or a subdirectory), and from the
@@ -98,7 +75,7 @@ mod launch_line {
         fs::create_dir(&deep).unwrap();
         for cwd in [&w.workspace, &deep, &w.repo] {
             assert_eq!(
-                line_of(w.launch_line_in(&[], cwd)),
+                one_line(w.launch_line_in(&[], cwd)),
                 want,
                 "cwd={}",
                 cwd.display()
@@ -113,7 +90,7 @@ mod launch_line {
             meta["slug"].as_str().unwrap(),
         ] {
             assert_eq!(
-                line_of(w.launch_line_in(&os_args![arg], &w.repo)),
+                one_line(w.launch_line_in(&os_args![arg], &w.repo)),
                 want,
                 "arg={arg}"
             );
@@ -153,7 +130,7 @@ mod launch_line {
             );
         }
         // Inside the first run's worktree it is still that run.
-        assert_eq!(line_of(w.launch_line_in(&[], &deep)), want);
+        assert_eq!(one_line(w.launch_line_in(&[], &deep)), want);
     }
 
     #[test]
@@ -173,7 +150,7 @@ mod launch_line {
         ];
         for args in &cases {
             let refs: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_os_str()).collect();
-            let text = line_of(w.launch_line(&refs));
+            let text = one_line(w.launch_line(&refs));
             let mut with_json = refs.clone();
             with_json.push("--json".as_ref());
             let r = w.launch_line(&with_json).ok();
@@ -216,7 +193,7 @@ mod launch_line {
         let r = common::cli(&os_args!["launch-line", w.run_dir], &env, &w.elsewhere);
         assert_eq!(
             r.stdout_text(),
-            shlex_join(&os(&["leadhand", "run", &deck])) + "\n",
+            shlex_join(&os_vec(&["leadhand", "run", &deck])) + "\n",
             "{r}"
         );
         let r = common::cli(
@@ -229,7 +206,7 @@ mod launch_line {
             r.json(),
             Json::object([(
                 "command",
-                Json::from(shlex_join(&os(&["leadhand", "run", &deck])))
+                Json::from(shlex_join(&os_vec(&["leadhand", "run", &deck])))
             )]),
             "{r}"
         );
@@ -252,13 +229,17 @@ mod launch_line {
         fs::remove_file(&link).unwrap();
         fs::write(&link, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&link, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        let line = line_of(common::cli(
+        let line = one_line(common::cli(
             &os_args!["launch-line", w.run_dir],
             &env,
             &w.elsewhere,
         ));
         assert!(
-            common::is_bin_command(&line, "", &format!(" {}", shlex_join(&os(&["run", &deck])))),
+            common::is_bin_command(
+                &line,
+                "",
+                &format!(" {}", shlex_join(&os_vec(&["run", &deck])))
+            ),
             "{line}"
         );
         assert_ne!(shlex_split(&line).unwrap()[0], "leadhand");
@@ -298,7 +279,7 @@ mod paths {
         let (settings, last) = (argv[2].as_str(), argv.last().unwrap().as_str());
         assert_eq!(
             argv[1..],
-            s(&[
+            str_vec(&[
                 "--settings",
                 settings,
                 "--agent",
@@ -329,10 +310,10 @@ mod paths {
         assert_eq!(start.rec["env"]["LEADHAND_CLI"], cli.as_str());
 
         // The launch line quotes the path as one word, and runs as printed.
-        let line = line_of(w.launch_line(&os_args![w.run_dir]));
-        assert_eq!(line, shlex_join(&os(&[&cli, "run", &deck])));
+        let line = one_line(w.launch_line(&os_args![w.run_dir]));
+        assert_eq!(line, shlex_join(&os_vec(&[&cli, "run", &deck])));
         let words = shlex_split(&line).unwrap();
-        assert_eq!(words, s(&[&cli, "run", &deck]));
+        assert_eq!(words, str_vec(&[&cli, "run", &deck]));
         let word_refs: Vec<&std::ffi::OsStr> = words.iter().map(|w| w.as_ref()).collect();
         let r = common::run_argv(
             &word_refs,
@@ -362,7 +343,7 @@ mod paths {
         let r = w.run(&[]);
         assert_eq!(r.code, 1, "{r}");
         // The error line, then the one command that fixes it alone on the last line.
-        let fix = s(&[
+        let fix = str_vec(&[
             &cli,
             "start",
             meta["deck_source"].as_str().unwrap(),
@@ -389,7 +370,7 @@ mod paths {
 
 mod descriptors {
     use super::*;
-    use common::launch_world::{FD_CLAUDE, FD_TOOL, strings};
+    use common::launch_world::{FD_CLAUDE, FD_TOOL, keep_awake_tool, keep_awake_unsupported};
     use common::{read_jsonl, started_by};
     use std::collections::BTreeMap;
     use std::os::unix::fs::MetadataExt;
@@ -414,9 +395,7 @@ mod descriptors {
         if common::rust_only() {
             return;
         }
-        // Python's `skipUnless(darwin or linux)`.
-        if !(cfg!(target_os = "macos") || cfg!(target_os = "linux")) {
-            println!("skipped: keep-awake runs only on macOS and Linux");
+        if keep_awake_unsupported() {
             return;
         }
         let mut w = World::new();
@@ -460,14 +439,14 @@ mod descriptors {
         let names: Vec<String> = recs
             .iter()
             .map(|rec| {
-                Path::new(&strings(&rec["argv"])[0])
+                Path::new(&common::strs(&rec["argv"])[0])
                     .file_name()
                     .unwrap()
                     .to_string_lossy()
                     .into_owned()
             })
             .collect();
-        assert_eq!(names, [keep_awake()]);
+        assert_eq!(names, [keep_awake_tool()]);
         let tool: BTreeMap<i64, (i64, i64)> = recs[0]["fds"]
             .as_array()
             .unwrap()
