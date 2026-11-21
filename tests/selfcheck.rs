@@ -862,3 +862,123 @@ fn fake_claude_logs_argv_cwd_and_env() {
     }
     assert_eq!(i64::from(text_of_pid(&spawned)), child);
 }
+
+// --------------------------------------------------------------------------
+// Forked drives: the test binary re-executed as a drive child (ruling S3-R23)
+
+mod drive_child {
+    use std::fs;
+    use std::time::Duration;
+
+    use crate::common::json::{self, Json};
+    use crate::common::supervisor::{FakeSupervisor, Step, card};
+
+    fn steps() -> [Step; 2] {
+        [
+            Step {
+                reply: Some("first".into()),
+                ..Step::default()
+            },
+            Step {
+                reply: Some("second".into()),
+                ..Step::default()
+            },
+        ]
+    }
+
+    fn action() -> Json {
+        json::parse(br#"{"card": 1, "kind": "implement"}"#)
+    }
+
+    /// The parent's world for drive `label`, or in its drive child the parent's world as
+    /// attached; both with `steps` scripted. The parent takes the first step before the fork.
+    fn world(label: &str) -> FakeSupervisor {
+        if let Some(mut w) = FakeSupervisor::attach_drive(label) {
+            w.script(1, "implement", steps());
+            return w;
+        }
+        let mut w = FakeSupervisor::new(&[card(1)]);
+        w.script(1, "implement", steps());
+        assert_eq!(w.take(&action()).reply.as_deref(), Some("first"));
+        w.advance(90.5);
+        w.parks.insert(1, "parked by the parent".into());
+        w.env.set("FAKE_MARK", "the parent's");
+        w
+    }
+
+    #[test]
+    fn gets_the_parents_world_and_exits_97_at_a_crash_point() {
+        let mut w = world("exit 97");
+        let counter = w.tmp.join("crash counter");
+        let saw = w.tmp.join("child saw.json");
+        let forked = w.fork("exit 97", Duration::from_secs(60), |w, pid| {
+            let seen = Json::object([
+                ("pid", Json::from(pid)),
+                ("step", Json::from(w.take(&action()).reply.unwrap())),
+                ("offset", Json::from(w.offset)),
+                ("park", Json::from(w.parks[&1].as_str())),
+                ("mark", Json::from(w.env.get_str("FAKE_MARK"))),
+            ]);
+            fs::write(&saw, json::dumps(&seen)).unwrap();
+            w.env
+                .set("LEADHAND_CRASH_AT", "before_commit")
+                .set("LEADHAND_CRASH_COUNTER", &counter);
+            w.crash_point("after_commit"); // not the armed point: passes
+            w.crash_point("before_commit");
+            panic!("the crash point returned");
+        });
+        assert_eq!((forked.code, forked.hung), (97, false), "{}", forked.output);
+        assert_eq!(forked.error, None);
+        let seen = json::parse(&fs::read(&saw).unwrap());
+        assert_eq!(seen["step"], "second", "{seen}");
+        assert_eq!(seen["offset"].as_f64(), Some(90.5));
+        assert_eq!(seen["park"], "parked by the parent");
+        assert_eq!(seen["mark"], "the parent's");
+        assert_ne!(seen["pid"].as_i64(), Some(i64::from(std::process::id())));
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "1\n");
+        // Nothing the child did reached the parent's world.
+        assert_eq!(w.take(&action()).reply.as_deref(), Some("second"));
+        assert_eq!(w.env.get("LEADHAND_CRASH_AT"), None);
+        // In the test process itself an armed crash point panics instead.
+        w.env.set("LEADHAND_CRASH_AT", "before_commit");
+        let message = assert_panics!(w.crash_point("before_commit"));
+        assert!(
+            message.contains("reached in the test process itself"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn dies_with_its_group_at_a_crash_point_that_kills_it() {
+        let mut w = world("killed");
+        let forked = w.fork("killed", Duration::from_secs(60), |w, pid| {
+            w.env
+                .set("LEADHAND_CRASH_AT", "after_commit")
+                .set("LEADHAND_CRASH_KILL_PGID", pid.to_string());
+            w.crash_point("after_commit");
+            panic!("the crash point returned");
+        });
+        assert_eq!((forked.code, forked.hung), (-9, false), "{}", forked.output);
+        assert_eq!(forked.error, None);
+    }
+
+    #[test]
+    fn a_panic_exits_1_with_its_message() {
+        let mut w = world("panics");
+        let forked = w.fork("panics", Duration::from_secs(60), |_, _| {
+            panic!("the drive broke");
+        });
+        assert_eq!((forked.code, forked.hung), (1, false), "{}", forked.output);
+        assert_eq!(forked.error.as_deref(), Some("the drive broke"));
+    }
+
+    #[test]
+    fn a_drive_past_its_deadline_is_killed_with_its_group() {
+        let mut w = world("hangs");
+        let forked = w.fork("hangs", Duration::from_secs(1), |_, _| {
+            std::thread::sleep(Duration::from_secs(60));
+        });
+        assert!(forked.hung, "{}", forked.output);
+        assert_eq!(forked.code, -9);
+    }
+}

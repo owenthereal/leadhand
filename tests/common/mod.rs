@@ -14,6 +14,7 @@
 
 #![allow(dead_code, unused_macros)]
 
+pub mod drive;
 pub mod git;
 pub mod json;
 pub mod rundir;
@@ -260,11 +261,8 @@ pub fn run_argv(
 pub enum Group {
     /// A group of its own (`process_group(0)`): a timeout kills the whole group.
     Own,
-    /// The test process's group: a timeout kills only the command.
+    /// The caller's group (in a drive child, the drive's): a timeout kills only the command.
     Inherit,
-    /// The existing group with this id (a fake supervisor's drive, `FakeSupervisor::fork`):
-    /// a timeout kills only the command.
-    Join(i32),
 }
 
 /// How `run_argv_spawn` starts a command: its process group, and a hook called with the
@@ -367,9 +365,6 @@ where
     match spawn.group {
         Group::Own => {
             cmd.process_group(0);
-        }
-        Group::Join(pgid) => {
-            cmd.process_group(pgid);
         }
         Group::Inherit => {}
     }
@@ -647,6 +642,15 @@ impl Env {
         self.vars
             .iter()
             .map(|(k, v)| (k.as_os_str(), v.as_os_str()))
+    }
+
+    /// An environment of exactly `vars`, with `fakes` as its fakes folder: one an `Env` gave
+    /// before (`vars`, `fakes`), rebuilt elsewhere, such as in a drive child.
+    pub fn from_parts(vars: impl IntoIterator<Item = (OsString, OsString)>, fakes: PathBuf) -> Env {
+        Env {
+            vars: vars.into_iter().collect(),
+            fakes,
+        }
     }
 
     /// The folder holding `codex` and `claude`, the fake binaries (the Rust `tests/fakes`).

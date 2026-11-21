@@ -35,18 +35,16 @@
 //! The same two points are the harness's own crash points (`crash_point`), which follow the
 //! CLI's LEADHAND_CRASH_* protocol, read from `env`: with LEADHAND_CRASH_AT naming one, the
 //! drive dies there with exit 97, as a crash of the session a Claude worker runs in would.
-//! Only a forked drive may die so; outside one the point panics instead.
+//! Only a forked drive may die so; in the test process itself the point panics instead.
 //!
-//! **Forked drives.** Python drives a world in an `os.fork()` child that is its own process
-//! group. Without `unsafe` there is no fork, so `fork` runs the drive in this process with
-//! fork's semantics: the drive gets a process group of its own (a placeholder leader, its
-//! pgid handed to the drive as Python's `os.getpid()`), every process the world starts
-//! during the drive joins that group, and the world's state is restored when the drive ends,
-//! as a forked child's changes never reach its parent. The drive dies, as a SIGKILLed child
-//! would, once its group is killed (a crash point's LEADHAND_CRASH_KILL_PGID): the world
-//! checks before each process it starts, after each one ends, and before each file it
-//! writes, and unwinds the drive there. `Forked` gives the drive's exit status as `Out.code`
-//! gives one (`-9` killed, `97` a harness crash point, `1` a panic, `0` a normal end).
+//! **Forked drives** (ruling S3-R23). Python drives a world in an `os.fork()` child that is
+//! its own process group. The Rust form re-executes the test binary (`common::drive`): `fork`
+//! writes the world's state and starts the same test again as a child in a process group of
+//! its own. There the test gets the parent's world from `attach_drive` where it would make
+//! one, scripts its steps and sets its hooks as before (steps the parent already took are
+//! skipped), and reaches the same `fork`, which runs the drive and ends the process. So the
+//! child dies at once with its group, every process it starts is in that group, nothing it
+//! changes reaches the parent, and `Forked::code` is its real exit status.
 //!
 //! **Subclasses.** Python tests subclass FakeSupervisor to override `launch`, `_cli`,
 //! `work_label` and `_take`; the Rust hooks for those are `before_launch`, `cli_cwd`,
@@ -62,26 +60,28 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use rustix::fs::{FlockOperation, flock, fsync};
-use rustix::process::{Pid, Signal, kill_process, kill_process_group};
+use rustix::process::{
+    Pid, Signal, getpgrp, getpid, kill_current_process_group, kill_process, kill_process_group,
+};
 
+use super::drive;
 use super::git::{self, IDENTITY};
 use super::json::{self, Json};
 use super::rundir::{RunPaths, read_records, run_paths};
 use super::{
-    Env, Group, Out, Spawn, TIMEOUT, TempRoot, bin, read_jsonl, run_argv_spawn, same_process,
-    shlex_split, start_time, started_by,
+    Env, Group, Out, Spawn, TIMEOUT, TempRoot, bin, read_json, read_jsonl, run_argv_spawn,
+    same_process, shlex_split, start_time, started_by,
 };
 
 pub const IMPLEMENTER_KINDS: [&str; 5] = ["implement", "fix", "answer", "continue", "final_fix"];
@@ -379,45 +379,19 @@ pub struct CliOpts<'a> {
 /// How a forked drive (`FakeSupervisor::fork`) ended.
 #[derive(Clone, Debug)]
 pub struct Forked {
-    /// Its exit status as `Out.code` gives one: `-9` when its group was killed, `97` at a
-    /// harness crash point, `1` when it panicked, `0` when it returned.
+    /// The drive child's exit status as `Out.code` gives one: `-9` when its group was
+    /// killed, `97` at a crash point, `1` when the drive panicked, `0` when it returned.
     pub code: i32,
-    /// The panic's message when it panicked (Python's traceback in the drive's error file).
+    /// The panic's message when the drive panicked (Python's traceback in its error file).
     pub error: Option<String>,
     /// True when it ran past its deadline and its group was killed.
     pub hung: bool,
+    /// Everything the drive child printed.
+    pub output: String,
 }
 
-/// The drive's process group: its placeholder leader's pid and start time.
-#[derive(Clone, Debug)]
-struct Drive {
-    pgid: i32,
-    start: String,
-}
-
-/// The unwinding payloads that end a drive as a process exit would.
-struct DriveExit(i32);
-struct DriveKilled;
-
-/// The world's state a forked drive may change, put back when it ends.
-struct Saved {
-    env: Env,
-    offset: f64,
-    run_dir: Option<PathBuf>,
-    steps: HashMap<(Option<i64>, String), Vec<Rc<Step>>>,
-    rulings: HashMap<i64, Vec<String>>,
-    parks: HashMap<i64, String>,
-    diff_checks: HashMap<i64, Vec<(bool, String)>>,
-    started: Vec<Json>,
-    run_started: Vec<Json>,
-    proxies: Vec<Proc>,
-    launch_log: Option<PathBuf>,
-    popen_log: Option<PathBuf>,
-    cli_cwd: Option<PathBuf>,
-    ids: u64,
-    messages: u64,
-    drive: Option<Drive>,
-}
+/// A step queue's key: (card, kind); card None for run level.
+type StepKey = (Option<i64>, String);
 
 pub struct FakeSupervisor {
     pub tmp: PathBuf,
@@ -432,7 +406,7 @@ pub struct FakeSupervisor {
     pub deck_path: PathBuf,
     pub base: String,
     pub run_dir: Option<PathBuf>,
-    pub steps: HashMap<(Option<i64>, String), Vec<Rc<Step>>>,
+    pub steps: HashMap<StepKey, Vec<Step>>,
     pub rulings: HashMap<i64, Vec<String>>,
     pub parks: HashMap<i64, String>,
     pub diff_checks: HashMap<i64, Vec<(bool, String)>>,
@@ -453,8 +427,15 @@ pub struct FakeSupervisor {
     pub take_fn: Option<TakeHook>,
     ids: u64,
     messages: u64,
-    drive: Option<Drive>,
-    _root: TempRoot,
+    /// Steps taken from each queue, and (in a drive child) how many of each queue's next
+    /// scripted steps to drop because the parent had taken them before the fork.
+    taken: HashMap<StepKey, usize>,
+    skip: HashMap<StepKey, usize>,
+    /// True in a drive child (`attach_drive`): crash points end the process, and dropping
+    /// the world touches nothing (the temp root and the run are the parent's).
+    drive_child: bool,
+    /// The temp root this world made (None in a drive child).
+    _root: Option<TempRoot>,
 }
 
 /// Python's `str.splitlines`.
@@ -617,8 +598,10 @@ impl FakeSupervisor {
             take_fn: None,
             ids: 1,
             messages: 1,
-            drive: None,
-            _root: root,
+            taken: HashMap::new(),
+            skip: HashMap::new(),
+            drive_child: false,
+            _root: Some(root),
         };
         w.write_deck_with(cards, o.title, "leadhand/demo");
         w
@@ -687,10 +670,14 @@ impl FakeSupervisor {
         kind: &str,
         steps: impl IntoIterator<Item = Step>,
     ) {
-        self.steps
-            .entry((card_number.into(), kind.to_string()))
-            .or_default()
-            .extend(steps.into_iter().map(Rc::new));
+        let key: StepKey = (card_number.into(), kind.to_string());
+        for step in steps {
+            if let Some(n) = self.skip.get_mut(&key).filter(|n| **n > 0) {
+                *n -= 1; // the parent took this one before the fork
+                continue;
+            }
+            self.steps.entry(key.clone()).or_default().push(step);
+        }
     }
 
     pub fn advance(&mut self, seconds: f64) {
@@ -819,7 +806,6 @@ impl FakeSupervisor {
                 let worker = self.launch(a);
                 if let Some(reply) = self.perform(a, &worker) {
                     let reply_file = os_path(&a["reply_file"]);
-                    self.check_alive();
                     make_parent(&reply_file);
                     fs::write(&reply_file, reply)
                         .unwrap_or_else(|e| panic!("writing {}: {e}", reply_file.display()));
@@ -926,7 +912,6 @@ impl FakeSupervisor {
             self.started.push(a.clone());
         }
         if let Some(log) = &self.launch_log {
-            self.check_alive();
             append(log, format!("{did}\n").as_bytes());
         }
         worker
@@ -948,9 +933,9 @@ impl FakeSupervisor {
     // -- workers --------------------------------------------------------------
 
     /// The next scripted step for the dispatch (`_take`); an empty step when none is left.
-    pub fn take(&mut self, a: &Json) -> Rc<Step> {
+    pub fn take(&mut self, a: &Json) -> Step {
         if let Some(f) = &self.take_fn {
-            return Rc::new(f(self, a));
+            return f(self, a);
         }
         let fix_review =
             a["card"].is_null() && a["kind"] == "final_review" && a.get("wave").is_some_and(truthy);
@@ -959,9 +944,13 @@ impl FakeSupervisor {
         } else {
             text(&a["kind"])
         };
-        match self.steps.get_mut(&(a["card"].as_i64(), kind.to_string())) {
-            Some(queue) if !queue.is_empty() => queue.remove(0),
-            _ => Rc::new(Step::default()),
+        let key: StepKey = (a["card"].as_i64(), kind.to_string());
+        match self.steps.get_mut(&key) {
+            Some(queue) if !queue.is_empty() => {
+                *self.taken.entry(key).or_default() += 1;
+                queue.remove(0)
+            }
+            _ => Step::default(),
         }
     }
 
@@ -1042,7 +1031,6 @@ impl FakeSupervisor {
                 .iter()
                 .map(|(p, t)| (p.as_str(), t.as_str()))
                 .collect();
-            self.check_alive();
             git::write(&ws, &pairs);
             self.crash_point("before_commit");
             if step.crash.as_deref() == Some("before_commit") {
@@ -1072,7 +1060,6 @@ impl FakeSupervisor {
         let report: PathBuf = os_path(&a["report"]).components().collect();
         let text = self.report_text(a, &step);
         if step.report.unwrap_or(true) {
-            self.check_alive();
             make_parent(&report);
             fs::write(&report, &text)
                 .unwrap_or_else(|e| panic!("writing {}: {e}", report.display()));
@@ -1085,7 +1072,6 @@ impl FakeSupervisor {
             Some(None) => {}
             Some(Some(t)) => {
                 let path = self.subagent_transcript(worker);
-                self.check_alive();
                 make_parent(&path);
                 append(&path, t.as_bytes());
             }
@@ -1149,7 +1135,6 @@ impl FakeSupervisor {
                 ]),
             ),
         ]);
-        self.check_alive();
         make_parent(path);
         append(path, format!("{}\n", json::dumps(&rec)).as_bytes());
     }
@@ -1233,7 +1218,6 @@ impl FakeSupervisor {
             .tmp
             .join(format!("scenario {}.jsonl", text(&a["dispatch_id"])));
         let body: String = lines.iter().map(|l| json::dumps(l) + "\n").collect();
-        self.check_alive();
         fs::write(&path, body).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
         path
     }
@@ -1315,7 +1299,6 @@ impl FakeSupervisor {
     #[track_caller]
     pub fn start_proxy(&mut self, a: &Json, step: &Step) -> Proc {
         let (argv, env) = self.proxy_argv_env(a, step);
-        self.check_alive();
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..])
             .current_dir(&self.tmp)
@@ -1324,16 +1307,9 @@ impl FakeSupervisor {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(d) = &self.drive {
-            cmd.process_group(d.pgid);
-        }
-        let child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                self.check_alive();
-                panic!("could not start {argv:?}: {e}");
-            }
-        };
+        let child = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("could not start {argv:?}: {e}"));
         self.log_popen(child.id(), &argv);
         let p = Proc::new(child);
         self.proxies.push(p.clone());
@@ -1343,8 +1319,8 @@ impl FakeSupervisor {
     /// The harness's crash point `name`, on the CLI's protocol, read from `env`: log every
     /// point passed to LEADHAND_CRASH_LOG; when LEADHAND_CRASH_AT names this one, count it in
     /// LEADHAND_CRASH_COUNTER under flock, past LEADHAND_CRASH_SKIP passes SIGKILL
-    /// LEADHAND_CRASH_KILL_PGID's group (0: the drive's own) and exit 97 at once. Only a
-    /// forked drive (`fork`) exits; outside one this panics.
+    /// LEADHAND_CRASH_KILL_PGID's group (0: this process's own) and exit 97 at once. Only a
+    /// drive child (`fork`) may exit so; in the test process itself this panics instead.
     #[track_caller]
     pub fn crash_point(&self, name: &str) {
         let env = &self.env;
@@ -1405,146 +1381,250 @@ impl FakeSupervisor {
                 return;
             }
         }
-        let Some(drive) = &self.drive else {
+        if !self.drive_child {
             panic!(
                 "crash point {name} reached in the test process itself; \
                  drive the world in a forked child to crash there"
             );
-        };
+        }
         if let Some(group) = set("LEADHAND_CRASH_KILL_PGID") {
-            let pgid = match group.to_string_lossy().trim().parse::<i32>() {
-                Ok(0) => Some(drive.pgid),
-                Ok(g) => Some(g),
-                Err(_) => None,
+            let own = getpgrp().as_raw_pid();
+            let killed_own = match group.to_string_lossy().trim().parse::<i32>() {
+                Ok(0) => kill_current_process_group(Signal::KILL).is_ok(),
+                Ok(g) => Pid::from_raw(g)
+                    .filter(|p| p.as_raw_pid() > 0)
+                    .is_some_and(|p| kill_process_group(p, Signal::KILL).is_ok() && g == own),
+                Err(_) => false,
             };
-            if let Some(group) = pgid.and_then(Pid::from_raw).filter(|p| p.as_raw_pid() > 0) {
-                let _ = kill_process_group(group, Signal::KILL);
+            if killed_own {
+                // Python's single-threaded child dies inside killpg. Here other threads
+                // (libtest's) may take the signal, so it lands a moment after kill(2)
+                // returns: wait for it rather than exit first.
+                thread::sleep(Duration::from_secs(10));
             }
         }
-        self.check_alive(); // the drive's own group was killed: it died with it
-        panic::resume_unwind(Box::new(DriveExit(97)));
+        std::process::exit(97);
     }
 
     // -- forked drives --------------------------------------------------------
 
-    /// Python's `os.fork()` drive: runs `f` with the world and the drive's process group id
-    /// (Python's `os.getpid()` in the child) as a forked child that is its own group would
-    /// run, and puts the world's state back afterwards, as a forked child's changes never
-    /// reach its parent. Every process the world starts meanwhile joins that group, so a
-    /// LEADHAND_CRASH_KILL_PGID kill takes them down with the drive, and the drive dies with
-    /// its group (see the module docs). Past `deadline` the group is killed and `hung` set.
-    pub fn fork(&mut self, deadline: Duration, f: impl FnOnce(&mut FakeSupervisor, i32)) -> Forked {
-        let saved = self.save();
-        let mut leader = Command::new("sleep")
-            .arg("86400")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap_or_else(|e| panic!("starting the drive's process group leader: {e}"));
-        let pgid = leader.id() as i32;
-        let start = start_time(pgid).expect("the drive's group leader runs");
-        self.drive = Some(Drive { pgid, start });
-        let hung = Arc::new(AtomicBool::new(false));
-        let (stop, stopped) = mpsc::channel::<()>();
-        let watchdog = {
-            let hung = Arc::clone(&hung);
-            thread::spawn(move || {
-                if let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(deadline) {
-                    hung.store(true, Ordering::SeqCst);
-                    if let Some(group) = Pid::from_raw(pgid) {
-                        let _ = kill_process_group(group, Signal::KILL);
-                    }
-                }
-            })
-        };
-        let result = panic::catch_unwind(AssertUnwindSafe(|| f(self, pgid)));
-        drop(stop);
-        let _ = watchdog.join();
-        // The leader is unreaped until here, so its pid (the group's id) was never reused.
-        let killed = matches!(leader.try_wait(), Ok(Some(_)));
-        let (code, error) = match result {
-            Ok(()) => (0, None),
-            Err(payload) => {
-                if let Some(DriveExit(code)) = payload.downcast_ref::<DriveExit>() {
-                    (*code, None)
-                } else if payload.is::<DriveKilled>() || killed {
-                    // Killed with its group: whatever it did after that never happened.
-                    (-9, None)
-                } else {
-                    let message = payload
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-                        .unwrap_or_else(|| "(a panic without a message)".to_string());
-                    (1, Some(message))
-                }
+    /// In a drive child started by `fork(label, …)`: the parent's world as it was at the
+    /// fork, attached to the parent's temp root; None otherwise. Call it where the test makes
+    /// its world. The test then scripts its steps and sets its hooks as before (the steps the
+    /// parent had already taken are dropped as they are scripted again), and reaches
+    /// `fork(label, …)`, which runs the drive and ends the process. What the test does
+    /// between `attach_drive` and `fork` runs in both processes, so it should only script
+    /// steps, set hooks and name paths; the rest of the setup belongs to the parent branch.
+    #[track_caller]
+    pub fn attach_drive(label: &str) -> Option<FakeSupervisor> {
+        let sel = drive::selected_for(label)?;
+        Some(FakeSupervisor::from_state(&read_json(&sel.payload)))
+    }
+
+    /// Python's `os.fork()` drive (ruling S3-R23).
+    ///
+    /// In the parent: writes the world's state, starts this test again as a drive child for
+    /// `label` (`drive::start`: its own process group, the selector on its `Command` only),
+    /// waits up to `deadline` (past it the child's group is killed and `hung` set) and says
+    /// how it ended. The world here is unchanged: the child's changes never reach it.
+    ///
+    /// In the drive child (a world from `attach_drive(label)`): runs `f` with the world and
+    /// this process's id, which is its group's (Python's `os.getpid()` in the child), and
+    /// ends the process: 0 when `f` returns, 1 when it panics (the message comes back as
+    /// `Forked::error`), 97 or a SIGKILL from its group at a crash point.
+    #[track_caller]
+    pub fn fork(
+        &mut self,
+        label: &str,
+        deadline: Duration,
+        f: impl FnOnce(&mut FakeSupervisor, i32),
+    ) -> Forked {
+        let slug: String = label
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let error = self.tmp.join(format!("drive {slug} error.txt"));
+        if self.drive_child {
+            match drive::selected() {
+                Some(sel) if sel.label == label => {}
+                other => panic!("fork({label:?}) in a drive child selected for {other:?}"),
             }
+            let pid = getpid().as_raw_pid();
+            drive::run_child(&error, || f(self, pid));
+        }
+        let state = self.tmp.join(format!("drive {slug} state.json"));
+        let output = self.tmp.join(format!("drive {slug} output.txt"));
+        let _ = fs::remove_file(&error);
+        fs::write(&state, json::dumps(&self.state()))
+            .unwrap_or_else(|e| panic!("writing {}: {e}", state.display()));
+        let sel = drive::Selector {
+            test: drive::this_test(),
+            label: label.to_string(),
+            payload: state,
         };
-        // The drive exits: its leader goes; the rest of its group stays, as a child's would.
-        let _ = leader.kill();
-        let _ = leader.wait();
-        self.restore(saved);
+        let ended = drive::start(&sel, &output).wait(deadline);
         Forked {
-            code,
-            error,
-            hung: hung.load(Ordering::SeqCst),
+            code: ended.code,
+            error: fs::read_to_string(&error).ok(),
+            hung: ended.hung,
+            output: ended.output,
         }
     }
 
-    /// True while in a forked drive.
-    pub fn in_drive(&self) -> bool {
-        self.drive.is_some()
+    /// The world's state, for a drive child (`from_state`): everything but the steps and
+    /// hooks, which the child's own run of the test makes again, and the proxies.
+    fn state(&self) -> Json {
+        let os = |p: &OsStr| Json::Str(json::from_os(p.as_bytes()));
+        let opt = |p: &Option<PathBuf>| p.as_ref().map_or(Json::Null, |p| os(p.as_os_str()));
+        let num = |n: i64| Json::from(n);
+        let card = |n: &Option<i64>| n.map_or(Json::Null, num);
+        Json::object([
+            ("tmp", os(self.tmp.as_os_str())),
+            (
+                "env",
+                Json::Arr(
+                    self.env
+                        .vars()
+                        .map(|(k, v)| Json::Arr(vec![os(k), os(v)]))
+                        .collect(),
+                ),
+            ),
+            ("fakes", os(self.env.fakes().as_os_str())),
+            ("repo", os(self.repo.as_os_str())),
+            ("docs", os(self.docs.as_os_str())),
+            ("claude_home", os(self.claude_home.as_os_str())),
+            ("codex_home", os(self.codex_home.as_os_str())),
+            ("config_file", os(self.config_file.as_os_str())),
+            ("offset", Json::from(self.offset)),
+            ("deck_path", os(self.deck_path.as_os_str())),
+            ("base", Json::from(self.base.as_str())),
+            ("run_dir", opt(&self.run_dir)),
+            (
+                "rulings",
+                Json::Arr(
+                    self.rulings
+                        .iter()
+                        .map(|(n, r)| Json::Arr(vec![num(*n), Json::from(&r[..])]))
+                        .collect(),
+                ),
+            ),
+            (
+                "parks",
+                Json::Arr(
+                    self.parks
+                        .iter()
+                        .map(|(n, r)| Json::Arr(vec![num(*n), Json::from(r.as_str())]))
+                        .collect(),
+                ),
+            ),
+            (
+                "diff_checks",
+                Json::Arr(
+                    self.diff_checks
+                        .iter()
+                        .map(|(n, q)| {
+                            let q = q
+                                .iter()
+                                .map(|(ok, note)| {
+                                    Json::Arr(vec![Json::from(*ok), Json::from(note.as_str())])
+                                })
+                                .collect();
+                            Json::Arr(vec![num(*n), Json::Arr(q)])
+                        })
+                        .collect(),
+                ),
+            ),
+            ("started", Json::Arr(self.started.clone())),
+            ("run_started", Json::Arr(self.run_started.clone())),
+            ("launch_log", opt(&self.launch_log)),
+            ("popen_log", opt(&self.popen_log)),
+            ("cli_cwd", opt(&self.cli_cwd)),
+            (
+                "taken",
+                Json::Arr(
+                    self.taken
+                        .iter()
+                        .map(|((c, k), n)| {
+                            Json::Arr(vec![card(c), Json::from(k.as_str()), num(*n as i64)])
+                        })
+                        .collect(),
+                ),
+            ),
+            ("ids", num(self.ids as i64)),
+            ("messages", num(self.messages as i64)),
+        ])
     }
 
-    /// In a forked drive whose group has been killed, ends the drive there (it died).
-    fn check_alive(&self) {
-        if let Some(d) = &self.drive
-            && !same_process(d.pgid, Some(&d.start))
-        {
-            panic::resume_unwind(Box::new(DriveKilled));
+    /// A drive child's world from the parent's `state`.
+    #[track_caller]
+    fn from_state(s: &Json) -> FakeSupervisor {
+        let path = |v: &Json| PathBuf::from(v.as_os().unwrap_or_else(|| panic!("not a path: {v}")));
+        let opt = |v: &Json| (!v.is_null()).then(|| path(v));
+        let int = |v: &Json| v.as_i64().unwrap_or_else(|| panic!("not an integer: {v}"));
+        let items = |v: &Json| {
+            v.as_array()
+                .unwrap_or_else(|| panic!("not a list: {v}"))
+                .to_vec()
+        };
+        let string = |v: &Json| text(v).to_string();
+        let env = Env::from_parts(
+            items(&s["env"]).iter().map(|kv| {
+                let os = |v: &Json| v.as_os().unwrap_or_else(|| panic!("not an OS string: {v}"));
+                (os(&kv[0]), os(&kv[1]))
+            }),
+            path(&s["fakes"]),
+        );
+        let taken: HashMap<StepKey, usize> = items(&s["taken"])
+            .iter()
+            .map(|t| ((t[0].as_i64(), string(&t[1])), int(&t[2]) as usize))
+            .collect();
+        FakeSupervisor {
+            tmp: path(&s["tmp"]),
+            env,
+            repo: path(&s["repo"]),
+            docs: path(&s["docs"]),
+            claude_home: path(&s["claude_home"]),
+            codex_home: path(&s["codex_home"]),
+            config_file: path(&s["config_file"]),
+            offset: s["offset"].as_f64().expect("a float offset"),
+            deck_path: path(&s["deck_path"]),
+            base: string(&s["base"]),
+            run_dir: opt(&s["run_dir"]),
+            steps: HashMap::new(),
+            rulings: items(&s["rulings"])
+                .iter()
+                .map(|r| (int(&r[0]), items(&r[1]).iter().map(string).collect()))
+                .collect(),
+            parks: items(&s["parks"])
+                .iter()
+                .map(|p| (int(&p[0]), string(&p[1])))
+                .collect(),
+            diff_checks: items(&s["diff_checks"])
+                .iter()
+                .map(|d| {
+                    let q = items(&d[1])
+                        .iter()
+                        .map(|c| (c[0].as_bool().expect("a bool"), string(&c[1])))
+                        .collect();
+                    (int(&d[0]), q)
+                })
+                .collect(),
+            started: items(&s["started"]),
+            run_started: items(&s["run_started"]),
+            proxies: Vec::new(),
+            launch_log: opt(&s["launch_log"]),
+            popen_log: opt(&s["popen_log"]),
+            cli_cwd: opt(&s["cli_cwd"]),
+            before_launch: None,
+            work_label_fn: None,
+            take_fn: None,
+            ids: int(&s["ids"]) as u64,
+            messages: int(&s["messages"]) as u64,
+            skip: taken.clone(),
+            taken,
+            drive_child: true,
+            _root: None,
         }
-    }
-
-    fn save(&self) -> Saved {
-        Saved {
-            env: self.env.clone(),
-            offset: self.offset,
-            run_dir: self.run_dir.clone(),
-            steps: self.steps.clone(),
-            rulings: self.rulings.clone(),
-            parks: self.parks.clone(),
-            diff_checks: self.diff_checks.clone(),
-            started: self.started.clone(),
-            run_started: self.run_started.clone(),
-            proxies: self.proxies.clone(),
-            launch_log: self.launch_log.clone(),
-            popen_log: self.popen_log.clone(),
-            cli_cwd: self.cli_cwd.clone(),
-            ids: self.ids,
-            messages: self.messages,
-            drive: self.drive.clone(),
-        }
-    }
-
-    fn restore(&mut self, s: Saved) {
-        self.env = s.env;
-        self.offset = s.offset;
-        self.run_dir = s.run_dir;
-        self.steps = s.steps;
-        self.rulings = s.rulings;
-        self.parks = s.parks;
-        self.diff_checks = s.diff_checks;
-        self.started = s.started;
-        self.run_started = s.run_started;
-        self.proxies = s.proxies;
-        self.launch_log = s.launch_log;
-        self.popen_log = s.popen_log;
-        self.cli_cwd = s.cli_cwd;
-        self.ids = s.ids;
-        self.messages = s.messages;
-        self.drive = s.drive;
     }
 
     fn next_id(&mut self) -> u64 {
@@ -1566,8 +1646,8 @@ impl FakeSupervisor {
         }
     }
 
-    /// Runs a command for the world: in the drive's group during a drive, else as
-    /// `run_argv` would; logged to `popen_log`.
+    /// Runs a command for the world as `run_argv` would (in a drive child, in the drive's
+    /// group: `env` names LEADHAND_CRASH_KILL_PGID); logged to `popen_log`.
     #[track_caller]
     fn exec(
         &self,
@@ -1577,45 +1657,35 @@ impl FakeSupervisor {
         stdin: Option<&str>,
         timeout: Duration,
     ) -> Out {
-        self.check_alive();
         let words: Vec<String> = argv
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         let log = |pid: u32| self.log_popen(pid, &words);
-        let group = match &self.drive {
-            Some(d) => Group::Join(d.pgid),
-            None => Spawn::default_for(env).group,
-        };
         let spawn = Spawn {
-            group,
+            group: Spawn::default_for(env).group,
             on_spawn: Some(&log),
         };
-        let out = panic::catch_unwind(AssertUnwindSafe(|| {
-            run_argv_spawn(argv, env, cwd, stdin, timeout, spawn)
-        }));
-        self.check_alive();
-        out.unwrap_or_else(|p| panic::resume_unwind(p))
+        run_argv_spawn(argv, env, cwd, stdin, timeout, spawn)
     }
 
-    /// `git` for the world (gitfixture's run_git): in the drive's group during a drive.
+    /// `git` for the world (gitfixture's run_git); in a drive child it stays in the drive's
+    /// group, as a forked child's `subprocess.run` does.
     #[track_caller]
     fn git(&self, cwd: &Path, args: &[&str]) -> String {
-        self.check_alive();
         let mut words = vec!["git".to_string()];
         words.extend(IDENTITY.iter().chain(args).map(|s| s.to_string()));
         let log = |pid: u32| self.log_popen(pid, &words);
-        let group = match &self.drive {
-            Some(d) => Group::Join(d.pgid),
-            None => Group::Own,
+        let group = if self.drive_child {
+            Group::Inherit
+        } else {
+            Group::Own
         };
         let spawn = Spawn {
             group,
             on_spawn: Some(&log),
         };
-        let out = panic::catch_unwind(AssertUnwindSafe(|| git::run_git_spawn(cwd, args, spawn)));
-        self.check_alive();
-        out.unwrap_or_else(|p| panic::resume_unwind(p))
+        git::run_git_spawn(cwd, args, spawn)
     }
 
     // -- the CLI --------------------------------------------------------------
@@ -1702,6 +1772,9 @@ impl FakeSupervisor {
 
 impl Drop for FakeSupervisor {
     fn drop(&mut self) {
+        if self.drive_child {
+            return; // the parent's run and temp root: the parent cleans them up
+        }
         let result = panic::catch_unwind(AssertUnwindSafe(|| self.kill_leftovers()));
         if let Err(payload) = result
             && !thread::panicking()

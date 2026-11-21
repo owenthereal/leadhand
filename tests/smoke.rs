@@ -247,19 +247,26 @@ mod crash_drive {
 
     #[test]
     fn test_runner_crash_takes_down_everything_the_drive_started() {
-        // The drive runs as a forked child would, in its own process group, as a supervisor
-        // session is (FakeSupervisor::fork). The runner's crash point kills that group: the
-        // dispatch line in flight must die with it, as FakeWorld's in-process engine and
-        // proxies did. Codex ignores SIGINT, so a dispatch line left alive would sit in its
-        // cancel of the orphaned Codex for up to 30 s.
-        let mut w = FakeSupervisor::with_options(
-            &[card(1)],
-            Options {
-                installed: &["claude", "codex"],
-                ..Options::default()
-            },
-        );
-        w.start();
+        // The drive runs in a forked child that is its own process group, as a supervisor
+        // session is: this test re-executed (FakeSupervisor::fork), which takes the world
+        // from attach_drive. The runner's crash point kills that group: the dispatch line in
+        // flight must die with it, as FakeWorld's in-process engine and proxies did. Codex
+        // ignores SIGINT, so a dispatch line left alive would sit in its cancel of the
+        // orphaned Codex for up to 30 s.
+        let mut w = match FakeSupervisor::attach_drive("crash drive") {
+            Some(w) => w,
+            None => {
+                let mut w = FakeSupervisor::with_options(
+                    &[card(1)],
+                    Options {
+                        installed: &["claude", "codex"],
+                        ..Options::default()
+                    },
+                );
+                w.start();
+                w
+            }
+        };
         w.script(
             1,
             "implement",
@@ -270,10 +277,10 @@ mod crash_drive {
         );
         let started = w.tmp.join("started processes.jsonl");
 
-        let forked = w.fork(Duration::from_secs(120), |w, group| {
+        let forked = w.fork("crash drive", Duration::from_secs(120), |w, pid| {
             w.env
                 .set("LEADHAND_CRASH_AT", "after_worker_launch")
-                .set("LEADHAND_CRASH_KILL_PGID", group.to_string())
+                .set("LEADHAND_CRASH_KILL_PGID", pid.to_string())
                 .set("FAKE_CODEX_IGNORE_SIGINT", "1");
             w.popen_log = Some(started.clone()); // every process the drive starts is logged
             w.run();
