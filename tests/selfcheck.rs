@@ -868,10 +868,14 @@ fn fake_claude_logs_argv_cwd_and_env() {
 
 mod drive_child {
     use std::fs;
-    use std::time::Duration;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use rustix::process::{Pid, Signal, kill_process};
 
     use crate::common::json::{self, Json};
-    use crate::common::supervisor::{FakeSupervisor, Step, card};
+    use crate::common::start_time;
+    use crate::common::supervisor::{FakeSupervisor, Step, card, recorded_alive};
 
     fn steps() -> [Step; 2] {
         [
@@ -975,10 +979,40 @@ mod drive_child {
     #[test]
     fn a_drive_past_its_deadline_is_killed_with_its_group() {
         let mut w = world("hangs");
-        let forked = w.fork("hangs", Duration::from_secs(1), |_, _| {
+        let sibling = w.tmp.join("sibling.json");
+        let forked = w.fork("hangs", Duration::from_secs(2), |_, _| {
+            // A second process in the drive's group, which the deadline kill must take too.
+            let mut p = Command::new("sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = p.id() as i32;
+            let rec = Json::object([
+                ("pid", Json::from(pid)),
+                ("start", Json::from(start_time(pid).unwrap())),
+            ]);
+            fs::write(&sibling, json::dumps(&rec)).unwrap();
             std::thread::sleep(Duration::from_secs(60));
+            let _ = p.kill();
+            let _ = p.wait();
         });
         assert!(forked.hung, "{}", forked.output);
         assert_eq!(forked.code, -9);
+        let rec = json::parse(&fs::read(&sibling).unwrap());
+        let end = Instant::now() + Duration::from_secs(5);
+        while recorded_alive(&rec) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let alive = recorded_alive(&rec);
+        if alive && let Some(pid) = rec["pid"].as_i64().and_then(|p| Pid::from_raw(p as i32)) {
+            let _ = kill_process(pid, Signal::KILL);
+        }
+        assert!(
+            !alive,
+            "the drive's other process outlived the deadline kill: {rec}"
+        );
     }
 }

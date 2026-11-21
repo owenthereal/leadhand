@@ -1444,17 +1444,31 @@ impl FakeSupervisor {
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
             .collect();
         let error = self.tmp.join(format!("drive {slug} error.txt"));
+        let reached = self.tmp.join(format!("drive {slug} reached"));
         if self.drive_child {
             match drive::selected() {
                 Some(sel) if sel.label == label => {}
                 other => panic!("fork({label:?}) in a drive child selected for {other:?}"),
             }
+            fs::write(&reached, "")
+                .unwrap_or_else(|e| panic!("writing {}: {e}", reached.display()));
             let pid = getpid().as_raw_pid();
             drive::run_child(&error, || f(self, pid));
         }
+        // A child selected for this very drive, with a world it did not attach (attach_drive
+        // forgotten, or given another label), would start the same drive again, and so would
+        // each child below it. A drive child may still start a drive with another label (a
+        // crash-matrix worker forking its crash run).
+        assert!(
+            drive::selected_for(label).is_none(),
+            "fork({label:?}) in its own drive child with a world not from \
+             FakeSupervisor::attach_drive({label:?}): the test must take its world from \
+             attach_drive with the same label, or the drive would start itself again"
+        );
         let state = self.tmp.join(format!("drive {slug} state.json"));
         let output = self.tmp.join(format!("drive {slug} output.txt"));
         let _ = fs::remove_file(&error);
+        let _ = fs::remove_file(&reached);
         fs::write(&state, json::dumps(&self.state()))
             .unwrap_or_else(|e| panic!("writing {}: {e}", state.display()));
         let sel = drive::Selector {
@@ -1463,6 +1477,15 @@ impl FakeSupervisor {
             payload: state,
         };
         let ended = drive::start(&sel, &output).wait(deadline);
+        // A child that died before its drive began (a panic in attach_drive or script, say:
+        // libtest's exit 101) has no drive outcome to report: fail with what it printed.
+        if !reached.exists() {
+            panic!(
+                "the drive child for {label:?} ended before reaching fork({label:?}) \
+                 (exit code {}, hung {}):\n{}",
+                ended.code, ended.hung, ended.output
+            );
+        }
         Forked {
             code: ended.code,
             error: fs::read_to_string(&error).ok(),
