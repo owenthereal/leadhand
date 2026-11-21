@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 
 use common::dispatch_world::{World, at, os_refs};
 use common::json::{self, Json};
-use common::supervisor::{CardOpts, CliOpts, FakeSupervisor, Options, Step, card_with, truthy};
+use common::supervisor::{
+    CardOpts, CliOpts, FakeSupervisor, Options, Step, card_with, run_dir, truthy,
+};
 use common::{Env, cli, jv, n_of, one, read_json};
 use serde_json::{Value, json};
 
@@ -194,10 +196,6 @@ fn claude_run(route: Option<&str>, config: &str) -> FakeSupervisor {
     );
     w.start();
     w
-}
-
-fn run_dir(w: &FakeSupervisor) -> PathBuf {
-    w.paths().root
 }
 
 /// A step with `status` (when given) and `transcript` (None: no transcript).

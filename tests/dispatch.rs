@@ -26,13 +26,14 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::dispatch_world::{World, alive, at, logged_alive, wait_for, wait_for_with, when};
+use common::dispatch_world::{
+    CARD_BRANCH, CARD_BRIEF, World, alive, at, implementer_prompt, logged_alive, wait_for,
+    wait_for_with, when,
+};
 use common::json::{self, Json};
 use common::supervisor::truthy;
-use common::{jv, key_set, one, read_json, realpath, strs};
+use common::{index, jv, key_set, lines, one, pick, read_json, read_text, realpath, strs};
 
-const CARD_BRANCH: &str = "leadhand/demo--card-1";
-const CARD_BRIEF: &str = "# Brief\n## Card 1: Widget card\n- Card branch: leadhand/demo--card-1\n";
 const ATTEMPT_FIELDS: [&str; 19] = [
     "dispatch",
     "run",
@@ -54,54 +55,6 @@ const ATTEMPT_FIELDS: [&str; 19] = [
     "status",
     "blocked_by",
 ];
-/// What a Codex implementer's prompt adds to the implementer agent's body (ruling R39).
-const CODEX_NO_COMMIT: &str = "## Commits (Codex workers)\n\n\
-    This overrides the contract's rule to commit on the card branch. Do not run git commit,\n\
-    git add, or any command that writes under .git; leave your changes in the working tree\n\
-    and list the changed files in your report. leadhand commits them on your branch after\n\
-    you finish.";
-
-/// The prompt a Codex implementer gets: the implementer agent's body without its front
-/// matter, the no-commit rule, then its files.
-fn implementer_prompt((brief, report): (PathBuf, PathBuf)) -> String {
-    let mut text = fs::read_to_string(common::plugin::root().join("agents/implementer.md"))
-        .expect("reading agents/implementer.md");
-    if let Some(rest) = text.strip_prefix("---\n")
-        && let Some((_, body)) = rest.split_once("\n---\n")
-    {
-        text = body.to_string();
-    }
-    format!(
-        "{}\n\n{CODEX_NO_COMMIT}\n\n## Your files\n\n- Brief: {}\n- Report file: {}\n\n\
-         Read the brief now, do the work, write the report, then reply.\n",
-        text.trim(),
-        brief.display(),
-        report.display()
-    )
-}
-
-/// The members `keys` of `v`, as a list (Python's tuple of `v[k]`s).
-#[track_caller]
-fn pick(v: &Json, keys: &[&str]) -> Json {
-    Json::Arr(keys.iter().map(|k| v[*k].clone()).collect())
-}
-
-/// Python's `list.index`.
-#[track_caller]
-fn index(items: &[String], item: &str) -> usize {
-    items
-        .iter()
-        .position(|a| a == item)
-        .unwrap_or_else(|| panic!("{item:?} is not in {items:?}"))
-}
-
-fn lines(text: &str) -> Vec<String> {
-    text.lines().map(str::to_string).collect()
-}
-
-fn read_text(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
-}
 
 fn s(path: &Path) -> &str {
     path.to_str().unwrap()

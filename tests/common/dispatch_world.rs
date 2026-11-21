@@ -29,6 +29,37 @@ use super::rundir::read_records;
 use super::supervisor::{FakeSupervisor, Options, Proc, card, recorded_alive};
 use super::{Env, Out, TIMEOUT, bin, cli_with, read_json, read_jsonl, set_mtime, started_by};
 
+/// The card branch of card 1 on the run `start` made (`CARD_BRANCH`).
+pub const CARD_BRANCH: &str = "leadhand/demo--card-1";
+/// A brief naming card 1 and its branch (`CARD_BRIEF`).
+pub const CARD_BRIEF: &str =
+    "# Brief\n## Card 1: Widget card\n- Card branch: leadhand/demo--card-1\n";
+/// What a Codex implementer's prompt adds to the implementer agent's body (ruling R39).
+pub const CODEX_NO_COMMIT: &str = "## Commits (Codex workers)\n\n\
+    This overrides the contract's rule to commit on the card branch. Do not run git commit,\n\
+    git add, or any command that writes under .git; leave your changes in the working tree\n\
+    and list the changed files in your report. leadhand commits them on your branch after\n\
+    you finish.";
+
+/// The prompt a Codex implementer gets: the implementer agent's body without its front
+/// matter, the no-commit rule, then its files.
+pub fn implementer_prompt((brief, report): (PathBuf, PathBuf)) -> String {
+    let mut text = fs::read_to_string(super::plugin::root().join("agents/implementer.md"))
+        .expect("reading agents/implementer.md");
+    if let Some(rest) = text.strip_prefix("---\n")
+        && let Some((_, body)) = rest.split_once("\n---\n")
+    {
+        text = body.to_string();
+    }
+    format!(
+        "{}\n\n{CODEX_NO_COMMIT}\n\n## Your files\n\n- Brief: {}\n- Report file: {}\n\n\
+         Read the brief now, do the work, write the report, then reply.\n",
+        text.trim(),
+        brief.display(),
+        report.display()
+    )
+}
+
 /// The fake's thread ID when the scenario names none.
 pub const DEFAULT_THREAD: &str = "0f0f0f0f-0000-4000-8000-00000000c0de";
 

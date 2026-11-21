@@ -484,14 +484,16 @@ pub fn truthy(v: &Json) -> bool {
     }
 }
 
+/// A JSON string that is UTF-8, as `&str` (Python's `str` value); panics on anything else.
 #[track_caller]
-fn text(v: &Json) -> &str {
+pub fn text(v: &Json) -> &str {
     v.as_str()
         .unwrap_or_else(|| panic!("not a UTF-8 string: {v}"))
 }
 
+/// A JSON string as a path, from its OS bytes (Python's `Path(v)`); panics on anything else.
 #[track_caller]
-fn os_path(v: &Json) -> PathBuf {
+pub fn os_path(v: &Json) -> PathBuf {
     PathBuf::from(
         v.as_os()
             .unwrap_or_else(|| panic!("not a path string: {v}")),
@@ -1800,6 +1802,12 @@ impl Drop for FakeSupervisor {
             panic::resume_unwind(payload);
         }
     }
+}
+
+/// The world's run directory (Python's `w.run_dir`); panics before `start`.
+#[track_caller]
+pub fn run_dir(w: &FakeSupervisor) -> PathBuf {
+    w.paths().root
 }
 
 /// True when `rec` is a `{pid, start}` record of a process that is still alive with that

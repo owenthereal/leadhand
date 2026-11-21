@@ -11,11 +11,11 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::path::Path;
 
+use common::engine::is_unpark_line;
 use common::json::Json;
 use common::rundir::{RunDir, outcome};
-use common::{Env, STATUS_KEYS, is_bin_command, key_set, set_of, shlex_quote};
+use common::{Env, STATUS_KEYS, key_set, set_of};
 
 /// The newest rollout files the Codex meter reads.
 const METER_SCAN_FILES: usize = 20;
@@ -35,18 +35,6 @@ fn usage_line(lines: &[String]) -> String {
         .find(|line| line.starts_with("Usage: "))
         .unwrap_or_else(|| panic!("no Usage line in {lines:?}"))
         .clone()
-}
-
-/// The parked card's attention line, its next step naming the binary (by file: S1-R11).
-fn is_unpark_line(line: &str, n: i64, root: &Path, reason: &str) -> bool {
-    is_bin_command(
-        line,
-        &format!("Card {n} parked: {reason} — next: "),
-        &format!(
-            " unpark {} --card {n} --note '…'",
-            shlex_quote(root.to_str().unwrap())
-        ),
-    )
 }
 
 mod status {

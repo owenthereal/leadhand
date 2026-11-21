@@ -234,6 +234,18 @@ pub fn commit(cwd: &Path, files: &[(&str, &str)], message: &str) -> String {
     run_git(cwd, &["rev-parse", "HEAD"])
 }
 
+/// Every branch of `repo`, as full ref names.
+#[track_caller]
+pub fn branches(repo: &Path) -> Vec<String> {
+    run_git(
+        repo,
+        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+    )
+    .lines()
+    .map(str::to_string)
+    .collect()
+}
+
 /// The checked-out branch, or None on a detached HEAD.
 #[track_caller]
 pub fn current_branch(cwd: &Path) -> Option<String> {

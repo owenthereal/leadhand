@@ -197,7 +197,7 @@ mod release_build {
     use crate::common::git::run_git;
     use crate::common::json::Json;
     use crate::common::supervisor::{
-        CardOpts, CliOpts, FakeSupervisor, Options, Step, card, card_with,
+        CardOpts, CliOpts, FakeSupervisor, Options, Step, card, card_with, run_dir,
     };
     use crate::common::{Env, TIMEOUT, TempRoot, cli, patch_env, run_argv};
 
@@ -367,10 +367,6 @@ mod release_build {
             }
         }));
         w
-    }
-
-    fn run_dir(w: &FakeSupervisor) -> PathBuf {
-        w.run_dir.clone().expect("no run yet")
     }
 
     /// Unpark card 1 once card 2 is accepted (once), through the world's engine call.

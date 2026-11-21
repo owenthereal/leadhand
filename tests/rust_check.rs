@@ -11,11 +11,11 @@
 mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use common::json::{self, Json};
 use common::supervisor::FakeSupervisor;
-use common::{Out, key_set, set_of};
+use common::{Out, key_set, resolve, set_of};
 
 const NOT_SUPPORTED: &str = "not supported in this version: ";
 
@@ -55,17 +55,6 @@ fn check_in(w: &FakeSupervisor, repo: &Path, flags: &[&str]) -> Out {
     ];
     args.extend(flags.iter().map(std::ffi::OsStr::new));
     w.cli(&args)
-}
-
-/// `path` with every symlink in its existing part resolved (Python's non-strict `resolve`).
-fn resolve(path: &Path) -> PathBuf {
-    if let Ok(real) = fs::canonicalize(path) {
-        return real;
-    }
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => resolve(parent).join(name),
-        _ => path.to_path_buf(),
-    }
 }
 
 /// Python's `str()` of a JSON value read back (`None`, an int, a string).

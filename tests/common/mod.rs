@@ -16,6 +16,7 @@
 
 pub mod dispatch_world;
 pub mod drive;
+pub mod engine;
 pub mod git;
 pub mod json;
 pub mod launch_world;
@@ -727,6 +728,17 @@ pub fn realpath(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| std::path::absolute(path).unwrap_or_default())
 }
 
+/// `path` with every symlink in its existing part resolved (Python's non-strict `resolve`).
+pub fn resolve(path: &Path) -> PathBuf {
+    if let Ok(real) = fs::canonicalize(path) {
+        return real;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => resolve(parent).join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
 /// True when `path_text` names the same file as `file` once both are resolved.
 pub fn names_file(file: &Path, path_text: impl AsRef<OsStr>) -> bool {
     !path_text.as_ref().is_empty() && realpath(Path::new(path_text.as_ref())) == realpath(file)
@@ -879,6 +891,32 @@ pub fn holds(mut cond: impl FnMut() -> bool, seconds: f64, what: &str) {
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The members `keys` of `v`, as a list (Python's tuple of `v[k]`s).
+#[track_caller]
+pub fn pick(v: &Json, keys: &[&str]) -> Json {
+    Json::Arr(keys.iter().map(|k| v[*k].clone()).collect())
+}
+
+/// Python's `list.index`.
+#[track_caller]
+pub fn index(items: &[String], item: &str) -> usize {
+    items
+        .iter()
+        .position(|a| a == item)
+        .unwrap_or_else(|| panic!("{item:?} is not in {items:?}"))
+}
+
+/// `text`'s lines, as owned strings (`str.splitlines()` of text with `\n` line ends).
+pub fn lines(text: &str) -> Vec<String> {
+    text.lines().map(str::to_string).collect()
+}
+
+/// A UTF-8 file's text (`Path.read_text`).
+#[track_caller]
+pub fn read_text(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 
 /// A JSON list of strings, as strings.

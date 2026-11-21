@@ -10,33 +10,13 @@
 mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use common::git::run_git;
+use common::git::branches;
+use common::resolve;
 use common::supervisor::FakeSupervisor;
 
 const NOT_SUPPORTED: &str = "not supported in this version: ";
-
-fn branches(w: &FakeSupervisor) -> Vec<String> {
-    run_git(
-        &w.repo,
-        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
-    )
-    .lines()
-    .map(str::to_string)
-    .collect()
-}
-
-/// `path` with every symlink in its existing part resolved (Python's non-strict `resolve`).
-fn resolve(path: &Path) -> PathBuf {
-    if let Ok(real) = fs::canonicalize(path) {
-        return real;
-    }
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => resolve(parent).join(name),
-        _ => path.to_path_buf(),
-    }
-}
 
 /// `check` and `start` both refuse with `expected`, and `start` creates nothing: no docs dir,
 /// no branch, no worktree (`assert_refused`).
@@ -45,7 +25,7 @@ macro_rules! assert_refused {
         let w: &FakeSupervisor = &$w;
         let docs: &Path = &$docs;
         let expected: &str = &$expected;
-        let before = branches(w);
+        let before = branches(&w.repo);
         let r = w.cli(&os_args!["check", w.deck_path, "--repo", w.repo]);
         assert_eq!(r.code, 1, "{r}");
         assert!(
@@ -56,7 +36,7 @@ macro_rules! assert_refused {
         assert_eq!(r.code, 1, "{r}");
         assert!(r.stderr_text().contains(expected), "{r}");
         assert!(!docs.exists(), "{}", docs.display());
-        assert_eq!(branches(w), before);
+        assert_eq!(branches(&w.repo), before);
         assert!(!w.repo.join(".worktrees").exists());
     }};
 }

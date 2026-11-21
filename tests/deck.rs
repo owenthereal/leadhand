@@ -502,23 +502,10 @@ mod deck {
     }
 }
 
-/// The lines of card `number` as the brief renders it, from its heading to the next heading.
-fn card_section(brief: &str, number: i64) -> Vec<String> {
-    let lines: Vec<&str> = brief.lines().collect();
-    let heading = format!("## Card {number}:");
-    let start = lines
-        .iter()
-        .position(|l| l.starts_with(&heading))
-        .unwrap_or_else(|| panic!("no {heading:?} in the brief:\n{brief}"));
-    let end = (start + 1..lines.len())
-        .find(|&i| lines[i].starts_with('#'))
-        .unwrap_or(lines.len());
-    lines[start..end].iter().map(|s| s.to_string()).collect()
-}
-
 mod briefs {
     //! What the parser took from a card, read back from the card's first implement brief.
     use super::*;
+    use crate::common::engine::card_section;
     use crate::common::supervisor::{FakeSupervisor, Options, card};
 
     /// The card's section of its first implement brief (`brief_card`).
