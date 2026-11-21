@@ -22,8 +22,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use common::engine::{
-    CARD1, NOTE, RUN, codex_world, files, last, parked_world, parked_world_with, run_id, seq,
-    tampering, unpark, with_status, with_verdict,
+    CARD1, NOTE, RUN, codex_world, files, found, found_by, last, parked_world, parked_world_with,
+    requested, run_id, seq, tampering, unpark, with_status, with_verdict,
 };
 use common::git::{self, commit, current_branch, git_ok, run_git};
 use common::json::Json;
@@ -73,15 +73,6 @@ fn drive_to(w: &mut FakeSupervisor, kind: &str, card_number: i64) -> Json {
     panic!("no {kind} dispatch for card {card_number}");
 }
 
-/// The `dispatch_requested` event of `dispatch_id` (Python's `next(...)`: a panic when none).
-#[track_caller]
-fn requested(w: &FakeSupervisor, dispatch_id: &str) -> Json {
-    w.events("dispatch_requested")
-        .into_iter()
-        .find(|e| e["dispatch_id"] == dispatch_id)
-        .unwrap_or_else(|| panic!("no dispatch_requested for {dispatch_id}"))
-}
-
 /// The worker that started `dispatch_id`.
 #[track_caller]
 fn worker_of(w: &FakeSupervisor, dispatch_id: &str) -> Json {
@@ -90,24 +81,6 @@ fn worker_of(w: &FakeSupervisor, dispatch_id: &str) -> Json {
         .find(|e| e["dispatch_id"] == dispatch_id)
         .map(|e| e["worker_id"].clone())
         .unwrap_or_else(|| panic!("no worker_started for {dispatch_id}"))
-}
-
-/// The `found` violations recorded by `by` (an event without `by` is the check's).
-#[track_caller]
-fn found_by(w: &FakeSupervisor, by: &str) -> Vec<Json> {
-    w.events("violation")
-        .into_iter()
-        .filter(|e| {
-            e.get("stage").is_some_and(|s| s == "found")
-                && e.get("by").filter(|b| truthy(b)).map_or("check", text) == by
-        })
-        .collect()
-}
-
-/// `found_by(w, "check")`.
-#[track_caller]
-fn found(w: &FakeSupervisor) -> Vec<Json> {
-    found_by(w, "check")
 }
 
 /// The violations of `stage` (`[e for e in violation if e.get("stage") == stage]`).

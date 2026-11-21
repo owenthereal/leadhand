@@ -1102,6 +1102,89 @@ pub fn set_mtime(path: &Path, when: SystemTime) {
         .unwrap_or_else(|e| panic!("setting the times of {}: {e}", path.display()));
 }
 
+/// Writes `text` to the file `path`, whose folder must exist (`Path.write_text`).
+#[track_caller]
+pub fn write_text(path: &Path, text: impl AsRef<[u8]>) {
+    fs::write(path, text).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+/// Makes `link` a symlink to `target` (`link.symlink_to(target)`); panics when `link`
+/// exists.
+#[track_caller]
+pub fn symlink(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link)
+        .unwrap_or_else(|e| panic!("linking {} to {}: {e}", link.display(), target.display()));
+}
+
+/// Makes the folder `path` and its missing parents; panics when `path` exists
+/// (`Path.mkdir(parents=True)` without `exist_ok`).
+#[track_caller]
+pub fn mkdir_new(path: &Path) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap_or_else(|e| panic!("making {}: {e}", parent.display()));
+    }
+    fs::create_dir(path).unwrap_or_else(|e| panic!("making {}: {e}", path.display()));
+}
+
+/// `path` relative to `start`, both absolute, without resolving symlinks
+/// (`os.path.relpath`).
+pub fn relpath(path: &Path, start: &Path) -> PathBuf {
+    let (p, s): (Vec<_>, Vec<_>) = (path.components().collect(), start.components().collect());
+    let common = p.iter().zip(&s).take_while(|(a, b)| a == b).count();
+    let mut out = PathBuf::new();
+    for _ in common..s.len() {
+        out.push("..");
+    }
+    for c in &p[common..] {
+        out.push(c);
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
+/// The local date, `YYYY-MM-DD` (Python's `date.today().isoformat()`).
+#[track_caller]
+pub fn today() -> String {
+    let out = Command::new("date")
+        .arg("+%F")
+        .stdin(Stdio::null())
+        .output()
+        .expect("running date");
+    assert!(out.status.success(), "date +%F failed: {out:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// The date `days` after the `YYYY-MM-DD` date `date` (`date + timedelta(days=days)`), in
+/// the proleptic Gregorian calendar.
+#[track_caller]
+pub fn add_days(date: &str, days: i64) -> String {
+    let parts: Vec<i64> = date
+        .split('-')
+        .map(|p| p.parse().unwrap_or_else(|_| panic!("not a date: {date:?}")))
+        .collect();
+    let [y, m, d] = parts[..] else {
+        panic!("not a date: {date:?}")
+    };
+    // Days from civil and back (H. Hinnant's algorithms), counted from 0000-03-01.
+    let (y0, mp) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y0.div_euclid(400);
+    let yoe = y0 - era * 400;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let z = era * 146097 + doe + days;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// A JSON literal, parsed by the harness decoder.
 #[track_caller]
 pub fn jv(text: &str) -> Json {

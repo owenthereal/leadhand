@@ -23,7 +23,6 @@ mod common;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::dispatch_world::{WAIT, wait_for, wait_for_with};
@@ -33,7 +32,7 @@ use common::json::Json;
 use common::supervisor::{FakeSupervisor, NO_HOOKS, Proc, Step, os_path, run_dir, text, truthy};
 use common::{
     Out, field, json_in, jv, lines, path_str as s, pick, read_json, read_jsonl, read_text,
-    started_by,
+    started_by, today,
 };
 
 /// A refusal: exit `code` (default 1), and for 1 `error: ...` on stderr (2 is the usage
@@ -184,18 +183,6 @@ fn run_log(w: &FakeSupervisor) -> Vec<String> {
     .lines()
     .map(str::to_string)
     .collect()
-}
-
-/// The local date, `YYYY-MM-DD` (Python's `date.today().isoformat()`).
-#[track_caller]
-fn today() -> String {
-    let out = Command::new("date")
-        .arg("+%F")
-        .stdin(Stdio::null())
-        .output()
-        .expect("running date");
-    assert!(out.status.success(), "date +%F failed: {out:?}");
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
 /// `^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$`.

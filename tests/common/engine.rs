@@ -2,7 +2,8 @@
 //! `tests/contract/contract_cards.py` that other contract files import (`codex_world`,
 //! `record`, `recorded`, `result`, `run_line`, `relaunch_env`, `status_lines`, `commit_on` and
 //! the deck constants), with `contract_deck.card_section` and `contract_status.is_unpark_line`;
-//! those of `contract_integration.py` (`NOTE`, `parked_world`, `unpark`) and of
+//! those of `contract_integration.py` (`NOTE`, `parked_world`, `unpark`, with `requested`,
+//! `found_by` and `found`, which `contract_worktree_safety.py` defines again) and of
 //! `contract_finish.py` (`base_wt`, `marker`, `gate_names`, `drive_to_run`,
 //! `drive_until_refused`, `to_last_step`) that later files import; and the step literals the
 //! files script (`with_status`, `with_verdict`, `files`, `tampering`), with the small helpers
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use super::git::run_git;
 use super::json::Json;
-use super::supervisor::{CliOpts, FakeSupervisor, Options, Step, card, run_dir, text};
+use super::supervisor::{CliOpts, FakeSupervisor, Options, Step, card, run_dir, text, truthy};
 use super::{Out, is_bin_command, process_env, shlex_quote};
 
 /// The run branch of the demo deck.
@@ -315,6 +316,33 @@ pub fn parked_world_with(
     w.run();
     w.parks.remove(&1).expect("card 1's park"); // Python's `del`: a KeyError when missing
     w
+}
+
+/// The `dispatch_requested` event of `dispatch_id` (Python's `next(...)`: a panic when none).
+#[track_caller]
+pub fn requested(w: &FakeSupervisor, dispatch_id: &str) -> Json {
+    w.events("dispatch_requested")
+        .into_iter()
+        .find(|e| e["dispatch_id"] == dispatch_id)
+        .unwrap_or_else(|| panic!("no dispatch_requested for {dispatch_id}"))
+}
+
+/// The `found` violations recorded by `by` (an event without `by` is the check's).
+#[track_caller]
+pub fn found_by(w: &FakeSupervisor, by: &str) -> Vec<Json> {
+    w.events("violation")
+        .into_iter()
+        .filter(|e| {
+            e.get("stage").is_some_and(|s| s == "found")
+                && e.get("by").filter(|b| truthy(b)).map_or("check", text) == by
+        })
+        .collect()
+}
+
+/// `found_by(w, "check")`.
+#[track_caller]
+pub fn found(w: &FakeSupervisor) -> Vec<Json> {
+    found_by(w, "check")
 }
 
 /// `unpark RUN_DIR --card N --note NOTE`, which must succeed.
