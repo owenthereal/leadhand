@@ -1126,8 +1126,9 @@ pub fn mkdir_new(path: &Path) {
     fs::create_dir(path).unwrap_or_else(|e| panic!("making {}: {e}", path.display()));
 }
 
-/// `path` relative to `start`, both absolute, without resolving symlinks
-/// (`os.path.relpath`).
+/// `path` relative to `start`, both absolute and normalised, without resolving symlinks
+/// (`os.path.relpath`). Unlike `os.path.relpath`, it does not collapse `..` components, so
+/// neither path may hold one.
 pub fn relpath(path: &Path, start: &Path) -> PathBuf {
     let (p, s): (Vec<_>, Vec<_>) = (path.components().collect(), start.components().collect());
     let common = p.iter().zip(&s).take_while(|(a, b)| a == b).count();

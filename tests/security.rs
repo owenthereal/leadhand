@@ -651,7 +651,8 @@ mod m1_confined_stop {
         let mut s = Anchored::new();
         write(&s.victim, &[("stray.env", "SECRET=1\n")]);
         let ws_head = run_git(&s.ws, &["rev-parse", "HEAD"]);
-        s.w.scenario("ready", &[("delay", "2")]);
+        // The window: run.json must be rewritten within the fake Codex's 5 s delay.
+        s.w.scenario("ready", &[("delay", "5")]);
         let branch = s.branch.clone();
         let p = s.w.popen_with(
             "d1",
@@ -1589,7 +1590,12 @@ mod git_safety {
         }
         w.base = run_git(&w.repo, &["rev-parse", "HEAD"]);
         w.write_deck(&[card(1), card(2)]);
-        let _ = fs::remove_file(&marker); // unlink(missing_ok=True)
+        match fs::remove_file(&marker) {
+            // unlink(missing_ok=True): only a missing file is ignored
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("removing {}: {e}", marker.display()),
+        }
         write(&sub, &[("README.md", "dirty\n")]); // a dirty nested repo is what triggers its fsmonitor
 
         let leave_a_change = |_world: &FakeSupervisor, ws: &Path, _a: &Json| {
