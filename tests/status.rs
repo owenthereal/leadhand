@@ -14,21 +14,9 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use common::json::Json;
-use common::rundir::RunDir;
-use common::{Env, is_bin_command, shlex_quote};
+use common::rundir::{RunDir, outcome};
+use common::{Env, STATUS_KEYS, is_bin_command, key_set, set_of, shlex_quote};
 
-const KEYS: [&str; 10] = [
-    "run_id",
-    "deck",
-    "state",
-    "headline",
-    "activity",
-    "progress",
-    "attention",
-    "cards",
-    "usage",
-    "updated_at",
-];
 /// The newest rollout files the Codex meter reads.
 const METER_SCAN_FILES: usize = 20;
 
@@ -59,23 +47,6 @@ fn is_unpark_line(line: &str, n: i64, root: &Path, reason: &str) -> bool {
             shlex_quote(root.to_str().unwrap())
         ),
     )
-}
-
-/// A JSON object's distinct keys, as Python's `set(d)`.
-fn key_set(v: &Json) -> BTreeSet<String> {
-    v.keys().into_iter().collect()
-}
-
-fn set_of(keys: &[&str]) -> BTreeSet<String> {
-    keys.iter().map(|k| k.to_string()).collect()
-}
-
-fn outcome(outcome: &str, qualifier: &str, reasons: &[&str]) -> [(&'static str, Json); 3] {
-    [
-        ("outcome", Json::from(outcome)),
-        ("qualifier", Json::from(qualifier)),
-        ("reasons", Json::from(reasons)),
-    ]
 }
 
 mod status {
@@ -442,7 +413,7 @@ mod status {
 mod fix_round {
     use super::*;
     use crate::common::rundir::{RATE_LIMIT_TS, write_rate_limit_with};
-    use std::fs::{self, File, FileTimes};
+    use std::fs;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -490,13 +461,7 @@ mod fix_round {
     fn test_meter_scan_is_capped_to_newest_files() {
         let w = RunDir::with_cards(1);
         let old = write_rate_limit_with(&w.sessions, 5.0, RATE_LIMIT_TS, "rollout-0-old.jsonl");
-        let one = UNIX_EPOCH + Duration::from_secs(1);
-        File::options()
-            .write(true)
-            .open(&old)
-            .unwrap()
-            .set_times(FileTimes::new().set_accessed(one).set_modified(one))
-            .unwrap();
+        common::set_mtime(&old, UNIX_EPOCH + Duration::from_secs(1));
         let line = usage_line(&status(&w, None));
         assert!(line.contains("· Codex meter 5.0% as of "), "{line:?}");
         for i in 0..METER_SCAN_FILES {
@@ -541,7 +506,7 @@ mod checkpoints {
         w.start();
         w.next();
         let s = read_json(&w.paths().status);
-        assert_eq!(key_set(&s), set_of(&KEYS), "{s}");
+        assert_eq!(key_set(&s), set_of(&STATUS_KEYS), "{s}");
         assert_json_eq!(s["run_id"], w.meta()["run_id"]);
         assert_json_eq!(s["deck"], Json::from("Demo deck"));
         assert_json_eq!(s["state"], Json::from("running"));

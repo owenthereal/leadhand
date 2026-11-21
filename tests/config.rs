@@ -11,9 +11,9 @@ mod common;
 use std::collections::BTreeSet;
 use std::fs;
 
-use common::Out;
 use common::json::Json;
 use common::supervisor::{FakeSupervisor, Options, card};
+use common::{Out, set_of};
 
 const NOT_SUPPORTED: &str = "not supported in this version: ";
 
@@ -71,10 +71,6 @@ fn keys_but_prefer(v: &Json) -> BTreeSet<String> {
     v.keys().into_iter().filter(|k| k != "prefer").collect()
 }
 
-fn set(items: &[&str]) -> BTreeSet<String> {
-    items.iter().map(|s| s.to_string()).collect()
-}
-
 mod config {
     use super::*;
     use crate::common::json;
@@ -99,7 +95,7 @@ mod config {
         assert_json_eq!(roles["implementer"]["prefer"], Json::from("codex"));
         assert_json_eq!(roles["reviewer"]["prefer"], Json::from("other"));
         assert_json_eq!(roles["dealer"]["prefer"], Json::from("claude"));
-        assert_eq!(keys_but_prefer(&roles["dealer"]), set(&["claude"]));
+        assert_eq!(keys_but_prefer(&roles["dealer"]), set_of(&["claude"]));
         assert_json_eq!(snap["run"]["branch_prefix"], Json::from("leadhand/"));
         assert_json_eq!(snap["after_run"]["step"], Json::from("none"));
         assert_json_eq!(snap["capacity"]["codex_pause_percent"], Json::from(95));
@@ -146,7 +142,7 @@ mod config {
         let snap = snapshot(&mut w);
         assert_eq!(
             keys_but_prefer(&snap["roles"]["implementer"]),
-            set(&["claude"])
+            set_of(&["claude"])
         );
         assert_json_eq!(
             snap["roles"]["final_reviewer"]["claude"],

@@ -10,7 +10,7 @@ mod common;
 use std::fs;
 
 use common::json::Json;
-use common::rundir::{AttemptOpts, DispatchOpts, RATE_LIMIT_NAME, RATE_LIMIT_TS, RunDir};
+use common::rundir::{AttemptOpts, DispatchOpts, RATE_LIMIT_NAME, RATE_LIMIT_TS, RunDir, outcome};
 use common::{is_bin_command, shlex_quote};
 
 const SECTIONS: [&str; 8] = [
@@ -23,14 +23,6 @@ const SECTIONS: [&str; 8] = [
     "## Usage",
     "## Routing suggestions",
 ];
-
-fn outcome(outcome: &str, qualifier: &str, reasons: &[&str]) -> [(&'static str, Json); 3] {
-    [
-        ("outcome", Json::from(outcome)),
-        ("qualifier", Json::from(qualifier)),
-        ("reasons", Json::from(reasons)),
-    ]
-}
 
 fn finished() -> RunDir {
     let w = RunDir::with_cards(2);

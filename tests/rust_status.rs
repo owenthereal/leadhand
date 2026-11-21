@@ -12,45 +12,15 @@
 #[macro_use]
 mod common;
 
-use std::collections::BTreeSet;
 use std::ffi::OsStr;
-use std::fs::{self, File, FileTimes};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use common::json::Json;
-use common::rundir::{RunDir, append_event};
+use common::rundir::{RunDir, append_event, outcome};
 use common::supervisor::{CardOpts, FakeSupervisor, card, card_with};
-use common::{Out, is_bin_command, read_json, shlex_quote};
-
-const KEYS: [&str; 10] = [
-    "run_id",
-    "deck",
-    "state",
-    "headline",
-    "activity",
-    "progress",
-    "attention",
-    "cards",
-    "usage",
-    "updated_at",
-];
-
-fn key_set(v: &Json) -> BTreeSet<String> {
-    v.keys().into_iter().collect()
-}
-
-fn set_of(keys: &[&str]) -> BTreeSet<String> {
-    keys.iter().map(|k| k.to_string()).collect()
-}
-
-fn outcome(outcome: &str, qualifier: &str, reasons: &[&str]) -> [(&'static str, Json); 3] {
-    [
-        ("outcome", Json::from(outcome)),
-        ("qualifier", Json::from(qualifier)),
-        ("reasons", Json::from(reasons)),
-    ]
-}
+use common::{Out, STATUS_KEYS, is_bin_command, key_set, read_json, set_of, shlex_quote};
 
 /// `shutil.copytree(src, dest)`: `dest` and its parents made, files copied.
 #[track_caller]
@@ -76,13 +46,7 @@ fn other_repos_run(docs: &Path) -> (RunDir, PathBuf) {
     let other = RunDir::with_cards(3);
     let dest = docs.join("runs").join("2099-01-01-elsewhere");
     copy_tree(&other.root, &dest);
-    let now = SystemTime::now();
-    File::options()
-        .write(true)
-        .open(dest.join("events.jsonl"))
-        .unwrap()
-        .set_times(FileTimes::new().set_accessed(now).set_modified(now))
-        .unwrap();
+    common::set_mtime(&dest.join("events.jsonl"), SystemTime::now());
     (other, dest)
 }
 
@@ -339,7 +303,7 @@ mod json {
         assert_eq!(r.stdout.iter().filter(|&&b| b == b'\n').count(), 1, "{r}");
         assert!(r.stdout.is_ascii(), "{r}"); // non-ASCII text as \u escapes
         let s = r.json();
-        assert_eq!(key_set(&s), set_of(&KEYS), "{r}");
+        assert_eq!(key_set(&s), set_of(&STATUS_KEYS), "{r}");
         // The same information as the text output.
         let stdout = text.stdout_text();
         let lines: Vec<&str> = stdout.lines().collect();
@@ -444,6 +408,7 @@ mod json {
                 .starts_with("# Run report: Demo deck\n\nOutcome: complete\n")
         );
         // json.loads(r.stdout) == r.json(): an independent decoder (the output is ASCII)
+        assert!(r.stdout.is_ascii(), "{r}");
         let plain: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
         assert_json_eq!(common::json::parse(plain.to_string().as_bytes()), r.json());
     }

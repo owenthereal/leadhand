@@ -21,7 +21,7 @@ pub mod plugin;
 pub mod rundir;
 pub mod supervisor;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use rustix::process::{Pid, Signal, kill_process_group};
 
@@ -876,6 +876,41 @@ pub fn holds(mut cond: impl FnMut() -> bool, seconds: f64, what: &str) {
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The top-level keys of status.json, and of `status --json`'s output.
+pub const STATUS_KEYS: [&str; 10] = [
+    "run_id",
+    "deck",
+    "state",
+    "headline",
+    "activity",
+    "progress",
+    "attention",
+    "cards",
+    "usage",
+    "updated_at",
+];
+
+/// A JSON object's distinct keys, as Python's `set(d)`.
+pub fn key_set(v: &Json) -> BTreeSet<String> {
+    v.keys().into_iter().collect()
+}
+
+/// `items` as a set of strings, as a Python set literal.
+pub fn set_of(items: &[&str]) -> BTreeSet<String> {
+    items.iter().map(|s| s.to_string()).collect()
+}
+
+/// Sets `path`'s access and modification times to `when` (`os.utime(path, (t, t))`;
+/// `SystemTime::now()` for `os.utime(path)`).
+#[track_caller]
+pub fn set_mtime(path: &Path, when: SystemTime) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_times(fs::FileTimes::new().set_accessed(when).set_modified(when)))
+        .unwrap_or_else(|e| panic!("setting the times of {}: {e}", path.display()));
 }
 
 /// `bytes` as an OS string (for paths in files the binary wrote).

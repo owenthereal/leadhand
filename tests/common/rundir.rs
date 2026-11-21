@@ -156,6 +156,15 @@ pub fn append_event<'a>(
     })
 }
 
+/// An `outcome` event's fields: `ev("outcome", outcome=…, qualifier=…, reasons=[…])`.
+pub fn outcome(outcome: &str, qualifier: &str, reasons: &[&str]) -> [(&'static str, Json); 3] {
+    [
+        ("outcome", Json::from(outcome)),
+        ("qualifier", Json::from(qualifier)),
+        ("reasons", Json::from(reasons)),
+    ]
+}
+
 pub const DECK: &str = "# Deck: Demo deck
 Source: docs/plan.md
 Base: main @ 0123456789abcdef0123456789abcdef01234567

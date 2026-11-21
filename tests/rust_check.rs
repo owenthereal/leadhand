@@ -10,13 +10,12 @@
 #[macro_use]
 mod common;
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::Out;
 use common::json::{self, Json};
 use common::supervisor::FakeSupervisor;
+use common::{Out, key_set, set_of};
 
 const NOT_SUPPORTED: &str = "not supported in this version: ";
 
@@ -111,13 +110,9 @@ mod check {
         assert_eq!(r.code, 1, "{r}");
         assert_eq!(r.stderr_text(), "", "{r}");
         let report = r.json();
-        let keys: BTreeSet<String> = report.keys().into_iter().collect();
         assert_eq!(
-            keys,
-            ["ok", "cards", "problems", "fix"]
-                .map(String::from)
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
+            key_set(&report),
+            set_of(&["ok", "cards", "problems", "fix"]),
             "{r}"
         );
         assert_json_eq!(
@@ -152,15 +147,7 @@ mod check {
         );
         assert!(problems_of.iter().any(|p| json::py_eq(p, &notify)), "{r}");
         for p in problems_of {
-            let keys: BTreeSet<String> = p.keys().into_iter().collect();
-            assert_eq!(
-                keys,
-                ["level", "card", "message"]
-                    .map(String::from)
-                    .into_iter()
-                    .collect::<BTreeSet<_>>(),
-                "{p}"
-            );
+            assert_eq!(key_set(p), set_of(&["level", "card", "message"]), "{p}");
             let message = p["message"].as_str().unwrap();
             if message.starts_with("card ") {
                 assert_eq!(
