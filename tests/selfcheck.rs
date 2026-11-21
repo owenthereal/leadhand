@@ -77,6 +77,13 @@ fn output_that_is_not_json_names_argv_and_stdout() {
 fn hung_binary_times_out() {
     // The sleeper is a child of the script, holding its stdout and stderr open: killing only
     // the script would leave the harness waiting on the pipes for 30 s.
+    //
+    // The timeout is 10 s, not the Python's 1 s: on a loaded machine the shell may not reach
+    // its `echo` within 1 s, and the sleeper's pid file must exist to check the kill. The
+    // time bound keeps the Python's meaning, the timeout plus less than the harness's 5 s
+    // grace for the pipes: it holds only if the group kill closed the pipes at once, and it
+    // stays far below the sleeper's 30 s.
+    const HANG_SECS: u64 = 10;
     let tmp = TempRoot::new("lh self ");
     let env = Env::new(tmp.path());
     let binary = fake_binary(tmp.path(), "sleep 30 &\necho $! > \"$1\"\nwait\n");
@@ -87,17 +94,18 @@ fn hung_binary_times_out() {
         &env,
         tmp.path(),
         None,
-        Duration::from_secs(1)
+        Duration::from_secs(HANG_SECS)
     ));
     assert!(
-        began.elapsed() < Duration::from_secs(5),
+        began.elapsed() < Duration::from_secs(HANG_SECS + 4),
         "took {:?}",
         began.elapsed()
     );
+    let timed_out = format!("timed out after {HANG_SECS} s");
     for part in [
         binary.to_str().unwrap(),
         pid_file.to_str().unwrap(),
-        "timed out after 1",
+        timed_out.as_str(),
     ] {
         assert!(text.contains(part), "{part:?} not in {text}");
     }
