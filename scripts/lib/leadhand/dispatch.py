@@ -338,6 +338,16 @@ def codex_executable() -> str:
     return "codex"
 
 
+def foreground_wait() -> float:
+    """How long `dispatch` waits in the foreground before exit 75: FOREGROUND_WAIT, read at
+    call time. Tests shorten it with LEADHAND_TEST_FOREGROUND_WAIT seconds, honoured only under
+    LEADHAND_TESTING=1."""
+    override = os.environ.get("LEADHAND_TEST_FOREGROUND_WAIT")
+    if os.environ.get("LEADHAND_TESTING") == "1" and override:
+        return float(override)
+    return FOREGROUND_WAIT
+
+
 def codex_argv(req: DispatchRequest, last_message: Path, git_common: Path,
                env_overrides: Mapping[str, str], extra_dirs: Iterable[Path] = ()) -> list[str]:
     """The `codex exec` command; the prompt goes on stdin (`-`). `extra_dirs` are writable
@@ -1341,9 +1351,9 @@ def write_request(req: DispatchRequest) -> Path:
 def dispatch(req: DispatchRequest, *, wait: float | None = None) -> DispatchResult:
     """Start or attach to the dispatch's runner and wait for its result.
 
-    Raises DispatchStillRunning after `wait` seconds (default FOREGROUND_WAIT); the
+    Raises DispatchStillRunning after `wait` seconds (default foreground_wait()); the
     runner carries on, and calling again attaches to it."""
-    wait = FOREGROUND_WAIT if wait is None else wait
+    wait = foreground_wait() if wait is None else wait
     if not req.dispatch_id or "/" in req.dispatch_id or req.dispatch_id in (".", ".."):
         raise DispatchError(f"bad dispatch id {req.dispatch_id!r}")
     wd = Path(req.run_dir) / "workers" / req.dispatch_id

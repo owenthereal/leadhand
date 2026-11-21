@@ -661,3 +661,6 @@ Each Python test in `tests/test_*.py`, as `file::Class::test`, mapped to one of:
 | test_test_hooks.py::SelfPath::test_self_path_override_names_dispatch_line_and_runner | contract_cards.Paths.test_spaced_cli_path_from_unrelated_cwd |
 | test_test_hooks.py::SelfPath::test_cli_path_ignores_override_without_testing | contract_launch.SelfPathHook.test_self_path_override_is_honoured_only_under_leadhand_testing |
 | test_test_hooks.py::SelfPath::test_launch_line_uses_override | contract_launch.SelfPathHook.test_launch_and_pause_name_the_override; contract_launch.SelfPathHook.test_self_path_override_is_honoured_only_under_leadhand_testing |
+| test_test_hooks.py::ForegroundWait::test_default_is_540_seconds | internal: Rust unit test (dispatch) |
+| test_test_hooks.py::ForegroundWait::test_hook_is_honoured_under_testing | contract_dispatch.RunnerLifecycle.test_foreground_wait_ends_with_exit_75_and_the_still_running_line; contract_dispatch.ForegroundWaitHook.test_foreground_wait_hook_is_honoured_only_under_leadhand_testing |
+| test_test_hooks.py::ForegroundWait::test_hook_is_ignored_without_testing | contract_dispatch.ForegroundWaitHook.test_foreground_wait_hook_is_honoured_only_under_leadhand_testing |

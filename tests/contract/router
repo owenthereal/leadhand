@@ -1,0 +1,46 @@
+#!/bin/sh
+# The contract suite's router for mixed Rust/Python runs (stage 2). Set LEADHAND_BIN to this
+# file. It routes on the first argument:
+# - a command named in LEADHAND_RUST_COMMANDS (a comma-separated list, or "all") runs
+#   "$LEADHAND_RUST_BIN";
+# - with "all", everything does, flags and unknown commands included;
+# - anything else runs "$LEADHAND_PY_BIN", default <repo>/scripts/leadhand.
+# It execs the chosen binary with the arguments unchanged, so the process stays the same.
+
+# The list as the harness reads it: whitespace stripped, "all" anywhere in it meaning all.
+list=$(printf '%s' "${LEADHAND_RUST_COMMANDS-}" | tr -d ' \t\n\r')
+case ",$list," in
+    *,all,*) rust=yes ;;
+    *)
+        rust=no
+        if [ "$#" -gt 0 ] && [ -n "$1" ]; then
+            case ",$list," in
+                *",$1,"*) rust=yes ;;
+            esac
+        fi
+        ;;
+esac
+
+if [ "$rust" = yes ]; then
+    if [ -z "${LEADHAND_RUST_BIN-}" ]; then
+        echo "router: LEADHAND_RUST_BIN is not set (needed for: ${1-})" >&2
+        exit 1
+    fi
+    exec "$LEADHAND_RUST_BIN" "$@"
+fi
+
+if [ -n "${LEADHAND_PY_BIN-}" ]; then
+    exec "$LEADHAND_PY_BIN" "$@"
+fi
+# The repository is two levels above this file, found through any symlinks to it (tests name
+# the CLI by symlinks: LEADHAND_TEST_CLI).
+self=$0
+while [ -L "$self" ]; do
+    link=$(readlink -- "$self") || exit 1
+    case $link in
+        /*) self=$link ;;
+        *) self=$(dirname -- "$self")/$link ;;
+    esac
+done
+root=$(CDPATH='' cd -P -- "$(dirname -- "$self")" && cd -P ../.. && pwd -P) || exit 1
+exec "$root/scripts/leadhand" "$@"

@@ -8,11 +8,15 @@ Run the suite from the repository root:
   is resolved against the starting directory, once, at import.
 - LEADHAND_IMPL: "python" (default), "rust" or "mixed"; with LEADHAND_RUST_COMMANDS (a
   comma-separated list of commands, or "all") it decides which tagged tests run.
+- With LEADHAND_BIN=tests/contract/router (router mode), the router sends the commands in
+  LEADHAND_RUST_COMMANDS to LEADHAND_RUST_BIN and the rest to LEADHAND_PY_BIN (default
+  <repo>/scripts/leadhand). Both are resolved like LEADHAND_BIN.
 
 Nothing here imports the leadhand package.
 """
 from __future__ import annotations
 
+import atexit
 import ctypes
 import json
 import os
@@ -35,12 +39,27 @@ IMPL = os.environ.get("LEADHAND_IMPL") or "python"
 if IMPL not in ("python", "rust", "mixed"):
     raise ValueError(f"LEADHAND_IMPL must be python, rust or mixed, not {IMPL!r}")
 RUST_COMMANDS = frozenset(n.strip() for n in os.environ.get("LEADHAND_RUST_COMMANDS", "").split(",") if n.strip())
+ROUTER = ROOT / "tests" / "contract" / "router"
+
+
+def _bin_var(name: str) -> Path | None:
+    value = os.environ.get(name)
+    return Path(os.path.abspath(value)) if value else None
+
+
+RUST_BIN = _bin_var("LEADHAND_RUST_BIN")
+PY_BIN = _bin_var("LEADHAND_PY_BIN")
+if os.path.realpath(BIN) == os.path.realpath(ROUTER) and "LEADHAND_TEST_CLI" in os.environ:
+    # Behind the router the harness names the CLI itself (hermetic_env); an inherited value
+    # would be dropped, and each binary would then name itself, bypassing the router.
+    raise RuntimeError("LEADHAND_TEST_CLI is set, but with LEADHAND_BIN as the router the suite sets it "
+                       "itself: unset it and run again")
 FAKES = ROOT / "tests" / "fakes"
 COMMANDS = ("cancel", "check", "dispatch", "dispatch-runner", "launch-line", "next", "pause", "record", "report",
             "route", "run", "start", "status", "stop-dispatch", "timer", "unpark", "version")
 
 # The suite's own settings, passed through to the binary (the stage-2 router reads them).
-_SUITE_VARS = ("LEADHAND_BIN", "LEADHAND_IMPL", "LEADHAND_RUST_COMMANDS")
+_SUITE_VARS = ("LEADHAND_BIN", "LEADHAND_IMPL", "LEADHAND_RUST_COMMANDS", "LEADHAND_RUST_BIN", "LEADHAND_PY_BIN")
 # Inherited variables that would steer the binary or the fakes: other LEADHAND_* names are
 # test hooks (LEADHAND_CRASH_*, LEADHAND_TEST_*, LEADHAND_INSTALLED_VENDORS,
 # LEADHAND_MINUTE_SECONDS) or set by leadhand itself (the run anchor, lock fds, dispatch tag).
@@ -166,7 +185,31 @@ def hermetic_env(test: unittest.TestCase, tmp: Path, *, installed=("claude",), c
         "CODEX_HOME": str(tmp / "codex home"),
         "LEADHAND_INSTALLED_VENDORS": ",".join(installed),
     })
+    env.update({name: str(path) for name, path in (("LEADHAND_RUST_BIN", RUST_BIN), ("LEADHAND_PY_BIN", PY_BIN))
+                if path is not None})
+    # Ruling S2-R5: behind the router, both implementations call themselves through it. A test's
+    # own value (dict(env, LEADHAND_TEST_CLI=...)) replaces this one. The process environment
+    # holds no LEADHAND_TEST_CLI in router mode (refused at import), so one here was patched in
+    # by a harness test of the dropping above (contract_self.HermeticEnv), which runs no binary.
+    if router_mode() and "LEADHAND_TEST_CLI" not in os.environ:
+        env["LEADHAND_TEST_CLI"] = str(_router_cli())
     return env
+
+
+_ROUTER_CLI: Path | None = None
+
+
+def _router_cli() -> Path:
+    """The path both implementations call themselves by behind the router: a symlink named
+    `leadhand` to it, made once per test process. It is the router by file (names_bin), and
+    reads as leadhand's own name where the text says so (a handoff's `leadhand run` step)."""
+    global _ROUTER_CLI
+    if _ROUTER_CLI is None:
+        folder = Path(tempfile.mkdtemp(prefix="lh-router-"))
+        atexit.register(shutil.rmtree, folder, True)
+        (folder / "leadhand").symlink_to(ROUTER)
+        _ROUTER_CLI = folder / "leadhand"
+    return _ROUTER_CLI
 
 
 # --------------------------------------------------------------------------
@@ -175,9 +218,30 @@ def hermetic_env(test: unittest.TestCase, tmp: Path, *, installed=("claude",), c
 # Where the binary prints or passes a path for itself (an unpark hint, the launch line, a
 # dispatch line's argv[0], LEADHAND_CLI), parity is the file it names, not its spelling.
 
+def router_mode() -> bool:
+    """True when the binary under test is the stage-2 router."""
+    return os.path.realpath(BIN) == os.path.realpath(ROUTER)
+
+
+def _routed_bins() -> list[Path]:
+    """The binaries the router can select under LEADHAND_RUST_COMMANDS: the Rust binary unless
+    the list is empty, the Python CLI unless it is "all"."""
+    bins = []
+    if RUST_COMMANDS and RUST_BIN is not None:
+        bins.append(RUST_BIN)
+    if "all" not in RUST_COMMANDS:
+        bins.append(PY_BIN or ROOT / "scripts" / "leadhand")
+    return bins
+
+
 def names_bin(path_text: str) -> bool:
-    """True when `path_text` names the binary under test: the same file as BIN once both are resolved."""
-    return os.path.realpath(path_text) == os.path.realpath(BIN)
+    """True when `path_text` names the binary under test: the same file as BIN once both are
+    resolved. In router mode, also a binary the router can select (ruling S2-R5): with
+    LEADHAND_TESTING=0 a binary names its own real path, which no router can change."""
+    real = os.path.realpath(path_text)
+    if real == os.path.realpath(BIN):
+        return True
+    return router_mode() and any(real == os.path.realpath(b) for b in _routed_bins())
 
 
 def is_bin_command(text: str, before: str, after: str) -> bool:

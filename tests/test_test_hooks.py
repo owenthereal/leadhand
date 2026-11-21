@@ -1,5 +1,6 @@
 """Test-only hooks, honoured only under LEADHAND_TESTING=1: the clock offset
-(LEADHAND_TEST_CLOCK_OFFSET) and the self-path override (LEADHAND_TEST_CLI)."""
+(LEADHAND_TEST_CLOCK_OFFSET), the self-path override (LEADHAND_TEST_CLI) and the foreground
+wait (LEADHAND_TEST_FOREGROUND_WAIT)."""
 from __future__ import annotations
 
 import json
@@ -72,6 +73,28 @@ class SelfPath(unittest.TestCase):
             self.assertIn(f"leadhand CLI: {ROUTER}.", launch.first_message(w.run_dir))
             self.assertEqual(json.loads(launch.cli_settings()),
                              {"sandbox": {"excludedCommands": [f"{ROUTER} *"]}})
+
+
+class ForegroundWait(unittest.TestCase):
+    def test_default_is_540_seconds(self):
+        self.assertEqual(dispatch.FOREGROUND_WAIT, 540.0)
+        with mock.patch.dict(os.environ, {"LEADHAND_TESTING": "1"}):
+            os.environ.pop("LEADHAND_TEST_FOREGROUND_WAIT", None)
+            self.assertEqual(dispatch.foreground_wait(), 540.0)
+            # Read at call time, so patching the constant still shortens the wait.
+            with mock.patch.object(dispatch, "FOREGROUND_WAIT", 0.2):
+                self.assertEqual(dispatch.foreground_wait(), 0.2)
+
+    def test_hook_is_honoured_under_testing(self):
+        with mock.patch.dict(os.environ, {"LEADHAND_TESTING": "1", "LEADHAND_TEST_FOREGROUND_WAIT": "2.5"}):
+            self.assertEqual(dispatch.foreground_wait(), 2.5)
+
+    def test_hook_is_ignored_without_testing(self):
+        with mock.patch.dict(os.environ, {"LEADHAND_TEST_FOREGROUND_WAIT": "2.5"}):
+            os.environ.pop("LEADHAND_TESTING", None)
+            self.assertEqual(dispatch.foreground_wait(), 540.0)
+        with mock.patch.dict(os.environ, {"LEADHAND_TESTING": "0", "LEADHAND_TEST_FOREGROUND_WAIT": "2.5"}):
+            self.assertEqual(dispatch.foreground_wait(), 540.0)
 
 
 if __name__ == "__main__":

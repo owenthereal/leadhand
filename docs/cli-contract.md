@@ -133,7 +133,7 @@ there.
 | `route` | The route line `<vendor> <model> <effort>`, then one line per reason. When the ladder is exhausted: `ladder exhausted: …` on stderr, exit 1. |
 | `start` | For a new run, `run: <run dir>`; when another run holds the deck's branch, a note before it, `run branch: <branch> (<requested> belongs to another run)`. For an unfinished run of the same deck: `existing run: <run dir>`. Unsupported settings give `warning: <message>` lines on stderr. |
 | `dispatch`, `stop-dispatch` | The worker's reply (its first 15 lines; with no reply, `Status: …`, maybe `Blocked by: …`, then `Stopped: <exit reason>`), then `session: <thread id or none>`. |
-| `dispatch` exit 75 | `still running: run the same command again (dispatch <id>)`, printed after the foreground wait, `FOREGROUND_WAIT` = 540 s (S1-R12). |
+| `dispatch` exit 75 | `still running: run the same command again (dispatch <id>)`, printed after the foreground wait, `FOREGROUND_WAIT` = 540 s by default; `LEADHAND_TEST_FOREGROUND_WAIT` replaces it in tests (S1-R12). |
 | `timer` | One line: `result recorded`, `deadline passed`, or `pause or cancel requested`. |
 | `pause` | `pause requested: … Continue it later with: <cli> run <run dir>`, where `<cli>` and the run dir are shell-quoted. |
 | `cancel` | `cancel requested: … If no supervisor is running, <cli> run <run dir> finishes the cancel.` |
@@ -163,7 +163,7 @@ Other lines:
 | 1 | An error, with `error: …` on stderr (`check` prints it on stdout). Also `check` finding an error in the deck, and `route` with an exhausted ladder. |
 | 2 | A usage error, with a message on stderr. The wording may differ: Rust's comes from clap (deliberate change 4). Tests assert the code only. |
 | 3 | `run` refused because the run is owned (the ownership message on stderr). Also a second `dispatch-runner` for a worker folder that already has a live runner (`leadhand: another runner owns <dir>`). |
-| 75 | `dispatch` still running: run the same command again. Printed after the 540 s foreground wait. |
+| 75 | `dispatch` still running: run the same command again. Printed after the foreground wait: 540 s by default, `LEADHAND_TEST_FOREGROUND_WAIT` in tests. |
 | 97 | A test crash point. Testing builds only (`LEADHAND_TESTING=1`). |
 
 `run` otherwise returns the supervisor's own exit code, or 128 plus the signal number when the
@@ -259,8 +259,10 @@ Configuration sources, merged in this order: the preset, the user file, then the
 
 ### Timing that parity tests depend on
 
-Contract tests wait on these, so a Rust binary keeps the same values. The foreground wait
-(540 s) and the heartbeat (touched every second, stale after 60 s) are given above.
+Contract tests wait on these, so a Rust binary keeps the same values. The heartbeat (touched
+every second, stale after 60 s) is given above. So is the foreground wait (540 s), which no
+contract test waits out: unit tests pin the 540 s default, and the contract suite shortens it
+with `LEADHAND_TEST_FOREGROUND_WAIT`.
 
 | Name in the Python | Value | What it times |
 |---|---|---|
@@ -473,7 +475,7 @@ A refusal prints `error: refused: …`.
 
 These are honoured only under `LEADHAND_TESTING=1`; release builds ignore them all (deliberate
 change 5). Without `LEADHAND_TESTING=1` each is ignored, and contract tests check that for the
-clock offset, the self path, the Codex binary override and the crash points.
+clock offset, the self path, the Codex binary override, the foreground wait and the crash points.
 
 | Variable | Effect |
 |---|---|
@@ -489,6 +491,7 @@ clock offset, the self path, the Codex binary override and the crash points.
 | `LEADHAND_MINUTE_SECONDS` | Seconds per "minute" of a worker's time limit. |
 | `LEADHAND_TEST_CLOCK_OFFSET` | Seconds added to the engine's clock, `engine._now`. That is the clock for dispatch deadlines (`next`'s `deadline`, `worker_started.deadline`), deadline checks and `timer`. It does not move `ts` stamps, file times, the runner's limits or the heartbeat. |
 | `LEADHAND_TEST_CLI` | The path the binary names itself by, everywhere (see "Conventions"). |
+| `LEADHAND_TEST_FOREGROUND_WAIT` | Seconds, read as a float, that replace `FOREGROUND_WAIT` (540 s) as how long `dispatch` waits in the foreground before exit 75. It does not change the runner's limits, the heartbeat or `LEADHAND_MINUTE_SECONDS`. |
 
 **The crash protocol.** A testing build must honour it in every process: the CLI and the
 detached runners alike. The contract suite's crash matrix depends on that. At each crash point

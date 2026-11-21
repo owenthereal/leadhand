@@ -572,7 +572,7 @@ class RunnerLifecycle(unittest.TestCase):
 
     def test_cli_prints_reply_and_session_or_still_running(self):
         # The first call is left before its runner finishes. (Its exit 75 and `still running` line,
-        # after the foreground's 540 s wait, are test_foreground_wait_ends_with_exit_75_….)
+        # after the foreground wait, are test_foreground_wait_ends_with_exit_75_….)
         w = World(self)
         w.scenario("ready", delay=1)
         w.start_detached()
@@ -584,10 +584,12 @@ class RunnerLifecycle(unittest.TestCase):
 
     def test_foreground_wait_ends_with_exit_75_and_the_still_running_line(self):
         """Covers R20."""
-        # Waits the real 540 s FOREGROUND_WAIT: no test hook shortens it (ruling S1-R12).
+        # LEADHAND_TEST_FOREGROUND_WAIT shortens the 540 s FOREGROUND_WAIT to 3 s (ruling S1-R12);
+        # unit tests pin the 540 s default.
         w = World(self)
-        w.scenario("ready", delay=600)          # Codex outlasts the foreground wait
-        r = w.dispatch(timeout=700)
+        w.scenario("ready", delay=120)          # Codex outlasts the foreground wait
+        w.env["LEADHAND_TEST_FOREGROUND_WAIT"] = "3"
+        r = w.dispatch(timeout=60)
         self.assertEqual(r.code, 75, r)
         self.assertEqual(r.stdout.splitlines(), ["still running: run the same command again (dispatch d1)"])
         self.assertFalse((w.wd() / "result.json").exists())
@@ -712,6 +714,32 @@ class RunnerLifecycle(unittest.TestCase):
         self.assertEqual(len(w.records("start")), 1)
 
 
+class ForegroundWaitHook(unittest.TestCase):
+    def test_foreground_wait_hook_is_honoured_only_under_leadhand_testing(self):
+        """Covers limit L4 (test hooks need LEADHAND_TESTING=1)."""
+        # Observed through what `dispatch` prints when a 1 s hook meets a Codex that answers after
+        # 4 s. Without LEADHAND_TESTING=1, LEADHAND_TEST_CODEX_BIN is ignored too, so in both cases
+        # the Codex is the fake found first on PATH as `codex`.
+        w = World(self)
+        w.scenario("ready", delay=4)
+        env = dict(w.env, PATH=f"{FAKES}{os.pathsep}{w.env['PATH']}", LEADHAND_TEST_FOREGROUND_WAIT="1")
+        env.pop("LEADHAND_TEST_CODEX_BIN")
+        for did, testing, honoured in (("d1", "1", True), ("d2", "0", False)):
+            with self.subTest(testing=testing):
+                r = run_cli(*w.args(did), env=dict(env, LEADHAND_TESTING=testing), cwd=w.tmp, timeout=120)
+                if honoured:
+                    self.assertEqual(r.code, 75, r)
+                    self.assertEqual(r.stdout.splitlines(),
+                                     [f"still running: run the same command again (dispatch {did})"])
+                    self.assertFalse((w.wd(did) / "result.json").exists())
+                else:
+                    lines = r.ok().stdout.splitlines()
+                    self.assertEqual(lines[0], "Status: READY", r)
+                    self.assertEqual(lines[-1], f"session: {DEFAULT_THREAD}", r)
+                    self.assertEqual(w.result(did)["status"], "READY")
+        self.assertEqual(len(w.records("start")), 2)
+
+
 class Cancellation(unittest.TestCase):
     """`stop-dispatch`, a cancel request, and a hung runner's replacement."""
 
@@ -789,6 +817,8 @@ class Cancellation(unittest.TestCase):
         w = World(self)
         w.scenario("slow")
         codex = w.start_detached()
+        # The one start counted below must have happened before Codex is orphaned and cancelled.
+        wait_for(lambda: w.records("start"), "the fake Codex's start record")
         runner = w.runner_json()["runner"]
         w.signal(runner, signal.SIGKILL)
         wait_for(lambda: not alive(runner), "the runner to die")
