@@ -473,7 +473,7 @@ fn splitlines(text: &str) -> Vec<&str> {
 }
 
 /// Python's truth value of a JSON value.
-fn truthy(v: &Json) -> bool {
+pub fn truthy(v: &Json) -> bool {
     match v {
         Json::Null => false,
         Json::Bool(b) => *b,

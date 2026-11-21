@@ -662,153 +662,26 @@ mod release_build_dispatch {
     //! Codex. The release binary starts its runner as itself (it ignores LEADHAND_TEST_CLI
     //! too). Each case's control runs the same line through LEADHAND_BIN (the testing build),
     //! which honours the hook.
-    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::time::Duration;
 
     use super::*;
-    use crate::common::json::{self, Json};
-    use crate::common::supervisor::{FakeSupervisor, Options, card};
-    use crate::common::{Env, Out, cli_with, read_json, read_jsonl, run_argv};
+    use crate::common::dispatch_world::{World, os_refs};
+    use crate::common::json::Json;
+    use crate::common::{Env, Out, cli_with, read_json, run_argv};
 
-    /// contract_dispatch.World, as these tests use it: a run `start` made, and the dispatch
-    /// commands on it.
-    struct World {
-        /// The world `start` ran in, kept for its cleanup on drop.
-        _sup: FakeSupervisor,
-        run_dir: PathBuf,
-        ws: PathBuf,
-        tmp: PathBuf,
-        log: PathBuf,
-        env: Env,
+    /// What these tests add to the shared dispatch world (`common::dispatch_world::World`):
+    /// the hooked environment, and the same dispatch line run by the release build or by the
+    /// testing build.
+    trait Hooks {
+        fn hooked_env(&self, hooks: &[(&str, &Path)]) -> Env;
+        fn release(&self, did: &str, env: &Env) -> Out;
+        fn run_testing(&self, did: &str, env: &Env) -> Out;
     }
 
-    impl World {
-        fn new() -> World {
-            let mut sup = FakeSupervisor::with_options(
-                &[card(1)],
-                Options {
-                    installed: &["claude", "codex"],
-                    ..Options::default()
-                },
-            );
-            let run_dir = sup.start();
-            let ws = PathBuf::from(sup.meta()["workspace"].as_os().unwrap());
-            let tmp = sup.tmp.clone();
-            let log = PathBuf::from(sup.env.get("FAKE_CODEX_LOG").unwrap());
-            let mut env = sup.env.clone();
-            env.set("LEADHAND_TEST_CODEX_BIN", sup.env.fakes().join("codex")) // R49: Codex from the test env
-                .set("GH_TOKEN", "parent-gh-token")
-                .set("GITHUB_TOKEN", "parent-github-token")
-                .set("SSH_AUTH_SOCK", "/nonexistent/agent.sock");
-            World {
-                _sup: sup,
-                run_dir,
-                ws,
-                tmp,
-                log,
-                env,
-            }
-        }
-
-        /// The fake's scenario, a name in tests/fixtures/scenarios, and its FAKE_CODEX_*
-        /// knobs.
-        fn scenario(&mut self, name: &str, knobs: &[(&str, &str)]) {
-            let stale: Vec<OsString> = self
-                .env
-                .vars()
-                .map(|(k, _)| k.to_os_string())
-                .filter(|k| {
-                    let k = k.to_string_lossy();
-                    k.starts_with("FAKE_CODEX_") && k != "FAKE_CODEX_LOG"
-                })
-                .collect();
-            for k in stale {
-                self.env.remove(k);
-            }
-            let path = common::plugin::root()
-                .join("tests")
-                .join("fixtures")
-                .join("scenarios")
-                .join(format!("{name}.jsonl"));
-            self.env.set("FAKE_CODEX_SCENARIO", path);
-            for (k, v) in knobs {
-                self.env.set(format!("FAKE_CODEX_{}", k.to_uppercase()), v);
-            }
-        }
-
-        /// Sets the role's limits in the run's configuration snapshot (config.json), which
-        /// `dispatch` reads.
-        fn set_limits(&self, role: &str, limits: &[(&str, Json)]) {
-            let path = self.run_dir.join("config.json");
-            let mut data = read_json(&path);
-            let Json::Obj(top) = &mut data else {
-                panic!("config.json is not an object")
-            };
-            let role_limits = member_obj(member_obj(top, "limits"), role);
-            for (k, v) in limits {
-                *member(role_limits, k) = v.clone();
-            }
-            fs::write(&path, json::dumps_indent(&data, 2) + "\n").unwrap();
-        }
-
-        /// The dispatch's brief and report in its scratch folder, <ws>/.leadhand/1/<id>/.
-        fn scratch(&self, did: &str) -> (PathBuf, PathBuf) {
-            let folder = self.ws.join(".leadhand").join("1").join(did);
-            fs::create_dir_all(&folder).unwrap();
-            let brief = folder.join("brief.md");
-            if !brief.exists() {
-                fs::write(&brief, "# Brief\n").unwrap();
-            }
-            (brief, folder.join("report.md"))
-        }
-
-        fn args(&self, did: &str) -> Vec<OsString> {
-            let (brief, report) = self.scratch(did);
-            os_args![
-                "dispatch",
-                "--run",
-                self.run_dir,
-                "--dispatch-id",
-                did,
-                "--card",
-                "1",
-                "--attempt",
-                "1",
-                "--role",
-                "implementer",
-                "--model",
-                "gpt-6-luna",
-                "--effort",
-                "low",
-                "--brief",
-                brief,
-                "--report",
-                report,
-                "--cwd",
-                self.ws
-            ]
-            .iter()
-            .map(|s| s.to_os_string())
-            .collect()
-        }
-
-        fn records(&self, event: &str) -> Vec<Json> {
-            if !self.log.exists() {
-                return Vec::new();
-            }
-            read_jsonl(&self.log)
-                .into_iter()
-                .filter(|r| r.get("event").is_some_and(|e| e == event))
-                .collect()
-        }
-
-        fn wd(&self, did: &str) -> PathBuf {
-            self.run_dir.join("workers").join(did)
-        }
-
+    impl Hooks for World {
         /// The world's environment as it is now (its scenario included), with the fakes first
         /// on PATH, LEADHAND_TESTING=1, no Codex override unless `hooks` names one, and
         /// `hooks`.
@@ -828,37 +701,19 @@ mod release_build_dispatch {
             let bin = require_release_bin();
             let args = self.args(did);
             let mut argv = vec![bin.as_os_str()];
-            argv.extend(args.iter().map(|a| a.as_os_str()));
+            argv.extend(os_refs(&args));
             run_argv(&argv, env, &self.tmp, None, Duration::from_secs(120))
         }
 
         fn run_testing(&self, did: &str, env: &Env) -> Out {
             let args = self.args(did);
-            let args: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_os_str()).collect();
-            cli_with(&args, env, &self.tmp, None, Duration::from_secs(120))
-        }
-    }
-
-    /// The member `key` of an object (added as null when absent), for editing.
-    fn member<'j>(members: &'j mut Vec<(Vec<u8>, Json)>, key: &str) -> &'j mut Json {
-        let at = match members.iter().rposition(|(k, _)| k == key.as_bytes()) {
-            Some(at) => at,
-            None => {
-                members.push((key.as_bytes().to_vec(), Json::Null));
-                members.len() - 1
-            }
-        };
-        &mut members[at].1
-    }
-
-    /// The object `key` of an object, for editing.
-    fn member_obj<'j>(
-        members: &'j mut Vec<(Vec<u8>, Json)>,
-        key: &str,
-    ) -> &'j mut Vec<(Vec<u8>, Json)> {
-        match member(members, key) {
-            Json::Obj(inner) => inner,
-            other => panic!("{key} is not an object: {other}"),
+            cli_with(
+                &os_refs(&args),
+                env,
+                &self.tmp,
+                None,
+                Duration::from_secs(120),
+            )
         }
     }
 

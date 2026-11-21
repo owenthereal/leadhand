@@ -14,6 +14,7 @@
 
 #![allow(dead_code, unused_macros)]
 
+pub mod dispatch_world;
 pub mod drive;
 pub mod git;
 pub mod json;
@@ -719,8 +720,9 @@ impl Env {
 // Where the binary prints or passes a path for itself (an unpark hint, the launch line, a
 // dispatch line's argv[0], LEADHAND_CLI), parity is the file it names, not its spelling.
 
-/// `path` with every symlink resolved; a path that does not exist is made absolute instead.
-fn realpath(path: &Path) -> PathBuf {
+/// `path` with every symlink resolved; a path that does not exist is made absolute instead
+/// (`os.path.realpath`).
+pub fn realpath(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| std::path::absolute(path).unwrap_or_default())
 }
 
@@ -878,6 +880,16 @@ pub fn holds(mut cond: impl FnMut() -> bool, seconds: f64, what: &str) {
     }
 }
 
+/// The lock that serializes a test file's wall-clock-sensitive group (ruling S3-R19): a
+/// test whose assertions rest on the binary's wall-clock budgets (the stop ladder's 5 s
+/// steps, the stale-heartbeat second look, the foreground wait) holds it for its whole run,
+/// so no two such tests in one file load the machine together. Each test file is its own
+/// binary, so the lock is per file. A test that failed holding it does not poison it.
+pub fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The top-level keys of status.json, and of `status --json`'s output.
 pub const STATUS_KEYS: [&str; 10] = [
     "run_id",
@@ -911,6 +923,26 @@ pub fn set_mtime(path: &Path, when: SystemTime) {
         .open(path)
         .and_then(|f| f.set_times(fs::FileTimes::new().set_accessed(when).set_modified(when)))
         .unwrap_or_else(|e| panic!("setting the times of {}: {e}", path.display()));
+}
+
+/// A JSON literal, parsed by the harness decoder.
+#[track_caller]
+pub fn jv(text: &str) -> Json {
+    json::parse(text.as_bytes())
+}
+
+/// The one item of `items` (Python's `[x] = items`); panics unless there is exactly one.
+#[track_caller]
+pub fn one(items: Vec<Json>) -> Json {
+    let [x] = n_of(items);
+    x
+}
+
+/// Exactly `N` items (Python's `a, b = items`); panics unless there are exactly `N`.
+#[track_caller]
+pub fn n_of<const N: usize>(items: Vec<Json>) -> [Json; N] {
+    <[Json; N]>::try_from(items)
+        .unwrap_or_else(|items| panic!("expected {N} items, got {}: {items:?}", items.len()))
 }
 
 /// `bytes` as an OS string (for paths in files the binary wrote).
