@@ -27,11 +27,14 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::dispatch_world::{WAIT, wait_for, wait_for_with};
-use common::engine::{RUN, record, recorded, result, with_status, with_verdict};
+use common::engine::{RUN, files, record, recorded, result, with_status, with_verdict};
 use common::git::{self, run_git, run_git_unchecked};
 use common::json::Json;
 use common::supervisor::{FakeSupervisor, NO_HOOKS, Proc, Step, os_path, run_dir, text, truthy};
-use common::{Out, jv, lines, path_str as s, pick, read_json, read_jsonl, read_text, started_by};
+use common::{
+    Out, field, json_in, jv, lines, path_str as s, pick, read_json, read_jsonl, read_text,
+    started_by,
+};
 
 /// A refusal: exit `code` (default 1), and for 1 `error: ...` on stderr (2 is the usage
 /// error's). Gives the `Out`.
@@ -52,37 +55,6 @@ macro_rules! assert_fails {
 
 // --------------------------------------------------------------------------
 // Helpers
-
-/// A step that writes and commits `files`.
-fn files(pairs: &[(&str, &str)]) -> Step {
-    Step {
-        files: Some(
-            pairs
-                .iter()
-                .map(|(p, t)| (p.to_string(), t.to_string()))
-                .collect(),
-        ),
-        ..Step::default()
-    }
-}
-
-/// Each event's member `key`, as a list (`[e[key] for e in events]`).
-#[track_caller]
-fn field(events: &[Json], key: &str) -> Json {
-    Json::Arr(events.iter().map(|e| e[key].clone()).collect())
-}
-
-/// Python's `needle in hay` for a JSON list (an item equal to it), object (a key) or string
-/// (a substring).
-#[track_caller]
-fn json_in(needle: &str, hay: &Json) -> bool {
-    match hay {
-        Json::Arr(items) => items.iter().any(|x| x == needle),
-        Json::Obj(_) => hay.get(needle).is_some(),
-        Json::Str(_) => text(hay).contains(needle),
-        other => panic!("`in` on a value that is no container: {other}"),
-    }
-}
 
 fn without_deadline(action: &Json) -> Json {
     Json::Obj(

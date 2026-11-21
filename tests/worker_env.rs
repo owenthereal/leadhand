@@ -27,7 +27,7 @@ mod worker_environment {
     use crate::common::dispatch_world::World;
     use crate::common::git::{make_repo_named, run_git};
     use crate::common::json::Json;
-    use crate::common::{Env, Out, process_env, run_argv};
+    use crate::common::{Env, Out, run_argv, which};
 
     /// What a parent may hold that the worker must not see.
     const TOKENS: [&str; 7] = [
@@ -186,18 +186,6 @@ mod worker_environment {
                 let _ = t.join();
             }
         }
-    }
-
-    /// `shutil.which(name)` on the test process's PATH.
-    fn which(name: &str) -> Option<PathBuf> {
-        let path = process_env()
-            .into_iter()
-            .rev()
-            .find(|(k, _)| k == "PATH")
-            .map(|(_, v)| v)?;
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(name))
-            .find(|p| p.is_file())
     }
 
     #[test]

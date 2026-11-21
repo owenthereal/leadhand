@@ -150,6 +150,13 @@ pub fn run_git_unchecked(cwd: &Path, args: &[&str]) -> String {
     git(cwd, args).1
 }
 
+/// Whether `git <args>` in `cwd` succeeds (`run_git` that returns False where it would raise;
+/// a timeout still panics).
+#[track_caller]
+pub fn git_ok(cwd: &Path, args: &[&str]) -> bool {
+    git(cwd, args).0 == 0
+}
+
 /// A repo `my repo` in `root` with one commit (README.md) on `main`.
 #[track_caller]
 pub fn make_repo(root: &Path) -> PathBuf {

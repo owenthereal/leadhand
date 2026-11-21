@@ -83,6 +83,15 @@ macro_rules! assert_json_eq {
     }};
 }
 
+/// `assertEqual(items, [])` for a list (a `Vec` or slice): it must be empty, and the message
+/// shows what it holds.
+macro_rules! assert_empty {
+    ($items:expr $(,)?) => {{
+        let items = &$items;
+        assert!(items.is_empty(), "expected none, got {items:?}");
+    }};
+}
+
 /// The message of the panic `f` raises, or None when it returns.
 pub fn panic_message(f: impl FnOnce()) -> Option<String> {
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).err()?;
@@ -897,6 +906,54 @@ pub fn holds(mut cond: impl FnMut() -> bool, seconds: f64, what: &str) {
 #[track_caller]
 pub fn pick(v: &Json, keys: &[&str]) -> Json {
     Json::Arr(keys.iter().map(|k| v[*k].clone()).collect())
+}
+
+/// Each item's member `key`, as a list (`[e[key] for e in items]`).
+#[track_caller]
+pub fn field(items: &[Json], key: &str) -> Json {
+    Json::Arr(items.iter().map(|e| e[key].clone()).collect())
+}
+
+/// Python's `needle in hay` for a JSON list (an item equal to it), object (a key) or string
+/// (a substring).
+#[track_caller]
+pub fn json_in(needle: &str, hay: &Json) -> bool {
+    match hay {
+        Json::Arr(items) => items.iter().any(|x| x == needle),
+        Json::Obj(_) => hay.get(needle).is_some(),
+        Json::Str(_) => supervisor::text(hay).contains(needle),
+        other => panic!("`in` on a value that is no container: {other}"),
+    }
+}
+
+/// `shutil.which(name)` on the test process's PATH.
+pub fn which(name: &str) -> Option<PathBuf> {
+    let path = process_env()
+        .into_iter()
+        .rev()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v)?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Every file and folder under `root`, recursively, without following symlinks to folders
+/// (`Path.rglob("*")`).
+#[track_caller]
+pub fn walk(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let entries = fs::read_dir(root).unwrap_or_else(|e| panic!("reading {}: {e}", root.display()));
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|e| panic!("reading {}: {e}", root.display()));
+        let path = entry.path();
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        found.push(path.clone());
+        if is_dir {
+            found.extend(walk(&path));
+        }
+    }
+    found
 }
 
 /// Python's `list.index`.

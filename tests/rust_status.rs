@@ -14,41 +14,12 @@ mod common;
 
 use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::path::Path;
 
 use common::json::Json;
-use common::rundir::{RunDir, append_event, outcome};
+use common::rundir::{RunDir, append_event, other_repos_run, outcome};
 use common::supervisor::{CardOpts, FakeSupervisor, card, card_with};
 use common::{Out, STATUS_KEYS, is_bin_command, key_set, read_json, set_of, shlex_quote};
-
-/// `shutil.copytree(src, dest)`: `dest` and its parents made, files copied.
-#[track_caller]
-fn copy_tree(src: &Path, dest: &Path) {
-    fs::create_dir_all(dest).unwrap_or_else(|e| panic!("making {}: {e}", dest.display()));
-    for entry in fs::read_dir(src).unwrap_or_else(|e| panic!("reading {}: {e}", src.display())) {
-        let entry = entry.unwrap();
-        let to = dest.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_tree(&entry.path(), &to);
-        } else {
-            fs::copy(entry.path(), &to)
-                .unwrap_or_else(|e| panic!("copying {}: {e}", entry.path().display()));
-        }
-    }
-}
-
-/// An unfinished run under `docs`/runs that belongs to another repository (RunDir's own,
-/// which does not exist), updated after everything else there: the run the Python's old
-/// choice would show. The RunDir is returned to keep its temp root for the test.
-#[track_caller]
-fn other_repos_run(docs: &Path) -> (RunDir, PathBuf) {
-    let other = RunDir::with_cards(3);
-    let dest = docs.join("runs").join("2099-01-01-elsewhere");
-    copy_tree(&other.root, &dest);
-    common::set_mtime(&dest.join("events.jsonl"), SystemTime::now());
-    (other, dest)
-}
 
 /// stderr's lines.
 fn stderr_lines(r: &Out) -> Vec<String> {

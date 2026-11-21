@@ -1,14 +1,18 @@
 //! Helpers that several engine test files share: the module helpers of
 //! `tests/contract/contract_cards.py` that other contract files import (`codex_world`,
 //! `record`, `recorded`, `result`, `run_line`, `relaunch_env`, `status_lines`, `commit_on` and
-//! the deck constants), with `contract_deck.card_section` and `contract_status.is_unpark_line`.
+//! the deck constants), with `contract_deck.card_section` and `contract_status.is_unpark_line`;
+//! those of `contract_integration.py` (`NOTE`, `parked_world`, `unpark`) and of
+//! `contract_finish.py` (`base_wt`, `marker`, `gate_names`, `drive_to_run`,
+//! `drive_until_refused`, `to_last_step`) that later files import; and the step literals the
+//! files script (`with_status`, `with_verdict`, `files`, `tampering`).
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use super::git::run_git;
 use super::json::Json;
-use super::supervisor::{CliOpts, FakeSupervisor, Options, Step, run_dir, text};
+use super::supervisor::{CliOpts, FakeSupervisor, Options, Step, card, run_dir, text};
 use super::{Out, is_bin_command, process_env, shlex_quote};
 
 /// The run branch of the demo deck.
@@ -48,6 +52,28 @@ pub fn with_status(status: &str) -> Step {
 pub fn with_verdict(verdict: &str) -> Step {
     Step {
         verdict: Some(verdict.into()),
+        ..Step::default()
+    }
+}
+
+/// A step that writes and commits `files` (Python's `{"files": {...}}`).
+pub fn files(pairs: &[(&str, &str)]) -> Step {
+    Step {
+        files: Some(
+            pairs
+                .iter()
+                .map(|(p, t)| (p.to_string(), t.to_string()))
+                .collect(),
+        ),
+        ..Step::default()
+    }
+}
+
+/// A step whose worker runs `tamper(world, workspace, action)` before its report (Python's
+/// `{"tamper": tamper}`).
+pub fn tampering(tamper: impl Fn(&FakeSupervisor, &Path, &Json) + 'static) -> Step {
+    Step {
+        tamper: Some(Box::new(tamper)),
         ..Step::default()
     }
 }
@@ -173,4 +199,151 @@ pub fn is_unpark_line(line: &str, n: i64, root: &Path, reason: &str) -> bool {
             shlex_quote(root.to_str().unwrap())
         ),
     )
+}
+
+// --------------------------------------------------------------------------
+// contract_integration.py
+
+/// The operator's note in an unpark.
+pub const NOTE: &str = "Use JSON; it is simpler.";
+
+/// `parked_world_with(&[], &[], &["claude"])`.
+#[track_caller]
+pub fn parked_world() -> FakeSupervisor {
+    parked_world_with(&[], &[], &["claude"])
+}
+
+/// Card 1 asks a product question and is parked; independent card 2 is accepted, so the run
+/// tip moves past card 1's base. `card1_files` and `card2_files` (none when empty) are what
+/// each card's implementer writes; with Codex `installed`, the fake `codex` is Codex, as in
+/// `codex_world`.
+#[track_caller]
+pub fn parked_world_with(
+    card1_files: &[(&str, &str)],
+    card2_files: &[(&str, &str)],
+    installed: &[&str],
+) -> FakeSupervisor {
+    let mut w = FakeSupervisor::with_options(
+        &[card(1), card(2)],
+        Options {
+            installed,
+            ..Options::default()
+        },
+    );
+    if installed.contains(&"codex") {
+        let codex = w.env.fakes().join("codex");
+        w.env.set("LEADHAND_TEST_CODEX_BIN", codex);
+    }
+    w.session("supervisor-1"); // the supervisor session the workers start in
+    w.start();
+    let first = if card1_files.is_empty() {
+        Step::default()
+    } else {
+        files(card1_files)
+    };
+    w.script(
+        1,
+        "implement",
+        [Step {
+            status: Some("QUESTION".into()),
+            ..first
+        }],
+    );
+    if !card2_files.is_empty() {
+        w.script(2, "implement", [files(card2_files)]);
+    }
+    w.parks
+        .insert(1, "product decision: storage format".to_string());
+    w.run();
+    w.parks.remove(&1).expect("card 1's park"); // Python's `del`: a KeyError when missing
+    w
+}
+
+/// `unpark RUN_DIR --card N --note NOTE`, which must succeed.
+#[track_caller]
+pub fn unpark(w: &FakeSupervisor, n: i64, note: &str) -> Out {
+    let rd = run_dir(w);
+    let card = n.to_string();
+    w.cli(&[
+        OsStr::new("unpark"),
+        rd.as_os_str(),
+        OsStr::new("--card"),
+        OsStr::new(&card),
+        OsStr::new("--note"),
+        OsStr::new(note),
+    ])
+    .ok()
+}
+
+// --------------------------------------------------------------------------
+// contract_finish.py
+
+/// In the evidence base worktree's admin folder: the run that added it (R60).
+pub const MARKER: &str = "leadhand-run";
+
+/// The evidence base worktree: `<repo>/.worktrees/<workspace name>--base`.
+#[track_caller]
+pub fn base_wt(w: &FakeSupervisor) -> PathBuf {
+    let ws = w.workspace();
+    let mut name = ws
+        .file_name()
+        .unwrap_or_else(|| panic!("a workspace with no name: {}", ws.display()))
+        .to_os_string();
+    name.push("--base");
+    ws.parent().expect("the workspace's parent").join(name)
+}
+
+/// The run's marker in the admin folder of the worktree at `path`.
+#[track_caller]
+pub fn marker(path: &Path) -> PathBuf {
+    PathBuf::from(run_git(path, &["rev-parse", "--absolute-git-dir"])).join(MARKER)
+}
+
+/// Every gate result's gate, in order.
+#[track_caller]
+pub fn gate_names(w: &FakeSupervisor) -> Vec<String> {
+    w.events("gate_result")
+        .iter()
+        .map(|e| text(&e["gate"]).to_string())
+        .collect()
+}
+
+/// Acts on every action until a run-level dispatch matching `pred`; returns it unacted.
+#[track_caller]
+pub fn drive_to_run(w: &mut FakeSupervisor, pred: impl Fn(&Json) -> bool) -> Json {
+    for _ in 0..80 {
+        let a = w.next();
+        if a["action"] == "dispatch" && a["card"].is_null() && pred(&a) {
+            return a;
+        }
+        w.act(&a);
+    }
+    panic!("no matching run-level dispatch");
+}
+
+/// Acts on every action until `next` fails (within 80 actions); returns that failing result.
+#[track_caller]
+pub fn drive_until_refused(w: &mut FakeSupervisor) -> Out {
+    let limit = 80;
+    let rd = run_dir(w);
+    for _ in 0..limit {
+        let r = w.cli(&[OsStr::new("next"), rd.as_os_str()]);
+        if r.code != 0 {
+            return r;
+        }
+        let a = r.json();
+        if a["action"] == "done" {
+            panic!("the run ended without the refusal: {a}");
+        }
+        w.act(&a);
+    }
+    panic!("`next` was never refused in {limit} actions");
+}
+
+/// Acts on every action up to and including the run's verify gate: the next `next` ends the
+/// run.
+#[track_caller]
+pub fn to_last_step(w: &mut FakeSupervisor) {
+    let a = drive_to_run(w, |a| a["kind"] == "verify");
+    w.act(&a);
 }
