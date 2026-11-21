@@ -12,6 +12,18 @@
 //! reaches the parent, and its exit status is a real one.
 //!
 //! The selector variable starts with LEADHAND_, so `Env` drops it: the binary never sees it.
+//!
+//! **Bounds** (ruling S3-R23, fix round 3). The selector carries the chain of drive labels
+//! from the top test down, and `start` refuses three forks, each with a panic saying how to
+//! structure the test:
+//! - (a) a drive whose label is already in the chain: it would start itself again at every
+//!   level (an alternating `worker → crash → worker …` chain, say);
+//! - (b) a drive that would nest past `MAX_DEPTH` (two) levels, the suite's own nesting: a
+//!   test forks a worker, whose drive forks one crash child;
+//! - (c) in a drive child, a fork for another drive before the child has reached its own
+//!   (`run_child`): each earlier fork in the test would start a redundant child, 2^(N-1) - 1
+//!   of them for N forks in a row. Branch on `selected()` before a test's forks, so a child
+//!   goes straight to its own drive.
 
 use std::fs::{self, File};
 use std::os::unix::ffi::OsStringExt;
@@ -19,6 +31,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,13 +42,21 @@ use super::json::{self, Json};
 /// The variable that makes a re-executed test binary a drive child: its selector, as JSON.
 pub const SELECT_VAR: &str = "LEADHAND_TEST_DRIVE";
 
-/// Which drive a child runs: the test (its libtest name), the drive's label within it, and a
-/// file the parent wrote for it.
+/// The deepest drive nesting `start` allows: a worker, and its one crash child.
+pub const MAX_DEPTH: usize = 2;
+
+/// Set once this process, a drive child, has reached its own drive (`run_child`).
+static REACHED: AtomicBool = AtomicBool::new(false);
+
+/// Which drive a child runs: the test (its libtest name), the drive's label within it, a
+/// file the parent wrote for it, and the chain of drive labels from the top test down to
+/// this one (its own label last).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selector {
     pub test: String,
     pub label: String,
     pub payload: PathBuf,
+    pub chain: Vec<String>,
 }
 
 impl Selector {
@@ -47,6 +68,7 @@ impl Selector {
                 "payload",
                 Json::Str(json::from_os(self.payload.as_os_str().as_encoded_bytes())),
             ),
+            ("chain", Json::from(&self.chain[..])),
         ]))
     }
 
@@ -65,6 +87,12 @@ impl Selector {
                     .as_os()
                     .unwrap_or_else(|| panic!("{SELECT_VAR}: no payload")),
             ),
+            chain: v["chain"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{SELECT_VAR}: no chain"))
+                .iter()
+                .map(|l| l.as_str().expect("a chain label").to_string())
+                .collect(),
         }
     }
 }
@@ -108,11 +136,25 @@ pub struct Ended {
     pub output: String,
 }
 
-/// Starts the test binary as a drive child for `sel`: only `sel.test` runs (`--exact`), in a
-/// process group of its own, with SELECT_VAR set on its `Command` only and its output
-/// written to `output`.
+/// Starts the test binary as a drive child for drive `label` of test `test`, with `payload`
+/// for it: only `test` runs (`--exact`), in a process group of its own, with SELECT_VAR set
+/// on its `Command` only (the chain extended by `label`) and its output written to `output`.
+/// Refuses (panics) the forks the module docs list.
 #[track_caller]
-pub fn start(sel: &Selector, output: &Path) -> DriveChild {
+pub fn start(test: &str, label: &str, payload: &Path, output: &Path) -> DriveChild {
+    let current = selected();
+    let mut chain = current
+        .as_ref()
+        .map(|s| s.chain.clone())
+        .unwrap_or_default();
+    refuse(current.as_ref(), &chain, label);
+    chain.push(label.to_string());
+    let sel = Selector {
+        test: test.to_string(),
+        label: label.to_string(),
+        payload: payload.to_path_buf(),
+        chain,
+    };
     let exe = std::env::current_exe().expect("the test binary's path");
     let out = File::create(output).unwrap_or_else(|e| panic!("creating {}: {e}", output.display()));
     let err = out.try_clone().expect("duplicating the output file");
@@ -129,6 +171,39 @@ pub fn start(sel: &Selector, output: &Path) -> DriveChild {
         child,
         output: output.to_path_buf(),
         test: sel.test.clone(),
+    }
+}
+
+/// Panics when starting drive `label` here would be one of the forks the module docs list:
+/// (a) a label already in `chain`, (c) a fork before this drive child reached its own drive,
+/// (b) nesting past `MAX_DEPTH`.
+#[track_caller]
+fn refuse(current: Option<&Selector>, chain: &[String], label: &str) {
+    if chain.iter().any(|l| l == label) {
+        panic!(
+            "drive refused (its label is already in the chain): fork({label:?}) inside the \
+             drive chain {chain:?} would start that drive again at every level. Branch on \
+             drive::selected() at the top of the test, so each drive child goes straight to \
+             its own drive (a crash child must not run its worker's fork again)."
+        );
+    }
+    if let Some(sel) = current
+        && !REACHED.load(Ordering::SeqCst)
+    {
+        panic!(
+            "drive refused (the child has not reached its own drive): the drive child for \
+             {:?} reached fork({label:?}) first, and each fork the test makes before its own \
+             would start a redundant child. Branch on drive::selected() (or attach_drive) \
+             before the test's forks, so a child goes straight to its own drive.",
+            sel.label
+        );
+    }
+    if chain.len() >= MAX_DEPTH {
+        panic!(
+            "drive refused (nesting past {MAX_DEPTH} levels): fork({label:?}) under the drive \
+             chain {chain:?}. The suite nests at most {MAX_DEPTH}: a test forks a worker, and \
+             the worker's drive forks one crash child."
+        );
     }
 }
 
@@ -179,9 +254,11 @@ impl DriveChild {
 }
 
 /// In a drive child: runs `f` and ends the process, never returning to the rest of the test.
+/// From here on the child may start drives of its own (`start`'s rule (c)).
 /// A return exits 0; a panic writes its message to `error` and exits 1 (Python's child
 /// writing its traceback). `f` may end the process itself (a crash point's exit 97).
 pub fn run_child(error: &Path, f: impl FnOnce()) -> ! {
+    REACHED.store(true, Ordering::SeqCst);
     match panic::catch_unwind(AssertUnwindSafe(f)) {
         Ok(()) => std::process::exit(0),
         Err(payload) => {

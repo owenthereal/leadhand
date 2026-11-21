@@ -1471,12 +1471,7 @@ impl FakeSupervisor {
         let _ = fs::remove_file(&reached);
         fs::write(&state, json::dumps(&self.state()))
             .unwrap_or_else(|e| panic!("writing {}: {e}", state.display()));
-        let sel = drive::Selector {
-            test: drive::this_test(),
-            label: label.to_string(),
-            payload: state,
-        };
-        let ended = drive::start(&sel, &output).wait(deadline);
+        let ended = drive::start(&drive::this_test(), label, &state, &output).wait(deadline);
         // A child that died before its drive began (a panic in attach_drive or script, say:
         // libtest's exit 101) has no drive outcome to report: fail with what it printed.
         if !reached.exists() {

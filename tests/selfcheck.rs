@@ -869,8 +869,10 @@ fn fake_claude_logs_argv_cwd_and_env() {
 mod drive_child {
     use std::ffi::OsString;
     use std::fs;
+    use std::io::Write;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    use std::path::PathBuf;
+    use std::panic::{self, AssertUnwindSafe};
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
@@ -878,8 +880,8 @@ mod drive_child {
 
     use crate::common::drive;
     use crate::common::json::{self, Json};
-    use crate::common::start_time;
-    use crate::common::supervisor::{FakeSupervisor, Step, card, recorded_alive};
+    use crate::common::supervisor::{FakeSupervisor, Forked, Step, card, recorded_alive};
+    use crate::common::{read_json, read_jsonl, start_time};
 
     fn steps() -> [Step; 2] {
         [
@@ -1034,28 +1036,48 @@ mod drive_child {
     fn a_drive_past_its_deadline_is_killed_with_its_group() {
         let mut w = world("hangs");
         let sibling = w.tmp.join("sibling.json");
-        let forked = w.fork("hangs", Duration::from_secs(2), |_, _| {
-            // A second process in the drive's group, which the deadline kill must take too.
-            let mut p = Command::new("sleep")
-                .arg("60")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap();
-            let pid = p.id() as i32;
-            let rec = Json::object([
-                ("pid", Json::from(pid)),
-                ("start", Json::from(start_time(pid).unwrap())),
-            ]);
-            fs::write(&sibling, json::dumps(&rec)).unwrap();
-            std::thread::sleep(Duration::from_secs(60));
-            let _ = p.kill();
-            let _ = p.wait();
-        });
+        let staged = w.tmp.join("sibling.json.tmp");
+        // 2 s is plenty for the child to start, attach and record its other process; on a
+        // loaded machine it may not be, and the attempt is made again with twice the time.
+        let mut deadline = Duration::from_secs(2);
+        let (forked, rec) = loop {
+            let _ = fs::remove_file(&sibling);
+            let attempt = panic::catch_unwind(AssertUnwindSafe(|| {
+                w.fork("hangs", deadline, |_, _| {
+                    // A second process in the drive's group, which the deadline kill must
+                    // take too.
+                    let mut p = Command::new("sleep")
+                        .arg("60")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap();
+                    let pid = p.id() as i32;
+                    let rec = Json::object([
+                        ("pid", Json::from(pid)),
+                        ("start", Json::from(start_time(pid).unwrap())),
+                    ]);
+                    fs::write(&staged, json::dumps(&rec)).unwrap();
+                    fs::rename(&staged, &sibling).unwrap(); // whole, or not there
+                    std::thread::sleep(Duration::from_secs(60));
+                    let _ = p.kill();
+                    let _ = p.wait();
+                })
+            }));
+            match (attempt, fs::read(&sibling)) {
+                (Ok(forked), Ok(bytes)) => break (forked, json::parse(&bytes)),
+                _ if deadline < Duration::from_secs(32) => deadline *= 2,
+                (Ok(forked), Err(_)) => panic!(
+                    "the drive child never recorded its other process in {} s:\n{}",
+                    deadline.as_secs(),
+                    forked.output
+                ),
+                (Err(payload), _) => panic::resume_unwind(payload),
+            }
+        };
         assert!(forked.hung, "{}", forked.output);
         assert_eq!(forked.code, -9);
-        let rec = json::parse(&fs::read(&sibling).unwrap());
         let end = Instant::now() + Duration::from_secs(5);
         while recorded_alive(&rec) && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(20));
@@ -1068,5 +1090,213 @@ mod drive_child {
             !alive,
             "the drive's other process outlived the deadline kill: {rec}"
         );
+    }
+
+    // -- the chain's bounds (drive::start's refusals) --------------------------------
+
+    const LONG: Duration = Duration::from_secs(60);
+
+    /// The top test's tmp, which every world of a chain test carries in its env (TOP_TMP).
+    fn top_of(w: &FakeSupervisor) -> PathBuf {
+        PathBuf::from(w.env.get("TOP_TMP").expect("TOP_TMP"))
+    }
+
+    /// The world for drive `label` in a chain test: the attached one in its own drive
+    /// child, else a new one that knows the top test's tmp (`top`, or its own at the top).
+    fn chain_world(label: &str, top: Option<&Path>) -> FakeSupervisor {
+        if let Some(w) = FakeSupervisor::attach_drive(label) {
+            return w;
+        }
+        let mut w = FakeSupervisor::new(&[card(1)]);
+        let top = top.map_or_else(|| w.tmp.clone(), Path::to_path_buf);
+        w.env.set("TOP_TMP", top);
+        w
+    }
+
+    /// First thing in a chain test. In a drive child: record this process (pid, start and
+    /// chain) in the top test's `children.jsonl`; and a child deeper than any rule allows
+    /// (one only a missing rule could start) records `too deep` there and stops at once, so
+    /// no chain can form even then.
+    fn enter_chain() {
+        let Some(sel) = drive::selected() else {
+            return;
+        };
+        let state = read_json(&sel.payload);
+        let top = state["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|kv| kv[0] == "TOP_TMP")
+            .and_then(|kv| kv[1].as_os())
+            .map(PathBuf::from)
+            .expect("the parent's world names TOP_TMP");
+        let pid = std::process::id() as i32;
+        let rec = Json::object([
+            ("pid", Json::from(pid)),
+            ("start", Json::from(start_time(pid).unwrap())),
+            ("chain", Json::from(&sel.chain[..])),
+        ]);
+        let mut log = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(top.join("children.jsonl"))
+            .unwrap();
+        log.write_all(format!("{}\n", json::dumps(&rec)).as_bytes())
+            .unwrap();
+        if sel.chain.len() > drive::MAX_DEPTH {
+            fs::write(top.join("too deep"), sel.chain.join(" > ")).unwrap();
+            std::process::exit(0);
+        }
+    }
+
+    /// Every drive child the test started (as `enter_chain` recorded them), once all are
+    /// gone; any still alive after 5 s is killed and fails the test.
+    fn children_gone(top: &Path) -> Vec<Json> {
+        let log = top.join("children.jsonl");
+        let children = if log.exists() {
+            read_jsonl(&log)
+        } else {
+            Vec::new()
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        while children.iter().any(recorded_alive) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let alive: Vec<&Json> = children.iter().filter(|c| recorded_alive(c)).collect();
+        for c in &alive {
+            if let Some(pid) = c["pid"].as_i64().and_then(|p| Pid::from_raw(p as i32)) {
+                let _ = kill_process(pid, Signal::KILL);
+            }
+        }
+        assert!(alive.is_empty(), "drive children still running: {alive:?}");
+        children
+    }
+
+    /// The chains the recorded children ran under, as `a > b`.
+    fn chains(children: &[Json]) -> Vec<String> {
+        children
+            .iter()
+            .map(|c| {
+                let labels: Vec<&str> = c["chain"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|l| l.as_str().unwrap())
+                    .collect();
+                labels.join(" > ")
+            })
+            .collect()
+    }
+
+    /// The crash child's drive: exit 97 at a harness crash point.
+    fn crash(c: &mut FakeSupervisor) -> Forked {
+        c.fork("crash", LONG, |c, _| {
+            c.env.set("LEADHAND_CRASH_AT", "before_commit");
+            c.crash_point("before_commit");
+        })
+    }
+
+    #[test]
+    fn a_worker_drive_forks_its_one_crash_child() {
+        enter_chain();
+        // The crash child goes straight to its own drive.
+        if drive::selected_for("crash").is_some() {
+            crash(&mut chain_world("crash", None));
+        }
+        let mut w = chain_world("worker", None);
+        let top = top_of(&w);
+        let forked = w.fork("worker", LONG, |w, _| {
+            let top = top_of(w);
+            let f = crash(&mut chain_world("crash", Some(&top)));
+            fs::write(
+                top.join("crash result"),
+                format!("{} {:?}", f.code, f.error),
+            )
+            .unwrap();
+        });
+        assert_eq!((forked.code, forked.error), (0, None), "{}", forked.output);
+        assert_eq!(
+            fs::read_to_string(top.join("crash result")).unwrap(),
+            "97 None"
+        );
+        let children = children_gone(&top);
+        assert_eq!(chains(&children), ["worker", "worker > crash"]);
+    }
+
+    #[test]
+    fn an_alternating_chain_is_refused_before_a_third_level() {
+        enter_chain();
+        // The mistake: the worker's fork runs again in the crash child (no branch on
+        // drive::selected() first), so worker → crash → worker → … would never end.
+        let mut w = chain_world("worker", None);
+        let top = top_of(&w);
+        let forked = w.fork("worker", LONG, |w, _| {
+            let top = top_of(w);
+            chain_world("crash", Some(&top)).fork("crash", LONG, |_, _| {});
+        });
+        assert_eq!(forked.code, 1, "{}", forked.output);
+        let error = forked.error.unwrap_or_default();
+        assert!(
+            error.contains("drive refused (its label is already in the chain): fork(\"worker\")"),
+            "{error}"
+        );
+        assert!(!top.join("too deep").exists(), "a third level started");
+        let children = children_gone(&top);
+        assert_eq!(chains(&children), ["worker", "worker > crash"]);
+    }
+
+    #[test]
+    fn a_child_reaching_an_earlier_fork_than_its_own_fails_loudly() {
+        enter_chain();
+        // The mistake: two drives in a row with no branch on drive::selected() first, so
+        // the child for "b" reaches fork("a") before its own.
+        let mut a = chain_world("a", None);
+        let top = top_of(&a);
+        let fa = a.fork("a", LONG, |_, _| {});
+        assert_eq!(fa.code, 0, "{}", fa.output);
+        let mut b = chain_world("b", Some(&top));
+        let message = assert_panics!(b.fork("b", LONG, |_, _| {}));
+        assert!(
+            message.contains("ended before reaching fork(\"b\")"),
+            "{message}"
+        );
+        assert!(
+            message.contains("drive refused (the child has not reached its own drive)"),
+            "{message}"
+        );
+        let children = children_gone(&top);
+        assert_eq!(chains(&children), ["a", "b"]);
+    }
+
+    #[test]
+    fn a_third_nesting_level_is_refused() {
+        enter_chain();
+        // Each child goes straight to its own drive, but the crash child's drive forks a
+        // third level.
+        if drive::selected_for("deeper").is_some() {
+            chain_world("deeper", None).fork("deeper", LONG, |_, _| {});
+        }
+        if drive::selected_for("crash").is_some() {
+            chain_world("crash", None).fork("crash", LONG, |c, _| {
+                let top = top_of(c);
+                chain_world("deeper", Some(&top)).fork("deeper", LONG, |_, _| {});
+            });
+        }
+        let mut w = chain_world("worker", None);
+        let top = top_of(&w);
+        let forked = w.fork("worker", LONG, |w, _| {
+            let top = top_of(w);
+            let f = chain_world("crash", Some(&top)).fork("crash", LONG, |_, _| {});
+            fs::write(top.join("crash error"), f.error.unwrap_or_default()).unwrap();
+        });
+        assert_eq!((forked.code, forked.error), (0, None), "{}", forked.output);
+        let error = fs::read_to_string(top.join("crash error")).unwrap();
+        assert!(
+            error.contains("drive refused (nesting past 2 levels): fork(\"deeper\")"),
+            "{error}"
+        );
+        assert!(!top.join("too deep").exists(), "a third level started");
+        let children = children_gone(&top);
+        assert_eq!(chains(&children), ["worker", "worker > crash"]);
     }
 }
