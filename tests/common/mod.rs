@@ -17,6 +17,7 @@
 pub mod drive;
 pub mod git;
 pub mod json;
+pub mod plugin;
 pub mod rundir;
 pub mod supervisor;
 
@@ -463,6 +464,48 @@ fn code_of(status: ExitStatus) -> i32 {
 }
 
 // --------------------------------------------------------------------------
+// The test's view of the process environment
+
+thread_local! {
+    static PATCHED: std::cell::RefCell<Vec<(OsString, OsString)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Variables laid over the process environment for the calling test's thread until the
+/// guard drops: the Rust form of `mock.patch.dict(os.environ, vars)`. The process
+/// environment itself is never changed (ruling S3-R19); `Env::new`/`with_options` and the
+/// Git helpers read it through `process_env`, so an `Env` made, or a fixture Git command
+/// run, while the guard lives sees `vars` too.
+#[must_use = "the variables are unset when the guard drops"]
+pub struct PatchedEnv {
+    previous: Vec<(OsString, OsString)>,
+}
+
+pub fn patch_env(vars: &[(&str, &str)]) -> PatchedEnv {
+    PATCHED.with(|p| {
+        let mut p = p.borrow_mut();
+        let previous = p.clone();
+        p.extend(vars.iter().map(|(k, v)| (k.into(), v.into())));
+        PatchedEnv { previous }
+    })
+}
+
+impl Drop for PatchedEnv {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.previous);
+        PATCHED.with(|p| *p.borrow_mut() = previous);
+    }
+}
+
+/// The process environment with this thread's `patch_env` variables over it (a later entry
+/// of the same name wins).
+pub fn process_env() -> Vec<(OsString, OsString)> {
+    let mut vars: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    PATCHED.with(|p| vars.extend(p.borrow().iter().cloned()));
+    vars
+}
+
+// --------------------------------------------------------------------------
 // Temporary roots and the sealed environment
 
 /// A new directory in the system temp dir, its name containing a space; removed on drop.
@@ -550,7 +593,7 @@ impl Env {
 
     /// `new` with the installed vendors and text appended to the user config.
     pub fn with_options(tmp: &Path, installed: &[&str], config_text: &str) -> Env {
-        Env::from_base(std::env::vars_os(), tmp, installed, config_text)
+        Env::from_base(process_env(), tmp, installed, config_text)
     }
 
     /// `with_options` over `base` in place of the test process's environment (a later entry

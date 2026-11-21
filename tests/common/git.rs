@@ -104,7 +104,8 @@ fn git(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 fn git_spawn(cwd: &Path, args: &[&str], spawn: super::Spawn) -> (i32, String, String) {
     confined(cwd);
     let ceiling = temp_dir();
-    let vars = std::env::vars_os()
+    let vars = super::process_env()
+        .into_iter()
         .filter(|(k, _)| !LEAKY_VARS.iter().any(|v| OsStr::new(v) == k))
         .chain(HERMETIC_ENV.iter().map(|(k, v)| (k.into(), v.into())))
         .chain([("GIT_CEILING_DIRECTORIES".into(), ceiling.into_os_string())]);
