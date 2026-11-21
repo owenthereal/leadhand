@@ -862,6 +862,22 @@ pub fn read_json(path: &Path) -> Json {
     json::parse(&fs::read(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display())))
 }
 
+/// Checks that `cond` stays true for a window of `seconds` (something must not happen);
+/// panics naming `what` as soon as it is false (`contract_dispatch.holds`).
+#[track_caller]
+pub fn holds(mut cond: impl FnMut() -> bool, seconds: f64, what: &str) {
+    let end = Instant::now() + Duration::from_secs_f64(seconds);
+    loop {
+        if !cond() {
+            panic!("{what}: no longer true within the {seconds} s window");
+        }
+        if Instant::now() > end {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// `bytes` as an OS string (for paths in files the binary wrote).
 pub fn os(bytes: &[u8]) -> OsString {
     OsString::from_vec(bytes.to_vec())
