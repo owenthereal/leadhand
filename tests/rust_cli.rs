@@ -184,8 +184,11 @@ mod surface {
 
 mod release_build {
     //! Review focus 4: a release build ignores every test hook (deliberate change 5).
+    //!
+    //! The world is contract_recovery's StableSupervisor, the crash matrix's, from
+    //! `common::recovery` (with its `operator`, `resume` and `final_state`).
     use std::cell::RefCell;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::fs;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
@@ -194,12 +197,10 @@ mod release_build {
     use rustix::process::{Pid, Signal, kill_process_group};
 
     use super::*;
-    use crate::common::git::run_git;
     use crate::common::json::Json;
-    use crate::common::supervisor::{
-        CardOpts, CliOpts, FakeSupervisor, Options, Step, card, card_with, run_dir,
-    };
-    use crate::common::{Env, TIMEOUT, TempRoot, cli, patch_env, run_argv};
+    use crate::common::recovery::{DATES, final_state, operator, resume, stable_supervisor};
+    use crate::common::supervisor::{FakeSupervisor, run_dir};
+    use crate::common::{Env, TIMEOUT, TempRoot, cli, jv, patch_env, py_str, run_argv};
 
     const HOOKS: [&str; 13] = [
         "LEADHAND_TESTING",
@@ -231,13 +232,6 @@ mod release_build {
         "before_gate_record",
     ];
 
-    // contract_recovery's constants and StableSupervisor, as this test uses them.
-    const RUN: &str = "leadhand/demo";
-    const NOTE: &str = "Use JSON; it is simpler.";
-    const CODEX_CARD: &str = "codex gpt-6-luna low";
-    const FIXED_DATE: &str = "2026-01-01T00:00:00+00:00";
-    const CARDS: [i64; 3] = [1, 2, 3];
-
     /// A process group that LEADHAND_CRASH_KILL_PGID names: it survives only if the hook is
     /// ignored. Killed with its group on drop.
     struct Decoy(Child);
@@ -267,191 +261,6 @@ mod release_build {
         fn drop(&mut self) {
             let _ = kill_process_group(Pid::from_child(&self.0), Signal::KILL);
             let _ = self.0.wait();
-        }
-    }
-
-    fn py_str(v: Option<&Json>) -> String {
-        match v {
-            None | Some(Json::Null) => "None".to_string(),
-            Some(Json::Num(n)) => n.clone(),
-            Some(s @ Json::Str(_)) => s.as_str().unwrap().to_string(),
-            Some(other) => other.to_string(),
-        }
-    }
-
-    fn requested(w: &FakeSupervisor, dispatch_id: &Json) -> Json {
-        w.events("dispatch_requested")
-            .into_iter()
-            .find(|e| &e["dispatch_id"] == dispatch_id)
-            .unwrap_or_else(|| panic!("no dispatch_requested for {dispatch_id}"))
-    }
-
-    /// A worker's work label: its card, attempt and step, never its dispatch ID
-    /// (StableSupervisor.label).
-    fn label(w: &FakeSupervisor, dispatch_id: &Json) -> String {
-        let e = requested(w, dispatch_id);
-        let kind = e["dispatch_kind"].as_str().unwrap().to_string();
-        let n = &e["card"];
-        if kind == "continue"
-            && let Some(c) = e.get("continues").filter(|c| !c.is_null() && **c != "")
-        {
-            return label(w, c);
-        }
-        if n.is_null() {
-            return format!("run-w{}-{kind}", py_str(e.get("wave")));
-        }
-        let seq = e["seq"].as_i64().unwrap();
-        let unparked = w
-            .events("unparked")
-            .iter()
-            .any(|u| u["card"] == *n && u["seq"].as_i64().unwrap() < seq);
-        let (n, attempt) = (py_str(Some(n)), py_str(e.get("attempt")));
-        if (kind == "implement" || kind == "answer") && unparked {
-            return format!("c{n}-a{attempt}-unparked");
-        }
-        format!("c{n}-a{attempt}-{kind}")
-    }
-
-    /// contract_recovery.StableSupervisor: three cards and the end-of-run gates. Card 1 asks a
-    /// product question and is parked; once card 2 is accepted the operator unparks it, and
-    /// it is integrated onto the moved run tip. Card 2 runs on Codex and has one fix round.
-    /// Card 3 ends SPENT and is escalated. Work is keyed to its label, and commit dates are
-    /// fixed (the caller's `patch_env`), so every run of the deck accepts the same SHAs.
-    fn stable() -> FakeSupervisor {
-        let mut w = FakeSupervisor::with_options(
-            &[
-                card(1),
-                card_with(
-                    2,
-                    CardOpts {
-                        route: Some(CODEX_CARD),
-                        ..CardOpts::default()
-                    },
-                ),
-                card(3),
-            ],
-            Options {
-                config: "preset = \"claude-only\"\n",
-                installed: &["claude", "codex"],
-                gates: true,
-                ..Options::default()
-            },
-        );
-        w.parks
-            .insert(1, "product decision: storage format".to_string());
-        let launch_log = w.tmp.join("launches.txt");
-        fs::write(&launch_log, "").unwrap();
-        w.launch_log = Some(launch_log);
-        w.work_label_fn = Some(Box::new(|w, a| label(w, &a["dispatch_id"])));
-        w.take_fn = Some(Box::new(|w, a| {
-            let status = |s: &str| Step {
-                status: Some(s.to_string()),
-                ..Step::default()
-            };
-            match label(w, &a["dispatch_id"]).as_str() {
-                "c1-a1-implement" => status("QUESTION"),
-                "c3-a1-implement" => status("SPENT"),
-                "c2-a1-review" => Step {
-                    verdict: Some("defects".to_string()),
-                    ..Step::default()
-                },
-                // production: a re-review follows
-                "c2-a1-fix" => Step {
-                    files: Some(vec![(
-                        "src/card2/fix.py".to_string(),
-                        "FIXED = 'c2-a1-fix'\n".to_string(),
-                    )]),
-                    ..Step::default()
-                },
-                _ => Step::default(),
-            }
-        }));
-        w
-    }
-
-    /// Unpark card 1 once card 2 is accepted (once), through the world's engine call.
-    fn operator(w: &FakeSupervisor) {
-        let events = w.events(None);
-        let parked = events
-            .iter()
-            .any(|e| e["kind"] == "parked" && e["card"] == 1);
-        let accepted = events
-            .iter()
-            .any(|e| e["kind"] == "accepted" && e["card"] == 2);
-        if parked && accepted && !events.iter().any(|e| e["kind"] == "unparked") {
-            w.engine_cli(&os_args![
-                "unpark",
-                run_dir(w),
-                "--card",
-                "1",
-                "--note",
-                NOTE
-            ])
-            .ok();
-        }
-    }
-
-    /// What a relaunch does: a new supervisor session, then `run` with the fake Claude on
-    /// PATH, which records `resumed` (contract_recovery.resume).
-    fn resume(w: &mut FakeSupervisor) {
-        w.session("supervisor-2");
-        let path = w.env.path_with_fakes();
-        w.cli_with(
-            &os_args!["run", run_dir(w)],
-            CliOpts {
-                env: vec![("PATH".into(), path)],
-                ..CliOpts::default()
-            },
-        )
-        .ok();
-    }
-
-    /// Each card's state, from `status RUN_DIR`'s card lines (contract_recovery.card_states).
-    fn card_states(w: &FakeSupervisor) -> BTreeMap<i64, String> {
-        let r = w.cli(&os_args!["status", run_dir(w)]).ok();
-        let stdout = r.stdout_text();
-        CARDS
-            .iter()
-            .map(|&n| {
-                let prefix = format!("Card {n}: Card number {n} · ");
-                let line = stdout
-                    .lines()
-                    .find_map(|l| l.strip_prefix(&prefix))
-                    .unwrap_or_else(|| panic!("no line for card {n} in status:\n{stdout}"));
-                (n, line.split(" · ").next().unwrap().to_string())
-            })
-            .collect()
-    }
-
-    #[derive(Debug, PartialEq)]
-    struct FinalState {
-        outcome: (String, String),
-        cards: BTreeMap<i64, String>,
-        accepted: BTreeMap<i64, String>,
-        head: String,
-        tree: String,
-    }
-
-    fn final_state(w: &FakeSupervisor) -> FinalState {
-        let out = w.events("outcome").pop().expect("no outcome event");
-        FinalState {
-            outcome: (py_str(out.get("outcome")), py_str(out.get("qualifier"))),
-            cards: card_states(w),
-            accepted: w
-                .events("accepted")
-                .iter()
-                .map(|e| {
-                    (
-                        e["card"].as_i64().unwrap(),
-                        e["sha"].as_str().unwrap().to_string(),
-                    )
-                })
-                .collect(),
-            head: w.branch_tip(RUN),
-            tree: run_git(
-                &w.repo,
-                &["rev-parse", &format!("refs/heads/{RUN}^{{tree}}")],
-            ),
         }
     }
 
@@ -488,7 +297,10 @@ mod release_build {
     fn action_ids(actions: &[Json]) -> Vec<(String, String)> {
         actions
             .iter()
-            .map(|a| (py_str(a.get("action")), py_str(a.get("dispatch_id"))))
+            .map(|a| {
+                let did = a.get("dispatch_id").unwrap_or(&Json::Null);
+                (py_str(&a["action"]), py_str(did))
+            })
             .collect()
     }
 
@@ -560,10 +372,7 @@ mod release_build {
         // `next` gets every hook set, with LEADHAND_CRASH_AT naming a point the same call of
         // the reference run passed, until each such point is named: it must never crash, log,
         // count or signal, and must reach the same final state.
-        let _dates = patch_env(&[
-            ("GIT_AUTHOR_DATE", FIXED_DATE),
-            ("GIT_COMMITTER_DATE", FIXED_DATE),
-        ]);
+        let _dates = patch_env(&DATES);
         let mut points: Vec<&str> = vec!["before_worker_launch", "after_worker_launch"];
         let mut sorted_next = NEXT_POINTS.to_vec();
         sorted_next.sort();
@@ -586,10 +395,10 @@ mod release_build {
             });
             r.json()
         };
-        let mut reference_world = stable();
+        let mut reference_world = stable_supervisor();
         let reference = drive(&mut reference_world, &mut reference_next, &|| false);
         let expected = final_state(&reference_world);
-        assert_eq!(expected.outcome, ("complete".to_string(), String::new()));
+        assert_json_eq!(expected["outcome"], jv(r#"["complete", ""]"#));
         let on_path: BTreeSet<String> = passed.iter().flatten().cloned().collect();
         assert_eq!(on_path, next_points);
 
@@ -622,10 +431,10 @@ mod release_build {
             r.json()
         };
 
-        let mut w = stable();
+        let mut w = stable_supervisor();
         let actions = drive(&mut w, &mut release_next, &|| false);
         assert_eq!(action_ids(&actions), action_ids(&reference));
-        assert_eq!(final_state(&w), expected);
+        assert_json_eq!(final_state(&w), expected);
         assert!(!w.events("reconciled").is_empty());
         // One call passes several points (the reconciling one passes four), and one `next`
         // names one: the same run again, as far as it takes to name the rest.
@@ -634,7 +443,7 @@ mod release_build {
             if all_named() {
                 break;
             }
-            let mut again = stable();
+            let mut again = stable_supervisor();
             drive(&mut again, &mut release_next, &all_named);
         }
         assert_eq!(*named.borrow(), next_points);

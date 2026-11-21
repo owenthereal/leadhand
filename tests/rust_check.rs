@@ -15,7 +15,7 @@ use std::path::Path;
 
 use common::json::{self, Json};
 use common::supervisor::FakeSupervisor;
-use common::{Out, key_set, resolve, set_of};
+use common::{Out, key_set, py_str, resolve, set_of};
 
 const NOT_SUPPORTED: &str = "not supported in this version: ";
 
@@ -55,16 +55,6 @@ fn check_in(w: &FakeSupervisor, repo: &Path, flags: &[&str]) -> Out {
     ];
     args.extend(flags.iter().map(std::ffi::OsStr::new));
     w.cli(&args)
-}
-
-/// Python's `str()` of a JSON value read back (`None`, an int, a string).
-fn py_str(v: &Json) -> String {
-    match v {
-        Json::Null => "None".to_string(),
-        Json::Num(n) => n.clone(),
-        Json::Str(_) => v.as_str().unwrap().to_string(),
-        other => other.to_string(),
-    }
 }
 
 mod check {

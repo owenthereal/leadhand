@@ -39,4 +39,4 @@ contract_self.Tags.test_rust_only_runs_once_every_command_it_uses_is_rust -> ret
 # --------------------------------------------------------------------------
 # The catalogue (contract_catalogue.py -> tests/catalogue.rs, Task 7)
 
-contract_catalogue.Catalogue.test_every_python_test_is_catalogued -> catalogue::every_catalogue_row_names_an_existing_test  # its row-integrity assertions carry over; "every Python test has a row" retires with the Python unit tests
+contract_catalogue.Catalogue.test_every_python_test_is_catalogued -> catalogue::every_catalogue_row_names_an_existing_test  # its row-integrity assertions carry over, and so does "every Python test has a row" (it reads tests/test_*.py), until Task 10 retires the Python unit tests

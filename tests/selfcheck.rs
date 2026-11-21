@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use common::json::{self, Json};
+use common::rust_src::code_only;
 use common::{Env, TempRoot, read_jsonl, run_argv};
 
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -254,106 +255,6 @@ fn inherited_hooks_are_dropped() {
 
 // --------------------------------------------------------------------------
 // The tests use the crate's library only as `leadhand::procs`
-
-/// The text of Rust source with comments and string and character literals blanked out
-/// (newlines kept), so only code is searched.
-fn code_only(src: &str) -> String {
-    let c: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
-    let blank = |out: &mut String, ch: char| out.push(if ch == '\n' { '\n' } else { ' ' });
-    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
-    let mut i = 0;
-    while i < c.len() {
-        let prev_ident = i > 0 && ident(c[i - 1]);
-        if c[i] == '/' && c.get(i + 1) == Some(&'/') {
-            while i < c.len() && c[i] != '\n' {
-                blank(&mut out, c[i]);
-                i += 1;
-            }
-        } else if c[i] == '/' && c.get(i + 1) == Some(&'*') {
-            let mut depth = 0;
-            while i < c.len() {
-                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    out.push_str("  ");
-                    i += 2;
-                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    out.push_str("  ");
-                    i += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    blank(&mut out, c[i]);
-                    i += 1;
-                }
-            }
-        } else if !prev_ident && raw_string_start(&c, i).is_some() {
-            let (hashes, quote) = raw_string_start(&c, i).unwrap();
-            let mut j = quote + 1;
-            while j < c.len() && !(c[j] == '"' && (1..=hashes).all(|h| c.get(j + h) == Some(&'#')))
-            {
-                j += 1;
-            }
-            let end = (j + 1 + hashes).min(c.len());
-            for &ch in &c[i..end] {
-                blank(&mut out, ch);
-            }
-            i = end;
-        } else if c[i] == '"' {
-            blank(&mut out, c[i]);
-            i += 1;
-            while i < c.len() && c[i] != '"' {
-                if c[i] == '\\' {
-                    blank(&mut out, c[i]);
-                    i += 1;
-                }
-                if i < c.len() {
-                    blank(&mut out, c[i]);
-                    i += 1;
-                }
-            }
-            if i < c.len() {
-                blank(&mut out, c[i]);
-                i += 1;
-            }
-        } else if c[i] == '\'' && (c.get(i + 1) == Some(&'\\') || c.get(i + 2) == Some(&'\'')) {
-            // A character literal ('x' or an escape); a lifetime has no closing quote.
-            let mut j = i + 1;
-            if c[j] == '\\' {
-                j += 2;
-            }
-            while j < c.len() && c[j] != '\'' {
-                j += 1;
-            }
-            let end = (j + 1).min(c.len());
-            for &ch in &c[i..end] {
-                blank(&mut out, ch);
-            }
-            i = end;
-        } else {
-            out.push(c[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
-/// For `r"`, `r#"`, `br"`, `cr#"` and the like at `i`: the number of `#`s and the index of
-/// the opening quote.
-fn raw_string_start(c: &[char], i: usize) -> Option<(usize, usize)> {
-    let mut j = i;
-    if matches!(c.get(j), Some('b' | 'c')) {
-        j += 1;
-    }
-    if c.get(j) != Some(&'r') {
-        return None;
-    }
-    j += 1;
-    let hashes = c[j..].iter().take_while(|&&ch| ch == '#').count();
-    (c.get(j + hashes) == Some(&'"')).then_some((hashes, j + hashes))
-}
 
 /// Every use of the crate's library in `src` other than `leadhand::procs`: each
 /// `leadhand::<item>` path, each item of a `leadhand::{...}` group, and a `use` or

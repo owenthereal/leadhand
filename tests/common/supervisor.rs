@@ -345,6 +345,21 @@ impl Proc {
     }
 }
 
+/// Its exit code once it has exited within `timeout`; None when it is still running
+/// (`Popen.wait(timeout)` raising TimeoutExpired).
+pub fn wait_timeout(p: &Proc, timeout: Duration) -> Option<i32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(code) = p.poll() {
+            return Some(code);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 // --------------------------------------------------------------------------
 // The world
 
@@ -1441,6 +1456,20 @@ impl FakeSupervisor {
         deadline: Duration,
         f: impl FnOnce(&mut FakeSupervisor, i32),
     ) -> Forked {
+        self.fork_noting(label, deadline, |_| {}, f)
+    }
+
+    /// `fork`, with `started(pid)` called in the parent once the drive child has started,
+    /// before the wait: Python's parent noting the forked child's pid (the crash matrix
+    /// records its crash child's group, for the cleanup of a worker killed at its deadline).
+    #[track_caller]
+    pub fn fork_noting(
+        &mut self,
+        label: &str,
+        deadline: Duration,
+        started: impl FnOnce(i32),
+        f: impl FnOnce(&mut FakeSupervisor, i32),
+    ) -> Forked {
         let slug: String = label
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -1473,7 +1502,14 @@ impl FakeSupervisor {
         let _ = fs::remove_file(&reached);
         fs::write(&state, json::dumps(&self.state()))
             .unwrap_or_else(|e| panic!("writing {}: {e}", state.display()));
-        let ended = drive::start(&drive::this_test(), label, &state, &output).wait(deadline);
+        let child = drive::start(&drive::this_test(), label, &state, &output);
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| started(child.pid()))) {
+            // Leave nothing running: the child's group is killed and the child reaped.
+            child.kill_group();
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| child.wait(Duration::ZERO)));
+            panic::resume_unwind(payload);
+        }
+        let ended = child.wait(deadline);
         // A child that died before its drive began (a panic in attach_drive or script, say:
         // libtest's exit 101) has no drive outcome to report: fail with what it printed.
         if !reached.exists() {

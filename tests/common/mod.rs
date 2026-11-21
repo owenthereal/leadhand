@@ -21,7 +21,10 @@ pub mod git;
 pub mod json;
 pub mod launch_world;
 pub mod plugin;
+#[macro_use]
+pub mod recovery;
 pub mod rundir;
+pub mod rust_src;
 pub mod supervisor;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1184,6 +1187,21 @@ pub fn add_days(date: &str, days: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Python's `str()` of a JSON value read back, as an f-string prints it: `None`, an int's
+/// digits, a string's text (anything else as JSON).
+#[track_caller]
+pub fn py_str(v: &Json) -> String {
+    match v {
+        Json::Null => "None".to_string(),
+        Json::Num(n) => n.clone(),
+        Json::Str(_) => v
+            .as_str()
+            .unwrap_or_else(|| panic!("not a UTF-8 string: {v}"))
+            .to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// A JSON literal, parsed by the harness decoder.

@@ -50,7 +50,7 @@ use common::json::Json;
 use common::rundir::append_event;
 use common::supervisor::{
     CardOpts, CliOpts, FakeSupervisor, Options, Proc, Step, card, card_with, os_path, run_dir,
-    text, truthy,
+    text, truthy, wait_timeout,
 };
 use common::{
     Out, TIMEOUT, bin, field, hold_lock, is_bin_command, json_in, jv, lines, one, path_str as s,
@@ -1865,21 +1865,6 @@ fn timer_proc(w: &mut FakeSupervisor, dispatch_id: &str) -> Proc {
     let p = Proc::new(child);
     w.proxies.push(p.clone());
     p
-}
-
-/// Its exit code once it has exited within `timeout`; None when it is still running
-/// (`Popen.wait(timeout)` raising TimeoutExpired).
-fn wait_timeout(p: &Proc, timeout: Duration) -> Option<i32> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(code) = p.poll() {
-            return Some(code);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
 }
 
 mod timer {
