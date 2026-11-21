@@ -11,6 +11,9 @@ Run the suite from the repository root:
 - With LEADHAND_BIN=tests/contract/router (router mode), the router sends the commands in
   LEADHAND_RUST_COMMANDS to LEADHAND_RUST_BIN and the rest to LEADHAND_PY_BIN (default
   <repo>/scripts/leadhand). Both are resolved like LEADHAND_BIN.
+- LEADHAND_FAKES_DIR: the folder holding the fake `codex` and `claude` (default
+  <repo>/tests/fakes), resolved like LEADHAND_BIN: a folder of symlinks to the Rust fakes
+  runs the suite against them.
 
 Nothing here imports the leadhand package.
 """
@@ -54,7 +57,7 @@ if os.path.realpath(BIN) == os.path.realpath(ROUTER) and "LEADHAND_TEST_CLI" in 
     # would be dropped, and each binary would then name itself, bypassing the router.
     raise RuntimeError("LEADHAND_TEST_CLI is set, but with LEADHAND_BIN as the router the suite sets it "
                        "itself: unset it and run again")
-FAKES = ROOT / "tests" / "fakes"
+FAKES = _bin_var("LEADHAND_FAKES_DIR") or ROOT / "tests" / "fakes"
 COMMANDS = ("cancel", "check", "dispatch", "dispatch-runner", "launch-line", "next", "pause", "record", "report",
             "route", "run", "start", "status", "stop-dispatch", "timer", "unpark", "version")
 
