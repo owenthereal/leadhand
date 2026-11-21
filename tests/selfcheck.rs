@@ -867,12 +867,16 @@ fn fake_claude_logs_argv_cwd_and_env() {
 // Forked drives: the test binary re-executed as a drive child (ruling S3-R23)
 
 mod drive_child {
+    use std::ffi::OsString;
     use std::fs;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
     use rustix::process::{Pid, Signal, kill_process};
 
+    use crate::common::drive;
     use crate::common::json::{self, Json};
     use crate::common::start_time;
     use crate::common::supervisor::{FakeSupervisor, Step, card, recorded_alive};
@@ -974,6 +978,56 @@ mod drive_child {
         });
         assert_eq!((forked.code, forked.hung), (1, false), "{}", forked.output);
         assert_eq!(forked.error.as_deref(), Some("the drive broke"));
+    }
+
+    #[test]
+    fn a_child_that_forks_its_own_drive_without_attaching_is_refused() {
+        const LABEL: &str = "own label";
+        // A second-level drive child (one that only a missing guard would start): it records
+        // itself in the top parent's tmp, which the first-level child told it about, and
+        // stops at once, so even without the guard no chain can form.
+        if let Some(sel) = drive::selected_for(LABEL)
+            && let Ok(top) = fs::read(sel.payload.parent().unwrap().join("top tmp"))
+        {
+            let top = PathBuf::from(OsString::from_vec(top));
+            fs::write(top.join("second level started"), "").unwrap();
+            std::process::exit(0);
+        }
+        // The mistake under test: the world does not come from attach_drive(LABEL).
+        let mut w = FakeSupervisor::new(&[card(1)]);
+        if let Some(sel) = drive::selected_for(LABEL) {
+            // The first-level child: where a second level would report.
+            let top = sel.payload.parent().unwrap().as_os_str().as_bytes();
+            fs::write(w.tmp.join("top tmp"), top).unwrap();
+        }
+        let second = w.tmp.join("second level started");
+        let message = assert_panics!(w.fork(LABEL, Duration::from_secs(30), |_, _| {}));
+        assert!(
+            message.contains("ended before reaching fork(\"own label\")"),
+            "{message}"
+        );
+        assert!(
+            message.contains("with a world not from FakeSupervisor::attach_drive(\"own label\")"),
+            "{message}"
+        );
+        assert!(!second.exists(), "a second-level drive child started");
+    }
+
+    #[test]
+    fn a_child_that_dies_before_its_drive_fails_the_parent_with_its_output() {
+        let mut w = world("dies early");
+        if drive::selected_for("dies early").is_some() {
+            panic!("the child broke before its drive");
+        }
+        let message = assert_panics!(w.fork("dies early", Duration::from_secs(30), |_, _| {}));
+        assert!(
+            message.contains("ended before reaching fork(\"dies early\")"),
+            "{message}"
+        );
+        assert!(
+            message.contains("the child broke before its drive"),
+            "{message}"
+        );
     }
 
     #[test]
