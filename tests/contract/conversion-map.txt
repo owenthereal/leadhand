@@ -34,7 +34,7 @@ contract_self.HermeticEnv.test_inherited_hooks_are_dropped -> selfcheck::inherit
 contract_self.NoPackageImport.test_contract_files_never_import_leadhand -> selfcheck::contract_tests_use_the_crate_only_for_procs  # the Rust form of the rule: no use of the crate's library in tests/ other than leadhand::procs
 contract_self.NoPackageImport.test_e2e_drivers_never_import_leadhand -> selfcheck::live_tests_use_the_crate_only_for_procs  # the same rule over tests/live*; the Python's check that its two drivers exist has no Rust form until Task 8 writes tests/live*, so the twin checks its file selection instead
 contract_self.Tags.test_reference_only_skips_under_rust -> selfcheck::rust_only_skips_under_python  # reference-only tests are not converted (spec); this tests the tag the Rust suite has, with the same skip-or-run assertions mirrored
-contract_self.Tags.test_rust_only_runs_once_every_command_it_uses_is_rust -> retired: the stage-2 mixed mode (LEADHAND_RUST_COMMANDS behind the router) leaves with the Python; the Rust rust_only tag depends on LEADHAND_IMPL alone, and selfcheck::rust_only_skips_under_python checks both its skip and its run
+contract_self.Tags.test_rust_only_runs_once_every_command_it_uses_is_rust -> retired: the stage-2 mixed mode (LEADHAND_RUST_COMMANDS behind the router) leaves with the Python; the Rust rust_only tag depends on LEADHAND_IMPL alone, selfcheck::rust_only_skips_under_python checks its skip-or-run decision for each LEADHAND_IMPL, and selfcheck::rust_only_skips_and_says_so_only_under_python checks rust_only() itself, run in a child under each
 
 # --------------------------------------------------------------------------
 # The catalogue (contract_catalogue.py -> tests/catalogue.rs, Task 7)

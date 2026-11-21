@@ -33,7 +33,8 @@ What it compares:
    A twin with fewer assertions than its Python test is an error. A Python test that counts
    0 (its assertions all in helper methods) is listed in the output, for the reviewer to
    compare by hand, and its twin must count at least 1.
-4. What a twin may not be (ruling S3-R21): `#[ignore]` or `#[should_panic]`, either of which
+4. What a twin may not be (ruling S3-R21): `#[ignore]` or `#[should_panic]`, directly or inside
+   another attribute such as `#[cfg_attr(<pred>, ignore)]`, either of which
    lets it pass without checking anything; nor may it call `rust_only()` (and so skip under
    LEADHAND_IMPL=python) unless its Python test is itself Rust-only (@rust_only on the
    method or its class).
@@ -262,8 +263,8 @@ TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|::|->|=>|\S")
 class RustFn:
     asserts: int
     is_test: bool
-    ignored: bool        # #[ignore]
-    should_panic: bool   # #[should_panic]
+    ignored: bool        # ignore, in any of its attributes (cfg_attr included)
+    should_panic: bool   # should_panic, likewise
     rust_only: bool      # calls rust_only()
 
 
@@ -324,8 +325,9 @@ def rust_functions(path: Path) -> dict[tuple[str, ...], RustFn]:
                         and body[k + 2] in ("(", "[", "{"))
             calls_rust_only = any(body[k] == "rust_only" and body[k + 1] == "("
                                   for k in range(len(body) - 1))
-            heads = [a.split(" ")[0] for a in attrs]
-            fn = RustFn(count, "test" in attrs, "ignore" in heads, "should_panic" in heads, calls_rust_only)
+            # Every token of every attribute, so `#[cfg_attr(<pred>, ignore)]` counts too.
+            words = {w for a in attrs for w in a.split(" ")}
+            fn = RustFn(count, "test" in attrs, "ignore" in words, "should_panic" in words, calls_rust_only)
             key = tuple(m[0] for m in mods) + (name,)
             if key not in found or (fn.is_test and not found[key].is_test):
                 found[key] = fn
@@ -464,9 +466,9 @@ def main(argv: list[str]) -> int:
                 bad.append("has no assertion; its Python test counts 0 (its checks are in helpers), so the "
                            "twin needs at least 1")
         if fn.ignored:
-            bad.append("is #[ignore]")
+            bad.append("is ignored (#[ignore], or an attribute such as cfg_attr holding it)")
         if fn.should_panic:
-            bad.append("is #[should_panic]")
+            bad.append("is should-panic (#[should_panic], or an attribute such as cfg_attr holding it)")
         if fn.rust_only and not test.rust_only:
             bad.append("calls rust_only(), so it skips under LEADHAND_IMPL=python, but its Python test is a "
                        "parity test, not @rust_only")

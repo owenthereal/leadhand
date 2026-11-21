@@ -544,13 +544,59 @@ fn rust_only_skips_under_python() {
     ] {
         assert_eq!(outcome(value), want, "LEADHAND_IMPL={value:?}");
     }
-    // rust_only() itself reads this process's LEADHAND_IMPL; calling it here would read to
-    // check_conversion.py as a skip.
-    let this_process = std::env::var_os("LEADHAND_IMPL");
-    assert_eq!(
-        common::rust_only_under(this_process.as_deref()),
-        common::impl_is_python()
-    );
+}
+
+/// Set in the child that `rust_only_skips_and_says_so_only_under_python` starts: the probe
+/// below then reports what `rust_only()` did.
+const PROBE: &str = "LEADHAND_SELFCHECK_RUST_ONLY_PROBE";
+
+/// Not a check on its own: under PROBE it calls the real `rust_only()` and prints what it
+/// returned, for the test below to read. Otherwise it does nothing.
+#[test]
+fn rust_only_probe() {
+    if std::env::var_os(PROBE).is_some() {
+        let skipped = common::rust_only();
+        println!("probe: rust_only() returned {skipped}");
+    }
+}
+
+/// The real tag, `rust_only()`, which every Rust-only test skips through: it skips, after
+/// printing `skipped: rust-only`, only under LEADHAND_IMPL=python. Each case runs this test
+/// binary again as a child with that LEADHAND_IMPL (this process's environment is never
+/// changed), running only `rust_only_probe`.
+#[test]
+fn rust_only_skips_and_says_so_only_under_python() {
+    let exe = std::env::current_exe().unwrap();
+    for (value, skips) in [
+        (None, false),
+        (Some(""), false),
+        (Some("rust"), false),
+        (Some("python"), true),
+    ] {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args([
+            "--exact",
+            "rust_only_probe",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(PROBE, "1")
+        .stdin(std::process::Stdio::null());
+        match value {
+            Some(v) => cmd.env("LEADHAND_IMPL", v),
+            None => cmd.env_remove("LEADHAND_IMPL"),
+        };
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let what = format!("LEADHAND_IMPL={value:?}: {stdout}");
+        assert!(out.status.success(), "{what}");
+        assert!(
+            stdout.contains(&format!("probe: rust_only() returned {skips}\n")),
+            "{what}"
+        );
+        assert_eq!(stdout.contains("skipped: rust-only\n"), skips, "{what}");
+    }
 }
 
 // --------------------------------------------------------------------------
