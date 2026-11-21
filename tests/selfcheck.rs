@@ -380,12 +380,24 @@ fn crate_uses(src: &str) -> Vec<String> {
         if c.get(j) == Some(&':') && c.get(j + 1) == Some(&':') {
             let k = skip_ws(j + 2);
             if c.get(k) == Some(&'{') {
-                let close = c[k..]
-                    .iter()
-                    .position(|&ch| ch == '}')
-                    .map_or(c.len(), |p| k + p);
-                let group: String = c[k + 1..close].iter().collect();
-                for item in group.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                // The group's top-level items, each with any nested group of its own
+                // (`procs::{identify}`), up to the brace that closes the group.
+                let mut items = vec![String::new()];
+                let mut depth = 0;
+                for &ch in &c[k + 1..] {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' if depth == 0 => break,
+                        '}' => depth -= 1,
+                        ',' if depth == 0 => {
+                            items.push(String::new());
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    items.last_mut().unwrap().push(ch);
+                }
+                for item in items.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
                     let head: String = item.chars().take_while(|&ch| ident(ch)).collect();
                     if head != "procs" {
                         found.push(format!("leadhand::{{{item}}}"));
@@ -448,7 +460,15 @@ fn uses_in(files: &[PathBuf], tests: &Path) -> Vec<String> {
 
 #[test]
 fn contract_tests_use_the_crate_only_for_procs() {
-    let samples: [(&str, &[&str]); 9] = [
+    let samples: [(&str, &[&str]); 11] = [
+        (
+            "use leadhand::{procs::{identify}, engine};",
+            &["leadhand::{engine}"],
+        ),
+        (
+            "use leadhand::{procs::{identify, same_process}, wire::{a, b}};",
+            &["leadhand::{wire::{a, b}}"],
+        ),
         ("use leadhand::engine;", &["leadhand::engine"]),
         ("use leadhand::procs;", &[]),
         ("    let x = leadhand::state::read();", &["leadhand::state"]),
@@ -524,7 +544,13 @@ fn rust_only_skips_under_python() {
     ] {
         assert_eq!(outcome(value), want, "LEADHAND_IMPL={value:?}");
     }
-    assert_eq!(common::rust_only(), common::impl_is_python());
+    // rust_only() itself reads this process's LEADHAND_IMPL; calling it here would read to
+    // check_conversion.py as a skip.
+    let this_process = std::env::var_os("LEADHAND_IMPL");
+    assert_eq!(
+        common::rust_only_under(this_process.as_deref()),
+        common::impl_is_python()
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -568,6 +594,44 @@ fn json_parse_keeps_distinct_strings_distinct() {
         json::parse(br#""\udced\udca0\udc80""#)
     );
     assert_eq!(json::parse(br#""\ud83d\ude00""#), Json::Str("😀".into()));
+}
+
+#[test]
+fn json_python_equality_compares_dicts_and_numbers_as_python_does() {
+    let p = |text: &str| json::parse(text.as_bytes());
+    // Equal under Python's ==, though not under the derived (textual, ordered) ==.
+    for (a, b) in [
+        (r#"{"a": 1, "b": [2, "x"]}"#, r#"{"b": [2.0, "x"], "a": 1}"#),
+        (r#"{"a": 1, "a": 2}"#, r#"{"a": 2}"#),
+        ("1.5", "1.50"),
+        ("1", "1.0"),
+        ("-0", "0.0"),
+        ("true", "1"),
+        ("100", "1e2"),
+        ("12345678901234567890", "12345678901234567890"),
+    ] {
+        assert!(json::py_eq(&p(a), &p(b)), "{a} == {b}");
+        assert_json_eq!(p(a), &p(b), "{a} == {b}");
+    }
+    // Unequal under Python's == too.
+    for (a, b) in [
+        ("[1, 2]", "[2, 1]"),
+        (r#"{"a": 1}"#, r#"{"a": 1, "b": 2}"#),
+        (r#"{"a": 1, "a": 2}"#, r#"{"a": 1}"#),
+        ("1.5", "1"),
+        ("9007199254740993", "9007199254740992.0"),
+        ("null", "0"),
+        (r#""1""#, "1"),
+        (r#""é""#, r#""\udcc3\udca9""#),
+    ] {
+        assert!(!json::py_eq(&p(a), &p(b)), "{a} != {b}");
+    }
+    assert_ne!(p("1.5"), p("1.50"), "the derived == stays textual");
+    let text = assert_panics!(assert_json_eq!(p("[1, 2]"), p("[2, 1]")));
+    assert!(
+        text.contains("left: [1, 2]") && text.contains("right: [2, 1]"),
+        "{text}"
+    );
 }
 
 // --------------------------------------------------------------------------

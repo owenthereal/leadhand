@@ -13,6 +13,11 @@
 # <file>::<path in tests/<file>.rs>. A note starts at the first " # " after the target and
 # runs to the end of the line; check_conversion.py prints every note and every retired
 # reason. A retired entry needs a reason, and no two Python tests may name the same Rust test.
+#
+# A twin, named here or by default, must hold at least as many assertions as its Python test
+# (at least one when the Python test counts none), must not be #[ignore] or #[should_panic],
+# and must not skip under Python through rust_only() unless its Python test is @rust_only
+# (rulings S3-R6, S3-R21; check_conversion.py's docstring gives the counting rules).
 
 # --------------------------------------------------------------------------
 # The harness's own tests (contract_self.py -> tests/selfcheck.rs). Static: they never run

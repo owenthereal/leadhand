@@ -55,6 +55,27 @@ macro_rules! assert_panics {
     };
 }
 
+/// `assert_eq!` for parsed JSON with Python's equality (`json::py_eq`): objects compare as
+/// dicts (duplicate keys collapsed, last value winning, in any order) and numbers by value
+/// (`1 == 1.0`, `1.5 == 1.50`). Use it wherever a Python test compares parsed JSON with
+/// `assertEqual`; the derived `==` on `Json` is stricter. Each side is a `Json` or `&Json`;
+/// an optional message follows, as for `assert_eq!`.
+macro_rules! assert_json_eq {
+    ($left:expr, $right:expr $(,)?) => {
+        assert_json_eq!($left, $right, "")
+    };
+    ($left:expr, $right:expr, $($arg:tt)+) => {{
+        let left: &$crate::common::json::Json = &$left;
+        let right: &$crate::common::json::Json = &$right;
+        if !$crate::common::json::py_eq(left, right) {
+            panic!(
+                "assertion `left == right` failed (Python equality of JSON) {}\n  left: {left}\n right: {right}",
+                format_args!($($arg)+)
+            );
+        }
+    }};
+}
+
 /// The message of the panic `f` raises, or None when it returns.
 pub fn panic_message(f: impl FnOnce()) -> Option<String> {
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).err()?;

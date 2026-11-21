@@ -350,6 +350,67 @@ fn quote(s: &[u8], out: &mut String) {
     out.push('"');
 }
 
+// --------------------------------------------------------------------------
+// Python's equality
+
+/// A JSON scalar as Python's numeric tower sees it: `bool` is an `int` (True == 1).
+enum PyNum {
+    /// An integer, as canonical decimal text (`-0` is `0`).
+    Int(String),
+    Float(f64),
+}
+
+fn py_num(v: &Json) -> Option<PyNum> {
+    match v {
+        Json::Bool(b) => Some(PyNum::Int(if *b { "1" } else { "0" }.to_string())),
+        Json::Num(text) => {
+            let digits = text.strip_prefix('-').unwrap_or(text);
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                Some(PyNum::Int(number(text)))
+            } else {
+                text.parse().ok().map(PyNum::Float)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn num_eq(a: &PyNum, b: &PyNum) -> bool {
+    match (a, b) {
+        (PyNum::Int(x), PyNum::Int(y)) => x == y,
+        (PyNum::Float(x), PyNum::Float(y)) => x == y,
+        // Python compares an int with a float exactly.
+        (PyNum::Int(i), PyNum::Float(f)) | (PyNum::Float(f), PyNum::Int(i)) => {
+            f.is_finite() && f.fract() == 0.0 && number(&format!("{f:.0}")) == *i
+        }
+    }
+}
+
+/// Python's `==` on the values `json.loads` makes of `a` and `b`, as `assertEqual` compares
+/// them: objects as dicts (a repeated key collapsed to its last value, member order
+/// ignored), arrays item by item, strings by their code points, and numbers and booleans by
+/// value (`1 == 1.0 == true`, `1.5 == 1.50`; NaN equals nothing). `null` equals only `null`.
+/// The derived `==` on `Json` is stricter: it compares members in order and numbers as text.
+pub fn py_eq(a: &Json, b: &Json) -> bool {
+    if let (Some(x), Some(y)) = (py_num(a), py_num(b)) {
+        return num_eq(&x, &y);
+    }
+    match (a, b) {
+        (Json::Null, Json::Null) => true,
+        (Json::Str(x), Json::Str(y)) => x == y,
+        (Json::Arr(x), Json::Arr(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| py_eq(p, q))
+        }
+        (Json::Obj(x), Json::Obj(y)) => {
+            let (x, y) = (dict(x), dict(y));
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.iter().any(|(k2, v2)| k == k2 && py_eq(v, v2)))
+        }
+        _ => false,
+    }
+}
+
 impl fmt::Display for Json {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&dumps(self))

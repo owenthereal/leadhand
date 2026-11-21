@@ -20,25 +20,37 @@ What it compares:
    letter follows (`HTTPServer` -> `http_server`), then lower-cases; a result that is a Rust
    keyword gets a trailing `_` (`Loop` -> `loop_`), as no module can be named `loop`.
    `tests/contract/conversion-map.txt` overrides the default; its header gives its syntax.
-3. Assertion counts (ruling S3-R6), per test, in the test function's own body: everything
-   lexically inside the `def` or `fn`, nested functions and closures included, each written
-   assertion counted once however often it runs.
-   - Python: calls `self.assert*(...)` and `assert` statements.
+3. Assertion counts (rulings S3-R6, S3-R21), per test, in the test function's own body:
+   everything lexically inside the `def` or `fn`, nested functions and closures included,
+   each written assertion counted once however often it runs.
+   - Python: every call `<expr>.assert*(...)`, whatever its receiver (`self.assertEqual`,
+     a helper object's `s.assert_refused`), and `assert` statements.
    - Rust: invocations of macros whose name starts with `assert` (`assert!`, `assert_eq!`,
-     `assert_ne!`, and harness macros such as `assert_panics!`). A Rust assertion helper
-     therefore counts only when it is a macro; a helper function's assertions do not count,
-     as a Python helper method's do not.
-   A twin with fewer assertions than its Python test is an error.
+     `assert_ne!`, and harness macros such as `assert_panics!` and `assert_json_eq!`): the
+     name, `!`, then `(`, `[` or `{` (so `asserts != 0` is no assertion). A Rust assertion
+     helper therefore counts only when it is a macro; a helper function's assertions do not
+     count, as a Python helper method's (`self.rewritten(...)`) do not.
+   A twin with fewer assertions than its Python test is an error. A Python test that counts
+   0 (its assertions all in helper methods) is listed in the output, for the reviewer to
+   compare by hand, and its twin must count at least 1.
+4. What a twin may not be (ruling S3-R21): `#[ignore]` or `#[should_panic]`, either of which
+   lets it pass without checking anything; nor may it call `rust_only()` (and so skip under
+   LEADHAND_IMPL=python) unless its Python test is itself Rust-only (@rust_only on the
+   method or its class).
 
 Errors (exit 1): a Python test with neither a twin nor a `retired` entry (allowed while its
-file is --pending); a twin with fewer assertions; a Rust test claimed by two Python tests; a
+file is --pending); a twin with fewer assertions, with none for a Python test that counts 0,
+ignored, should-panic, or skipping a parity test (rust_only); a Rust test claimed by two
+Python tests; a
 map line that does not parse, names an unknown or reference-only Python test, repeats one,
 retires one without a reason, or names a Rust test that does not exist (allowed while the
 Python test's file is --pending). A Rust twin whose source the parser cannot find is an
 error too: twins live in inline modules of `tests/<file>.rs`.
 
-It prints the counts per Python file, then every `retired` entry with its reason and every
-note, for the reviewer. --pending takes file names (`contract_cards.py`, a path to it, or
+A twin that exists is checked even while its file is --pending.
+
+It prints the counts per Python file, then every `retired` entry with its reason, every note
+and every Python test that counts 0, for the reviewer. --pending takes file names (`contract_cards.py`, a path to it, or
 `contract_cards`), once each or several after one flag. Exit 2 on bad usage.
 """
 from __future__ import annotations
@@ -88,6 +100,7 @@ def default_twin(py_id: str) -> str:
 class PyTest:
     file: str          # contract_<x>
     asserts: int
+    rust_only: bool    # tagged @rust_only (on the method or its class)
 
 
 def _iter_tests(suite):
@@ -124,10 +137,10 @@ def _python_asserts(func) -> int:
 
 
 def _is_assertion(node: ast.AST) -> bool:
+    """An `assert` statement, or a call `<expr>.assert*(...)` whatever the receiver."""
     if isinstance(node, ast.Assert):
         return True
     return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"
             and node.func.attr.startswith("assert"))
 
 
@@ -149,10 +162,11 @@ def python_tests() -> tuple[dict[str, PyTest], set[str]]:
             raise SystemExit(f"check_conversion: unexpected test id {tid}")
         cls = type(test)
         func = getattr(cls, test._testMethodName)
-        if _skip_reason(cls, func).startswith("reference-only"):
+        why = _skip_reason(cls, func)
+        if why.startswith("reference-only"):
             reference.add(tid)
             continue
-        tests[tid] = PyTest(tid.split(".")[0], _python_asserts(func))
+        tests[tid] = PyTest(tid.split(".")[0], _python_asserts(func), why.startswith("rust-only"))
     return tests, reference
 
 
@@ -244,12 +258,21 @@ RAW_STRING = re.compile(r'[bc]?r(#*)"')
 TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|::|->|=>|\S")
 
 
-def rust_functions(path: Path) -> dict[tuple[str, ...], int]:
-    """{(module, ..., fn): assertion count} for the functions in `path`'s inline modules; a
-    `#[test]` function wins over another function of the same path."""
+@dataclass
+class RustFn:
+    asserts: int
+    is_test: bool
+    ignored: bool        # #[ignore]
+    should_panic: bool   # #[should_panic]
+    rust_only: bool      # calls rust_only()
+
+
+def rust_functions(path: Path) -> dict[tuple[str, ...], RustFn]:
+    """{(module, ..., fn): RustFn} for the functions in `path`'s inline modules; a `#[test]`
+    function wins over another function of the same path."""
     toks = TOKEN.findall(_blank_rust(path.read_text(encoding="utf-8")))
     ident = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-    found: dict[tuple[str, ...], tuple[int, bool]] = {}
+    found: dict[tuple[str, ...], RustFn] = {}
     mods: list[tuple[str, int]] = []
     attrs: list[str] = []
     depth = i = 0
@@ -296,12 +319,16 @@ def rust_functions(path: Path) -> dict[tuple[str, ...], int]:
                 continue
             end = matching(j, "{", "}")
             body = toks[j:end]
-            count = sum(1 for k in range(len(body) - 1)
-                        if body[k].startswith("assert") and ident.match(body[k]) and body[k + 1] == "!")
-            is_test = any(a == "test" for a in attrs)
+            count = sum(1 for k in range(len(body) - 2)
+                        if body[k].startswith("assert") and ident.match(body[k]) and body[k + 1] == "!"
+                        and body[k + 2] in ("(", "[", "{"))
+            calls_rust_only = any(body[k] == "rust_only" and body[k + 1] == "("
+                                  for k in range(len(body) - 1))
+            heads = [a.split(" ")[0] for a in attrs]
+            fn = RustFn(count, "test" in attrs, "ignore" in heads, "should_panic" in heads, calls_rust_only)
             key = tuple(m[0] for m in mods) + (name,)
-            if key not in found or (is_test and not found[key][1]):
-                found[key] = (count, is_test)
+            if key not in found or (fn.is_test and not found[key].is_test):
+                found[key] = fn
             attrs = []
             i = end
             continue
@@ -314,14 +341,14 @@ def rust_functions(path: Path) -> dict[tuple[str, ...], int]:
         if t in (";", "{", "}"):
             attrs = []
         i += 1
-    return {k: v[0] for k, v in found.items()}
+    return found
 
 
-_rust_sources: dict[str, dict[tuple[str, ...], int] | None] = {}
+_rust_sources: dict[str, dict[tuple[str, ...], RustFn] | None] = {}
 
 
-def rust_asserts(rust_id: str) -> int | None:
-    """The assertions in the Rust test's body; None when its source is not found."""
+def rust_fn(rust_id: str) -> RustFn | None:
+    """What the Rust test's source says of it; None when its source is not found."""
     file, *path = rust_id.split("::")
     if file not in _rust_sources:
         for candidate in (ROOT / "tests" / f"{file}.rs", ROOT / "tests" / file / "main.rs"):
@@ -424,13 +451,27 @@ def main(argv: list[str]) -> int:
             else:
                 errors.append(f"{pid}: no Rust twin {twin} (and no conversion-map.txt entry)")
             continue
-        found = rust_asserts(twin)
-        if found is None:
+        fn = rust_fn(twin)
+        if fn is None:
             errors.append(f"{pid}: the source of its twin {twin} was not found in an inline module of "
                           f"tests/{twin.split('::')[0]}.rs")
             continue
-        if found < test.asserts:
-            errors.append(f"{pid}: its twin {twin} has {found} assertion(s), fewer than its {test.asserts}")
+        bad = []
+        if fn.asserts < max(test.asserts, 1):
+            if test.asserts:
+                bad.append(f"has {fn.asserts} assertion(s), fewer than its {test.asserts}")
+            else:
+                bad.append("has no assertion; its Python test counts 0 (its checks are in helpers), so the "
+                           "twin needs at least 1")
+        if fn.ignored:
+            bad.append("is #[ignore]")
+        if fn.should_panic:
+            bad.append("is #[should_panic]")
+        if fn.rust_only and not test.rust_only:
+            bad.append("calls rust_only(), so it skips under LEADHAND_IMPL=python, but its Python test is a "
+                       "parity test, not @rust_only")
+        if bad:
+            errors.append(f"{pid}: its twin {twin} " + "; ".join(bad))
             continue
         counts["twinned"] += 1
     for twin, pids in sorted(claimed.items()):
@@ -455,6 +496,11 @@ def main(argv: list[str]) -> int:
     print(f"Notes ({len(notes)}):")
     for e in sorted(notes, key=lambda e: e.line):
         print(f"  {e.py} -> {e.rust}: {e.note}")
+    retired_ids = {e.py for e in entries.values() if e.rust is None}
+    zero = sorted(pid for pid, t in py.items() if t.asserts == 0 and pid not in retired_ids)
+    print(f"Python tests that count 0 assertions, to compare with their twins by hand ({len(zero)}):")
+    for pid in zero:
+        print(f"  {pid}")
     stale = sorted(f for f in pending if f in per_file and per_file[f]["pending"] == 0)
     if stale:
         print(f"Pending files with no missing twin (drop --pending): {', '.join(stale)}")
