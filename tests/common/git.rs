@@ -92,6 +92,16 @@ fn confined(path: &Path) -> PathBuf {
 /// stderr).
 #[track_caller]
 fn git(cwd: &Path, args: &[&str]) -> (i32, String, String) {
+    let spawn = super::Spawn {
+        group: super::Group::Own,
+        on_spawn: None,
+    };
+    git_spawn(cwd, args, spawn)
+}
+
+/// `git` started as `spawn` says (a fake supervisor's drive puts it in the drive's group).
+#[track_caller]
+fn git_spawn(cwd: &Path, args: &[&str], spawn: super::Spawn) -> (i32, String, String) {
     confined(cwd);
     let ceiling = temp_dir();
     let vars = std::env::vars_os()
@@ -100,7 +110,7 @@ fn git(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         .chain([("GIT_CEILING_DIRECTORIES".into(), ceiling.into_os_string())]);
     let mut argv: Vec<&OsStr> = vec![OsStr::new("git")];
     argv.extend(IDENTITY.iter().chain(args).map(OsStr::new));
-    match super::run_process(&argv, vars, cwd, None, Duration::from_secs(60), true) {
+    match super::run_process(&argv, vars, cwd, None, Duration::from_secs(60), spawn) {
         Ok(out) => (
             out.code,
             String::from_utf8_lossy(&out.stdout)
@@ -116,6 +126,17 @@ fn git(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 #[track_caller]
 pub fn run_git(cwd: &Path, args: &[&str]) -> String {
     let (code, out, err) = git(cwd, args);
+    if code != 0 {
+        panic!("git {} failed ({code}): {err}", args.join(" "));
+    }
+    out
+}
+
+/// `run_git` started as `spawn` says: in a process group and with a spawn hook of the
+/// caller's choosing.
+#[track_caller]
+pub fn run_git_spawn(cwd: &Path, args: &[&str], spawn: super::Spawn) -> String {
+    let (code, out, err) = git_spawn(cwd, args, spawn);
     if code != 0 {
         panic!("git {} failed ({code}): {err}", args.join(" "));
     }

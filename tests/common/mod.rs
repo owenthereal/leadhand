@@ -16,6 +16,8 @@
 
 pub mod git;
 pub mod json;
+pub mod rundir;
+pub mod supervisor;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -250,18 +252,68 @@ pub fn run_argv(
     stdin: Option<&str>,
     timeout: Duration,
 ) -> Out {
-    let own_group = env.get("LEADHAND_CRASH_KILL_PGID").is_none();
+    run_argv_spawn(argv, env, cwd, stdin, timeout, Spawn::default_for(env))
+}
+
+/// The process group a command starts in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    /// A group of its own (`process_group(0)`): a timeout kills the whole group.
+    Own,
+    /// The test process's group: a timeout kills only the command.
+    Inherit,
+    /// The existing group with this id (a fake supervisor's drive, `FakeSupervisor::fork`):
+    /// a timeout kills only the command.
+    Join(i32),
+}
+
+/// How `run_argv_spawn` starts a command: its process group, and a hook called with the
+/// pid of the process once it has started (a fake supervisor's log of what it started).
+#[derive(Clone, Copy)]
+pub struct Spawn<'a> {
+    pub group: Group,
+    pub on_spawn: Option<&'a dyn Fn(u32)>,
+}
+
+impl Spawn<'_> {
+    /// `run_argv`'s choice for `env`: a group of its own, or the caller's in a crash drive
+    /// (`env` names LEADHAND_CRASH_KILL_PGID).
+    pub fn default_for(env: &Env) -> Spawn<'static> {
+        let group = if env.get("LEADHAND_CRASH_KILL_PGID").is_some() {
+            Group::Inherit
+        } else {
+            Group::Own
+        };
+        Spawn {
+            group,
+            on_spawn: None,
+        }
+    }
+}
+
+/// `run_argv` with the process group and spawn hook `spawn` gives. A run past `timeout`
+/// kills the command's group when it has one of its own (`Group::Own`), else only the
+/// command, then panics naming the command.
+#[track_caller]
+pub fn run_argv_spawn(
+    argv: &[&OsStr],
+    env: &Env,
+    cwd: &Path,
+    stdin: Option<&str>,
+    timeout: Duration,
+    spawn: Spawn,
+) -> Out {
     match run_process(
         argv,
         env.vars(),
         cwd,
         stdin.map(str::as_bytes),
         timeout,
-        own_group,
+        spawn,
     ) {
         Ok(out) => out,
         Err(out) => {
-            let killed = if own_group {
+            let killed = if spawn.group == Group::Own {
                 "its process group was"
             } else {
                 "it was"
@@ -284,15 +336,15 @@ fn seconds_g(d: Duration) -> String {
 }
 
 /// Runs `argv` with exactly the environment `vars`, collecting both outputs. Err when it ran
-/// past `timeout`: it (or its group) was killed, and the output is whatever came before the
-/// pipes closed, or a note when a process outside the group held them for another 5 s.
+/// past `timeout`: it (or its own group) was killed, and the output is whatever came before
+/// the pipes closed, or a note when a process outside the group held them for another 5 s.
 fn run_process<K, V>(
     argv: &[&OsStr],
     vars: impl IntoIterator<Item = (K, V)>,
     cwd: &Path,
     stdin: Option<&[u8]>,
     timeout: Duration,
-    own_group: bool,
+    spawn: Spawn,
 ) -> Result<Out, Out>
 where
     K: AsRef<OsStr>,
@@ -311,8 +363,15 @@ where
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if own_group {
-        cmd.process_group(0);
+    let own_group = spawn.group == Group::Own;
+    match spawn.group {
+        Group::Own => {
+            cmd.process_group(0);
+        }
+        Group::Join(pgid) => {
+            cmd.process_group(pgid);
+        }
+        Group::Inherit => {}
     }
     let mut child = cmd.spawn().unwrap_or_else(|e| {
         panic!(
@@ -321,6 +380,9 @@ where
             cwd.display()
         )
     });
+    if let Some(hook) = spawn.on_spawn {
+        hook(child.id());
+    }
     let (tx, rx) = mpsc::channel::<(u8, Vec<u8>)>();
     let read = |n: u8, mut pipe: Box<dyn Read + Send>, tx: mpsc::Sender<(u8, Vec<u8>)>| {
         thread::spawn(move || {
@@ -773,4 +835,43 @@ pub fn start_time(pid: i32) -> Option<String> {
 /// True when `pid` is alive (not a zombie) and still has start time `start`.
 pub fn same_process(pid: i32, start: Option<&str>) -> bool {
     leadhand::procs::same_process(Some(pid), start)
+}
+
+/// A start time as seconds since the epoch (on Linux to the second of the boot time).
+fn start_wall(start: &str) -> Option<f64> {
+    match start.strip_prefix("ticks:") {
+        Some(ticks) => {
+            let stat = fs::read_to_string("/proc/stat").ok()?;
+            let btime: f64 = stat
+                .lines()
+                .find_map(|line| line.strip_prefix("btime "))?
+                .trim()
+                .parse()
+                .ok()?;
+            Some(btime + ticks.parse::<f64>().ok()? / clock_ticks()?)
+        }
+        None => start.parse().ok(),
+    }
+}
+
+/// The kernel's clock ticks per second (`os.sysconf("SC_CLK_TCK")`), from `getconf`.
+fn clock_ticks() -> Option<f64> {
+    static TICKS: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *TICKS.get_or_init(|| {
+        let out = Command::new("getconf")
+            .arg("CLK_TCK")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    })
+}
+
+/// The start time of `pid` when it is alive and started no later than `when` (seconds since
+/// the epoch), so it is the process a record written at `when` named, not a later one reusing
+/// the pid; else None (`harness.started_by`).
+pub fn started_by(pid: i32, when: f64) -> Option<String> {
+    let start = start_time(pid)?;
+    (start_wall(&start)? <= when).then_some(start)
 }

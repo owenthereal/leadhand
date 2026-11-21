@@ -238,6 +238,63 @@ fn write_json(v: &Json, out: &mut String) {
     }
 }
 
+/// `json.dumps(v, separators=(",", ":"))`: `dumps` with no spaces.
+pub fn dumps_compact(v: &Json) -> String {
+    let mut out = String::new();
+    write_layout(v, None, 0, &mut out);
+    out
+}
+
+/// `json.dumps(v, indent=indent)`: each item on its own line, `indent` spaces deeper per
+/// level, `","` and `": "` separators, and `[]` and `{}` for empty containers.
+pub fn dumps_indent(v: &Json, indent: usize) -> String {
+    let mut out = String::new();
+    write_layout(v, Some(indent), 0, &mut out);
+    out
+}
+
+/// `json.dumps` with compact separators (`indent` None) or an indented layout.
+fn write_layout(v: &Json, indent: Option<usize>, depth: usize, out: &mut String) {
+    let newline = |out: &mut String, depth: usize| {
+        if let Some(n) = indent {
+            out.push('\n');
+            out.push_str(&" ".repeat(n * depth));
+        }
+    };
+    let key_sep = if indent.is_some() { ": " } else { ":" };
+    match v {
+        Json::Arr(items) if !items.is_empty() => {
+            out.push('[');
+            for (n, item) in items.iter().enumerate() {
+                if n > 0 {
+                    out.push(',');
+                }
+                newline(out, depth + 1);
+                write_layout(item, indent, depth + 1, out);
+            }
+            newline(out, depth);
+            out.push(']');
+        }
+        Json::Obj(members) if !members.is_empty() => {
+            out.push('{');
+            for (n, (k, item)) in dict(members).into_iter().enumerate() {
+                if n > 0 {
+                    out.push(',');
+                }
+                newline(out, depth + 1);
+                quote(k, out);
+                out.push_str(key_sep);
+                write_layout(item, indent, depth + 1, out);
+            }
+            newline(out, depth);
+            out.push('}');
+        }
+        Json::Arr(_) => out.push_str("[]"),
+        Json::Obj(_) => out.push_str("{}"),
+        scalar => write_json(scalar, out),
+    }
+}
+
 /// An object's members as a Python dict holds them: a repeated key keeps its first place
 /// and its last value.
 pub fn dict(members: &[(Vec<u8>, Json)]) -> Vec<(&[u8], &Json)> {
@@ -583,6 +640,13 @@ impl From<i64> for Json {
 impl From<i32> for Json {
     fn from(n: i32) -> Json {
         Json::Num(n.to_string())
+    }
+}
+
+/// A Python float: `json.dumps` writes it as its `repr` (`20.0`, `12.5`).
+impl From<f64> for Json {
+    fn from(f: f64) -> Json {
+        Json::Num(json_float(f))
     }
 }
 
