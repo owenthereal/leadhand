@@ -1044,7 +1044,12 @@ mod pricing {
             let Json::Obj(prices) = at(config, &["prices"]) else {
                 panic!("prices is not an object")
             };
+            // Python's `del config["prices"]["sonnet"]`: a KeyError when there is none.
+            let before = prices.len();
             prices.retain(|(k, _)| k != b"sonnet");
+            if prices.len() == before {
+                panic!("config.json has no sonnet price to delete");
+            }
         });
         let t = text(&[claude_line_model(
             "m1",

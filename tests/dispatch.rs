@@ -715,7 +715,8 @@ mod runner_lifecycle {
         wait_for_with("Codex started", WAIT, Some(&fg), || w.codex_of("d1"));
         // The foreground's own group: never the runner's session.
         let _ = kill_process_group(Pid::from_raw(fg.pid()).unwrap(), Signal::KILL);
-        let _ = fg.communicate(Duration::from_secs(10));
+        fg.communicate(Duration::from_secs(10))
+            .expect("the foreground's pipes were still held 10 s after it was killed");
         wait_for_with("result.json", Duration::from_secs(20), None, || {
             when(w.wd("d1").join("result.json").exists())
         });

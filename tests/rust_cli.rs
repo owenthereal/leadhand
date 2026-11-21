@@ -798,6 +798,7 @@ mod release_build_dispatch {
         if common::rust_only() {
             return;
         }
+        let _serial = common::serial(); // group: the foreground wait (S3-R19)
         require_release_bin();
         let mut w = World::new();
         w.scenario("ready", &[("delay", "4")]);

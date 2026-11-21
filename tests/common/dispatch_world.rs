@@ -497,7 +497,11 @@ impl World {
             self.codex_of(did)
         });
         p.kill();
-        let _ = p.communicate(Duration::from_secs(10));
+        // Python's communicate(timeout=10) raises TimeoutExpired here, failing the test, when
+        // something (the detached runner) still holds the dispatch line's pipes.
+        p.communicate(Duration::from_secs(10)).unwrap_or_else(|| {
+            panic!("the foreground's pipes were still held 10 s after it was killed ({did})")
+        });
         codex
     }
 
