@@ -817,6 +817,8 @@ class Cancellation(unittest.TestCase):
         w = World(self)
         w.scenario("slow")
         codex = w.start_detached()
+        # The one start counted below must have happened before Codex is orphaned and cancelled.
+        wait_for(lambda: w.records("start"), "the fake Codex's start record")
         runner = w.runner_json()["runner"]
         w.signal(runner, signal.SIGKILL)
         wait_for(lambda: not alive(runner), "the runner to die")
