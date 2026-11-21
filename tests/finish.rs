@@ -34,7 +34,6 @@ use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -43,7 +42,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use common::engine::{
     CODEX_CARD, RUN, base_wt, codex_world, drive_to_run, drive_until_refused, files, gate_names,
-    marker, relaunch_env, tampering, to_last_step, with_status, with_verdict,
+    gated, gated_with, last, marker, path_before, relaunch_env, run_id, seq, tampering,
+    to_last_step, with_status, with_verdict, write_script,
 };
 use common::git::{self, commit, run_git, run_git_unchecked};
 use common::json::Json;
@@ -61,25 +61,6 @@ const FINAL: &str = "leadhand/demo--card-final";
 
 // --------------------------------------------------------------------------
 // Helpers
-
-/// A world with `cards` that runs the real end of run.
-#[track_caller]
-fn gated(cards: &[String]) -> FakeSupervisor {
-    gated_with(cards, "")
-}
-
-/// `gated` with the user config `config`.
-#[track_caller]
-fn gated_with(cards: &[String], config: &str) -> FakeSupervisor {
-    FakeSupervisor::with_options(
-        cards,
-        Options {
-            config,
-            gates: true,
-            ..Options::default()
-        },
-    )
-}
 
 /// `card(n, risk=risk)`.
 fn risky(n: i64, risk: &str) -> String {
@@ -104,11 +85,6 @@ fn gates(w: &FakeSupervisor) -> Vec<Json> {
         .iter()
         .map(|e| pick(e, &["gate", "examined_sha", "passed"]))
         .collect()
-}
-
-/// The last `n` items (`items[-n:]`).
-fn last<T>(items: &[T], n: usize) -> &[T] {
-    &items[items.len().saturating_sub(n)..]
 }
 
 /// The last outcome event (`w.events("outcome")[-1]`).
@@ -191,20 +167,6 @@ fn sorted_cards(events: &[Json]) -> Vec<i64> {
         .collect();
     cards.sort();
     cards
-}
-
-/// The run's id.
-#[track_caller]
-fn run_id(w: &FakeSupervisor) -> String {
-    text(&w.meta()["run_id"]).to_string()
-}
-
-/// An event's `seq`.
-#[track_caller]
-fn seq(e: &Json) -> i64 {
-    e["seq"]
-        .as_i64()
-        .unwrap_or_else(|| panic!("no integer seq: {e}"))
 }
 
 /// `run RUN_DIR` with the fake `claude` on PATH, which must succeed.
@@ -334,21 +296,6 @@ fn mtime(path: &Path) -> SystemTime {
     fs::metadata(path)
         .and_then(|m| m.modified())
         .unwrap_or_else(|e| panic!("reading the time of {}: {e}", path.display()))
-}
-
-/// Writes an executable script at `path`.
-#[track_caller]
-fn write_script(path: &Path, text: &str) {
-    fs::write(path, text).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
-/// `"<dir>:<the world's PATH>"`.
-fn path_before(w: &FakeSupervisor, dir: &Path) -> OsString {
-    let mut path = dir.as_os_str().to_os_string();
-    path.push(":");
-    path.push(w.env.get("PATH").expect("PATH in the world's environment"));
-    path
 }
 
 // --------------------------------------------------------------------------
@@ -1014,13 +961,9 @@ mod unpark {
         finish(&mut w, &gate_action, &worker);
         w.parks.remove(&1).expect("card 1's park"); // Python's `del`: a KeyError when missing
         let done = finish_run(&mut w);
-        assert_eq!(
-            done["outcome"],
-            "complete",
-            "{} {:?}",
-            done["reasons"],
-            w.events("accepted")
-        );
+        // Python builds its message eagerly: a done action without `reasons` raises
+        let (reasons, accepted) = (&done["reasons"], w.events("accepted"));
+        assert_eq!(done["outcome"], "complete", "{reasons} {accepted:?}");
         let head = w.branch_tip(RUN);
         assert_json_eq!(field(&w.events("accepted"), "card"), jv("[2, 1]"));
         for n in [1, 2] {
@@ -1420,7 +1363,8 @@ mod fix_round2 {
         let r = next_crashing(&w, "after_fast_forward");
         assert_eq!(r.code, 97, "{r}");
         let done = finish_run(&mut w);
-        assert_eq!(done["outcome"], "complete", "{}", done["reasons"]);
+        let reasons = &done["reasons"]; // Python's message, built eagerly: a KeyError when missing
+        assert_eq!(done["outcome"], "complete", "{reasons}");
         assert_empty!(found_violations(&w));
         assert_eq!(sorted_cards(&w.events("accepted")), [1, 2]);
         let head = w.branch_tip(RUN);
@@ -2298,7 +2242,7 @@ mod runner_finalize {
         let shim = w.tmp.join("slow git");
         fs::create_dir(&shim).unwrap();
         write_script(&shim.join("git"), SLOW_GIT);
-        let log = w.tmp.join("slow git.jsonl");
+        let log = w.tmp.join("slow git.log");
         let path = path_before(&w, &shim);
         let real = which("git").expect("git on PATH");
         let workers = run_dir(&w).join("workers");
@@ -2323,7 +2267,7 @@ mod runner_finalize {
         let beat = slow.join("beats").join(did);
         assert!(beat.exists(), "no heartbeat of {did} in {}", slow.display());
         // touched while the commit ran
-        assert!(mtime(&beat) >= mtime(&slow.join("began")));
+        assert!(mtime(&beat) > mtime(&slow.join("began")));
     }
 
     #[test]

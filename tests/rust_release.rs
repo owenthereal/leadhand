@@ -20,16 +20,14 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use common::engine::{RUN, base_wt, to_last_step};
+use common::engine::{RUN, base_wt, gated_with, path_before, seq, to_last_step, write_script};
 use common::git::{run_git, run_git_unchecked};
 use common::json::{self, Json};
 use common::rundir::append_event;
-use common::supervisor::{FakeSupervisor, Options, Step, card, run_dir, text, truthy};
+use common::supervisor::{FakeSupervisor, Step, card, run_dir, text, truthy};
 use common::{lines, one, path_str as s, read_text, which};
 
 const FREE: &str =
@@ -41,19 +39,6 @@ const GIT_LOG: &str = r#"#!/bin/sh
 printf '%s\0' "$#" "$@" >> "$GIT_ARGV_LOG"
 exec "$GIT_ARGV_REAL" "$@"
 "#;
-
-/// A world with one card that runs the real end of run, with the user config `config`.
-#[track_caller]
-fn gated_with(config: &str) -> FakeSupervisor {
-    FakeSupervisor::with_options(
-        &[card(1)],
-        Options {
-            config,
-            gates: true,
-            ..Options::default()
-        },
-    )
-}
 
 /// The kinds of the events named, in log order.
 #[track_caller]
@@ -67,11 +52,8 @@ fn kinds(w: &FakeSupervisor, names: &[&str]) -> Vec<String> {
 
 /// The `seq` of the one event of `kind`.
 #[track_caller]
-fn seq(w: &FakeSupervisor, kind: &str) -> i64 {
-    let e = one(w.events(kind));
-    e["seq"]
-        .as_i64()
-        .unwrap_or_else(|| panic!("no integer seq: {e}"))
+fn seq_of(w: &FakeSupervisor, kind: &str) -> i64 {
+    seq(&one(w.events(kind)))
 }
 
 /// The lines of the report's Result section.
@@ -122,13 +104,9 @@ fn can_switch(w: &FakeSupervisor) -> bool {
 fn git_wrapper(w: &mut FakeSupervisor) -> PathBuf {
     let folder = w.tmp.join("git wrapper");
     fs::create_dir(&folder).unwrap();
-    let git = folder.join("git");
-    fs::write(&git, GIT_LOG).unwrap();
-    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&folder.join("git"), GIT_LOG);
     let log = w.tmp.join("git argv.log");
-    let mut path: OsString = folder.into_os_string();
-    path.push(":");
-    path.push(w.env.get("PATH").expect("PATH in the world's environment"));
+    let path = path_before(w, &folder);
     let real = which("git").expect("git on PATH");
     w.env
         .set("PATH", path)
@@ -144,6 +122,13 @@ fn logged(log: &Path) -> Vec<Vec<String>> {
         return Vec::new();
     }
     let data = fs::read(log).unwrap_or_else(|e| panic!("reading {}: {e}", log.display()));
+    // every record ends with a NUL: one cut off inside its last argument is no record, as a
+    // cut-off JSON line fails json.loads
+    assert!(
+        data.is_empty() || data.ends_with(&[0]),
+        "a cut-off record at the end of {}",
+        log.display()
+    );
     let mut fields = data
         .split(|b| *b == 0)
         .map(|f| String::from_utf8_lossy(f).into_owned());
@@ -175,7 +160,7 @@ mod branch_release {
         if common::rust_only() {
             return;
         }
-        let mut w = gated_with("");
+        let mut w = gated_with(&[card(1)], "");
         w.start();
         let ws = w.workspace();
         let done = w.run().pop().expect("an action");
@@ -235,7 +220,7 @@ mod branch_release {
         if common::rust_only() {
             return;
         }
-        let mut w = gated_with("");
+        let mut w = gated_with(&[card(1)], "");
         w.start();
         let ws = w.workspace();
         fs::remove_dir_all(&ws).unwrap();
@@ -283,7 +268,7 @@ mod branch_release {
         if common::rust_only() {
             return;
         }
-        let mut w = gated_with("[run]\nevidence = \"block\"\n");
+        let mut w = gated_with(&[card(1)], "[run]\nevidence = \"block\"\n");
         w.start();
         let gap = || Step {
             result: Some("fail".into()),
@@ -314,7 +299,7 @@ mod branch_release {
         if common::rust_only() {
             return;
         }
-        let mut w = gated_with("");
+        let mut w = gated_with(&[card(1)], "");
         w.start();
         to_last_step(&mut w); // the next `next` ends the run
         let log = git_wrapper(&mut w);
@@ -373,7 +358,7 @@ mod branch_release {
             "report_written",
         ];
         for detached_before in [false, true] {
-            let mut w = gated_with("");
+            let mut w = gated_with(&[card(1)], "");
             w.start();
             assert_eq!(
                 w.run().pop().expect("an action")["outcome"],
@@ -426,7 +411,7 @@ mod branch_release {
             // The release is finished first, once, then the report is written.
             assert_eq!(kinds(&w, &all), all, "detached_before={detached_before}");
             assert!(
-                seq(&w, "branch_released") < seq(&w, "report_written"),
+                seq_of(&w, "branch_released") < seq_of(&w, "report_written"),
                 "detached_before={detached_before}"
             );
             let released = one(w.events("branch_released"));

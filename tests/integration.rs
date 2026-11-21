@@ -22,8 +22,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use common::engine::{
-    CARD1, NOTE, RUN, codex_world, files, parked_world, parked_world_with, tampering, unpark,
-    with_status, with_verdict,
+    CARD1, NOTE, RUN, codex_world, files, last, parked_world, parked_world_with, run_id, seq,
+    tampering, unpark, with_status, with_verdict,
 };
 use common::git::{self, commit, current_branch, git_ok, run_git};
 use common::json::Json;
@@ -137,20 +137,6 @@ fn on_branch(w: &FakeSupervisor, branch: &str, path: &str) -> bool {
     )
 }
 
-/// The run's id.
-#[track_caller]
-fn run_id(w: &FakeSupervisor) -> String {
-    text(&w.meta()["run_id"]).to_string()
-}
-
-/// An event's `seq`.
-#[track_caller]
-fn seq(e: &Json) -> i64 {
-    e["seq"]
-        .as_i64()
-        .unwrap_or_else(|| panic!("no integer seq: {e}"))
-}
-
 /// The cards of the `accepted` events, in order.
 #[track_caller]
 fn accepted_cards(w: &FakeSupervisor) -> Json {
@@ -166,11 +152,6 @@ fn brief(v: &Json) -> String {
 /// A list of `items`, as Python's tuple.
 fn tuple(items: Vec<Json>) -> Json {
     Json::Arr(items)
-}
-
-/// The last `n` items (`items[-n:]`).
-fn last<T>(items: &[T], n: usize) -> &[T] {
-    &items[items.len().saturating_sub(n)..]
 }
 
 /// The worker rewrites README.md, naming its dispatch.
@@ -1052,11 +1033,8 @@ mod one_card_in_flight {
             .filter(|e| e["card"] == 1 && e["dispatch_id"] != "c1-a1-implement-1")
             .collect();
         assert!(!later.is_empty());
-        assert!(
-            later.iter().all(|e| seq(e) > accept2),
-            "{}",
-            field(&later, "dispatch_id")
-        );
+        let later_ids = field(&later, "dispatch_id"); // Python's message, built eagerly
+        assert!(later.iter().all(|e| seq(e) > accept2), "{later_ids}");
         let not_implementer: Vec<Json> = w
             .events("violation")
             .into_iter()

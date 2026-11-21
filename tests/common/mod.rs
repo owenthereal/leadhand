@@ -926,8 +926,13 @@ pub fn json_in(needle: &str, hay: &Json) -> bool {
     }
 }
 
-/// `shutil.which(name)` on the test process's PATH.
+/// `shutil.which(name)` on the test process's PATH: the first file of that name with an
+/// execute bit set.
 pub fn which(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |p: &Path| {
+        fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
     let path = process_env()
         .into_iter()
         .rev()
@@ -935,7 +940,7 @@ pub fn which(name: &str) -> Option<PathBuf> {
         .map(|(_, v)| v)?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(name))
-        .find(|p| p.is_file())
+        .find(|p| executable(p))
 }
 
 /// Every file and folder under `root`, recursively, without following symlinks to folders

@@ -5,7 +5,9 @@
 //! those of `contract_integration.py` (`NOTE`, `parked_world`, `unpark`) and of
 //! `contract_finish.py` (`base_wt`, `marker`, `gate_names`, `drive_to_run`,
 //! `drive_until_refused`, `to_last_step`) that later files import; and the step literals the
-//! files script (`with_status`, `with_verdict`, `files`, `tampering`).
+//! files script (`with_status`, `with_verdict`, `files`, `tampering`), with the small helpers
+//! those files share (`gated`, `gated_with`, `run_id`, `seq`, `last`, `write_script`,
+//! `path_before`).
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -54,6 +56,62 @@ pub fn with_verdict(verdict: &str) -> Step {
         verdict: Some(verdict.into()),
         ..Step::default()
     }
+}
+
+/// A world with `cards` that runs the real end of run (`FakeSupervisor(..., gates=True)`).
+#[track_caller]
+pub fn gated(cards: &[String]) -> FakeSupervisor {
+    gated_with(cards, "")
+}
+
+/// `gated` with the user config `config`.
+#[track_caller]
+pub fn gated_with(cards: &[String], config: &str) -> FakeSupervisor {
+    FakeSupervisor::with_options(
+        cards,
+        Options {
+            config,
+            gates: true,
+            ..Options::default()
+        },
+    )
+}
+
+/// The run's id (`w.meta()["run_id"]`).
+#[track_caller]
+pub fn run_id(w: &FakeSupervisor) -> String {
+    text(&w.meta()["run_id"]).to_string()
+}
+
+/// An event's `seq`.
+#[track_caller]
+pub fn seq(e: &Json) -> i64 {
+    e["seq"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("no integer seq: {e}"))
+}
+
+/// The last `n` items (`items[-n:]`).
+pub fn last<T>(items: &[T], n: usize) -> &[T] {
+    &items[items.len().saturating_sub(n)..]
+}
+
+/// Writes an executable script at `path` (`write_text`, then `chmod(0o755)`).
+#[track_caller]
+pub fn write_script(path: &Path, text: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, text).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|e| panic!("making {} executable: {e}", path.display()));
+}
+
+/// `"<dir>:<the world's PATH>"` (`f"{dir}{os.pathsep}{w.env['PATH']}"`).
+#[track_caller]
+pub fn path_before(w: &FakeSupervisor, dir: &Path) -> OsString {
+    let mut path = dir.as_os_str().to_os_string();
+    path.push(":");
+    path.push(w.env.get("PATH").expect("PATH in the world's environment"));
+    path
 }
 
 /// A step that writes and commits `files` (Python's `{"files": {...}}`).
