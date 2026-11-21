@@ -18,6 +18,7 @@ pub mod dispatch_world;
 pub mod drive;
 pub mod git;
 pub mod json;
+pub mod launch_world;
 pub mod plugin;
 pub mod rundir;
 pub mod supervisor;
@@ -877,6 +878,41 @@ pub fn holds(mut cond: impl FnMut() -> bool, seconds: f64, what: &str) {
             return;
         }
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `path` opened read-write (created, mode 0644, never truncated), for flock.
+#[track_caller]
+pub fn open_lock_file(path: &Path) -> fs::File {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o644)
+        .open(path)
+        .unwrap_or_else(|e| panic!("opening {}: {e}", path.display()))
+}
+
+/// Takes an exclusive flock on `path`, as another leadhand process would; dropping the file
+/// (closing the descriptor) releases it.
+#[track_caller]
+pub fn hold_lock(path: &Path) -> fs::File {
+    let f = open_lock_file(path);
+    rustix::fs::flock(&f, rustix::fs::FlockOperation::LockExclusive)
+        .unwrap_or_else(|e| panic!("locking {}: {e}", path.display()));
+    f
+}
+
+/// Whether an exclusive flock on `path` can be taken now (it is taken and dropped again).
+#[track_caller]
+pub fn lockable(path: &Path) -> bool {
+    let f = open_lock_file(path);
+    match rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => true,
+        Err(rustix::io::Errno::WOULDBLOCK) => false,
+        Err(e) => panic!("locking {}: {e}", path.display()),
     }
 }
 

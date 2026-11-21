@@ -787,12 +787,10 @@ mod state_lock {
     //! is released they finish.
     use super::*;
     use crate::common::supervisor::{FakeSupervisor, Proc, card};
-    use crate::common::{Out, holds, read_jsonl};
-    use rustix::fs::{FlockOperation, flock};
+    use crate::common::{Out, hold_lock, holds, read_jsonl};
     use rustix::process::{Pid, Signal, kill_process_group};
     use std::ffi::OsString;
-    use std::fs::{self, File, OpenOptions};
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::fs;
     use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
@@ -810,22 +808,6 @@ mod state_lock {
         let run_dir = w.start();
         let events = run_dir.join("events.jsonl");
         Setup { w, run_dir, events }
-    }
-
-    /// Takes an exclusive flock on `path`; dropping the file releases it.
-    #[track_caller]
-    fn hold(path: &Path) -> File {
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o644)
-            .open(path)
-            .unwrap_or_else(|e| panic!("opening {}: {e}", path.display()));
-        flock(&f, FlockOperation::LockExclusive)
-            .unwrap_or_else(|e| panic!("locking {}: {e}", path.display()));
-        f
     }
 
     /// The binary in the background in its own process group; dropping it kills the group.
@@ -872,7 +854,7 @@ mod state_lock {
         #[track_caller]
         fn wait_while_held(&self, commands: &[Vec<OsString>]) -> Vec<Out> {
             let before = fs::read(&self.events).unwrap();
-            let held = hold(&self.run_dir.join("state.lock"));
+            let held = hold_lock(&self.run_dir.join("state.lock"));
             let mut all: Vec<Vec<OsString>> = commands.to_vec();
             all.push(vec!["status".into(), self.run_dir.clone().into()]);
             let procs: Vec<Background> = all.iter().map(|a| self.background(a)).collect();
@@ -944,7 +926,7 @@ mod state_lock {
     #[test]
     fn test_state_lock_is_not_the_run_lock() {
         let s = set_up();
-        let _held = hold(&s.run_dir.join("run.lock"));
+        let _held = hold_lock(&s.run_dir.join("run.lock"));
         let timeout = Duration::from_secs(60);
         let a = common::cli_with(
             &os_args!["next", s.run_dir],
