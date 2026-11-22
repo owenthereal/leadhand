@@ -283,10 +283,19 @@ pub(crate) fn turn_limit(reply: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
-
     use super::*;
-    use crate::wire::tests::python;
+
+    /// The reference's outputs for `inputs` in section `section` of `engine.json`.
+    fn reference<T: serde::de::DeserializeOwned>(
+        section: &str,
+        inputs: &[impl serde::Serialize],
+    ) -> Vec<T> {
+        let inputs: Vec<serde_json::Value> = inputs.iter().map(|x| serde_json::json!(x)).collect();
+        crate::wire::tests::reference_outputs("engine.json", section, &inputs)
+            .into_iter()
+            .map(|out| serde_json::from_value(out).unwrap())
+            .collect()
+    }
 
     #[test]
     fn questions_are_read_as_the_python_reads_them() {
@@ -300,15 +309,8 @@ mod tests {
             "no question here",
             "## Question\n## Empty\n",
         ];
-        let code = "import json, sys\nfrom leadhand import engine\n\
-                    out = []\n\
-                    for t in json.loads(sys.argv[1]):\n\
-                    \x20   m = engine._QUESTION.search(t)\n\
-                    \x20   out.append(m.group(1).strip() if m else '')\n\
-                    print(json.dumps(out))";
-        let arg = serde_json::to_string(&texts).unwrap();
-        let theirs: Vec<String> =
-            serde_json::from_slice(&crate::wire::tests::python(code, &[OsStr::new(&arg)])).unwrap();
+        // `engine.json`: `_QUESTION.search(t)`'s group 1, stripped, or "".
+        let theirs: Vec<String> = reference("question", &texts);
         let ours: Vec<String> = texts.iter().map(|t| question(t)).collect();
         assert_eq!(ours, theirs);
     }
@@ -334,16 +336,10 @@ mod tests {
             "stopped at ITS 7-TURN LIMIT",
             "stopped at its -turn limit",
         ];
-        let code = "import json, sys\nfrom leadhand import engine\n\
-                    out = []\n\
-                    for t in json.loads(sys.argv[1]):\n\
-                    \x20   h = engine._head(t, '', None, False)\n\
-                    \x20   out.append([h['status'], h['verdict'], h.get('cross_checked', False),\n\
-                    \x20               bool(engine._TURN_LIMIT.search(t))])\n\
-                    print(json.dumps(out))";
-        let arg = serde_json::to_string(&texts).unwrap();
+        // `engine.json`: `_head(t, '', None, False)`'s status, verdict and `cross_checked`,
+        // and whether `_TURN_LIMIT` finds the text.
         let theirs: Vec<(String, Option<String>, bool, bool)> =
-            serde_json::from_slice(&python(code, &[OsStr::new(&arg)])).unwrap();
+            reference("heads_cross_check", &texts);
         let ours: Vec<(String, Option<String>, bool, bool)> = texts
             .iter()
             .map(|t| {
@@ -370,15 +366,10 @@ mod tests {
             (None, "", false, true),
             (Some("Result: pass\n"), "", false, true),
         ];
-        let code = "import json, sys\nfrom leadhand import engine\n\
-                    out = []\n\
-                    for report, reply, stopped, interrupted in json.loads(sys.argv[1]):\n\
-                    \x20   h = engine._head(report, reply, None, stopped, interrupted)\n\
-                    \x20   out.append([h['status'], h['head'], h['source'], h['raw_kept'], h.get('interrupted', False)])\n\
-                    print(json.dumps(out))";
-        let arg = serde_json::to_string(&cases).unwrap();
+        // `engine.json`: `_head(report, reply, None, stopped, interrupted)`'s status, head,
+        // source, `raw_kept` and `interrupted`.
         let theirs: Vec<(String, String, String, bool, bool)> =
-            serde_json::from_slice(&python(code, &[OsStr::new(&arg)])).unwrap();
+            reference("heads_fall_back", &cases);
         let ours: Vec<(String, String, String, bool, bool)> = cases
             .iter()
             .map(|(report, reply, stopped, interrupted)| {

@@ -434,11 +434,13 @@ mod tests {
             "a\\|b",
             "",
         ];
-        let code = "import json, sys\nfrom leadhand import engine\n\
-                    print(json.dumps([engine._md_cell(t) for t in sys.argv[1:]]))";
-        let args: Vec<&std::ffi::OsStr> = texts.iter().map(std::ffi::OsStr::new).collect();
+        // `engine.json`: the reference's `_md_cell` of each text.
+        let inputs: Vec<serde_json::Value> = texts.iter().map(|t| serde_json::json!(t)).collect();
         let theirs: Vec<String> =
-            serde_json::from_slice(&crate::wire::tests::python(code, &args)).unwrap();
+            crate::wire::tests::reference_outputs("engine.json", "md_cell", &inputs)
+                .iter()
+                .map(|out| out.as_str().unwrap().to_string())
+                .collect();
         let ours: Vec<String> = texts.iter().map(|t| md_cell(t)).collect();
         assert_eq!(ours, theirs);
     }

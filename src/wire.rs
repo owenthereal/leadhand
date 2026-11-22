@@ -713,31 +713,12 @@ pub(crate) mod tests {
     use std::fs;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::Path;
-    use std::process::Command;
 
     use serde::{Deserialize, Serialize};
     use serde_json::value::RawValue;
 
     use super::*;
     use crate::store::{append_jsonl, read_jsonl};
-
-    /// Runs `code` under the Python reference (`PYTHONPATH=scripts/lib python3 -B -c`) with
-    /// `args`; returns its stdout, failing the test if it fails.
-    pub(crate) fn python(code: &str, args: &[&OsStr]) -> Vec<u8> {
-        let lib = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/lib");
-        let out = Command::new("python3")
-            .args(["-B", "-c", code])
-            .args(args)
-            .env("PYTHONPATH", lib)
-            .output()
-            .expect("run python3");
-        assert!(
-            out.status.success(),
-            "python3 failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        out.stdout
-    }
 
     /// A file of `tests/fixtures/reference/`: what the reference wrote, recorded by the generator
     /// there and read at run time.

@@ -178,33 +178,63 @@ mod tests {
         assert_eq!(distinct.len(), tags.len());
     }
 
-    /// A Python child in a new session that starts `sleep 30` in another new session, prints
-    /// its pid, and kills it when its stdin closes; with `tag` in its environment, if given.
-    /// Returns the child, its stdin, and the grandchild's pid.
+    /// Set in `detached_sleeper_parent_child`'s process only; unset in an ordinary run.
+    const SLEEPER_PARENT: &str = "LEADHAND_PROCS_TEST_SLEEPER_PARENT";
+
+    /// Not a test of its own: the child `parent_of_detached_sleeper` starts (this test binary,
+    /// running this test alone). It starts `sleep 30` in a new session, prints its pid, and
+    /// kills it when its stdin closes. Does nothing in an ordinary run.
+    #[test]
+    fn detached_sleeper_parent_child() {
+        if std::env::var_os(SLEEPER_PARENT).is_none() {
+            return;
+        }
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").stdin(Stdio::null());
+        detach_session(&mut cmd);
+        let mut sleeper = cmd.spawn().expect("spawn sleep");
+        // On a line of its own: libtest has printed `test <name> ... ` without a newline.
+        println!("\nsleeper {}", sleeper.id());
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+    }
+
+    /// A child in a new session (this test binary, as `detached_sleeper_parent_child`) that
+    /// starts `sleep 30` in another new session, prints its pid, and kills it when its stdin
+    /// closes; with `tag` in its environment, if given. Returns the child, its stdin, and the
+    /// grandchild's pid.
     fn parent_of_detached_sleeper(tag: Option<&str>) -> (Kid, ChildStdin, i32) {
-        let mut cmd = Command::new("python3");
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
         cmd.args([
-            "-c",
-            "import subprocess, sys\n\
-             p = subprocess.Popen(['sleep', '30'], start_new_session=True, stdin=subprocess.DEVNULL)\n\
-             print(p.pid, flush=True)\n\
-             sys.stdin.read()\n\
-             p.kill()\n\
-             p.wait()\n",
+            "procs::tests::detached_sleeper_parent_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
         ])
+        .env(SLEEPER_PARENT, "1")
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
         if let Some((name, value)) = tag.and_then(|t| t.split_once('=')) {
             cmd.env(name, value);
         }
         detach_session(&mut cmd);
-        let mut kid = Kid(cmd.spawn().expect("spawn python3"));
+        let mut kid = Kid(cmd.spawn().expect("spawn the test binary"));
         let stdin = kid.0.stdin.take().unwrap();
+        let mut out = BufReader::new(kid.0.stdout.take().unwrap());
         let mut line = String::new();
-        BufReader::new(kid.0.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let grandchild = line.trim().parse().expect("the grandchild's pid");
+        while !line.starts_with("sleeper ") {
+            line.clear();
+            assert_ne!(out.read_line(&mut line).unwrap(), 0, "no sleeper line");
+        }
+        let grandchild = line["sleeper ".len()..]
+            .trim()
+            .parse()
+            .expect("the grandchild's pid");
+        // The child's libtest summary is still to come: read it in the background so the
+        // child never blocks on a full pipe.
+        std::thread::spawn(move || std::io::copy(&mut out, &mut std::io::sink()));
         (kid, stdin, grandchild)
     }
 
@@ -261,20 +291,39 @@ mod tests {
     // test_ps_fallback_parses_lstart_with_spaces is not ported (S2-R19): it tests the
     // Python's `ps` fallback, and Rust never runs `ps`.
 
+    /// Set in `waiting_child`'s process only; unset in an ordinary run.
+    const WAITING: &str = "LEADHAND_PROCS_TEST_WAITING";
+
+    /// Not a test of its own: the tagged process `tagged_processes_finds_a_process_by_an_
+    /// environment_entry` starts (this test binary, running this test alone). It waits for its
+    /// stdin to close, starting nothing. Does nothing in an ordinary run.
+    #[test]
+    fn waiting_child() {
+        if std::env::var_os(WAITING).is_some() {
+            let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+        }
+    }
+
     #[test]
     fn tagged_processes_finds_a_process_by_an_environment_entry() {
         let tag = unique_tag();
         let (name, value) = tag.split_once('=').unwrap();
-        let mut cmd = Command::new("python3");
+        // This test binary as `waiting_child`, with the entry also as an argument (a libtest
+        // filter that names no test).
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
         cmd.args([
-            "-c",
-            "import time; time.sleep(30)",
+            "procs::tests::waiting_child",
+            "--exact",
+            "--test-threads=1",
             &format!("{name}={value}-argv"),
         ])
+        .env(WAITING, "1")
         .env(name, value)
-        .stdin(Stdio::null());
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
         detach_session(&mut cmd);
-        let p = Kid(cmd.spawn().expect("spawn python3"));
+        let p = Kid(cmd.spawn().expect("spawn the test binary"));
         let other = sleeper(true);
         std::thread::sleep(Duration::from_millis(200));
         let (found, _) = tagged(&tag).expect("environments are readable on Linux and macOS");

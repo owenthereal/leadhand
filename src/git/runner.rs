@@ -554,27 +554,17 @@ mod tests {
 
     #[test]
     fn pinned_settings_match_the_python_reference() {
-        let script = "import json; from leadhand.gitops import SAFE_CONFIG, SAFE_ENV, _REPO_VARS; \
-                      print(json.dumps([list(SAFE_CONFIG), sorted(SAFE_ENV.items()), list(_REPO_VARS)]))";
-        let out = std::process::Command::new("python3")
-            .args(["-B", "-c", script])
-            .env(
-                "PYTHONPATH",
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/lib"),
-            )
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        // `git.json`: the reference's `[list(SAFE_CONFIG), sorted(SAFE_ENV.items()),
+        // list(_REPO_VARS)]`.
+        let recorded = crate::wire::tests::reference_json("git.json");
+        let rows = recorded["pinned_settings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
         let mut env: Vec<[&str; 2]> = SAFE_ENV.iter().map(|(k, v)| [*k, *v]).collect();
         env.sort();
         let ours = serde_json::to_string(&(SAFE_CONFIG, env, REPO_VARS)).unwrap();
-        let theirs: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let theirs = &rows[0];
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&ours).unwrap(),
+            &serde_json::from_str::<serde_json::Value>(&ours).unwrap(),
             theirs
         );
     }

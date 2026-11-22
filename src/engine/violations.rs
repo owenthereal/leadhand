@@ -678,12 +678,14 @@ mod tests {
             "heads/no-prefix",
             "refs/heads/a_b.c",
         ];
-        let code = "import json, re, sys\n\
-                    print(json.dumps([re.sub(r'[^A-Za-z0-9_]+', '-', n.removeprefix('refs/')).strip('-') or 'ref'\n\
-                    \x20                 for n in sys.argv[1:]]))";
-        let args: Vec<&std::ffi::OsStr> = names.iter().map(std::ffi::OsStr::new).collect();
+        // `engine.json`: the reference's naming of each,
+        // `re.sub(r'[^A-Za-z0-9_]+', '-', n.removeprefix('refs/')).strip('-') or 'ref'`.
+        let inputs: Vec<serde_json::Value> = names.iter().map(|n| serde_json::json!(n)).collect();
         let theirs: Vec<String> =
-            serde_json::from_slice(&crate::wire::tests::python(code, &args)).unwrap();
+            crate::wire::tests::reference_outputs("engine.json", "keep_ref_suffix", &inputs)
+                .iter()
+                .map(|out| out.as_str().unwrap().to_string())
+                .collect();
         let ours: Vec<String> = names.iter().map(|n| ref_slug(&(*n).into())).collect();
         assert_eq!(ours, theirs);
         // An undecodable byte is a character outside the class too.

@@ -290,7 +290,10 @@ mod tests {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use super::*;
-    use crate::wire::tests::{python, read_reference};
+    use crate::wire::tests::{read_reference, reference_outputs};
+
+    /// The reference fixture of the tests here (besides the worker prompts).
+    const FIXTURE: &str = "briefs.json";
 
     /// `worker-prompts/<role>.txt`: the reference's `worker_prompt` for each role, for each of
     /// these brief and report paths in turn, as the OS gets it (`os.fsencode`), the prompts
@@ -386,18 +389,15 @@ mod tests {
             ("ws//a/.", Some(-2), "x"),
             (".", None, "d"),
         ];
-        let code = "import sys\nfrom leadhand import briefs\n\
-                    a = sys.argv[1:]\n\
-                    for ws, card, did in zip(a[::3], a[1::3], a[2::3]):\n\
-                    \x20   print(briefs.scratch_dir(ws, None if card == '-' else int(card), did))\n";
-        let mut args: Vec<OsString> = Vec::new();
-        for (ws, card, did) in cases {
-            args.push(ws.into());
-            args.push(card.map_or("-".to_string(), |c| c.to_string()).into());
-            args.push(did.into());
-        }
-        let args: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
-        let theirs = String::from_utf8(python(code, &args)).unwrap();
+        // `briefs.json`: the reference's `scratch_dir` of each case.
+        let inputs: Vec<serde_json::Value> = cases
+            .iter()
+            .map(|(ws, card, did)| serde_json::json!([ws, card, did]))
+            .collect();
+        let theirs: String = reference_outputs(FIXTURE, "scratch_dir", &inputs)
+            .iter()
+            .map(|out| format!("{}\n", out.as_str().unwrap()))
+            .collect();
         let ours: String = cases
             .iter()
             .map(|(ws, card, did)| {
@@ -447,24 +447,22 @@ mod tests {
             "status:ready\u{2028}Blocked by: environment",
         ];
         let cases: Vec<String> = cases.iter().map(|s| s.to_string()).collect();
-        let theirs = python_heads(&cases);
+        let theirs = reference_heads("report_head", &cases);
         assert!(theirs.iter().all(|r| r.is_ok()), "{theirs:?}");
         assert_same_heads(&cases, theirs);
     }
 
-    /// `briefs.parse_report_head` of each text: the triple, or the key its `KeyError` names.
-    fn python_heads(texts: &[String]) -> Vec<std::result::Result<Vec<String>, String>> {
-        let code = "import json, sys\nfrom leadhand import briefs\n\
-                    out = []\n\
-                    for t in json.loads(sys.argv[1]):\n\
-                    \x20   try:\n\
-                    \x20       out.append(['ok', *briefs.parse_report_head(t)])\n\
-                    \x20   except KeyError as e:\n\
-                    \x20       out.append(['KeyError', e.args[0]])\n\
-                    print(json.dumps(out))\n";
-        let arg = serde_json::to_string(texts).unwrap();
-        let out: Vec<Vec<String>> =
-            serde_json::from_slice(&python(code, &[OsStr::new(&arg)])).unwrap();
+    /// The reference's `briefs.parse_report_head` of each text, from section `section` of
+    /// `briefs.json`: the triple, or the key its `KeyError` names.
+    fn reference_heads(
+        section: &str,
+        texts: &[String],
+    ) -> Vec<std::result::Result<Vec<String>, String>> {
+        let inputs: Vec<serde_json::Value> = texts.iter().map(|t| serde_json::json!(t)).collect();
+        let out: Vec<Vec<String>> = reference_outputs(FIXTURE, section, &inputs)
+            .into_iter()
+            .map(|row| serde_json::from_value(row).unwrap())
+            .collect();
         out.into_iter()
             .map(|mut r| match r[0].as_str() {
                 "ok" => Ok(r.split_off(1)),
@@ -504,7 +502,7 @@ mod tests {
                 }
             }
         }
-        let theirs = python_heads(&texts);
+        let theirs = reference_heads("report_head_folded", &texts);
         let raised = theirs.iter().filter(|r| r.is_err()).count();
         // `statuſ`, `verdıct`, `verdİct` and `reſult` raise (two texts each); `ſtatus` parses,
         // and a letter that folds to none of the key's is no match.
@@ -535,6 +533,6 @@ mod tests {
             parse_report_head(&texts[1]),
             Ok(("Status", "BLOCKED", "usage limit"))
         );
-        assert_same_heads(&texts, python_heads(&texts));
+        assert_same_heads(&texts, reference_heads("report_head_kelvin", &texts));
     }
 }

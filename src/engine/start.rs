@@ -431,11 +431,8 @@ mod tests {
             "\u{3a3}\u{3a3} ok",
         ];
         let inputs: Vec<serde_json::Value> = titles.iter().map(|t| serde_json::json!(t)).collect();
-        let theirs = crate::pytext::tests::python_eval(
-            "from leadhand.engine import _slug",
-            "_slug(x)",
-            &inputs,
-        );
+        // `engine.json`: the reference's `_slug` of each title.
+        let theirs = crate::wire::tests::reference_outputs("engine.json", "slug", &inputs);
         for (title, want) in titles.iter().zip(theirs) {
             assert_eq!(slug(title), want.as_str().unwrap(), "{title:?}");
         }

@@ -291,39 +291,42 @@ mod tests {
                 inside.to_str().unwrap(),
             ],
         );
-        let env: Vec<(OsString, OsString)> = f
+        // `git.json`: the reference's `git_common_dir` of each folder, in the same layout
+        // under a root written `{root}` (its parent `{parent}`), run with these sealed Git
+        // variables.
+        let root = f.root().to_str().unwrap();
+        let parent = f.root().parent().unwrap().to_str().unwrap();
+        let placeheld = |t: &str| t.replace(root, "{root}").replace(parent, "{parent}");
+        let fill = |t: &str| t.replace("{root}", root).replace("{parent}", parent);
+        let mut env: Vec<[String; 2]> = f
             .hermetic_env()
             .into_iter()
-            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .filter_map(|(k, v)| v.map(|v| [k, v]))
+            .map(|[k, v]| [k.into_string().unwrap(), placeheld(v.to_str().unwrap())])
             .collect();
-        for dir in [
+        env.sort();
+        let recorded = crate::wire::tests::reference_json("git.json");
+        assert_eq!(
+            recorded["env"],
+            serde_json::json!([env]),
+            "git.json: recorded with other Git variables"
+        );
+        let dirs = [
             repo.clone(),
             repo.join("src"),
             inside.clone(),
             inside.join("src"),
-        ] {
-            let ours = git_common_dir(&dir).unwrap();
-            let out = std::process::Command::new("python3")
-                .args([
-                    "-B",
-                    "-c",
-                    "import os, sys\nfrom pathlib import Path\nfrom leadhand import gitops\n\
-                     sys.stdout.buffer.write(os.fsencode(gitops.git_common_dir(Path(sys.argv[1]))))\n",
-                ])
-                .arg(&dir)
-                .envs(env.iter().cloned())
-                .env(
-                    "PYTHONPATH",
-                    Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/lib"),
-                )
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            assert_eq!(ours.as_os_str().as_bytes(), out.stdout, "{dir:?}");
+        ];
+        let inputs: Vec<serde_json::Value> = dirs
+            .iter()
+            .map(|d| serde_json::json!(placeheld(d.to_str().unwrap())))
+            .collect();
+        let theirs = crate::wire::tests::reference_outputs("git.json", "git_common_dir", &inputs);
+        for (dir, out) in dirs.iter().zip(theirs) {
+            let ours = git_common_dir(dir).unwrap();
+            let out = fill(out.as_str().unwrap());
+            assert!(!out.is_empty(), "{dir:?}");
+            assert_eq!(ours.as_os_str().as_bytes(), out.as_bytes(), "{dir:?}");
             assert_eq!(ours, real(&repo.join(".git")));
         }
         // Outside a checkout, Git's own refusal.

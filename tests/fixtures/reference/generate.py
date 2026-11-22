@@ -13,11 +13,13 @@ are inputs, never written: frozen copies of repository files the reference read,
 later edit of those files changes neither side (ruling S3-R30). They are
 worker-prompts/agents/ (the agent files of the worker prompts and of the configuration's
 maxTurns), config/presets/ (the presets),
-usage/codex-rollout/codex-rollout-interrupted.jsonl (a rollout fixture) and
-dispatch/shell/scenarios/ (the fake Codex scenarios the runner runs replay).
+usage/codex-rollout/codex-rollout-interrupted.jsonl (a rollout fixture),
+dispatch/shell/scenarios/ (the fake Codex scenarios the runner runs replay) and
+briefs/templates/ (the brief templates).
 
-The dispatch runs (dispatch/caller.json, dispatch/shell/) build temporary worlds whose
-paths and pids vary; what is recorded writes them as placeholders the Rust tests fill in.
+The dispatch runs (dispatch/caller.json, dispatch/shell/), the briefs
+(briefs/write-brief.json) and the Git checks (git.json) build temporary worlds whose paths
+and pids vary; what is recorded writes them as placeholders the Rust tests fill in.
 
 This file is the only one here that may name the Python reference; the fixtures and the
 README never do (each write is checked). It is deleted with the Python in Task 10.
@@ -29,6 +31,7 @@ import fcntl
 import io
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -1903,6 +1906,363 @@ def dispatch_shell_fixture() -> None:
         lambda w: {"probe": Path(w.root, "probe.out").read_text()})
 
 
+# --------------------------------------------------------------------------
+# briefs.json: the brief helpers (`briefs::tests`, `briefs_write::tests`)
+
+def report_head(text: str) -> list:
+    """`parse_report_head`: `["ok", key, value, blocked_by]`, or the key its KeyError names."""
+    try:
+        return ["ok", *briefs.parse_report_head(text)]
+    except KeyError as e:
+        return ["KeyError", e.args[0]]
+
+
+def briefs_fixture() -> None:
+    scratch = [["/ws", 1, "c1-a1-implement-1"], ["/ws/", None, "run-a1-final_review-1"],
+               ["ws//a/.", -2, "x"], [".", None, "d"]]
+    heads = [
+        "Status: READY",
+        "  **Status**: ready  ",
+        "\n\n_Status_ :  `Blocked`\nBlocked by: environment (no network)",
+        "Status: BLOCKED\nBlocked by: Usage limit reached",
+        "Status: BLOCKED\nBlocked by:\nBlocked by: usage limit",
+        "Status: BLOCKED\n\n\n\n\nBlocked by: environment",
+        "Status: BLOCKED\na\nb\nc\nd\nBlocked by: environment",
+        "Status: BLOCKED\nblocked  by : environment",
+        "Status: BLOCKED\nBlocked by: something else",
+        "Status: BLOCKED\nBlocKed by: environment",
+        "Status: QUESTION\nBlocked by: environment",
+        "# Verdict: clean",
+        "> Result: FAIL",
+        "# > Verdict : Clean",
+        "Verdict: dirty",
+        "Result: pass extra",
+        "Status: SPENT\r\nmore",
+        "ſtatus: READY",
+        "Status: BKOCKED",
+        "Status: BLOKED",
+        "Status: ſpent",
+        "Status : READY　",
+        "Statusx: READY",
+        "Status READY",
+        "",
+        "   \n\t",
+        "**",
+        "status:ready Blocked by: environment",
+    ]
+    # Each folding letter in every position of every key (`parse_report_head_fails_where_…`).
+    folded = []
+    for word, value in (("status", "READY"), ("verdict", "clean"), ("result", "pass")):
+        for at in range(len(word)):
+            for fold in ("ſ", "ı", "İ", "K"):
+                key = word[:at] + fold + word[at + 1:]
+                folded.append(f"{key}: {value}")
+                folded.append(f"**{key}**: {value}\nBlocked by: environment")
+    kelvin = ["Status: BLOCKED", "status: blocKed\nBlocked by: usage limit",
+              "Status: BLOKKED"]
+
+    def message(args: list) -> list:
+        b, r = Path(args[0]), Path(args[1])
+        return [briefs.dispatch_message("leadhand:implementer", b, r),
+                briefs.dispatch_message("leadhand:codex", b, r, codex_command=args[2:])]
+
+    write("briefs.json", sections({
+        "scratch_dir": mapped(lambda c: str(briefs.scratch_dir(c[0], c[1], c[2])), scratch),
+        "report_head": mapped(report_head, heads),
+        "report_head_folded": mapped(report_head, folded),
+        "report_head_kelvin": mapped(report_head, kelvin),
+        "dispatch_message": mapped(message, [[
+            "/ws/.leadhand/1/c1-a1-implement-1/brief.md",
+            "/ws/.leadhand/1/c1-a1-implement-1/report.md",
+            "/bin/lead hand", "dispatch", "--run", "it's $HOME; x"]]),
+    }))
+
+
+# --------------------------------------------------------------------------
+# briefs/write-brief.json: every brief kind written (`briefs_write::tests`), from the frozen
+# templates in briefs/templates/ (an input, never written)
+
+FROZEN_TEMPLATES = OUT / "briefs" / "templates"
+
+
+def kind_extra(kind: str) -> list:
+    """`briefs_write::tests::kind_extra`: a kind's extra, with a card's base and branch."""
+    out = [("base", "b" * 40), ("branch", "leadhand/widget--card-3")]
+    out += {
+        "fix": [("findings", "/x/findings.md"), ("round", "2")],
+        "answer": [("ruling", "Use option B: keep the old byte order.")],
+        "integrate": [("run_tip", "c" * 40), ("conflicts", "src/widget/header.py"),
+                      ("card_intent", "add a field"), ("run_intent", "rename the struct")],
+        "review": [("diff_range", "abc123..def456"), ("implementer_report", "/x/impl report.md")],
+        "rereview": [("diff_range", "abc123..def456"), ("findings", "/x/findings.md"),
+                     ("implementer_report", "/x/impl report.md")],
+        "final_review": [("diff_range", "base0..tip9"), ("cards", "3")],
+        "final_fix": [("gate", "security"), ("findings", "/x/security.md"),
+                      ("branch", "leadhand/widget")],
+        "security": [("diff_range", "base0..tip9")],
+        "evidence": [("base_worktree", "/x/base tree"), ("cards", "3")],
+    }.get(kind, [])
+    return out
+
+
+def brief_specs() -> list:
+    """`every_kind_matches_the_python_brief`'s specs: `[kind, with_card, extra, notes]`."""
+    specs = []
+    for kind in briefs.BRIEF_KINDS:
+        pairs = kind_extra(kind)
+        if kind == "answer":
+            pairs.append(("ruling", "Use B.\n  Keep the old order.  \n\n"))
+        pairs.append(("test_first", "always" if kind == "review" else "when-cheap"))
+        notes = "## Previous attempt\n\nIt ended SPENT.\n\n\n" if kind == "fix" else ""
+        specs.append([kind, kind in briefs.CARD_KINDS, dict(pairs), notes])
+    return specs
+
+
+def write_brief_fixture() -> None:
+    from leadhand.config import Route
+    from leadhand.deck import Card, Deck
+
+    report_frozen(FROZEN_TEMPLATES, ROOT / "templates", "brief-*.md")
+    card = Card(number=3, title="Parse the widget header", role="implementer", hard=True,
+                hard_reason="touches the on-disk format", risk="high", depends_on=(1, 2),
+                covers=("R1", "R4"), source="docs/plan.md#task-3",
+                allowed_paths=("src/widget/**", "tests/test_widget.py"),
+                out_of_scope="Rendering; the CLI flags.",
+                done_when="`test_header_roundtrip` passes and `make check` is clean.",
+                stop_if="the header needs a new version byte.",
+                inferred=('"Done when" test name (plan named no test)',),
+                route_pin=Route("codex", "gpt-6.1-sol", "xhigh"),
+                context="The header is 16 bytes, little-endian.\nKeep the parser pure.",
+                missing=("SENTINEL-missing",), line=4242, unknown_keys=((77, "SENTINEL-unknown"),))
+    with tempfile.TemporaryDirectory() as tmp, environment_kept(), \
+            patched(briefs, TEMPLATES=FROZEN_TEMPLATES):
+        root = os.path.realpath(tmp)
+        git_env = hermetic_git_env(root)
+        ws = make_repo(root, "work space", {**git_env, "PATH": os.environ.get("PATH", "")})
+        os.environ.update(git_env)
+        deck = Deck(path=Path(ws, "docs/my deck.md"), title="Widget work", source="docs/plan.md",
+                    base_ref="main", base_sha="a" * 40, branch="leadhand/widget",
+                    build="make build", test="make test", profile=None, finish=None,
+                    requirements=(), cards=(card,), digest="0" * 64)
+
+        def written(spec: list) -> str:
+            kind, with_card, extra, notes = spec
+            brief, _ = briefs.write_brief(kind, ws=Path(ws), deck=deck,
+                                          card=card if with_card else None, attempt=2,
+                                          dispatch_id=f"py-{kind}-1", extra=extra, notes=notes)
+            return rooted_all(brief.read_text(encoding="utf-8"), root)
+
+        rows = mapped(written, brief_specs())
+    write("briefs/write-brief.json", sections({"briefs": rows}))
+
+
+def rooted_all(text: str, root: str) -> str:
+    """`text` with every `root` written `{root}`."""
+    return text.replace(root, "{root}")
+
+
+# --------------------------------------------------------------------------
+# engine.json: the engine's text and time helpers (`engine::*::tests`)
+
+def engine_fixture() -> None:
+    from leadhand import engine
+
+    stamps = ["0", "1794268800", "1794268800.9999996", "1794268859.5", "951782400.25"]
+    times = ["2026-11-14T10:20:30Z", "2026-11-14T10:20:30.250000+00:00",
+             "2026-11-14T03:20:30-07:00"]
+    record = r'{"seq":3,"ts":"t","kind":"ruling","card":1,"text":"a, b: \"c\" \\ x","x":[1,{"y":null}],"f":1e-05}'
+    voided = ["", "## The operator's note\n\nGo on.", "trailing newlines\n\n\n", "\n", "café",
+              "already voided\n\n## An earlier run of this check was voided\n\nkeep"]
+    brief = "/run/cards/run/run-w1-final_fix-1/brief.md"
+    continued = [[n, "final_fix", "run-w1-final_fix-1", brief]
+                 for n in ("", "## Fix wave\n\nkeep\n\n", "café", "x\n\n## The interrupted step\n")]
+
+    def continue_notes(row: list) -> str:
+        note, kind, id_, brief_path = row
+
+        class D:
+            pass
+
+        D.kind, D.id = kind, id_
+        D.result = {"files": {"brief": brief_path}}
+        D.req = {"brief": "/ws/brief.md"}
+        return engine._continue_notes(note, D())
+
+    questions = [
+        "Status: QUESTION\n## Summary\nx\n## Question\nWhich storage format should widgets use?\nOptions:\n- A: JSON\n## Concerns\nNone\n",
+        "# question  \n\n  Which one?  \n",
+        "### QUESTION\nA?\n#Not a heading\n## Next\nB",
+        "## Questions\nno\n",
+        "## Queſtion\nfolded\n",
+        "##Question\r\nCRLF?\r\n## End\n",
+        "no question here",
+        "## Question\n## Empty\n",
+    ]
+
+    def question(t: str) -> str:
+        m = engine._QUESTION.search(t)
+        return m.group(1).strip() if m else ""
+
+    heads = [
+        "Verdict: clean\n## Findings\n2. [High] src/a.py:3 — leaks — close it\n## Notes\nRead the diff.\n",
+        "Verdict: clean\n## Findings\n  1) [medium] src/a.py:3 — x — y\n",
+        "Verdict: clean\n## Findings\n1. [low] src/a.py:3 — nit — rename\n## Notes\n- [high] earlier round: fixed\n1. [medium] fixed\n",
+        "Verdict: clean\n[high] src/a.py:3 outside any section\n## Findings\nNone\n",
+        "Verdict: clean\n## Findings\n- [high] src/a.py:3 — leaks — close it\n",
+        "Verdict: clean\n## Findings\n  * [Medium] src/a.py:3 — x — y\n## Notes\nRead the diff.\n",
+        "Verdict: clean\n## Findings\nNone\n## Notes\n1. [high] src/widget.py:1 — fixed\n",
+        "Verdict: clean\n##findings \r\n- [mediuM] a\n",
+        "Verdict: clean\n## Findings\n\n\n   \n١٢. [hıgh] unicode digits\n",
+        "Verdict: clean\n## Findings x\n- [high] not the heading\n",
+        "Verdict: clean\n## Findings\nNone\n## Findings\n- [high] the second one\n",
+        "Verdict: defects\n## Findings\n- [high] a\n",
+        "Status: READY\n## Findings\n- [high] a\n",
+        "Verdict: clean\n## Findings\n-[high]\n#### Findings\n",
+        "NOTE: this agent stopped at its 150-turn limit before finishing.\n",
+        "stopped at ITS 7-TURN LIMIT",
+        "stopped at its -turn limit",
+    ]
+
+    def cross_checked(t: str) -> list:
+        h = engine._head(t, "", None, False)
+        return [h["status"], h["verdict"], h.get("cross_checked", False),
+                bool(engine._TURN_LIMIT.search(t))]
+
+    fallbacks = [
+        [None, "Status: READY\nReport: x", False, False],
+        ["   \n", "I changed some things.\n", False, False],
+        [None, "NOTE: this agent stopped at its 150-turn limit.\n", False, False],
+        ["Status: QUESTION\n", "Status: READY", True, False],
+        [None, "Status: READY", True, False],
+        [None, "", False, True],
+        ["Result: pass\n", "", False, True],
+    ]
+
+    def fallen_back(c: list) -> list:
+        h = engine._head(c[0], c[1], None, c[2], c[3])
+        return [h["status"], h["head"], h["source"], h["raw_kept"], h.get("interrupted", False)]
+
+    cells = ["Widgets | phase 1", "  tabs\tand\nnewlines  ", "café line\u0085x", "a\\|b", ""]
+    sensitive = [
+        ".github/workflows/ci.yml", ".GitHub/Actions/x", "a/.github/workflows/ci.yml",
+        ".gitlab-ci.yml", ".gitlab-ci.yaml\n", ".gitlab-ci.yml.bak", ".circleci/config.yml",
+        ".buildkite/p.yml", "ci/Jenkinsfile", "Jenkinsfile.old", "azure-pipelines.yml",
+        ".travis.yaml", "scripts/install.sh", "scripts/installer", "scripts/install-deps/x",
+        "scripts/installs", "release", "x/release_notes.md", "releases/v1/notes",
+        "src/packaging/x", "infra/main.go", "x/k8s/y", "deploy/x", "deployments/y", "main.tf",
+        "vars.tfvars", "x.tf.json", "Dockerfile", "docker/Dockerfile.dev", "Dockerfile/x",
+        "docker-compose.yml", "ops/docker-compose.prod.yaml", "docker-compose.yml/x",
+        "src/auth/session.py", "src/auth.py", "src/author.py", "src/oauthlib/x", "src/sessions",
+        "src/Session-store.js", "app/login.html", "app/loginpage.html", "x/crypto", ".env",
+        "config/.env.local", ".envrc", "certs/server.pem", "a.KEY", "store.keystore",
+        "db/migrations/0001_init.sql", "migration/x", "db/migrate/1.rb", "database/migrate/2.rb",
+        "alembic/versions/x.py", "src/widget.py", "docs/authoring.md", "src/İnstall.sh",
+        "K8s/x", "src/ſecret", "src/secrét", "", "/", "src/permissions\n",
+    ]
+    titles = ["Demo deck", "  --Retry uploads!! (v2) -- ", "", "!!!",
+              "Café Kelvin İstanbul",
+              "a very long title that goes well past the forty character limit",
+              "exactly forty characters long title ab-c-", "ΣΣ ok"]
+    ref_names = ["refs/heads/leadhand/demo", "refs/heads/leadhand/demo--card-1",
+                 "refs/leadhand/abc/elsewhere/note", "refs/heads/café/x", "refs/---", "refs/",
+                 "heads/no-prefix", "refs/heads/a_b.c"]
+
+    def ref_slug(n: str) -> str:
+        """The keep ref's suffix, as the reference names it (`violations::tests`)."""
+        return re.sub(r"[^A-Za-z0-9_]+", "-", n.removeprefix("refs/")).strip("-") or "ref"
+
+    write("engine.json", sections({
+        "format_time": mapped(lambda a: engine._format_time(float(a)), stamps),
+        "parse_time": mapped(lambda t: repr(engine._parse_time(t)), times),
+        "records_read_back": mapped(lambda line: json.dumps(json.loads(line), ensure_ascii=True)
+                                    + "\n", [record]),
+        "voided_notes": mapped(engine._voided_notes, voided),
+        "continue_notes": mapped(continue_notes, continued),
+        "question": mapped(question, questions),
+        "heads_cross_check": mapped(cross_checked, heads),
+        "heads_fall_back": mapped(fallen_back, fallbacks),
+        "md_cell": mapped(engine._md_cell, cells),
+        "sensitive_path": mapped(engine.is_sensitive_path, sensitive),
+        "slug": mapped(engine._slug, titles),
+        "keep_ref_suffix": mapped(ref_slug, ref_names),
+    }))
+
+
+# --------------------------------------------------------------------------
+# git.json: the Git layer's pinned settings and path checks (`git::*::tests`)
+#
+# The checks that read a repository run on one laid out under a resolved temporary root, as
+# the Rust test lays it out; what is recorded writes that root `{root}` and its parent
+# `{parent}`.
+
+def git_placeheld(text: str, root: str) -> str:
+    return text.replace(root, "{root}").replace(os.path.dirname(root), "{parent}")
+
+
+def git_common_dir_rows() -> dict:
+    """`git_common_dir_matches_python`: the repository `my repo` with a commit of
+    `src/x.txt` and a worktree `.worktrees/my slug` on a new branch `run`, the reference's
+    `git_common_dir` of four folders in them, run with the test's sealed Git variables."""
+    from leadhand import gitops
+
+    with tempfile.TemporaryDirectory() as tmp, environment_kept():
+        root = os.path.realpath(tmp)
+        git_env = hermetic_git_env(root)
+        env = {**git_env, "PATH": os.environ.get("PATH", "")}
+        repo = make_repo(root, "my repo", env)
+        os.makedirs(f"{repo}/src")
+        Path(repo, "src/x.txt").write_text("x\n")
+        git_in(repo, env, "add", "--", "src/x.txt")
+        git_in(repo, env, "commit", "--quiet", "-m", "src")
+        inside = f"{repo}/.worktrees/my slug"
+        git_in(repo, env, "worktree", "add", "--quiet", "-b", "run", inside)
+        os.environ.update(git_env)
+        dirs = [repo, f"{repo}/src", inside, f"{inside}/src"]
+        rows = [{"in": git_placeheld(d, root),
+                 "out": git_placeheld(str(gitops.git_common_dir(Path(d))), root)} for d in dirs]
+        shown = [[k, git_placeheld(v, root)] for k, v in sorted(git_env.items())]
+    return {"env": [shown], "git_common_dir": rows}
+
+
+def resolves_in_place_rows() -> list:
+    """`resolves_in_place_matches_python`: the links it lays out under `{root}`."""
+    from leadhand import gitops
+
+    with tempfile.TemporaryDirectory() as tmp:
+        top = os.path.realpath(tmp)
+        root = f"{top}/root"
+        os.makedirs(f"{root}/real/inner")
+        os.symlink(f"{root}/real", f"{root}/link")
+        os.symlink(root, f"{top}/root link")
+        cases = [(root, f"{root}/real/inner"), (root, f"{root}/link/inner"), (root, f"{root}/link"),
+                 (root, f"{root}/missing/x"), (root, root), (root, f"{top}/outside"),
+                 (f"{root}/real", f"{root}/real/../link"),
+                 (f"{top}/root link", f"{top}/root link/real/inner")]
+        return [{"in": [c.replace(top, "{root}") for c in case],
+                 "out": gitops.resolves_in_place(Path(case[0]), Path(case[1]))} for case in cases]
+
+
+def git_fixture() -> None:
+    from leadhand import gitops
+
+    paths = ["tests/test_x.py", "test/a.c", "spec/a_spec.rb", "docs/guide.html",
+             "tests/deep/helper.py", "test_foo.py", "src/foo_test.go", "src/foo.test.ts",
+             "src/foo.spec.js", "README.md", "notes/usage.rst", "notes/todo.txt", "src/main.py",
+             "scripts/build.sh", "src/contest.py", "src/latest.py", "docs", "tests",
+             "src/tester.py", "pkg/tests/helper.py", "pkg/spec/x.py", "app/docs/views.py",
+             "requirements.txt", "requirements-dev.txt", "tests/requirements.txt",
+             "constraints.txt", "CMakeLists.txt", "src/CMakeLists.txt", "NOTES.MD",
+             "src/Test_x.py", "./tests//a.py", "/tests/a.py", "tests/", "", "src/café.TXT",
+             "src/x.spec", "a.test."]
+    pinned = [list(gitops.SAFE_CONFIG), sorted(gitops.SAFE_ENV.items()), list(gitops._REPO_VARS)]
+    write("git.json", sections({
+        "pinned_settings": [pinned],
+        **git_common_dir_rows(),
+        "test_or_doc_path": mapped(gitops.is_test_or_doc_path, paths),
+        "resolves_in_place": resolves_in_place_rows(),
+    }))
+
+
 def main() -> None:
     procs_samples()
     events_with_raw_bytes()
@@ -1924,6 +2284,10 @@ def main() -> None:
     dispatch_runner_fixture()
     dispatch_caller_fixture()
     dispatch_shell_fixture()
+    briefs_fixture()
+    write_brief_fixture()
+    engine_fixture()
+    git_fixture()
     for path in sorted(WRITTEN):
         print(f"{path.stat().st_size:>8}  {path.relative_to(OUT)}")
 

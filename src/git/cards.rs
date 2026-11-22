@@ -730,11 +730,13 @@ mod tests {
             "src/x.spec",
             "a.test.",
         ];
-        let code = "import json, sys\nfrom leadhand.gitops import is_test_or_doc_path\n\
-                    print(json.dumps([is_test_or_doc_path(p) for p in sys.argv[1:]]))";
-        let args: Vec<&OsStr> = paths.iter().map(OsStr::new).collect();
+        // `git.json`: the reference's `is_test_or_doc_path` of each path.
+        let inputs: Vec<serde_json::Value> = paths.iter().map(|p| serde_json::json!(p)).collect();
         let theirs: Vec<bool> =
-            serde_json::from_slice(&crate::wire::tests::python(code, &args)).unwrap();
+            crate::wire::tests::reference_outputs("git.json", "test_or_doc_path", &inputs)
+                .iter()
+                .map(|out| out.as_bool().unwrap())
+                .collect();
         let ours: Vec<bool> = paths
             .iter()
             .map(|p| is_test_or_doc_path(&PyStr::from(*p)))

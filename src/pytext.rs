@@ -533,45 +533,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// `expr` (a Python expression over `x`) applied by `python3` to each input, after
-    /// `prelude` (Python statements, with the reference's `leadhand` package importable); the
-    /// results as JSON values.
-    pub(crate) fn python_eval(
-        prelude: &str,
-        expr: &str,
-        inputs: &[serde_json::Value],
-    ) -> Vec<serde_json::Value> {
-        let script = format!(
-            "import json, sys\n{prelude}\n\
-             print(json.dumps([(lambda x: {expr})(x) for x in json.load(sys.stdin)]))"
-        );
-        let mut child = std::process::Command::new("python3")
-            .args(["-B", "-c", &script])
-            .env(
-                "PYTHONPATH",
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/lib"),
-            )
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("python3 runs");
-        {
-            use std::io::Write;
-            let mut stdin = child.stdin.take().unwrap();
-            stdin
-                .write_all(serde_json::to_string(inputs).unwrap().as_bytes())
-                .unwrap();
-        }
-        let out = child.wait_with_output().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        serde_json::from_slice(&out.stdout).unwrap()
-    }
-
     fn strings(items: &[&str]) -> Vec<serde_json::Value> {
         items.iter().map(|s| serde_json::json!(s)).collect()
     }

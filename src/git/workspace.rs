@@ -828,15 +828,19 @@ mod tests {
                 f.root().join("root link/real/inner"),
             ),
         ];
-        let code = "import json, sys\nfrom pathlib import Path\nfrom leadhand.gitops import resolves_in_place\n\
-                    a = sys.argv[1:]\n\
-                    print(json.dumps([resolves_in_place(Path(a[i]), Path(a[i + 1])) for i in range(0, len(a), 2)]))";
-        let args: Vec<&OsStr> = cases
+        // `git.json`: the reference's `resolves_in_place` of each case, on the same links under
+        // a root written `{root}`.
+        let top = f.root().to_str().unwrap();
+        let placeheld = |p: &Path| p.to_str().unwrap().replacen(top, "{root}", 1);
+        let inputs: Vec<serde_json::Value> = cases
             .iter()
-            .flat_map(|(r, p)| [r.as_os_str(), p.as_os_str()])
+            .map(|(r, p)| serde_json::json!([placeheld(r), placeheld(p)]))
             .collect();
         let theirs: Vec<bool> =
-            serde_json::from_slice(&crate::wire::tests::python(code, &args)).unwrap();
+            crate::wire::tests::reference_outputs("git.json", "resolves_in_place", &inputs)
+                .iter()
+                .map(|out| out.as_bool().unwrap())
+                .collect();
         let ours: Vec<bool> = cases.iter().map(|(r, p)| resolves_in_place(r, p)).collect();
         assert_eq!(ours, theirs);
         assert_eq!(ours[..3], [true, false, false]);
