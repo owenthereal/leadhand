@@ -284,18 +284,10 @@ pub(crate) fn turn_limit(reply: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::tests::reference_for;
 
-    /// The reference's outputs for `inputs` in section `section` of `engine.json`.
-    fn reference<T: serde::de::DeserializeOwned>(
-        section: &str,
-        inputs: &[impl serde::Serialize],
-    ) -> Vec<T> {
-        let inputs: Vec<serde_json::Value> = inputs.iter().map(|x| serde_json::json!(x)).collect();
-        crate::wire::tests::reference_outputs("engine.json", section, &inputs)
-            .into_iter()
-            .map(|out| serde_json::from_value(out).unwrap())
-            .collect()
-    }
+    /// The reference fixture of the tests here.
+    const FIXTURE: &str = "engine.json";
 
     #[test]
     fn questions_are_read_as_the_python_reads_them() {
@@ -310,7 +302,7 @@ mod tests {
             "## Question\n## Empty\n",
         ];
         // `engine.json`: `_QUESTION.search(t)`'s group 1, stripped, or "".
-        let theirs: Vec<String> = reference("question", &texts);
+        let theirs: Vec<String> = reference_for(FIXTURE, "question", &texts);
         let ours: Vec<String> = texts.iter().map(|t| question(t)).collect();
         assert_eq!(ours, theirs);
     }
@@ -339,7 +331,7 @@ mod tests {
         // `engine.json`: `_head(t, '', None, False)`'s status, verdict and `cross_checked`,
         // and whether `_TURN_LIMIT` finds the text.
         let theirs: Vec<(String, Option<String>, bool, bool)> =
-            reference("heads_cross_check", &texts);
+            reference_for(FIXTURE, "heads_cross_check", &texts);
         let ours: Vec<(String, Option<String>, bool, bool)> = texts
             .iter()
             .map(|t| {
@@ -369,7 +361,7 @@ mod tests {
         // `engine.json`: `_head(report, reply, None, stopped, interrupted)`'s status, head,
         // source, `raw_kept` and `interrupted`.
         let theirs: Vec<(String, String, String, bool, bool)> =
-            reference("heads_fall_back", &cases);
+            reference_for(FIXTURE, "heads_fall_back", &cases);
         let ours: Vec<(String, String, String, bool, bool)> = cases
             .iter()
             .map(|(report, reply, stopped, interrupted)| {

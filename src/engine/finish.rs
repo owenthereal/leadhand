@@ -435,12 +435,8 @@ mod tests {
             "",
         ];
         // `engine.json`: the reference's `_md_cell` of each text.
-        let inputs: Vec<serde_json::Value> = texts.iter().map(|t| serde_json::json!(t)).collect();
         let theirs: Vec<String> =
-            crate::wire::tests::reference_outputs("engine.json", "md_cell", &inputs)
-                .iter()
-                .map(|out| out.as_str().unwrap().to_string())
-                .collect();
+            crate::wire::tests::reference_for("engine.json", "md_cell", &texts);
         let ours: Vec<String> = texts.iter().map(|t| md_cell(t)).collect();
         assert_eq!(ours, theirs);
     }

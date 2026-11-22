@@ -27,6 +27,7 @@ README never do (each write is checked). It is deleted with the Python in Task 1
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import fcntl
 import io
 import json
@@ -2053,7 +2054,9 @@ def write_brief_fixture() -> None:
             return rooted_all(brief.read_text(encoding="utf-8"), root)
 
         rows = mapped(written, brief_specs())
-    write("briefs/write-brief.json", sections({"briefs": rows}))
+        # The deck the briefs were written for, its one card included, every field.
+        given = {"deck": {**dataclasses.asdict(deck), "path": rooted_all(str(deck.path), root)}}
+    write("briefs/write-brief.json", sections({"given": [given], "briefs": rows}))
 
 
 def rooted_all(text: str, root: str) -> str:

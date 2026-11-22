@@ -804,6 +804,22 @@ pub(crate) mod tests {
         rows.iter().map(|r| r["out"].clone()).collect()
     }
 
+    /// `reference_outputs` for `inputs` written as JSON, each output read as a `T`.
+    #[track_caller]
+    pub(crate) fn reference_for<T: serde::de::DeserializeOwned>(
+        name: &str,
+        section: &str,
+        inputs: &[impl Serialize],
+    ) -> Vec<T> {
+        let inputs: Vec<serde_json::Value> = inputs.iter().map(|x| serde_json::json!(x)).collect();
+        reference_outputs(name, section, &inputs)
+            .into_iter()
+            .map(|out| {
+                serde_json::from_value(out).unwrap_or_else(|e| panic!("{name} {section}: {e}"))
+            })
+            .collect()
+    }
+
     /// A record line with its `ts` written `<ts>`: a line the reference wrote at its fixed time,
     /// beside one written now.
     pub(crate) fn mask_ts(line: &str) -> String {

@@ -659,12 +659,8 @@ mod tests {
             "src/permissions\n",
         ];
         // `engine.json`: the reference's `is_sensitive_path` of each path.
-        let inputs: Vec<serde_json::Value> = paths.iter().map(|p| serde_json::json!(p)).collect();
         let theirs: Vec<bool> =
-            crate::wire::tests::reference_outputs("engine.json", "sensitive_path", &inputs)
-                .iter()
-                .map(|out| out.as_bool().unwrap())
-                .collect();
+            crate::wire::tests::reference_for("engine.json", "sensitive_path", &paths);
         let ours: Vec<bool> = paths
             .iter()
             .map(|p| is_sensitive_path(&PyStr::from(*p)))

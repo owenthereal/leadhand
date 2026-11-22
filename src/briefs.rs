@@ -285,15 +285,15 @@ fn blocked_reason(line: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use super::*;
-    use crate::wire::tests::{read_reference, reference_outputs};
+    use crate::wire::tests::{read_reference, reference_for};
 
     /// The reference fixture of the tests here (besides the worker prompts).
-    const FIXTURE: &str = "briefs.json";
+    pub(crate) const FIXTURE: &str = "briefs.json";
 
     /// `worker-prompts/<role>.txt`: the reference's `worker_prompt` for each role, for each of
     /// these brief and report paths in turn, as the OS gets it (`os.fsencode`), the prompts
@@ -390,13 +390,9 @@ mod tests {
             (".", None, "d"),
         ];
         // `briefs.json`: the reference's `scratch_dir` of each case.
-        let inputs: Vec<serde_json::Value> = cases
+        let theirs: String = reference_for::<String>(FIXTURE, "scratch_dir", &cases)
             .iter()
-            .map(|(ws, card, did)| serde_json::json!([ws, card, did]))
-            .collect();
-        let theirs: String = reference_outputs(FIXTURE, "scratch_dir", &inputs)
-            .iter()
-            .map(|out| format!("{}\n", out.as_str().unwrap()))
+            .map(|out| format!("{out}\n"))
             .collect();
         let ours: String = cases
             .iter()
@@ -458,11 +454,7 @@ mod tests {
         section: &str,
         texts: &[String],
     ) -> Vec<std::result::Result<Vec<String>, String>> {
-        let inputs: Vec<serde_json::Value> = texts.iter().map(|t| serde_json::json!(t)).collect();
-        let out: Vec<Vec<String>> = reference_outputs(FIXTURE, section, &inputs)
-            .into_iter()
-            .map(|row| serde_json::from_value(row).unwrap())
-            .collect();
+        let out: Vec<Vec<String>> = reference_for(FIXTURE, section, texts);
         out.into_iter()
             .map(|mut r| match r[0].as_str() {
                 "ok" => Ok(r.split_off(1)),

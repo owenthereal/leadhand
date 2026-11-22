@@ -200,6 +200,29 @@ mod tests {
         sleeper.wait().unwrap();
     }
 
+    /// What `kid` wrote on its stderr (a pipe), read to its end: for a failure's message only.
+    fn stderr_of(kid: &mut Kid) -> String {
+        let mut err = String::new();
+        if let Some(mut pipe) = kid.0.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut pipe, &mut err);
+        }
+        err
+    }
+
+    /// For a failure's message: how `kid` ended and its stderr when it has exited, or nothing
+    /// while it runs (its stderr would not end).
+    fn ending_of(kid: &mut Kid) -> String {
+        match kid.0.try_wait() {
+            Ok(Some(status)) => {
+                format!(
+                    "the child exited ({status}); its stderr:\n{}",
+                    stderr_of(kid)
+                )
+            }
+            _ => String::new(),
+        }
+    }
+
     /// A child in a new session (this test binary, as `detached_sleeper_parent_child`) that
     /// starts `sleep 30` in another new session, prints its pid, and kills it when its stdin
     /// closes; with `tag` in its environment, if given. Returns the child, its stdin, and the
@@ -215,7 +238,7 @@ mod tests {
         .env(SLEEPER_PARENT, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
         if let Some((name, value)) = tag.and_then(|t| t.split_once('=')) {
             cmd.env(name, value);
         }
@@ -226,7 +249,12 @@ mod tests {
         let mut line = String::new();
         while !line.starts_with("sleeper ") {
             line.clear();
-            assert_ne!(out.read_line(&mut line).unwrap(), 0, "no sleeper line");
+            if out.read_line(&mut line).unwrap() == 0 {
+                panic!(
+                    "no sleeper line; the child's stderr:\n{}",
+                    stderr_of(&mut kid)
+                );
+            }
         }
         let grandchild = line["sleeper ".len()..]
             .trim()
@@ -321,13 +349,13 @@ mod tests {
         .env(name, value)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
         detach_session(&mut cmd);
-        let p = Kid(cmd.spawn().expect("spawn the test binary"));
+        let mut p = Kid(cmd.spawn().expect("spawn the test binary"));
         let other = sleeper(true);
         std::thread::sleep(Duration::from_millis(200));
         let (found, _) = tagged(&tag).expect("environments are readable on Linux and macOS");
-        assert_eq!(pids(&found), vec![p.pid()]);
+        assert_eq!(pids(&found), vec![p.pid()], "{}", ending_of(&mut p));
         assert_eq!(
             Some(found[0].start.clone()),
             identify(p.pid()).map(|i| i.start)

@@ -731,12 +731,8 @@ mod tests {
             "a.test.",
         ];
         // `git.json`: the reference's `is_test_or_doc_path` of each path.
-        let inputs: Vec<serde_json::Value> = paths.iter().map(|p| serde_json::json!(p)).collect();
         let theirs: Vec<bool> =
-            crate::wire::tests::reference_outputs("git.json", "test_or_doc_path", &inputs)
-                .iter()
-                .map(|out| out.as_bool().unwrap())
-                .collect();
+            crate::wire::tests::reference_for("git.json", "test_or_doc_path", &paths);
         let ours: Vec<bool> = paths
             .iter()
             .map(|p| is_test_or_doc_path(&PyStr::from(*p)))

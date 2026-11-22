@@ -783,7 +783,9 @@ mod tests {
     use super::*;
     use crate::config::Route;
     use crate::git::fixture::Fixture;
-    use crate::wire::tests::{read_reference_text, reference_outputs};
+    use crate::wire::tests::{
+        read_reference_text, reference_for, reference_json, reference_outputs,
+    };
 
     fn card() -> Card {
         Card {
@@ -829,6 +831,59 @@ mod tests {
             cards: vec![card()],
             digest: "0".repeat(64),
         }
+    }
+
+    /// Every field of `c`, as the reference's `dataclasses.asdict` of its card gives it.
+    fn card_json(c: &Card) -> serde_json::Value {
+        serde_json::json!({
+            "number": c.number,
+            "title": c.title,
+            "role": c.role,
+            "hard": c.hard,
+            "hard_reason": c.hard_reason,
+            "risk": c.risk,
+            "depends_on": c.depends_on,
+            "covers": c.covers,
+            "source": c.source,
+            "allowed_paths": c.allowed_paths,
+            "out_of_scope": c.out_of_scope,
+            "done_when": c.done_when,
+            "stop_if": c.stop_if,
+            "inferred": c.inferred,
+            "route_pin": c.route_pin.as_ref().map(|r| serde_json::json!({
+                "vendor": r.vendor, "model": r.model, "effort": r.effort,
+            })),
+            "context": c.context,
+            "missing": c.missing,
+            "line": c.line,
+            "unknown_keys": c.unknown_keys,
+        })
+    }
+
+    /// Every field of `d`, as the reference's `dataclasses.asdict` of its deck gives it, its
+    /// path with `root` written `{root}`.
+    fn deck_json(d: &Deck, root: &str) -> serde_json::Value {
+        let requirements: Vec<serde_json::Value> = d
+            .requirements
+            .iter()
+            .map(|r| serde_json::json!({"id": r.id, "text": r.text, "cards": r.cards}))
+            .collect();
+        let cards: Vec<serde_json::Value> = d.cards.iter().map(card_json).collect();
+        serde_json::json!({
+            "path": d.path.to_str().unwrap().replacen(root, "{root}", 1),
+            "title": d.title,
+            "source": d.source,
+            "base_ref": d.base_ref,
+            "base_sha": d.base_sha,
+            "branch": d.branch,
+            "build": d.build,
+            "test": d.test,
+            "profile": d.profile,
+            "finish": d.finish,
+            "requirements": requirements,
+            "cards": cards,
+            "digest": d.digest,
+        })
     }
 
     /// The pairs as a Python dict holds them: a repeated key keeps its first place and its
@@ -1015,10 +1070,17 @@ mod tests {
                 serde_json::json!([k, c, map, notes])
             })
             .collect();
-        let theirs = reference_outputs("briefs/write-brief.json", "briefs", &json);
         assert_eq!(w.ws, w.f.root().join("work space"));
         assert_eq!(w.deck.path, w.ws.join("docs/my deck.md"));
         let root = w.f.root().to_str().unwrap();
+        // The deck (its one card included) the reference was given, every field, before any
+        // brief is compared: a field that no brief shows is pinned too.
+        assert_eq!(
+            reference_json("briefs/write-brief.json")["given"],
+            serde_json::json!([{"deck": deck_json(&w.deck, root)}]),
+            "briefs/write-brief.json: recorded on another card or deck"
+        );
+        let theirs = reference_outputs("briefs/write-brief.json", "briefs", &json);
         for ((kind, with_card, pairs, notes), want) in specs.iter().zip(theirs) {
             let want = want.as_str().unwrap().replace("{root}", root);
             let card = w.deck.cards[0].clone();
@@ -1116,13 +1178,13 @@ mod tests {
         // `briefs.json`: the reference's two messages for these paths and this command.
         let mut args = vec![brief.lossy().into_owned(), report.lossy().into_owned()];
         args.extend(argv.iter().map(|a| a.to_str().unwrap().to_string()));
-        let theirs: Vec<String> = reference_outputs(
-            "briefs.json",
+        let theirs: Vec<String> = reference_for::<Vec<String>>(
+            crate::briefs::tests::FIXTURE,
             "dispatch_message",
-            &[serde_json::json!(args)],
+            &[args],
         )
         .into_iter()
-        .flat_map(|out| serde_json::from_value::<Vec<String>>(out).unwrap())
+        .flatten()
         .collect();
         assert_eq!(
             [claude.lossy().into_owned(), codex.lossy().into_owned()].to_vec(),

@@ -832,15 +832,12 @@ mod tests {
         // a root written `{root}`.
         let top = f.root().to_str().unwrap();
         let placeheld = |p: &Path| p.to_str().unwrap().replacen(top, "{root}", 1);
-        let inputs: Vec<serde_json::Value> = cases
+        let inputs: Vec<[String; 2]> = cases
             .iter()
-            .map(|(r, p)| serde_json::json!([placeheld(r), placeheld(p)]))
+            .map(|(r, p)| [placeheld(r), placeheld(p)])
             .collect();
         let theirs: Vec<bool> =
-            crate::wire::tests::reference_outputs("git.json", "resolves_in_place", &inputs)
-                .iter()
-                .map(|out| out.as_bool().unwrap())
-                .collect();
+            crate::wire::tests::reference_for("git.json", "resolves_in_place", &inputs);
         let ours: Vec<bool> = cases.iter().map(|(r, p)| resolves_in_place(r, p)).collect();
         assert_eq!(ours, theirs);
         assert_eq!(ours[..3], [true, false, false]);

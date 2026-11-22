@@ -680,12 +680,8 @@ mod tests {
         ];
         // `engine.json`: the reference's naming of each,
         // `re.sub(r'[^A-Za-z0-9_]+', '-', n.removeprefix('refs/')).strip('-') or 'ref'`.
-        let inputs: Vec<serde_json::Value> = names.iter().map(|n| serde_json::json!(n)).collect();
         let theirs: Vec<String> =
-            crate::wire::tests::reference_outputs("engine.json", "keep_ref_suffix", &inputs)
-                .iter()
-                .map(|out| out.as_str().unwrap().to_string())
-                .collect();
+            crate::wire::tests::reference_for("engine.json", "keep_ref_suffix", &names);
         let ours: Vec<String> = names.iter().map(|n| ref_slug(&(*n).into())).collect();
         assert_eq!(ours, theirs);
         // An undecodable byte is a character outside the class too.

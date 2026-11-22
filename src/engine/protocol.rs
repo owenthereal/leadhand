@@ -547,20 +547,10 @@ pub(crate) fn budget_seconds(req: &events::DispatchRequested, minute_seconds: f6
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::tests::reference_for;
 
-    /// The reference's outputs for `inputs` in section `section` of `engine.json`.
-    fn reference(section: &str, inputs: &[&str]) -> Vec<serde_json::Value> {
-        let inputs: Vec<serde_json::Value> = inputs.iter().map(|t| serde_json::json!(t)).collect();
-        crate::wire::tests::reference_outputs("engine.json", section, &inputs)
-    }
-
-    /// The text of each output.
-    fn texts(outputs: Vec<serde_json::Value>) -> Vec<PyStr> {
-        outputs
-            .iter()
-            .map(|out| PyStr::from(out.as_str().unwrap()))
-            .collect()
-    }
+    /// The reference fixture of the tests here.
+    const FIXTURE: &str = "engine.json";
 
     #[test]
     fn deadlines_are_written_and_read_as_the_python_does() {
@@ -573,9 +563,9 @@ mod tests {
             "1794268859.5",
             "951782400.25",
         ];
-        let theirs: String = reference("format_time", &stamps)
+        let theirs: String = reference_for::<String>(FIXTURE, "format_time", &stamps)
             .iter()
-            .map(|out| format!("{}\n", out.as_str().unwrap()))
+            .map(|out| format!("{out}\n"))
             .collect();
         let ours: String = stamps
             .iter()
@@ -587,8 +577,11 @@ mod tests {
             "2026-11-14T10:20:30.250000+00:00",
             "2026-11-14T03:20:30-07:00",
         ];
-        for (text, out) in times.iter().zip(reference("parse_time", &times)) {
-            let theirs: f64 = out.as_str().unwrap().trim().parse().unwrap();
+        for (text, out) in times
+            .iter()
+            .zip(reference_for::<String>(FIXTURE, "parse_time", &times))
+        {
+            let theirs: f64 = out.trim().parse().unwrap();
             assert_eq!(parse_time(text).unwrap(), theirs, "{text}");
         }
         assert_eq!(
@@ -606,7 +599,7 @@ mod tests {
         let line = r#"{"seq":3,"ts":"t","kind":"ruling","card":1,"text":"a, b: \"c\" \\ x","x":[1,{"y":null}],"f":1e-05}"#;
         // `engine.json`: the reference's `json.dumps(json.loads(line), ensure_ascii=True)`,
         // printed.
-        let theirs = reference("records_read_back", &[line]);
+        let theirs: Vec<serde_json::Value> = reference_for(FIXTURE, "records_read_back", &[line]);
         assert_eq!(format!("{}\n", spaced(line)), theirs[0].as_str().unwrap());
     }
 
@@ -626,7 +619,7 @@ mod tests {
             "caf\u{e9}",
             "already voided\n\n## An earlier run of this check was voided\n\nkeep",
         ];
-        let theirs = texts(reference("voided_notes", &notes));
+        let theirs: Vec<PyStr> = reference_for(FIXTURE, "voided_notes", &notes);
         let ours: Vec<PyStr> = notes.iter().map(|n| voided_notes(&(*n).into())).collect();
         assert_eq!(ours, theirs);
         // Again on its own result: unchanged.
@@ -645,15 +638,12 @@ mod tests {
             "x\n\n## The interrupted step\n",
         ];
         let brief = PyStr::from("/run/cards/run/run-w1-final_fix-1/brief.md");
-        let inputs: Vec<serde_json::Value> = notes
+        let shown = brief.lossy();
+        let inputs: Vec<[&str; 4]> = notes
             .iter()
-            .map(|n| serde_json::json!([n, "final_fix", "run-w1-final_fix-1", brief.lossy()]))
+            .map(|n| [*n, "final_fix", "run-w1-final_fix-1", shown.as_ref()])
             .collect();
-        let theirs = texts(crate::wire::tests::reference_outputs(
-            "engine.json",
-            "continue_notes",
-            &inputs,
-        ));
+        let theirs: Vec<PyStr> = reference_for(FIXTURE, "continue_notes", &inputs);
         let ours: Vec<PyStr> = notes
             .iter()
             .map(|n| continue_notes(&(*n).into(), "final_fix", "run-w1-final_fix-1", &brief))

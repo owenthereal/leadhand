@@ -317,14 +317,15 @@ mod tests {
             inside.clone(),
             inside.join("src"),
         ];
-        let inputs: Vec<serde_json::Value> = dirs
+        let inputs: Vec<String> = dirs
             .iter()
-            .map(|d| serde_json::json!(placeheld(d.to_str().unwrap())))
+            .map(|d| placeheld(d.to_str().unwrap()))
             .collect();
-        let theirs = crate::wire::tests::reference_outputs("git.json", "git_common_dir", &inputs);
+        let theirs: Vec<String> =
+            crate::wire::tests::reference_for("git.json", "git_common_dir", &inputs);
         for (dir, out) in dirs.iter().zip(theirs) {
             let ours = git_common_dir(dir).unwrap();
-            let out = fill(out.as_str().unwrap());
+            let out = fill(&out);
             assert!(!out.is_empty(), "{dir:?}");
             assert_eq!(ours.as_os_str().as_bytes(), out.as_bytes(), "{dir:?}");
             assert_eq!(ours, real(&repo.join(".git")));
