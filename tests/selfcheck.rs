@@ -566,6 +566,45 @@ fn rust_only_never_skips_and_fails_under_python() {
 }
 
 // --------------------------------------------------------------------------
+// Descriptor identity: the device number in one representation
+
+/// A macOS device of 2^31 or more reads on the test's side as BSD `stat -f %d` prints it in
+/// the shell stand-in: `dev()` sign-extends the signed 32-bit `dev_t` (-1590744321), and
+/// `stat` prints the same bits unsigned (2704222975). Pure arithmetic, so it runs everywhere.
+#[test]
+fn macos_device_number_reads_as_bsd_stat_prints_it() {
+    let sign_extended = (-1_590_744_321_i32) as i64 as u64;
+    assert_eq!(
+        common::launch_world::macos_stat_dev(sign_extended),
+        2_704_222_975
+    );
+    assert_eq!(common::launch_world::macos_stat_dev(16_777_232), 16_777_232);
+}
+
+/// A real file's device reads as this platform's `stat` prints it (BSD `stat` on macOS, GNU
+/// `stat` on Linux, the two `sh_open_fds!` uses).
+#[test]
+fn stat_dev_matches_the_platform_stat() {
+    let tmp = TempRoot::new("lh self ");
+    let path = tmp.path().join("f");
+    fs::write(&path, "").unwrap();
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("/usr/bin/stat");
+        c.args(["-f", "%d"]);
+        c
+    } else {
+        let mut c = std::process::Command::new("stat");
+        c.args(["-L", "-c", "%d"]);
+        c
+    };
+    let out = cmd.arg(&path).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let printed: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+    let m = fs::metadata(&path).unwrap();
+    assert_eq!(common::launch_world::stat_dev(&m), printed);
+}
+
+// --------------------------------------------------------------------------
 // The JSON decoder
 
 #[test]

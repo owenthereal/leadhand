@@ -110,6 +110,26 @@ macro_rules! sh_open_fds {
     };
 }
 
+/// A file's device number as `sh_open_fds!`'s `stat` prints it, so the test's side of a
+/// descriptor-identity comparison reads the same number as the shell stand-in's. macOS's
+/// `dev_t` is a signed 32-bit integer, which `MetadataExt::dev()` sign-extends, while BSD
+/// `stat -f %d` prints it unsigned: a device of 2^31 or more (GitHub's macos-15 runners) would
+/// read negative on one side only. Linux's `dev_t` is 64-bit unsigned and GNU `stat` prints it
+/// unsigned, so there the number is used as it is.
+pub fn stat_dev(m: &fs::Metadata) -> i64 {
+    if cfg!(target_os = "macos") {
+        macos_stat_dev(m.dev())
+    } else {
+        m.dev() as i64
+    }
+}
+
+/// A macOS `MetadataExt::dev()` value as BSD `stat -f %d` prints it: the low 32 bits, unsigned.
+/// Separate from `stat_dev` so the selfcheck can feed it any device on any platform.
+pub fn macos_stat_dev(dev: u64) -> i64 {
+    i64::from(dev as u32)
+}
+
 /// A keep-awake tool that logs how it was started and runs until SIGTERM (Python's
 /// LOGGING_TOOL, as a shell script: the suite runs no Python).
 pub const LOGGING_TOOL: &str = concat!(

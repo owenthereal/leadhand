@@ -370,15 +370,17 @@ mod paths {
 
 mod descriptors {
     use super::*;
-    use common::launch_world::{FD_CLAUDE, FD_TOOL, keep_awake_tool, keep_awake_unsupported};
+    use common::launch_world::{
+        FD_CLAUDE, FD_TOOL, keep_awake_tool, keep_awake_unsupported, stat_dev,
+    };
     use common::{read_jsonl, started_by};
     use std::collections::BTreeMap;
     use std::os::unix::fs::MetadataExt;
 
-    /// A file's (device, inode).
+    /// A file's (device, inode), the device as the shell stand-in's `stat` prints it.
     fn id_of(path: &Path) -> (i64, i64) {
         let m = fs::metadata(path).unwrap();
-        (m.dev() as i64, m.ino() as i64)
+        (stat_dev(&m), m.ino() as i64)
     }
 
     /// A logged descriptor's (device, inode).
