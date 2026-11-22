@@ -1119,6 +1119,17 @@ mod tests {
         );
     }
 
+    /// The platform's own strerror text for `errno`, as the standard library
+    /// words it without its " (os error N)" suffix.
+    fn os_wording(errno: i32) -> String {
+        let shown = std::io::Error::from_raw_os_error(errno).to_string();
+        let suffix = format!(" (os error {errno})");
+        shown
+            .strip_suffix(&suffix)
+            .unwrap_or_else(|| panic!("{shown:?} does not end with {suffix:?}"))
+            .to_string()
+    }
+
     #[test]
     fn a_brief_is_never_written_through_a_symlink() {
         let w = world();
@@ -1152,10 +1163,7 @@ mod tests {
         let folder = w.ws.join(".leadhand/run/d-1");
         std::os::unix::fs::symlink(outside.join("x"), folder.join("report.md")).unwrap();
         let read = read_scratch_file(&w.ws, None, "d-1", "report.md").unwrap_err();
-        assert_eq!(
-            read.reason(),
-            PyStr::from("Too many levels of symbolic links")
-        );
+        assert_eq!(read.reason(), PyStr::from(os_wording(libc::ELOOP)));
         remove_scratch_file(&w.ws, None, "d-1", "report.md").unwrap();
         assert!(!folder.join("report.md").exists());
         assert_eq!(
