@@ -1470,10 +1470,7 @@ impl FakeSupervisor {
         started: impl FnOnce(i32),
         f: impl FnOnce(&mut FakeSupervisor, i32),
     ) -> Forked {
-        let slug: String = label
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect();
+        let slug = drive::slug(label);
         let error = self.tmp.join(format!("drive {slug} error.txt"));
         let reached = self.tmp.join(format!("drive {slug} reached"));
         if self.drive_child {

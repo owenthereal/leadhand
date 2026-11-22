@@ -132,8 +132,17 @@ fn catalogue_rows() -> Vec<(String, String)> {
 // --------------------------------------------------------------------------
 // A small Python reader
 
-/// Python source with comments and string literals blanked out (newlines kept).
-fn python_code_only(src: &str) -> String {
+/// The 1-based line of the character at `i`.
+fn line_of(c: &[char], i: usize) -> usize {
+    c[..i.min(c.len())].iter().filter(|ch| **ch == '\n').count() + 1
+}
+
+/// Python source with comments and string literals blanked out (newlines kept). Panics,
+/// naming `file` and the line, on a string that never closes: a one-line string at its
+/// line's end, or any string at the end of the file. The reader would misread everything
+/// after it.
+#[track_caller]
+fn python_code_only(file: &str, src: &str) -> String {
     let c: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
     let blank = |out: &mut String, ch: char| out.push(if ch == '\n' { '\n' } else { ' ' });
@@ -158,9 +167,15 @@ fn python_code_only(src: &str) -> String {
             let q = c[j];
             let triple = c.get(j + 1) == Some(&q) && c.get(j + 2) == Some(&q);
             let mut k = j + if triple { 3 } else { 1 };
+            let unterminated = || -> ! {
+                panic!(
+                    "{file}:{}: a string that never closes (the Python reader stops here)",
+                    line_of(&c, i)
+                )
+            };
             let end = loop {
                 if k >= c.len() {
-                    break c.len();
+                    unterminated();
                 }
                 if c[k] == '\\' {
                     k += 2;
@@ -173,12 +188,11 @@ fn python_code_only(src: &str) -> String {
                 } else if !triple && c[k] == q {
                     break k + 1;
                 } else if !triple && c[k] == '\n' {
-                    break k;
+                    unterminated();
                 } else {
                     k += 1;
                 }
             };
-            let end = end.min(c.len());
             for &ch in &c[i..end] {
                 blank(&mut out, ch);
             }
@@ -192,24 +206,40 @@ fn python_code_only(src: &str) -> String {
 }
 
 /// The logical lines of blanked Python code that start a statement: (indent, text), the
-/// continuation lines inside brackets or after a `\` left out.
-fn logical_lines(code: &str) -> Vec<(usize, String)> {
+/// continuation lines inside brackets or after a `\` left out. Panics, naming `file` and the
+/// line, on a closing bracket with none open, and on brackets still open at the end of the
+/// file: the reader would take the wrong lines for statements.
+#[track_caller]
+fn logical_lines(file: &str, code: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut depth: usize = 0;
+    let mut opened = 0;
     let mut continued = false;
-    for line in code.split('\n') {
+    for (n, line) in code.split('\n').enumerate() {
         if depth == 0 && !continued && !line.trim().is_empty() {
             let indent = line.chars().take_while(|c| *c == ' ' || *c == '\t').count();
             out.push((indent, line.trim().to_string()));
         }
         for ch in line.chars() {
             match ch {
-                '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                '(' | '[' | '{' => {
+                    if depth == 0 {
+                        opened = n + 1;
+                    }
+                    depth += 1;
+                }
+                ')' | ']' | '}' => {
+                    depth = depth.checked_sub(1).unwrap_or_else(|| {
+                        panic!("{file}:{}: a closing {ch:?} with no bracket open", n + 1)
+                    });
+                }
                 _ => {}
             }
         }
         continued = line.trim_end().ends_with('\\');
+    }
+    if depth != 0 {
+        panic!("{file}:{opened}: a bracket opened here is still open at the end of the file");
     }
     out
 }
@@ -256,13 +286,14 @@ struct PyModule {
 
 /// The top-level classes (with their body's `def`s) and functions of Python source, as
 /// `ast.parse(...).body` holds them.
-fn python_defs(src: &str) -> PyModule {
+#[track_caller]
+fn python_defs(file: &str, src: &str) -> PyModule {
     let mut module = PyModule::default();
     let mut current: Option<usize> = None;
     let mut body_indent: Option<usize> = None;
     let mut top_decorators: Vec<String> = Vec::new();
     let mut body_decorators: Vec<String> = Vec::new();
-    for (indent, text) in logical_lines(&python_code_only(src)) {
+    for (indent, text) in logical_lines(file, &python_code_only(file, src)) {
         if indent == 0 {
             body_decorators.clear();
             if text.starts_with('@') {
@@ -320,7 +351,7 @@ fn python_tests() -> Vec<String> {
     let mut keys = Vec::new();
     for path in files {
         let name = path.file_name().unwrap().to_str().unwrap().to_string();
-        let module = python_defs(&read(&path));
+        let module = python_defs(&format!("tests/{name}"), &read(&path));
         // ast's body order: classes and functions interleaved; the order does not matter here.
         for class in &module.classes {
             for (method, _) in &class.methods {
@@ -355,7 +386,7 @@ fn contract_methods(module: &str) -> Option<Classes> {
             .any(|d| d == "reference_only" || d.ends_with(".reference_only"))
     };
     Some(
-        python_defs(&read(&path))
+        python_defs(&format!("tests/contract/{module}.py"), &read(&path))
             .classes
             .into_iter()
             .map(|class| {
@@ -701,7 +732,7 @@ mod checker_is_strict {
             BTreeSet::from(["m::a".to_string(), "m::c".to_string(), "top".to_string()])
         );
         let py = "@reference_only\nclass A(unittest.TestCase):\n    s = \"\"\"\nclass B:\n    def test_no(self): pass\n\"\"\"\n\n    @unittest.skipUnless(\n        x,\n        \"why\")\n    def test_one(self):\n        def test_nested(): pass\n    async def test_two(self): pass\n\ndef test_module(): pass\n";
-        let module = python_defs(py);
+        let module = python_defs("sample.py", py);
         let methods: Vec<&str> = module.classes[0]
             .methods
             .iter()

@@ -1731,23 +1731,15 @@ mod every_crash_point {
         thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 4))
     }
 
-    /// A crash point's name as a label part: what the drive helper's slug keeps
-    /// (alphanumerics), the rest `-`.
-    fn slug(point: &str) -> String {
-        point
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect()
-    }
-
-    /// A worker's drive label.
+    /// A worker's drive label, built from the point's slug (`drive::slug`), so the label is
+    /// its own slug.
     fn worker_label(point: &str, k: usize) -> String {
-        format!("worker-{}-{k}", slug(point))
+        format!("worker-{}-{k}", drive::slug(point))
     }
 
     /// A worker's crash child's drive label.
     fn crash_label(point: &str, k: usize) -> String {
-        format!("crash-{}-{k}", slug(point))
+        format!("crash-{}-{k}", drive::slug(point))
     }
 
     /// `stable_world`: a StableSupervisor with the supervisor session "supervisor-1",
@@ -2042,7 +2034,10 @@ mod every_crash_point {
             .iter()
             .flat_map(|p| (0..count(p)).map(move |k| (p.clone(), k)))
             .collect();
-        let labels: BTreeSet<String> = todo.iter().map(|(p, k)| worker_label(p, *k)).collect();
+        let labels: BTreeSet<String> = todo
+            .iter()
+            .map(|(p, k)| drive::slug(&worker_label(p, *k)))
+            .collect();
         assert!(
             labels.len() == todo.len(),
             "two crash runs share a drive label after the slug: {order:?}"

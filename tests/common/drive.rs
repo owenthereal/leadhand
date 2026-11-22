@@ -109,6 +109,16 @@ pub fn selected_for(label: &str) -> Option<Selector> {
     selected().filter(|s| s.label == label)
 }
 
+/// A drive label as it appears in the drive's file names (`FakeSupervisor::fork_noting`'s
+/// `drive <slug> state.json` and the like): ASCII letters and digits kept, every other
+/// character `-`. Two labels with the same slug would share those files.
+pub fn slug(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 /// The running test's name as libtest names it (`module::test_fn`): its thread's name.
 #[track_caller]
 pub fn this_test() -> String {
