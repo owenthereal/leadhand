@@ -37,6 +37,8 @@ cargo test --locked --features testing
 cargo test --locked --lib
 ```
 
+Build the release binary before the tests: some of them test `target/release/leadhand` in the checkout, whatever build is there (`CARGO_TARGET_DIR` doesn't move it).
+
 - `cargo build --locked --release` builds `target/release/leadhand`, which `bin/leadhand` runs in a source checkout (`claude --plugin-dir <checkout>`).
 - `cargo test --locked --features testing` runs the unit tests and the contract tests (`tests/*.rs`), against a build with the test hooks compiled in.
 - `cargo test --locked --lib` runs the unit tests without the hooks, which checks that a release build has none.

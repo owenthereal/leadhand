@@ -359,28 +359,35 @@ mod json {
         w.accept(1);
         w.ev("outcome", outcome("complete", "", &[]));
         let parent = w.root.parent().unwrap();
-        let text = common::cli(&os_args!["report", w.root], &w.env, parent).ok();
+        // The run under a non-ASCII name, so the report's path in the JSON needs \u escapes.
+        let root = parent.join("run dé ✓");
+        common::rundir::copy_tree(&w.root, &root);
+        let report = common::rundir::run_paths(&root).report;
+        let report_text = report.to_str().unwrap();
+        assert!(!report_text.is_ascii(), "{report_text}");
+        let text = common::cli(&os_args!["report", root], &w.env, parent).ok();
         assert_eq!(
             text.stdout_text(),
-            format!("{}\n", w.paths.report.display()),
+            format!("{}\n", report.display()),
             "{text}"
         );
-        fs::remove_file(&w.paths.report).unwrap();
-        let r = common::cli(&os_args!["report", w.root, "--json"], &w.env, parent).ok();
+        fs::remove_file(&report).unwrap();
+        let r = common::cli(&os_args!["report", root, "--json"], &w.env, parent).ok();
         assert_eq!(r.stderr_text(), "", "{r}");
         assert_json_eq!(
             r.json(),
-            Json::object([("report", Json::from(w.paths.report.to_str().unwrap()))]),
+            Json::object([("report", Json::from(report_text))]),
             "{r}"
         );
         assert!(
-            fs::read_to_string(&w.paths.report)
+            fs::read_to_string(&report)
                 .unwrap()
                 .starts_with("# Run report: Demo deck\n\nOutcome: complete\n")
         );
         // json.loads(r.stdout) == r.json(): an independent decoder (the output is ASCII)
-        assert!(r.stdout.is_ascii(), "{r}");
+        assert!(r.stdout.is_ascii(), "{r}"); // non-ASCII text as \u escapes
         let plain: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
         assert_json_eq!(common::json::parse(plain.to_string().as_bytes()), r.json());
+        assert_eq!(plain["report"].as_str(), Some(report_text), "{r}");
     }
 }

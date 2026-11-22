@@ -137,7 +137,9 @@ Codex workers and the runner:
   after a relaunch) scans all of the user's processes for that exact environment entry
   (`/proc/<pid>/environ` on Linux; `sysctl` `KERN_PROCARGS2` on macOS, no `ps`), adds them to
   the recorded set and stops them with the same ladder, identified by (pid, start time), and
-  scans again before "stopped" is confirmed. The tree snapshot is kept. A process whose
+  scans again before "stopped" is confirmed. The tree snapshot is kept; on macOS it is the
+  only cover for an escaped shell, which the sweep can't see (the tagged-process sweep on
+  macOS, under Known limits). A process whose
   environment cannot be read is listed in `procs.json` (`tag_unreadable`) and is covered by
   the snapshot only; on a platform with neither source the scan is skipped. Recovery re-checks the recorded set before re-dispatching. Only the SIGINT
   step was exercised (nothing was left after it); the SIGTERM/SIGKILL escalation to
@@ -290,8 +292,9 @@ exclusion), so any Claude worker of the session can run it too. What the CLI che
   symlink or a file at any of those folders, `next` refuses with an error naming the path and
   writes or removes nothing; the run waits until the operator removes it and runs `next`
   again. A symlink named like the file itself is replaced or removed, never followed.
-- `run` refuses a CLI or `--plugin-dir` inside the run's workspace, and `start` an in-place
-  run of the repository that holds the CLI.
+- `run` refuses a CLI or `--plugin-dir` inside the run's workspace. The Python reference's
+  `start` also refused an in-place run of the repository that holds the CLI; the binary
+  refuses every in-place run (deliberate change 1).
 - The evidence base worktree is reset only when neither it nor a folder between the
   repository and it is a symlink, and only when it is the run's own: its admin dir carries the
   run's marker (written right after the run adds it), or, after a crash between the add and
@@ -307,8 +310,9 @@ exclusion), so any Claude worker of the session can run it too. What the CLI che
   the workspace restored), an implementer's is committed or kept as leftovers like any other;
   a sparse checkout a worker turns on is turned off again. Sparse checkouts are not supported
   in this version: `check`, `start` and every launch refuse a repository whose checkout is
-  sparse (a worktree run's worktrees would inherit it), and an in-place run is also refused
-  while its checkout has such an entry.
+  sparse (a worktree run's worktrees would inherit it). The Python reference also refused an
+  in-place run while its checkout had such an entry; that check went with in-place runs
+  (deliberate change 1).
 - Leadhand's Git calls run with `GIT_LFS_SKIP_SMUDGE=1`, so git-lfs never fetches an object
   (from a URL a worker's `.lfsconfig` could choose). Files under LFS are pointer files in
   leadhand's own checkouts; the clean filter stays on, so checked-out LFS content does not
@@ -346,10 +350,11 @@ Known limits, until Plan 2's run guard (a caller check on the CLI):
   `unpark`, `pause`, `cancel`) and so pass its own gates, and `start --repo` reaches any
   repository the operator owns.
 - The run lock (L3): every command of the session inherits the `run.lock` descriptor, and
-  unlocking it drops the lock; a relaunch is still refused while the supervisor lives. An
-  in-place run's checkout claim (a lock on the checkout's directory that keeps `start` and
-  `run` of any other in-place run of the repository out while its supervisor lives) is
-  inherited the same way, and unlocking it lets an in-place run from another runs folder in.
+  unlocking it drops the lock; a relaunch is still refused while the supervisor lives. In the
+  Python reference, an in-place run's checkout claim (a lock on the checkout's directory that
+  kept `start` and `run` of any other in-place run of the repository out while its supervisor
+  lived) was inherited the same way, and unlocking it let an in-place run from another runs
+  folder in. The claim went with in-place runs (deliberate change 1).
 - Test hooks (L4, closed): in the Python reference, `LEADHAND_TESTING=1` turned on test-only
   behaviour (crash points, a fake Codex binary through `LEADHAND_TEST_CODEX_BIN`) that an
   environment-prefixed command could reach if the exclusion matched it. Closed by deliberate
@@ -457,8 +462,15 @@ Claude:
 
 ## Linux: not yet observed live
 
-Everything above was observed on macOS. CI builds and tests the Rust binary on Linux
-(x86_64 and arm64), but these behaviours have not been observed in a live run there:
+Everything above was observed on macOS. What each workflow tests:
+
+- CI tests the binary on three platforms: macOS arm64, and Linux x86_64 and arm64 with
+  glibc.
+- The release workflow runs the same tests on the same three platforms, runs the unit tests
+  on both musl targets, and smoke-tests the shipped musl binaries: each must start, print its
+  version and be statically linked. The contract tests (`tests/*.rs`) don't run on musl.
+
+These behaviours have not been observed in a live run on Linux:
 
 - Claude Code's Linux sandbox, and whether the CLI's sandbox exclusion (`"<cli path> *"`)
   works there.

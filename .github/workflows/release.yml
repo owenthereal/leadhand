@@ -37,7 +37,8 @@ jobs:
       # Each platform reports its own result.
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-24.04]
+        # CI's platforms: macOS arm64, Linux x86_64, Linux arm64.
+        os: [macos-15, ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
@@ -50,6 +51,8 @@ jobs:
           rustup toolchain install 1.99 --profile minimal
           rustup default 1.99
 
+      # The release build, which the release-build tests in tests/rust_cli.rs run.
+      - run: cargo build --locked --release
       # The contract tests run against the testing build; the second run checks that the
       # test hooks are compiled out without the feature.
       - run: cargo test --locked --features testing
@@ -92,6 +95,12 @@ jobs:
 
       # The release package: no testing feature, so no test hooks and one binary.
       - run: cargo build --locked --release --target "$RUST_TARGET"
+      # The unit tests on musl, the C library the shipped Linux binaries link against; the
+      # test job tests the glibc build.
+      - name: Run the unit tests on musl
+        if: runner.os == 'Linux'
+        run: cargo test --locked --lib --target "$RUST_TARGET"
+        timeout-minutes: 15
 
       - name: Check the binary
         run: |

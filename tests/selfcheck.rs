@@ -217,11 +217,17 @@ fn inherited_hooks_are_dropped() {
         ("CLAUDE_CODE_SESSION_ID", "abc"),
         ("FAKE_CODEX_SCENARIO", "hang"),
         ("GIT_DIR", "/elsewhere/.git"),
+        // The Python-era router's settings, which nothing reads since the cut-over.
         ("LEADHAND_RUST_COMMANDS", "check"),
+        ("LEADHAND_RUST_BIN", "/elsewhere/leadhand"),
+        ("LEADHAND_PY_BIN", "/elsewhere/reference"),
     ];
     // The test process's own environment with these on top, as the Python test patched
-    // os.environ; nothing here changes the process environment (S3-R19).
-    let base = std::env::vars_os().chain(inherited.iter().map(|(k, v)| (k.into(), v.into())));
+    // os.environ; nothing here changes the process environment (S3-R19). Without
+    // PYTHONDONTWRITEBYTECODE, so the check below sees only what the harness sets.
+    let base = std::env::vars_os()
+        .filter(|(k, _)| k != "PYTHONDONTWRITEBYTECODE")
+        .chain(inherited.iter().map(|(k, v)| (k.into(), v.into())));
     let env = Env::from_base(base, tmp.path(), &["codex"], "");
     for name in [
         "LEADHAND_CRASH_AT",
@@ -233,14 +239,18 @@ fn inherited_hooks_are_dropped() {
         "CLAUDE_CODE_SESSION_ID",
         "FAKE_CODEX_SCENARIO",
         "GIT_DIR",
+        "LEADHAND_RUST_COMMANDS",
+        "LEADHAND_RUST_BIN",
+        "LEADHAND_PY_BIN",
     ] {
         assert!(env.get(name).is_none(), "{name} was not dropped");
     }
+    // The harness sets nothing for Python any more.
+    assert!(env.get("PYTHONDONTWRITEBYTECODE").is_none());
     assert_eq!(
         env.get("LEADHAND_INSTALLED_VENDORS"),
         Some(OsStr::new("codex"))
     );
-    assert_eq!(env.get("LEADHAND_RUST_COMMANDS"), Some(OsStr::new("check")));
     assert_eq!(env.get("LEADHAND_TESTING"), Some(OsStr::new("1")));
     assert_eq!(env.get("GIT_CONFIG_GLOBAL"), Some(OsStr::new("/dev/null")));
     let config = PathBuf::from(env.get("LEADHAND_CONFIG").unwrap());
@@ -465,28 +475,33 @@ fn live_tests_use_the_crate_only_for_procs() {
 // --------------------------------------------------------------------------
 // Tags
 
-/// "ran" or "skipped": what a rust-only test does under LEADHAND_IMPL=`value`.
-fn outcome(value: Option<&str>) -> &'static str {
-    if common::rust_only_under(value.map(OsStr::new)) {
-        "skipped"
-    } else {
-        "ran"
-    }
-}
+/// What LEADHAND_IMPL=python now says: the Python reference is gone, so a test can't run
+/// against it, and must not pass by skipping.
+const PYTHON_GONE: &str = "the Python reference left at the cut-over";
 
+/// The Rust-only tag never skips: unset, empty and `rust` run the test, `python` panics
+/// naming the cut-over, and any other value panics too (ruling S3-R37, M4).
 #[test]
-fn rust_only_skips_under_python() {
-    for (value, want) in [
-        (None, "ran"),
-        (Some(""), "ran"),
-        (Some("rust"), "ran"),
-        (Some("python"), "skipped"),
-    ] {
-        assert_eq!(outcome(value), want, "LEADHAND_IMPL={value:?}");
+fn rust_only_runs_and_refuses_python() {
+    for value in [None, Some(""), Some("rust")] {
+        assert!(
+            !common::rust_only_under(value.map(OsStr::new)),
+            "LEADHAND_IMPL={value:?} skips"
+        );
     }
+    let python = assert_panics!(common::rust_only_under(Some(OsStr::new("python"))));
+    assert!(
+        python.contains("LEADHAND_IMPL=python") && python.contains(PYTHON_GONE),
+        "{python}"
+    );
+    let other = assert_panics!(common::rust_only_under(Some(OsStr::new("pypy"))));
+    assert!(
+        other.contains("LEADHAND_IMPL") && other.contains("pypy"),
+        "{other}"
+    );
 }
 
-/// Set in the child that `rust_only_skips_and_says_so_only_under_python` starts: the probe
+/// Set in the child that `rust_only_never_skips_and_fails_under_python` starts: the probe
 /// below then reports what `rust_only()` did.
 const PROBE: &str = "LEADHAND_SELFCHECK_RUST_ONLY_PROBE";
 
@@ -500,18 +515,19 @@ fn rust_only_probe() {
     }
 }
 
-/// The real tag, `rust_only()`, which every Rust-only test skips through: it skips, after
-/// printing `skipped: rust-only`, only under LEADHAND_IMPL=python. Each case runs this test
-/// binary again as a child with that LEADHAND_IMPL (this process's environment is never
-/// changed), running only `rust_only_probe`.
+/// The real tag, `rust_only()`, which every Rust-only test calls: it returns false (run the
+/// test) unless LEADHAND_IMPL=python, where the test fails, naming the cut-over, and never
+/// prints `skipped: rust-only`. Each case runs this test binary again as a child with that
+/// LEADHAND_IMPL (this process's environment is never changed), running only
+/// `rust_only_probe`.
 #[test]
-fn rust_only_skips_and_says_so_only_under_python() {
+fn rust_only_never_skips_and_fails_under_python() {
     let exe = std::env::current_exe().unwrap();
-    for (value, skips) in [
-        (None, false),
-        (Some(""), false),
-        (Some("rust"), false),
-        (Some("python"), true),
+    for (value, runs) in [
+        (None, true),
+        (Some(""), true),
+        (Some("rust"), true),
+        (Some("python"), false),
     ] {
         let mut cmd = std::process::Command::new(&exe);
         cmd.args([
@@ -529,13 +545,23 @@ fn rust_only_skips_and_says_so_only_under_python() {
         };
         let out = cmd.output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let what = format!("LEADHAND_IMPL={value:?}: {stdout}");
-        assert!(out.status.success(), "{what}");
-        assert!(
-            stdout.contains(&format!("probe: rust_only() returned {skips}\n")),
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let what = format!("LEADHAND_IMPL={value:?}: {stdout}{stderr}");
+        assert_eq!(out.status.success(), runs, "{what}");
+        assert_eq!(
+            stdout.contains("probe: rust_only() returned false\n"),
+            runs,
             "{what}"
         );
-        assert_eq!(stdout.contains("skipped: rust-only\n"), skips, "{what}");
+        assert!(!stdout.contains("returned true"), "{what}");
+        assert!(!stdout.contains("skipped: rust-only"), "{what}");
+        if !runs {
+            assert!(
+                stderr.contains("LEADHAND_IMPL=python") && stderr.contains(PYTHON_GONE),
+                "{what}"
+            );
+            assert!(stdout.contains("test rust_only_probe ... FAILED"), "{what}");
+        }
     }
 }
 

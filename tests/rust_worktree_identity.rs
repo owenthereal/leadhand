@@ -13,8 +13,8 @@
 //! workspace and the top Git found, and the one command that fixes it alone on the last line.
 //! While the repository still lists the worktree, that is `git -C <repo> worktree repair`,
 //! which restores the `.git` file. The scenario is the final review's probe. The Python
-//! reference acts on the operator's checkout there, so every test here returns early under
-//! LEADHAND_IMPL=python.
+//! reference acted on the operator's checkout there, so every test here was Rust-only
+//! (`rust_only`).
 
 #[macro_use]
 mod common;

@@ -18,6 +18,10 @@ use common::plugin::{read, root};
 
 const VERSION: &str = "0.2.0";
 
+/// Another version, for the cases where a version must disagree with `VERSION`. Plainly
+/// synthetic, so that no bump of `VERSION` can turn a mismatch case into a match.
+const OTHER_VERSION: &str = "999.999.999";
+
 /// What a `dist` tree holds besides the binaries, as the brief lists it.
 const PLUGIN_PATHS: [&str; 9] = [
     ".claude-plugin",
@@ -326,7 +330,7 @@ fn check_refuses_an_incomplete_tree() {
         case(
             &format!("{manifest} at another version"),
             manifest,
-            &|dir| set_version(dir, manifest, "0.2.1"),
+            &|dir| set_version(dir, manifest, OTHER_VERSION),
         );
     }
     case("a missing folder", "no such folder", &|dir| {
@@ -356,7 +360,15 @@ fn source_copy(tmp: &Path) -> PathBuf {
 #[test]
 fn assemble_refuses_tag_version_mismatch() {
     let tmp = TempRoot::new("leadhand dist");
-    for version in ["0.2.1", "v0.2.0", "0.2", "0.2.0 ", ""] {
+    // Another version, and near misses of the package's own.
+    let short = VERSION.rsplit_once('.').expect("a three-part version").0;
+    for version in [
+        OTHER_VERSION,
+        &format!("v{VERSION}"),
+        short,
+        &format!("{VERSION} "),
+        "",
+    ] {
         let (ran, out) = assemble_with(&script(), &tmp, version);
         assert_eq!(ran.code, Some(1), "{version:?}: {}", ran.stderr);
         assert!(
@@ -375,24 +387,24 @@ fn assemble_refuses_tag_version_mismatch() {
         let (ran, _) = assemble_with(&src.join("scripts/assemble-dist.sh"), &case, VERSION);
         assert_eq!(ran.code, Some(0), "{file}, unchanged: {}", ran.stderr);
         fs::remove_dir_all(case.join("dist")).unwrap();
-        set_version(&src, file, "0.2.1");
-        for version in [VERSION, "0.2.1"] {
+        set_version(&src, file, OTHER_VERSION);
+        for version in [VERSION, OTHER_VERSION] {
             let (ran, out) = assemble_with(&src.join("scripts/assemble-dist.sh"), &case, version);
             assert_eq!(
                 ran.code,
                 Some(1),
-                "{file} at 0.2.1, {version}: {}",
+                "{file} at {OTHER_VERSION}, {version}: {}",
                 ran.stderr
             );
             assert!(!out.exists(), "{file}, {version}: wrote {}", out.display());
-            // Every place that disagrees with the version is named, and no other: at 0.2.0
-            // the spoiled file, at 0.2.1 the other three.
+            // Every place that disagrees with the version is named, and no other: at VERSION
+            // the spoiled file, at OTHER_VERSION the other three.
             for other in VERSIONED {
                 let disagrees = (other == *file) == (version == VERSION);
                 assert_eq!(
                     ran.stderr.contains(&format!("{other}'s version")),
                     disagrees,
-                    "{file} at 0.2.1, {version}, naming {other}: {}",
+                    "{file} at {OTHER_VERSION}, {version}, naming {other}: {}",
                     ran.stderr
                 );
             }
@@ -629,10 +641,81 @@ fn release_workflow_pins_actions_and_checks_the_tree() {
     ] {
         assert!(build.contains(target), "{target}");
     }
-    // The tests are the post-cut-over pair (ruling S3-R18).
+    // The tests are the post-cut-over pair (ruling S3-R18), after the release build that
+    // rust_cli's release tests run (ruling S3-R35), on CI's three platforms (S3-R36).
     let test = jobs["test"].join("\n");
     assert!(test.contains("cargo test --locked --features testing"));
     assert!(test.contains("cargo test --locked --lib"));
+    assert_eq!(
+        cargo_runs(&jobs["test"]),
+        [
+            (None, "cargo build --locked --release".to_string()),
+            (None, "cargo test --locked --features testing".to_string()),
+            (None, "cargo test --locked --lib".to_string()),
+        ]
+    );
+    assert_eq!(
+        value(&jobs["test"], 8, "os"),
+        Some("[macos-15, ubuntu-24.04, ubuntu-24.04-arm]")
+    );
+    // The Linux legs run the unit tests on musl, the C library of the binaries they ship
+    // (S3-R36), before the binary is uploaded.
+    let linux = Some("runner.os == 'Linux'".to_string());
+    assert_eq!(
+        cargo_runs(&jobs["build"]),
+        [
+            (
+                None,
+                "cargo build --locked --release --target \"$RUST_TARGET\"".to_string()
+            ),
+            (
+                linux,
+                "cargo test --locked --lib --target \"$RUST_TARGET\"".to_string()
+            ),
+        ]
+    );
+    let build_steps = steps(&jobs["build"]);
+    let at = |what: &str| {
+        build_steps
+            .iter()
+            .position(|s| s.iter().any(|l| l.contains(what)))
+            .unwrap_or_else(|| panic!("no build step with {what}"))
+    };
+    assert!(at("cargo test --locked --lib") < at("uses: actions/upload-artifact@"));
+}
+
+/// The steps of a job: the lines from each `- ` item under `steps:` to the next.
+fn steps<'a>(job: &[&'a str]) -> Vec<Vec<&'a str>> {
+    let lines = block(job, 4, "steps").expect("a steps: block");
+    let mut out: Vec<Vec<&str>> = Vec::new();
+    // `block` trims its lines; a step's first line is the one that opens a list item.
+    for line in lines {
+        if line.starts_with("- ") {
+            out.push(vec![line]);
+        } else {
+            out.last_mut().expect("a step").push(line);
+        }
+    }
+    out
+}
+
+/// Each step of a job whose `run:` names `cargo`, in order: its `if:` condition, and its
+/// command. A step's own lines are trimmed, so its keys are read without their indentation.
+fn cargo_runs(job: &[&str]) -> Vec<(Option<String>, String)> {
+    steps(job)
+        .into_iter()
+        .filter_map(|step| {
+            let key = |key: &str| {
+                let prefix = format!("{key}: ");
+                step.iter()
+                    .map(|l| l.trim_start_matches("- "))
+                    .find_map(|l| l.strip_prefix(&prefix))
+                    .map(str::to_string)
+            };
+            let run = key("run")?;
+            run.starts_with("cargo ").then(|| (key("if"), run))
+        })
+        .collect()
 }
 
 // --------------------------------------------------------------------------
@@ -799,29 +882,29 @@ fn tree_at(tmp: &Path, base: &Path, name: &str, version: &str, changed: bool) ->
 
 /// The publish step (ruling for Task 11 fix round 1): no dist yet starts it as an orphan; a
 /// higher version adds one commit on top; the same version with the same tree is a no-op; the
-/// same version with another tree, a lower version (by version order, not text: 0.2.9 is lower
-/// than 0.2.10), and a dist head with no readable version are refused, naming both versions,
+/// same version with another tree, a lower version (by version order, not text: 900.2.9 is lower
+/// than 900.2.10), and a dist head with no readable version are refused, naming both versions,
 /// and leave dist as it was.
 #[test]
 fn publish_step_adds_one_commit_per_higher_release_and_never_rolls_back() {
     let trees = TempRoot::new("leadhand dist");
     let base = assembled(&trees);
-    let v020 = tree_at(&trees, &base, "0.2.0", "0.2.0", false);
-    let v020_rebuilt = tree_at(&trees, &base, "0.2.0 rebuilt", "0.2.0", true);
-    let v021 = tree_at(&trees, &base, "0.2.1", "0.2.1", false);
-    let v019 = tree_at(&trees, &base, "0.1.9", "0.1.9", false);
-    let v0210 = tree_at(&trees, &base, "0.2.10", "0.2.10", false);
-    let v029 = tree_at(&trees, &base, "0.2.9", "0.2.9", false);
+    let v2_0 = tree_at(&trees, &base, "900.2.0", "900.2.0", false);
+    let v2_0_rebuilt = tree_at(&trees, &base, "900.2.0 rebuilt", "900.2.0", true);
+    let v2_1 = tree_at(&trees, &base, "900.2.1", "900.2.1", false);
+    let v1_9 = tree_at(&trees, &base, "900.1.9", "900.1.9", false);
+    let v2_10 = tree_at(&trees, &base, "900.2.10", "900.2.10", false);
+    let v2_9 = tree_at(&trees, &base, "900.2.9", "900.2.9", false);
 
     let mut p = Publisher::new();
     // No dist yet: an orphan commit.
-    let (code, out) = p.publish(&v020, "0.2.0");
+    let (code, out) = p.publish(&v2_0, "900.2.0");
     assert_eq!(code, Some(0), "{out}");
     let dist = p.dist();
     assert_eq!(dist.len(), 1, "{dist:?}");
     assert_eq!(
         (dist[0].1.as_str(), dist[0].2.as_str()),
-        ("", "leadhand 0.2.0")
+        ("", "leadhand 900.2.0")
     );
     // The commit's tree is the assembled tree, executable bits included.
     let modes = common::git::run_git(&p.origin, &["ls-tree", "-r", "refs/heads/dist", "bin"]);
@@ -839,30 +922,30 @@ fn publish_step_adds_one_commit_per_higher_release_and_never_rolls_back() {
     }
 
     // The same version with the same tree: a re-run, which succeeds and adds nothing.
-    let (code, out) = p.publish(&v020, "0.2.0");
+    let (code, out) = p.publish(&v2_0, "900.2.0");
     assert_eq!(code, Some(0), "{out}");
     assert_eq!(p.dist(), dist);
 
     // The same version with another tree: refused.
-    p.refused(&v020_rebuilt, "0.2.0", &["0.2.0"]);
+    p.refused(&v2_0_rebuilt, "900.2.0", &["900.2.0"]);
 
     // A higher version: one commit on top.
-    let (code, out) = p.publish(&v021, "0.2.1");
+    let (code, out) = p.publish(&v2_1, "900.2.1");
     assert_eq!(code, Some(0), "{out}");
     let dist = p.dist();
     assert_eq!(dist.len(), 2, "{dist:?}");
-    assert_eq!(dist[0].1, dist[1].0, "0.2.1's parent is 0.2.0");
-    assert_eq!(dist[0].2, "leadhand 0.2.1");
+    assert_eq!(dist[0].1, dist[1].0, "900.2.1's parent is 900.2.0");
+    assert_eq!(dist[0].2, "leadhand 900.2.1");
 
     // A lower version: refused, naming both.
-    p.refused(&v019, "0.1.9", &["0.1.9", "0.2.1"]);
-    p.refused(&v020, "0.2.0", &["0.2.0", "0.2.1"]);
+    p.refused(&v1_9, "900.1.9", &["900.1.9", "900.2.1"]);
+    p.refused(&v2_0, "900.2.0", &["900.2.0", "900.2.1"]);
 
     // Version order, not text order.
-    let (code, out) = p.publish(&v0210, "0.2.10");
+    let (code, out) = p.publish(&v2_10, "900.2.10");
     assert_eq!(code, Some(0), "{out}");
     assert_eq!(p.dist().len(), 3);
-    p.refused(&v029, "0.2.9", &["0.2.9", "0.2.10"]);
+    p.refused(&v2_9, "900.2.9", &["900.2.9", "900.2.10"]);
 
     // A dist head with no readable version: refused rather than published.
     let mut p = Publisher::new();
@@ -879,6 +962,6 @@ fn publish_step_adds_one_commit_per_higher_release_and_never_rolls_back() {
             &format!("{stray}:refs/heads/dist"),
         ],
     );
-    p.refused(&v021, "0.2.1", &["0.2.1", "version"]);
+    p.refused(&v2_1, "900.2.1", &["900.2.1", "version"]);
     assert_eq!(p.dist().len(), 1);
 }

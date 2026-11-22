@@ -4,8 +4,8 @@
 //! - LEADHAND_BIN: the binary under test (default the testing build, `CARGO_BIN_EXE_leadhand`).
 //!   A relative value is resolved against the test process's working directory, the package
 //!   root (ruling S3-R5), so `LEADHAND_BIN=target/release/leadhand` works.
-//! - LEADHAND_IMPL: `rust` (the default) or `python`. Rust-only tests return early under
-//!   `python` (`rust_only`).
+//! - LEADHAND_IMPL: `rust`, or unset. `python`, which named the Python reference until the
+//!   cut-over, fails the test (`rust_only`).
 //!
 //! Tests run in parallel (ruling S3-R19): nothing here changes the test process's own
 //! environment or relies on running alone. Each test makes its own `TempRoot`, and `Env`
@@ -133,36 +133,36 @@ pub fn bin() -> PathBuf {
     }
 }
 
-fn impl_of(value: Option<&OsStr>) -> &'static str {
+/// Checks LEADHAND_IMPL=`value` (None: unset): it must be `rust`, empty or unset. `python`
+/// named the Python reference, which left at the cut-over, so it panics rather than let a
+/// test pass by skipping.
+fn check_impl(value: Option<&OsStr>) {
     match value.map(OsStr::as_bytes) {
-        None | Some(b"" | b"rust") => "rust",
-        Some(b"python") => "python",
+        None | Some(b"" | b"rust") => {}
+        Some(b"python") => panic!(
+            "LEADHAND_IMPL=python: the Python reference left at the cut-over, so every test \
+             runs the Rust binary; unset LEADHAND_IMPL"
+        ),
         Some(other) => panic!(
-            "LEADHAND_IMPL must be rust or python, not {:?}",
+            "LEADHAND_IMPL must be rust or unset, not {:?}",
             String::from_utf8_lossy(other)
         ),
     }
 }
 
-/// True when LEADHAND_IMPL is `python`: the binary under test is the Python reference.
-pub fn impl_is_python() -> bool {
-    impl_of(std::env::var_os("LEADHAND_IMPL").as_deref()) == "python"
-}
-
-/// Whether a rust-only test skips under LEADHAND_IMPL=`value` (None: unset).
+/// Whether a rust-only test skips under LEADHAND_IMPL=`value` (None: unset): never. Any value
+/// but `rust` or empty panics (`check_impl`).
 pub fn rust_only_under(value: Option<&OsStr>) -> bool {
-    impl_of(value) == "python"
+    check_impl(value);
+    false
 }
 
-/// The rust-only tag, for new Rust behaviour: true when the test must skip (under
-/// LEADHAND_IMPL=python), after printing `skipped: rust-only`. Use it as
-/// `if common::rust_only() { return; }`.
+/// The rust-only tag, from before the cut-over, when a test of new Rust behaviour skipped
+/// under the Python reference. Every binary under test is Rust now, so it returns false, and
+/// panics under LEADHAND_IMPL=python. Its calls, `if common::rust_only() { return; }`, stay
+/// until a follow-up removes them.
 pub fn rust_only() -> bool {
-    let skip = rust_only_under(std::env::var_os("LEADHAND_IMPL").as_deref());
-    if skip {
-        println!("skipped: rust-only");
-    }
-    skip
+    rust_only_under(std::env::var_os("LEADHAND_IMPL").as_deref())
 }
 
 // --------------------------------------------------------------------------
@@ -632,13 +632,7 @@ impl AsRef<Path> for TempRoot {
 }
 
 /// The suite's own settings, passed through to the binary.
-const SUITE_VARS: [&str; 5] = [
-    "LEADHAND_BIN",
-    "LEADHAND_IMPL",
-    "LEADHAND_RUST_COMMANDS",
-    "LEADHAND_RUST_BIN",
-    "LEADHAND_PY_BIN",
-];
+const SUITE_VARS: [&str; 2] = ["LEADHAND_BIN", "LEADHAND_IMPL"];
 /// Inherited variables that would steer the binary or the fakes: other LEADHAND_* names are
 /// test hooks or set by leadhand itself.
 const INHERITED_PREFIXES: [&str; 3] = ["LEADHAND_", "FAKE_CODEX_", "FAKE_CLAUDE_"];
@@ -707,9 +701,8 @@ impl Env {
         text.extend_from_slice(b"\"\n");
         text.extend_from_slice(config_text.as_bytes());
         fs::write(&config, text).unwrap_or_else(|e| panic!("writing {}: {e}", config.display()));
-        let set: [(&str, OsString); 6] = [
+        let set: [(&str, OsString); 5] = [
             ("LEADHAND_TESTING", "1".into()),
-            ("PYTHONDONTWRITEBYTECODE", "1".into()),
             ("LEADHAND_CONFIG", config.into()),
             ("CLAUDE_CONFIG_DIR", tmp.join("claude home").into()),
             ("CODEX_HOME", tmp.join("codex home").into()),

@@ -56,6 +56,19 @@ impl Tree {
         fs::canonicalize(self.plugin()).unwrap()
     }
 
+    /// Adds a stub `sysctl` that runs the shell code `answer` when asked
+    /// `sysctl -n sysctl.proc_translated`, and exits 2 when asked anything else. Without one,
+    /// the PATH below has no `sysctl` (macOS and Linux keep it in `/usr/sbin` or `/sbin`).
+    fn sysctl(&self, answer: &str) {
+        script(
+            &self.tmp.join("stubs/sysctl"),
+            &format!(
+                "if [ \"$#\" = 2 ] && [ \"$1\" = -n ] && [ \"$2\" = sysctl.proc_translated ]; \
+                 then {answer}; else exit 2; fi\n"
+            ),
+        );
+    }
+
     /// PATH: the stub `uname` first, then the system's tools.
     fn path(&self) -> String {
         format!("{}:/usr/bin:/bin", self.tmp.join("stubs").display())
@@ -185,6 +198,8 @@ fn unsupported_platform_message() {
         ("FreeBSD", "amd64"),
     ] {
         let tree = Tree::new(os, arch);
+        // Not translated, whatever the host's own sysctl would say.
+        tree.sysctl("echo 0");
         stub_binary(&tree.plugin().join("target/release/leadhand"), "checkout");
         let line = one_line_failure(&tree.run());
         assert!(line.contains(&format!("{os} {arch}")), "{line}");
@@ -193,6 +208,67 @@ fn unsupported_platform_message() {
             assert!(line.contains(supported), "{line}");
         }
     }
+}
+
+/// A Rosetta shell on Apple silicon (an x86_64 process, as the Bash tool of a Claude Code
+/// started by an x86_64 Node is) reports `Darwin x86_64`, and `sysctl.proc_translated` is 1:
+/// the shim runs the darwin-arm64 binary. The answer counts only for Darwin x86_64.
+#[test]
+fn rosetta_shell_runs_darwin_arm64() {
+    for (os, arch, target) in [
+        ("Darwin", "x86_64", "darwin-arm64"),
+        ("Darwin", "arm64", "darwin-arm64"),
+        ("Linux", "x86_64", "linux-x86_64"),
+    ] {
+        let tree = Tree::new(os, arch);
+        tree.sysctl("echo 1");
+        for t in ["darwin-arm64", "linux-x86_64", "linux-arm64"] {
+            stub_binary(&tree.plugin().join(format!("bin/{t}/leadhand")), t);
+        }
+        let ran = tree.run();
+        assert_eq!(ran.code, Some(0), "{os} {arch}: {}", ran.stderr);
+        assert_eq!(ran.stdout, expected_output(target), "{os} {arch}");
+        assert_eq!(ran.stderr, "", "{os} {arch}");
+    }
+}
+
+/// Darwin x86_64 that isn't translated (an Intel Mac, which has no `sysctl.proc_translated`,
+/// or a `sysctl` that fails, prints nothing or is missing) stays unsupported, with the
+/// one-line message and nothing of `sysctl`'s own.
+#[test]
+fn untranslated_darwin_x86_64_is_unsupported() {
+    let check = |what: &str, ran: Ran| {
+        let line = one_line_failure(&ran);
+        assert!(
+            line.contains("unsupported platform Darwin x86_64"),
+            "{what}: {line}"
+        );
+    };
+    for (what, answer) in [
+        ("prints 0", "echo 0"),
+        (
+            "has no such name",
+            "echo \"sysctl: unknown oid 'sysctl.proc_translated'\" >&2; exit 1",
+        ),
+        ("prints nothing", ":"),
+        ("prints something else", "echo yes"),
+    ] {
+        let tree = Tree::new("Darwin", "x86_64");
+        tree.sysctl(answer);
+        stub_binary(&tree.plugin().join("bin/darwin-arm64/leadhand"), "dist");
+        check(what, tree.run());
+    }
+
+    // No sysctl at all: PATH holds only the stub `uname` and the `dirname` the shim needs.
+    let tree = Tree::new("Darwin", "x86_64");
+    stub_binary(&tree.plugin().join("bin/darwin-arm64/leadhand"), "dist");
+    let tools = tree.tmp.join("tools");
+    fs::create_dir_all(&tools).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/dirname", tools.join("dirname")).unwrap();
+    let path = format!("{}:{}", tree.tmp.join("stubs").display(), tools.display());
+    let mut cmd = Command::new(tree.plugin().join("bin/leadhand"));
+    cmd.env_clear().env("PATH", path).args(ARGS);
+    check("no sysctl", ran(&mut cmd));
 }
 
 /// With no binary at either path, one line naming the platform, both paths it looked for and

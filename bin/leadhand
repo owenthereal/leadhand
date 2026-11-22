@@ -9,6 +9,12 @@ root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 # The platform, as the dist branch names its binaries (bin/<target>/leadhand).
 os=$(uname -s)
 arch=$(uname -m)
+# A Rosetta shell on Apple silicon (an x86_64 process) reports x86_64; sysctl says 1 when the
+# process is translated, so the machine is arm64. Anything else leaves it x86_64.
+if [ "$os $arch" = 'Darwin x86_64' ] &&
+    [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || :)" = 1 ]; then
+    arch=arm64
+fi
 case "$os $arch" in
     'Darwin arm64') target=darwin-arm64 ;;
     'Linux x86_64') target=linux-x86_64 ;;

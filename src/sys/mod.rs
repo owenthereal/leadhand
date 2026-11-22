@@ -220,6 +220,8 @@ unsafe extern "C" {
 /// after `tzset(3)`, so `TZ` and the system's zone are read as the C library reads them.
 /// `None` when the C library cannot convert the time.
 pub fn local_date(secs: i64) -> Option<(i32, u32, u32)> {
+    // The `time_t` alias is deprecated on musl only, and both shipped musl targets are 64-bit.
+    #[allow(deprecated)]
     let t = libc::time_t::try_from(secs).ok()?;
     // SAFETY: `tzset` takes no arguments and only (re)reads `TZ` into the C library's zone
     // state. Reading the environment races only with a concurrent `setenv`/`unsetenv`, and
