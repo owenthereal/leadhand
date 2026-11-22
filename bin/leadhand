@@ -4,13 +4,36 @@
 set -eu
 
 # <root>, the plugin folder: this script's parent folder.
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 
-# In a source checkout: the release build.
-bin=$root/target/release/leadhand
-if [ -x "$bin" ]; then
-    exec "$bin" "$@"
+# The platform, as the dist branch names its binaries (bin/<target>/leadhand).
+os=$(uname -s)
+arch=$(uname -m)
+case "$os $arch" in
+    'Darwin arm64') target=darwin-arm64 ;;
+    'Linux x86_64') target=linux-x86_64 ;;
+    'Linux aarch64' | 'Linux arm64') target=linux-arm64 ;;
+    *)
+        echo "leadhand: unsupported platform $os $arch; leadhand runs on darwin-arm64, linux-x86_64 and linux-arm64" >&2
+        exit 1
+        ;;
+esac
+
+# On the dist branch: the platform's binary.
+dist=$root/bin/$target/leadhand
+if [ -e "$dist" ]; then
+    if [ ! -x "$dist" ]; then
+        echo "leadhand: $dist is not executable; reinstall the plugin" >&2
+        exit 1
+    fi
+    exec "$dist" "$@"
 fi
 
-echo "leadhand: no binary at $bin; build it with \`cargo build --release\` in $root" >&2
+# In a source checkout: the release build.
+build=$root/target/release/leadhand
+if [ -x "$build" ]; then
+    exec "$build" "$@"
+fi
+
+echo "leadhand: no leadhand binary for $target at $dist or $build; reinstall the plugin, or in a source checkout run \`cargo build --release\` in $root" >&2
 exit 1

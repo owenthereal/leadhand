@@ -58,7 +58,7 @@ jobs:
       # so that this file, which the grep covers, doesn't match itself.
       - name: Hygiene grep
         run: |
-          ! grep -rnE '[O]wen|/Users/[o]wen|agent[-]docs|pipeline[/]' agents skills presets templates docs .claude-plugin .codex-plugin bin src tests .github
+          ! grep -rnE '[O]wen|/Users/[o]wen|agent[-]docs|pipeline[/]' agents skills presets templates docs .claude-plugin .codex-plugin bin scripts src tests .github
 
       # Build
       - run: cargo fmt --check

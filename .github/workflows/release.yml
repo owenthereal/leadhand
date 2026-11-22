@@ -1,0 +1,250 @@
+name: Release
+
+# Tests, builds the three release binaries, assembles the dist tree and uploads it, on every
+# trigger. Only a version tag goes on to publish the tree on the dist branch; a pull request or
+# a manual run is a dry run.
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'Cargo.*'
+      - 'bin/**'
+      - 'scripts/assemble-dist.sh'
+      - '.github/workflows/release.yml'
+      - 'agents/**'
+      - 'skills/**'
+      - 'presets/**'
+      - 'templates/**'
+      - '.claude-plugin/**'
+      - '.codex-plugin/**'
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request cancels the dry run it supersedes; a release is never
+# cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      # Each platform reports its own result.
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.99
+        run: |
+          rustup toolchain install 1.99 --profile minimal
+          rustup default 1.99
+
+      # The contract tests run against the testing build; the second run checks that the
+      # test hooks are compiled out without the feature.
+      - run: cargo test --locked --features testing
+        timeout-minutes: 45
+      - run: cargo test --locked --lib
+        timeout-minutes: 15
+
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each natively. The Linux binaries are linked statically against musl, so they run on
+        # any distribution.
+        include:
+          - os: macos-15
+            rust_target: aarch64-apple-darwin
+            target: darwin-arm64
+          - os: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-musl
+            target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            target: linux-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      RUST_TARGET: ${{ matrix.rust_target }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.99 for ${{ matrix.rust_target }}
+        run: |
+          rustup toolchain install 1.99 --profile minimal
+          rustup default 1.99
+          rustup target add "$RUST_TARGET"
+
+      # The release package: no testing feature, so no test hooks and one binary.
+      - run: cargo build --locked --release --target "$RUST_TARGET"
+
+      - name: Check the binary
+        run: |
+          bin=target/$RUST_TARGET/release/leadhand
+          file "$bin"
+          "$bin" version
+      - name: Check the binary is statically linked
+        if: runner.os == 'Linux'
+        run: |
+          bin=target/$RUST_TARGET/release/leadhand
+          if readelf --program-headers "$bin" | grep -q INTERP; then
+            echo "::error::$bin asks for a dynamic loader; the Linux binaries must be static"
+            exit 1
+          fi
+
+      # As assemble-dist.sh takes them: <binaries dir>/<target>/leadhand.
+      - name: Stage the binary
+        run: |
+          mkdir -p "$RUNNER_TEMP/bins/$TARGET"
+          cp "target/$RUST_TARGET/release/leadhand" "$RUNNER_TEMP/bins/$TARGET/leadhand"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ runner.temp }}/bins
+          if-no-files-found: error
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Artefacts lose file modes; assemble-dist.sh sets the binaries' to 0755.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binary-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/bins
+
+      # On a tag, the tag's version, which assemble-dist.sh refuses unless the code agrees;
+      # otherwise the code's own.
+      - name: Choose the version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$REF_TYPE" = tag ]; then
+            version=${REF_NAME#v}
+          else
+            version=$(awk '/^\[/ { p = ($0 == "[package]"); next }
+              p && /^version *= *"/ { sub(/^version *= *"/, ""); sub(/".*/, ""); print; exit }' Cargo.toml)
+          fi
+          echo "version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble the dist tree
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: sh scripts/assemble-dist.sh "$VERSION" "$RUNNER_TEMP/dist" "$RUNNER_TEMP/bins"
+      - name: Check the dist tree
+        run: sh scripts/assemble-dist.sh --check "$RUNNER_TEMP/dist"
+
+      # One tar archive, which keeps the executable bits that an artefact would drop.
+      - name: Pack the dist tree
+        run: |
+          tar -C "$RUNNER_TEMP/dist" -cf "$RUNNER_TEMP/leadhand-dist.tar" .
+          tar -tvf "$RUNNER_TEMP/leadhand-dist.tar"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: leadhand-dist
+          path: ${{ runner.temp }}/leadhand-dist.tar
+          if-no-files-found: error
+
+  publish:
+    name: publish to dist
+    needs: [test, assemble]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    # One release at a time writes dist.
+    concurrency:
+      group: release-dist
+      cancel-in-progress: false
+    steps:
+      # The tagged sources, for assemble-dist.sh --check. The job's token stays in this
+      # checkout's Git config, for the push below.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: leadhand-dist
+          path: ${{ runner.temp }}/artifact
+
+      - name: Unpack and check the dist tree
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          mkdir "$RUNNER_TEMP/dist"
+          tar -xf "$RUNNER_TEMP/artifact/leadhand-dist.tar" -C "$RUNNER_TEMP/dist"
+          sh scripts/assemble-dist.sh --check "$RUNNER_TEMP/dist"
+          version=$(jq -r .version "$RUNNER_TEMP/dist/.claude-plugin/plugin.json")
+          if [ "v$version" != "$REF_NAME" ]; then
+            echo "::error::the dist tree is version $version, not the tag $REF_NAME"
+            exit 1
+          fi
+
+      # The commit's tree is exactly the assembled tree, staged through an index of its own. Its
+      # parent is dist's head; the first release starts dist as an orphan branch. The push is a
+      # plain one, so it can only add a commit on top of dist, never replace one.
+      - name: Commit the tree onto dist and push it
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          export GIT_DIR="$GITHUB_WORKSPACE/.git" GIT_INDEX_FILE="$RUNNER_TEMP/dist.index"
+          cd "$RUNNER_TEMP/dist"
+          git --work-tree=. add --all --force .
+          tree=$(git write-tree)
+          subject="leadhand ${REF_NAME#v}"
+          body="Built from $GITHUB_SHA ($REF_NAME) by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          if git ls-remote --exit-code --heads origin refs/heads/dist > /dev/null; then
+            found=0
+          else
+            found=$?
+          fi
+          case $found in
+            0)
+              git fetch --no-tags --depth=1 origin refs/heads/dist
+              parent=$(git rev-parse FETCH_HEAD)
+              if [ "$(git rev-parse "$parent^{tree}")" = "$tree" ]; then
+                echo "dist already holds this tree, at $parent; nothing to publish"
+                exit 0
+              fi
+              commit=$(git commit-tree "$tree" -p "$parent" -m "$subject" -m "$body")
+              ;;
+            2)
+              echo "no dist branch yet; starting it"
+              commit=$(git commit-tree "$tree" -m "$subject" -m "$body")
+              ;;
+            *)
+              echo "::error::git ls-remote failed with exit status $found"
+              exit 1
+              ;;
+          esac
+          git show --stat --format=fuller "$commit"
+          git push origin "$commit:refs/heads/dist"
