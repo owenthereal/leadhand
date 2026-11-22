@@ -8,9 +8,13 @@
 mod common;
 
 use std::fs;
+use std::time::{Duration, SystemTime};
 
 use common::json::Json;
-use common::rundir::{AttemptOpts, DispatchOpts, RATE_LIMIT_NAME, RATE_LIMIT_TS, RunDir, outcome};
+use common::rundir::{
+    AttemptOpts, DispatchOpts, RATE_LIMIT_NAME, RATE_LIMIT_TS, RunDir, outcome,
+    write_rate_limit_with,
+};
 use common::{is_bin_command, shlex_quote};
 
 const SECTIONS: [&str; 8] = [
@@ -207,12 +211,18 @@ mod report {
                 ..AttemptOpts::default()
             },
         );
-        w.rate_limit_with(20.0, RATE_LIMIT_TS, RATE_LIMIT_NAME);
-        w.rate_limit_with(
+        let older = write_rate_limit_with(&w.sessions, 20.0, RATE_LIMIT_TS, RATE_LIMIT_NAME);
+        let newer = write_rate_limit_with(
+            &w.sessions,
             31.0,
             "2026-01-03T03:04:05.000Z",
             "rollout-2026-01-03-abc.jsonl",
         );
+        // the meter picks the newest file by mtime; Linux's coarse file clock can give
+        // back-to-back writes the same mtime, so set the order explicitly
+        let now = SystemTime::now();
+        common::set_mtime(&older, now - Duration::from_secs(60));
+        common::set_mtime(&newer, now);
         // the meter at the start of the run was recorded by an earlier status write
         fs::write(
             w.root.join("meter-start.json"),
