@@ -1,0 +1,2 @@
+# The fixture's CR and form-feed bytes are deliberate test input for line splitting.
+tests/fixtures/reference/usage/claude-records/transcript.jsonl -whitespace
