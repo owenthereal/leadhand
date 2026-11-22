@@ -469,7 +469,7 @@ pub fn py_fixed(x: f64, digits: usize) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::wire::tests::{float_bits, reference_outputs};
+    use crate::wire::tests::{float_bits, hex, reference_outputs};
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     /// The reference fixture the tests here read.
@@ -648,19 +648,14 @@ pub(crate) mod tests {
             b"no end",
         ];
         // Each case in hex; the reference split it as OS text and gave each line's bytes.
-        let hexes: Vec<serde_json::Value> = cases
-            .iter()
-            .map(|c| serde_json::json!(c.iter().map(|b| format!("{b:02x}")).collect::<String>()))
-            .collect();
+        let hexes: Vec<serde_json::Value> =
+            cases.iter().map(|c| serde_json::json!(hex(c))).collect();
         let theirs: Vec<Vec<String>> = reference_outputs(FIXTURE, "splitlines_bytes", &hexes)
             .into_iter()
             .map(|v| serde_json::from_value(v).unwrap())
             .collect();
         for (case, want) in cases.iter().zip(theirs) {
-            let ours: Vec<String> = py_splitlines_bytes(case)
-                .iter()
-                .map(|l| l.iter().map(|b| format!("{b:02x}")).collect())
-                .collect();
+            let ours: Vec<String> = py_splitlines_bytes(case).iter().map(|l| hex(l)).collect();
             assert_eq!(ours, want, "{case:?}");
         }
     }

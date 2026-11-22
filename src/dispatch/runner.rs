@@ -943,7 +943,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::wire::tests::reference_outputs;
+    use crate::wire::tests::{hex, reference_outputs};
 
     fn term() -> i32 {
         Signal::TERM.as_raw()
@@ -1712,15 +1712,7 @@ mod tests {
         ];
         // Python's `_Stream` over each (a stream file), as JSON: steps, thread_id, turn_open,
         // last_agent_message, error_texts. The inputs are the streams' bytes in hex.
-        let hex: Vec<serde_json::Value> = streams
-            .iter()
-            .map(|b| {
-                b.iter()
-                    .map(|x| format!("{x:02x}"))
-                    .collect::<String>()
-                    .into()
-            })
-            .collect();
+        let hex: Vec<serde_json::Value> = streams.iter().map(|b| hex(b).into()).collect();
         let theirs = reference_lines("stream", &hex);
         for (bytes, want) in streams.into_iter().zip(theirs) {
             let ours = StreamSummary::of(bytes);

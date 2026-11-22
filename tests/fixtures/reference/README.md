@@ -74,7 +74,11 @@ resolved temporary root, writes the test's request, and runs the reference runne
 child process with only the test's environment, with the reference's own fake Codex (the one
 written in Python). The Rust test replays each case with its own runner and the Rust fake
 Codex, `leadhand-fake-codex`. Each file is a JSON object, one key per line: the runner's `exit`
-code, then what the test compares. Records are steadied as the test steadies its own:
+code; what it ran on, which the Rust test checks its own world against first (`request`, the
+`request.json` it read; `env`, its environment as `[name, value]` pairs ordered by name, with
+`{tmpdir}` for TMPDIR, `{fd}` for the probe's descriptor number, `{fake_codex}` for the fake
+Codex and `{frozen}` for the frozen scenarios' folder; and `crafted` or `probe_codex`, the
+scenario or probe file the test writes for its case); then what the test compares. Records are steadied as the test steadies its own:
 `result.json` with `confirmed_at` 0, no start or end time, and each stopped process as
 `{"pid": 0, "pgid": 0, "start": null}`; each attempt without its run ID (checked first to be
 the world's) or times; each charge with an empty `ts`. The root is written `{root}`.

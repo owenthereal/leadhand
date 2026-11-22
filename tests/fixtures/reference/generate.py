@@ -1735,6 +1735,22 @@ class ShellWorld:
         assert SHELL_RUN_ID not in text, text
         return text.replace(self.root, "{root}")
 
+    def shown_env(self, env: dict) -> list:
+        """The runner's environment as the fixture gives it: `[name, value]` pairs ordered by
+        name, what varies by host written `{tmpdir}` (TMPDIR), `{fd}` (the probe's descriptor
+        number), `{fake_codex}` (the fake Codex), `{frozen}` (the frozen scenarios' folder)
+        and `{root}`."""
+        out = []
+        for k, v in sorted(env.items()):
+            if k == "TMPDIR":
+                v = "{tmpdir}"
+            elif k == "PROBE_FD":
+                v = "{fd}"
+            elif k == "LEADHAND_TEST_CODEX_BIN" and v == str(FAKE_CODEX):
+                v = "{fake_codex}"
+            out.append([k, self.placeheld(v.replace(str(FROZEN_SCENARIOS), "{frozen}"))])
+        return out
+
     def result(self) -> str | None:
         """`result.json` steadied (`steady`): times and process identities cleared."""
         text = self.text("result.json")
@@ -1798,7 +1814,13 @@ def shell_case(name: str, change=None, setup=None, env_change=None, fd: bool = F
                 if fd:
                     os.close(held_fd)
                     held.close()
-            snapshot = {"exit": code, **record(w)}
+            # What the run was given, which the Rust test checks its own world against: the
+            # request, the environment, and the files the test writes for a case.
+            given = {"request": w.placeheld(w.text("request.json")), "env": w.shown_env(env)}
+            for key, file in (("crafted", "crafted.jsonl"), ("probe_codex", "probe codex")):
+                if Path(w.root, file).exists():
+                    given[key] = w.placeheld(Path(w.root, file).read_text())
+            snapshot = {"exit": code, **given, **record(w)}
             text = "{" + ",\n".join(dumps(k) + ":" + dumps(v) for k, v in snapshot.items()) + "}\n"
             write(f"dispatch/shell/{name}.json", text.encode("ascii"))
     return run

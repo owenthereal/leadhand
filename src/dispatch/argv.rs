@@ -206,7 +206,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::wire::tests::{read_reference, reference_outputs};
+    use crate::wire::tests::{hex, read_reference, reference_outputs};
     use crate::wire::to_line;
 
     fn os(b: &[u8]) -> OsString {
@@ -389,10 +389,7 @@ mod tests {
     fn shown(got: Result<Vec<OsString>>) -> String {
         match got {
             Ok(argv) => {
-                let hex: Vec<String> = argv
-                    .iter()
-                    .map(|a| a.as_bytes().iter().map(|b| format!("{b:02x}")).collect())
-                    .collect();
+                let hex: Vec<String> = argv.iter().map(|a| hex(a.as_bytes())).collect();
                 format!("ok {}", hex.join(" "))
             }
             Err(e) => format!("err {}", e.message),

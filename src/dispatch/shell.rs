@@ -648,6 +648,8 @@ mod tests {
     use crate::git::fixture::Fixture;
     use crate::state::{AttemptRecord, read_attempts, run_paths};
     use crate::usage::{Charge, read_charges};
+    #[cfg(feature = "testing")]
+    use crate::wire::tests::fake_bin;
     use crate::wire::tests::{reference_fixture, reference_json};
 
     #[cfg(feature = "testing")]
@@ -657,22 +659,13 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     }
 
-    /// The Rust fake Codex, `leadhand-fake-codex`, which a `--features testing` build puts in
-    /// the profile folder (`target/<profile>/`), an ancestor of this test binary's folder.
+    /// The Rust fake Codex, `leadhand-fake-codex`, from the profile folder a `--features
+    /// testing` build puts it in (`fake_bin`). A `--lib` run does not rebuild it: after editing
+    /// `tests/fakes/codex.rs`, run the full `cargo test --features testing` once, or these
+    /// tests replay the stale fake.
     #[cfg(feature = "testing")]
     fn fake_codex() -> PathBuf {
-        let exe = std::env::current_exe().unwrap();
-        exe.ancestors()
-            .skip(1)
-            .map(|dir| dir.join("leadhand-fake-codex"))
-            .find(|fake| fake.is_file())
-            .unwrap_or_else(|| {
-                panic!(
-                    "no leadhand-fake-codex in any folder above {}: build with \
-                     `cargo test --features testing`",
-                    exe.display()
-                )
-            })
+        fake_bin("leadhand-fake-codex")
     }
 
     /// A run with one worker folder, `d1`, whose workspace is a Git repository; and a `PATH`
@@ -952,11 +945,67 @@ mod tests {
         root: String,
     }
 
-    /// The reference's run of scenario `name`, its root read as `w`'s.
-    fn reference(name: &str, w: &World) -> Reference {
+    /// The reference's run of scenario `name`, its root read as `w`'s, once it is checked to
+    /// have run on what the Rust runner ran on in `w` with `env`: the same request, the same
+    /// environment, and the same files the test wrote for the case (a scenario, a probe).
+    #[track_caller]
+    fn reference(name: &str, w: &World, env: &[(OsString, OsString)]) -> Reference {
         let recorded = reference_json(&format!("dispatch/shell/{name}.json"));
         let root = w.root.display().to_string();
-        Reference { recorded, root }
+        let theirs = Reference { recorded, root };
+        let req = crate::dispatch::read_request(&w.wd).unwrap().unwrap();
+        let recorded_req: DispatchRequest = theirs.parsed("request");
+        assert_eq!(req, recorded_req, "{name}: recorded on another request");
+        let mut recorded_env: Vec<(String, String)> = theirs.value("env");
+        // Only a `testing` build gives the runner a fake Codex (`env_with`).
+        if cfg!(not(feature = "testing")) {
+            recorded_env.retain(|(k, _)| k != "LEADHAND_TEST_CODEX_BIN");
+        }
+        assert_eq!(
+            shown_env(env, w),
+            recorded_env,
+            "{name}: recorded on another environment"
+        );
+        for (key, file) in [("crafted", "crafted.jsonl"), ("probe_codex", "probe codex")] {
+            let path = w.root.join(file);
+            assert_eq!(
+                path.exists(),
+                !theirs.recorded[key].is_null(),
+                "{name}: {file}"
+            );
+            if path.exists() {
+                let text = fs::read_to_string(&path).unwrap();
+                assert_eq!(text, theirs.text(key), "{name}: recorded on another {file}");
+            }
+        }
+        theirs
+    }
+
+    /// `env` as the shell fixtures give a runner's environment: ordered by name, what varies
+    /// by host written `{tmpdir}` (TMPDIR), `{fd}` (the probe's descriptor), `{fake_codex}`
+    /// (the fake Codex), `{frozen}` (the frozen scenarios' folder) and `{root}`.
+    fn shown_env(env: &[(OsString, OsString)], w: &World) -> Vec<(String, String)> {
+        let frozen = reference_fixture("dispatch/shell/scenarios");
+        let frozen = frozen.display().to_string();
+        let root = w.root.display().to_string();
+        let mut shown: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| {
+                let k = k.to_str().unwrap().to_string();
+                let v = match k.as_str() {
+                    "TMPDIR" => "{tmpdir}".to_string(),
+                    "PROBE_FD" => "{fd}".to_string(),
+                    #[cfg(feature = "testing")]
+                    "LEADHAND_TEST_CODEX_BIN" if Path::new(v) == fake_codex() => {
+                        "{fake_codex}".to_string()
+                    }
+                    _ => v.to_str().unwrap().to_string(),
+                };
+                (k, v.replace(&frozen, "{frozen}").replace(&root, "{root}"))
+            })
+            .collect();
+        shown.sort();
+        shown
     }
 
     impl Reference {
@@ -1088,7 +1137,8 @@ mod tests {
     #[test]
     fn fake_codex_ready_scenario_writes_result_and_attempt() {
         let ours = world_with(|_, _| {});
-        let out = rust_runner(&ours.wd, &ours.frozen_env("ready"));
+        let env = ours.frozen_env("ready");
+        let out = rust_runner(&ours.wd, &env);
         assert_eq!(out.status.code(), Some(0), "{}", shown(&out));
         let r = ours.result().expect("result.json");
         assert_eq!(
@@ -1162,7 +1212,7 @@ mod tests {
         assert!(ours.wd.join(crate::dispatch::LAST).is_file());
 
         // The Python reference runner, on the same request, left the same records.
-        let theirs = reference("ready", &ours);
+        let theirs = reference("ready", &ours, &env);
         assert_eq!(theirs.exit(), 0);
         assert_same_records(&ours, &theirs);
         assert_eq!(
@@ -1178,7 +1228,8 @@ mod tests {
     fn step_limit_scenario_stops_codex_with_sigint() {
         let ours = world_with(|_, req| req.steps = 3);
         let started = Instant::now();
-        let out = rust_runner(&ours.wd, &ours.frozen_env("many-steps"));
+        let env = ours.frozen_env("many-steps");
+        let out = rust_runner(&ours.wd, &env);
         assert_eq!(out.status.code(), Some(0), "{}", shown(&out));
         assert!(started.elapsed() < Duration::from_secs(20));
         let r = ours.result().unwrap();
@@ -1201,7 +1252,7 @@ mod tests {
             "{stopping}"
         );
         // The reference's exit code and its result's status, exit reason and Codex exit.
-        let theirs = reference("step-limit", &ours);
+        let theirs = reference("step-limit", &ours, &env);
         assert_eq!(theirs.exit(), 0);
         let theirs_r: (Status, ExitReason, Option<i32>) = theirs.value("stop");
         assert_eq!(theirs_r, (r.status, r.exit_reason, r.codex_exit));
@@ -1233,7 +1284,8 @@ mod tests {
                 })
                 .collect()
         };
-        let out = rust_runner(&ours.wd, &with_scenario(&ours));
+        let env = with_scenario(&ours);
+        let out = rust_runner(&ours.wd, &env);
         assert_eq!(out.status.code(), Some(1), "{}", shown(&out));
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("KeyError: 'Re\u{17f}ult'"),
@@ -1248,7 +1300,7 @@ mod tests {
             "it stopped before finalizing"
         );
         // The reference, on the same scenario: the same.
-        let theirs = reference("crafted-head", &ours);
+        let theirs = reference("crafted-head", &ours, &env);
         assert_eq!(theirs.exit(), 1);
         assert!(!theirs.value::<bool>("result_exists"));
         assert_eq!(theirs.attempts(), []);
@@ -1292,9 +1344,10 @@ mod tests {
             name.push("ef.md");
             req.brief = w.ws.join(".leadhand/1/d1").join(name);
         });
-        let out = rust_runner(&ours.wd, &ours.frozen_env("ready"));
+        let env = ours.frozen_env("ready");
+        let out = rust_runner(&ours.wd, &env);
         assert_eq!(out.status.code(), Some(0), "{}", shown(&out));
-        let theirs = reference("prompt-not-utf8", &ours);
+        let theirs = reference("prompt-not-utf8", &ours, &env);
         assert_eq!(theirs.exit(), 0);
         let text = stderr_text(&ours);
         assert!(
@@ -1331,9 +1384,10 @@ mod tests {
         let ours = world_with(|_, req| {
             req.model = serde_json::from_str(r#""gpt\ud800""#).unwrap();
         });
-        let out = rust_runner(&ours.wd, &ours.frozen_env("ready"));
+        let env = ours.frozen_env("ready");
+        let out = rust_runner(&ours.wd, &env);
         assert_eq!(out.status.code(), Some(1), "{}", shown(&out));
-        let theirs = reference("unencodable-model", &ours);
+        let theirs = reference("unencodable-model", &ours, &env);
         assert_eq!(theirs.exit(), 1);
         #[derive(Deserialize)]
         struct Launch {
@@ -1377,9 +1431,10 @@ mod tests {
             "{\"requested_at\": \"earlier\", \"token\": \"tok\"}",
         )
         .unwrap();
-        let out = rust_runner(&ours.wd, &ours.frozen_env("ready"));
+        let env = ours.frozen_env("ready");
+        let out = rust_runner(&ours.wd, &env);
         assert_eq!(out.status.code(), Some(0), "{}", shown(&out));
-        let theirs = reference("cancel-before-launch", &ours);
+        let theirs = reference("cancel-before-launch", &ours, &env);
         assert_eq!(theirs.exit(), 0);
         let r = ours.result().unwrap();
         assert_eq!(
@@ -1516,7 +1571,7 @@ mod tests {
         );
         // The Python reference runner, given the same probe and a descriptor of its own the
         // same way: what the probe reported.
-        let theirs = reference("probe", &ours);
+        let theirs = reference("probe", &ours, &env);
         assert_eq!(theirs.exit(), 0);
         assert_eq!(
             theirs.text("probe"),

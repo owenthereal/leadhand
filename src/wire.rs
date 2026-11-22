@@ -747,6 +747,38 @@ pub(crate) mod tests {
             .join(name)
     }
 
+    /// `bytes` in lowercase hex, as the reference fixtures give bytes.
+    pub(crate) fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The test-only binary `name` (`leadhand-fake-codex`, `leadhand-fake-claude`), which a
+    /// `--features testing` build puts in the profile folder: the nearest ancestor of this
+    /// test binary that holds Cargo's `.cargo-lock` (`target/debug`, or
+    /// `<target dir>/<triple>/<profile>` under `CARGO_TARGET_DIR`, `--target-dir` or
+    /// `--target`). The search stops there, so it never finds an unrelated file higher up.
+    ///
+    /// A unit-test run (`--lib`) builds no `[[bin]]` target: it runs the binary an earlier
+    /// build left. After editing a fake, run the full `cargo test --features testing` once.
+    #[cfg(feature = "testing")]
+    pub(crate) fn fake_bin(name: &str) -> std::path::PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let profile = exe
+            .ancestors()
+            .skip(1)
+            .find(|dir| dir.join(".cargo-lock").is_file())
+            .unwrap_or_else(|| panic!("no Cargo profile folder above {}", exe.display()));
+        let bin = profile.join(name);
+        assert!(
+            bin.is_file(),
+            "no {name} in {}: build with `cargo test --features testing` (and after editing \
+             the fake, run the full `cargo test --features testing` once: a `--lib` run does \
+             not rebuild it)",
+            profile.display()
+        );
+        bin
+    }
+
     /// The bytes of the reference fixture `name`, failing the test when it is missing.
     #[track_caller]
     pub(crate) fn read_reference(name: &str) -> Vec<u8> {
@@ -901,10 +933,7 @@ pub(crate) mod tests {
             b"\x80\xbf\xc2",
         ];
         // Each case in hex; the reference decoded it and wrote the string as JSON.
-        let hex: Vec<serde_json::Value> = cases
-            .iter()
-            .map(|b| serde_json::json!(b.iter().map(|x| format!("{x:02x}")).collect::<String>()))
-            .collect();
+        let hex: Vec<serde_json::Value> = cases.iter().map(|b| serde_json::json!(hex(b))).collect();
         let decoded = reference_outputs(FIXTURE, "surrogateescape", &hex);
         for (bytes, want) in cases.iter().zip(decoded) {
             let s = PyStr::from_os(OsStr::from_bytes(bytes));

@@ -507,7 +507,7 @@ mod tests {
 
     use super::*;
     use crate::cli::resolve_caller_in;
-    use crate::wire::tests::reference_outputs;
+    use crate::wire::tests::{hex, reference_outputs};
     use crate::wire::{ascii_json, to_line};
 
     /// The run directories, workspaces and worker folders every scenario runs against.
@@ -1137,6 +1137,11 @@ mod tests {
     /// path it writes `{real}`), its own pid written `{pid}`.
     const FIXTURE: &str = "dispatch/caller.json";
 
+    /// A path's bytes in hex.
+    fn path_hex(p: &Path) -> String {
+        hex(p.as_os_str().as_bytes())
+    }
+
     /// `value` as JSON, `root` written `{root}`: an input as the reference was given it.
     fn rooted<T: Serialize>(value: &T, root: &Path) -> serde_json::Value {
         let text = to_line(value).unwrap();
@@ -1264,18 +1269,11 @@ mod tests {
                 reqs.push(req);
             }
         }
-        let hex = |p: &Path| -> String {
-            p.as_os_str()
-                .as_bytes()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect()
-        };
         // The reference's `evidence_dirs` of each request, on the same layout under its own
         // resolved root: `ok` and each folder's bytes in hex, or `err` and the DispatchError's
         // text; the root written `{root}`, or `{root_hex}` in hex.
         let inputs: Vec<serde_json::Value> = reqs.iter().map(|r| rooted(r, &root)).collect();
-        let (shown, shown_hex) = (root.display().to_string(), hex(&root));
+        let (shown, shown_hex) = (root.display().to_string(), path_hex(&root));
         let theirs: Vec<String> = reference_outputs(FIXTURE, "evidence_dirs", &inputs)
             .iter()
             .map(|o| {
@@ -1289,7 +1287,7 @@ mod tests {
         for (req, want) in reqs.iter().zip(&theirs) {
             let ours = match evidence_dirs(req) {
                 Ok(dirs) => {
-                    let hex: Vec<String> = dirs.iter().map(|d| hex(d)).collect();
+                    let hex: Vec<String> = dirs.iter().map(|d| path_hex(d)).collect();
                     format!("ok {}", hex.join(" "))
                 }
                 Err(e) => format!("err {}", e.message),
