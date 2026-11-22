@@ -268,11 +268,22 @@ def claude_line(mid: str, out: int, inp: int = 0, cached: int = 0, w5: int = 0,
                                "ephemeral_1h_input_tokens": w1}}}})
 
 
+FROZEN_ROLLOUT = OUT / "usage" / "codex-rollout" / "codex-rollout-interrupted.jsonl"
+
+
+def frozen_rollout_lines() -> list[str]:
+    """The frozen copy of the rollout fixture (an input, S3-R30), split as Rust's `str::lines`
+    splits it."""
+    lines = FROZEN_ROLLOUT.read_text(encoding="utf-8").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return [line.removesuffix("\r") for line in lines]
+
+
 def charge_checkpoint() -> None:
     transcript = [claude_line("m1", 5, 100, 1000, 50, 0), claude_line("m2", 7, 3, 0, 0, 4),
                   claude_line("m1", 40, 100, 1000, 50, 0), claude_line("m3", 9, 1, 2, 0, 0)]
-    rollout = (ROOT / "tests" / "fixtures" / "codex-rollout-interrupted.jsonl").read_text(
-        encoding="utf-8").splitlines()
+    rollout = frozen_rollout_lines()
     with tempfile.TemporaryDirectory() as tmp, patched(u, utc_now=lambda: FIXED_TS):
         tmp = Path(tmp)
         root = tmp / "run with spaces"
@@ -955,15 +966,8 @@ def state_fixture() -> None:
 # --------------------------------------------------------------------------
 # usage/: charges and the vendors' usage records (`usage::tests`)
 
-FROZEN_ROLLOUT = OUT / "usage" / "codex-rollout" / "codex-rollout-interrupted.jsonl"
-
-
-def line_of(value) -> str:
-    return json.dumps(value, separators=(",", ":"))
-
-
 def usage_fixture() -> None:
-    report_frozen(FROZEN_ROLLOUT.parent, ROOT / "tests" / "fixtures", "*.jsonl")
+    report_frozen(FROZEN_ROLLOUT.parent, ROOT / "tests" / "fixtures", FROZEN_ROLLOUT.name)
 
     # A charge of a one-message transcript, as `Case::claude(1, ..)` makes it.
     with tempfile.TemporaryDirectory() as tmp, patched(u, utc_now=lambda: FIXED_TS):
@@ -976,7 +980,7 @@ def usage_fixture() -> None:
                  dispatch_id="d1", role="implementer", path_or_thread=f)
         (c,) = u.read_charges(paths)
         record = paths.charges.read_text(encoding="ascii")
-        assert record == line_of(u._charge_to_record(c)) + "\n", record
+        assert record == dumps(u._charge_to_record(c)) + "\n", record
         checkpoints = (json.dumps(u.charged_checkpoint([c], "claude", "agent1")) + " "
                        + json.dumps(u.charged_checkpoint([c], "claude", "other")) + "\n")
     write("usage/charge-record.txt", (record + checkpoints).encode("ascii"))
@@ -985,12 +989,12 @@ def usage_fixture() -> None:
     for x in (u.Usage(input=1, output=10, model="claude-opus-4-1"),
               u.Usage(input=2, output=20, model="claude-opus-4-1"), u.Usage(model="<synthetic>")):
         s = u.add(s, x)
-    write("usage/single-model.json", (line_of(u.usage_to_dict(s)) + "\n").encode("ascii"))
+    write("usage/single-model.json", (dumps(u.usage_to_dict(s)) + "\n").encode("ascii"))
 
     a = u.Usage(input=1000, output=100, model="claude-opus-4")
     b = u.Usage(input=2000, output=200, model="claude-sonnet-4-5")
     write("usage/serialized.jsonl", "".join(
-        line_of(u.usage_to_dict(x)) + "\n" for x in (a, u.add(a, b), u.UNKNOWN)).encode("ascii"))
+        dumps(u.usage_to_dict(x)) + "\n" for x in (a, u.add(a, b), u.UNKNOWN)).encode("ascii"))
 
     p = {"opus": {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write_5m": 18.75,
                   "cache_write_1h": 30.0}}
@@ -1017,17 +1021,14 @@ def usage_fixture() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         f = Path(tmp) / "odd.jsonl"
         f.write_bytes(transcript)
-        messages = "".join(f"{json.dumps(mid)} {line_of(u.usage_to_dict(x))}\n"
+        messages = "".join(f"{json.dumps(mid)} {dumps(u.usage_to_dict(x))}\n"
                            for mid, x in u._claude_messages(str(f)).items())
     write("usage/claude-records/transcript.jsonl", transcript)
     write("usage/claude-records/messages.txt", messages.encode("ascii"))
 
     # The rollout of `codex::tests::rollout_reads_as_the_python_reads_it`: the frozen fixture's
     # lines (as Rust's `str::lines` gives them), and four more.
-    base = FROZEN_ROLLOUT.read_text(encoding="utf-8").split("\n")
-    if base and base[-1] == "":
-        base.pop()
-    base = [line.removesuffix("\r") for line in base]
+    base = frozen_rollout_lines()
     rollout = base + [
         base[16],
         '{"type":"token_usage_record","payload":{"response_id":7,"usage":{"input_tokens":5}}}',
@@ -1042,8 +1043,8 @@ def usage_fixture() -> None:
         def d(v):
             return None if v is None else u.usage_to_dict(v)
 
-        read = "".join(f"{line_of(rid)} {line_of(d(v))}\n" for rid, v in r.responses.items())
-        read += line_of(d(r.thread_total)) + "\n" + line_of(d(r.token_count_total)) + "\n"
+        read = "".join(f"{dumps(rid)} {dumps(d(v))}\n" for rid, v in r.responses.items())
+        read += dumps(d(r.thread_total)) + "\n" + dumps(d(r.token_count_total)) + "\n"
     write("usage/codex-rollout/read.txt", read.encode("ascii"))
 
 

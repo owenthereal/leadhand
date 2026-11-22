@@ -322,7 +322,7 @@ mod tests {
     use crate::state::run_paths;
     use crate::usage::claude::tests::{OPUS, claude_line};
     use crate::usage::codex::tests::{
-        ROLLOUT, append_lines, codex_line, fixture_lines, rollout_path,
+        ROLLOUT, append_lines, codex_line, fixture_lines, frozen_rollout_lines, rollout_path,
     };
     use crate::usage::{Group, add, claude_usage, totals};
     use crate::wire::{
@@ -407,9 +407,22 @@ mod tests {
         }
 
         fn place_rollout(&self, count: Option<usize>) -> std::path::PathBuf {
+            self.place_rollout_lines(fixture_lines(ROLLOUT), count)
+        }
+
+        /// `place_rollout`, from the frozen copy of the rollout the reference fixtures were
+        /// recorded from.
+        fn place_frozen_rollout(&self, count: Option<usize>) -> std::path::PathBuf {
+            self.place_rollout_lines(frozen_rollout_lines(), count)
+        }
+
+        fn place_rollout_lines(
+            &self,
+            lines: Vec<String>,
+            count: Option<usize>,
+        ) -> std::path::PathBuf {
             let f = rollout_path(&self.sessions, "thr1");
             fs::create_dir_all(f.parent().unwrap()).unwrap();
-            let lines = fixture_lines(ROLLOUT);
             let lines = &lines[..count.unwrap_or(lines.len())];
             fs::write(&f, lines.join("\n") + "\n").unwrap();
             f
@@ -904,15 +917,6 @@ mod tests {
         assert_eq!(c.implementer_total(), total);
     }
 
-    /// The lines of the reference fixture `name`.
-    fn reference_lines(name: &str) -> Vec<String> {
-        String::from_utf8(wire::tests::read_reference(name))
-            .unwrap()
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
     /// Rust continues the checkpoints of the charges the reference wrote
     /// (`charge-checkpoint/charges.jsonl`) for the first half of a transcript and a rollout,
     /// charging only the rest; charging again finds nothing new; and the totals are the
@@ -921,7 +925,8 @@ mod tests {
     fn charge_continues_reference_checkpoint() {
         let c = Case::new();
         let f = c.tmp.join("projects/p/s/subagents/agent-agent1.jsonl");
-        let transcript = reference_lines("charge-checkpoint/transcript.jsonl");
+        let transcript = read_reference_text("charge-checkpoint/transcript.jsonl");
+        let transcript: Vec<&str> = transcript.lines().collect();
         assert_eq!(
             transcript,
             [
@@ -931,10 +936,10 @@ mod tests {
                 claude_line("m3", 9, 1, 2, 0, 0),
             ]
         );
-        let lines: Vec<&str> = transcript.iter().map(String::as_str).collect();
+        let lines = &transcript;
         // The reference charged the start: m1 mid-stream, m2 whole; and the killed Codex turn.
         append_lines(&f, &lines[..2]);
-        c.place_rollout(Some(18));
+        c.place_frozen_rollout(Some(18));
         fs::write(
             &c.paths.charges,
             wire::tests::read_reference("charge-checkpoint/charges.jsonl"),
@@ -944,7 +949,7 @@ mod tests {
         // The transcript grows (m1 tops up, m3 is new) and the resumed turn lands; Rust
         // charges the rest.
         append_lines(&f, &lines[2..]);
-        c.place_rollout(None);
+        c.place_frozen_rollout(None);
         let claude = c.claude_as("rs1:claude", "agent1", 2, &f);
         let codex = charge(
             &c.paths,
@@ -1009,7 +1014,8 @@ mod tests {
         // And every line, checkpoints included, is the one the reference wrote when it made
         // the same charges alone (`charge-checkpoint/charges-all.jsonl`), but for the time.
         let written = fs::read_to_string(&c.paths.charges).unwrap();
-        let reference = reference_lines("charge-checkpoint/charges-all.jsonl");
+        let reference = read_reference_text("charge-checkpoint/charges-all.jsonl");
+        let reference: Vec<&str> = reference.lines().collect();
         assert_eq!(reference.len(), 6);
         assert_eq!(
             written.lines().map(mask_ts).collect::<Vec<_>>(),
@@ -1110,9 +1116,13 @@ mod tests {
         assert_eq!(theirs.trim_end(), wire::to_line(&one.usage).unwrap());
     }
 
-    /// The folder `concurrent_charges_from_two_processes_keep_exact_totals` charges in (its
-    /// `Case`'s), for `two_process_charge_child`; unset in an ordinary run.
+    /// The run directory `concurrent_charges_from_two_processes_keep_exact_totals` charges in,
+    /// for `two_process_charge_child`; unset in an ordinary run.
     const CHARGE_CHILD: &str = "LEADHAND_CHARGES_TEST_CHARGE_CHILD";
+    /// That test's Claude transcript, for the child.
+    const CHARGE_CHILD_TRANSCRIPT: &str = "LEADHAND_CHARGES_TEST_CHARGE_CHILD_TRANSCRIPT";
+    /// That test's Codex sessions folder, for the child.
+    const CHARGE_CHILD_SESSIONS: &str = "LEADHAND_CHARGES_TEST_CHARGE_CHILD_SESSIONS";
 
     /// How many lines each writer of that test adds.
     const RACE_LINES: u64 = 12;
@@ -1123,12 +1133,15 @@ mod tests {
     /// both sources as the supervisor. Does nothing in an ordinary run.
     #[test]
     fn two_process_charge_child() {
-        let Some(tmp) = std::env::var_os(CHARGE_CHILD) else {
+        let Some(root) = std::env::var_os(CHARGE_CHILD) else {
             return;
         };
-        let tmp = Path::new(&tmp);
-        let paths = run_paths(&tmp.join("run with spaces"));
-        let (claude_file, sessions) = (tmp.join("projects/p/S.jsonl"), tmp.join("sessions"));
+        let given = |name: &str| {
+            std::path::PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name}")))
+        };
+        let paths = run_paths(Path::new(&root));
+        let claude_file = given(CHARGE_CHILD_TRANSCRIPT);
+        let sessions = given(CHARGE_CHILD_SESSIONS);
         // On a line of its own: libtest has printed `test <name> ... ` without a newline.
         println!("\nready");
         let mut go = String::new();
@@ -1194,7 +1207,9 @@ mod tests {
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .env(CHARGE_CHILD, &c.tmp)
+            .env(CHARGE_CHILD, &c.paths.root)
+            .env(CHARGE_CHILD_TRANSCRIPT, &claude_file)
+            .env(CHARGE_CHILD_SESSIONS, &c.sessions)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1273,6 +1288,18 @@ mod tests {
         assert_eq!(
             (codex.input, codex.cached, codex.output),
             (100 + 10 * n - 20, 20, 5 * (n + 1))
+        );
+        // A charged Codex too, from the same rollout: each of its n Codex charges found the
+        // session file (its usage is known), so the two writers raced on the Codex checkpoint.
+        let a_codex: Vec<&Charge> = charges
+            .iter()
+            .filter(|x| x.dispatch_id.starts_with('A') && x.source == "codex")
+            .collect();
+        assert_eq!(a_codex.len() as u64, n);
+        assert!(
+            a_codex.iter().all(|x| x.usage.known),
+            "{:?}",
+            a_codex.iter().map(|x| &x.charge_id).collect::<Vec<_>>()
         );
         // Every line is whole, and the reader reads them all.
         let text = fs::read_to_string(&c.paths.charges).unwrap();

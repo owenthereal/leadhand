@@ -296,6 +296,15 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// The lines of the frozen copy of `ROLLOUT` that the reference fixtures were recorded
+    /// from (S3-R30): a later edit of the live fixture changes neither side.
+    pub(crate) fn frozen_rollout_lines() -> Vec<String> {
+        read_reference_text("usage/codex-rollout/codex-rollout-interrupted.jsonl")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
     /// `<sessions>/2026/11/10/rollout-…-<thread>.jsonl` (the Python tests' `rollout_path`).
     pub(crate) fn rollout_path(sessions: &Path, thread: &str) -> PathBuf {
         sessions
@@ -443,11 +452,7 @@ pub(crate) mod tests {
         let f = rollout_path(&sessions, "thr1");
         // The rollout fixture as the reference read it: a frozen copy, so a later edit of the
         // fixture changes neither side.
-        let mut lines: Vec<String> =
-            read_reference_text("usage/codex-rollout/codex-rollout-interrupted.jsonl")
-                .lines()
-                .map(str::to_string)
-                .collect();
+        let mut lines = frozen_rollout_lines();
         // A repeated response, a record whose response_id is not a string, a payload that is
         // not an object, and a response ID with a lone surrogate.
         lines.push(lines[16].clone());
