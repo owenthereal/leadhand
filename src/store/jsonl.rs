@@ -155,7 +155,6 @@ fn rfind_newline(f: &File, before: u64, file: &Path) -> Result<Option<u64>> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::fs;
     use std::process::{Command, Stdio};
 
@@ -255,33 +254,83 @@ mod tests {
         assert_eq!(seqs, (1..=200).collect::<Vec<u64>>());
     }
 
+    /// The run directory `two_process_append_child` appends to; unset in an ordinary run.
+    const APPEND_CHILD: &str = "LEADHAND_STORE_TEST_APPEND_CHILD";
+
+    /// The second writer's record: a `ruling` event numbered from the last line under the
+    /// lock, naming its writer and number in `who` and `i`, padded long.
+    #[derive(Serialize)]
+    struct ChildLine {
+        seq: u64,
+        ts: &'static str,
+        kind: &'static str,
+        who: &'static str,
+        i: u32,
+        pad: String,
+    }
+
+    /// Not a test of its own: the second writer `concurrent_appends_from_two_processes_keep_
+    /// unique_seq` starts (this test binary, running this test alone). It says it is ready,
+    /// waits for the word to go, then appends 200 events to the run directory it was given.
+    /// Does nothing in an ordinary run.
     #[test]
-    fn concurrent_appends_with_python_writer_keep_unique_seq() {
+    fn two_process_append_child() {
+        let Some(run) = std::env::var_os(APPEND_CHILD) else {
+            return;
+        };
+        let run = Path::new(&run);
+        // On a line of its own: libtest has printed `test <name> ... ` without a newline.
+        println!("\nready");
+        let mut go = String::new();
+        std::io::stdin().read_line(&mut go).unwrap();
+        let events = run.join("events.jsonl");
+        for i in 0..200 {
+            append_jsonl_with(run, &events, |last| {
+                let seq = last.map_or(1, |l| serde_json::from_str::<Seq>(l.get()).unwrap().seq + 1);
+                Ok(ChildLine {
+                    seq,
+                    ts: "2026-01-01T00:00:00.000Z",
+                    kind: "ruling",
+                    who: "child",
+                    i,
+                    pad: "x".repeat(300),
+                })
+            })
+            .unwrap();
+        }
+    }
+
+    /// Two processes append at once under `state.lock` (the stage-2 test raced the Python
+    /// reference's writer; here the second writer is this test binary again): every line is
+    /// whole, the seqs are 1..=400 in order, and each writer's lines are all there, in order.
+    #[test]
+    fn concurrent_appends_from_two_processes_keep_unique_seq() {
         let tmp = run_dir();
         let run = tmp.path();
-        let lib = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/lib");
-        let code = "import sys\nfrom pathlib import Path\nfrom leadhand import state\n\
-                    paths = state.run_paths(Path(sys.argv[1]))\n\
-                    print('ready', flush=True)\n\
-                    sys.stdin.readline()\n\
-                    for i in range(200):\n\
-                    \x20   state.append_event(paths, 'ruling', who='python', i=i, pad='x' * 300)\n";
-        let mut child = Command::new("python3")
-            .args(["-B", "-c", code])
-            .arg(run)
-            .env("PYTHONPATH", &lib)
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "store::jsonl::tests::two_process_append_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(APPEND_CHILD, run)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("run python3");
-        // Both writers start together: Python once its imports are done.
+            .expect("run the test binary");
+        // Both writers start together: the child once it is running its test.
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut ready = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(child.stdout.as_mut().unwrap()),
-            &mut ready,
-        )
-        .unwrap();
+        loop {
+            ready.clear();
+            if std::io::BufRead::read_line(&mut stdout, &mut ready).unwrap() == 0
+                || ready == "ready\n"
+            {
+                break;
+            }
+        }
         assert_eq!(ready, "ready\n");
         std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"go\n").unwrap();
         for i in 0..200 {
@@ -299,8 +348,8 @@ mod tests {
         let lines: Vec<&[u8]> = raw.split(|&b| b == b'\n').collect();
         let lines = &lines[..lines.len() - 1];
         assert_eq!(lines.len(), 400);
-        // Python's lines name their writer and number in `who` and `i`; Rust's, in the
-        // ruling's text.
+        // The child's lines name their writer and number in `who` and `i`; the parent's, in
+        // the ruling's text.
         #[derive(Deserialize)]
         struct Line {
             seq: u64,
@@ -326,7 +375,7 @@ mod tests {
                 _ => panic!("a line of neither writer (seq {})", e.seq),
             }
         };
-        for who in ["python", "rust"] {
+        for who in ["child", "rust"] {
             let mine: Vec<u32> = parsed
                 .iter()
                 .map(writer)
@@ -335,11 +384,9 @@ mod tests {
                 .collect();
             assert_eq!(mine, (0..200).collect::<Vec<u32>>(), "{who}");
         }
-        // Python reads every line Rust wrote.
-        let check = "import sys\nfrom pathlib import Path\nfrom leadhand import state\n\
-                     print(len(state.read_events(state.run_paths(Path(sys.argv[1])))))\n";
-        let n = crate::wire::tests::python(check, &[OsStr::new(run)]);
-        assert_eq!(n, b"400\n");
+        // The event reader reads every line either writer wrote.
+        let n = crate::state::read_events(&run_paths(run)).unwrap().len();
+        assert_eq!(n, 400);
     }
 
     #[test]

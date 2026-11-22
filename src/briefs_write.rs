@@ -4,11 +4,10 @@
 //! `remove_scratch_file`).
 //!
 //! A brief's text lines are contract output (ruling S1-R10): the templates are compiled in from
-//! `scripts/lib/leadhand/templates/brief-<kind>.md` and filled as Python's `string.Template`
-//! fills them. A brief is text as the Python holds it (`PyStr`, a path with an undecodable
-//! byte carried as a surrogate escape) and is written as strict UTF-8, as the Python's
-//! `open(..., "w", encoding="utf-8")` writes it, so such a path fails the write with the
-//! Python's `UnicodeEncodeError` text.
+//! `templates/brief-<kind>.md` and filled as Python's `string.Template` fills them. A brief is
+//! text as the Python holds it (`PyStr`, a path with an undecodable byte carried as a surrogate
+//! escape) and is written as strict UTF-8, as the Python's `open(..., "w", encoding="utf-8")`
+//! writes it, so such a path fails the write with the Python's `UnicodeEncodeError` text.
 //!
 //! The scratch folder `<ws>/.leadhand/<card or run>/<dispatch id>/` is worker-writable, so it
 //! is reached only through `SafeDir` (spec, bug class 5): a symlink or a non-folder on the way
@@ -89,54 +88,21 @@ pub const TEST_FIRST: [&str; 3] = ["when-cheap", "always", "off"];
 
 /// Each kind's template (`templates/brief-<kind>.md`).
 const TEMPLATES: [(&str, &str); 12] = [
-    (
-        "implement",
-        include_str!("../scripts/lib/leadhand/templates/brief-implement.md"),
-    ),
-    (
-        "fix",
-        include_str!("../scripts/lib/leadhand/templates/brief-fix.md"),
-    ),
-    (
-        "answer",
-        include_str!("../scripts/lib/leadhand/templates/brief-answer.md"),
-    ),
-    (
-        "continue",
-        include_str!("../scripts/lib/leadhand/templates/brief-continue.md"),
-    ),
-    (
-        "integrate",
-        include_str!("../scripts/lib/leadhand/templates/brief-integrate.md"),
-    ),
-    (
-        "review",
-        include_str!("../scripts/lib/leadhand/templates/brief-review.md"),
-    ),
-    (
-        "rereview",
-        include_str!("../scripts/lib/leadhand/templates/brief-rereview.md"),
-    ),
+    ("implement", include_str!("../templates/brief-implement.md")),
+    ("fix", include_str!("../templates/brief-fix.md")),
+    ("answer", include_str!("../templates/brief-answer.md")),
+    ("continue", include_str!("../templates/brief-continue.md")),
+    ("integrate", include_str!("../templates/brief-integrate.md")),
+    ("review", include_str!("../templates/brief-review.md")),
+    ("rereview", include_str!("../templates/brief-rereview.md")),
     (
         "final_review",
-        include_str!("../scripts/lib/leadhand/templates/brief-final_review.md"),
+        include_str!("../templates/brief-final_review.md"),
     ),
-    (
-        "final_fix",
-        include_str!("../scripts/lib/leadhand/templates/brief-final_fix.md"),
-    ),
-    (
-        "security",
-        include_str!("../scripts/lib/leadhand/templates/brief-security.md"),
-    ),
-    (
-        "evidence",
-        include_str!("../scripts/lib/leadhand/templates/brief-evidence.md"),
-    ),
-    (
-        "verify",
-        include_str!("../scripts/lib/leadhand/templates/brief-verify.md"),
-    ),
+    ("final_fix", include_str!("../templates/brief-final_fix.md")),
+    ("security", include_str!("../templates/brief-security.md")),
+    ("evidence", include_str!("../templates/brief-evidence.md")),
+    ("verify", include_str!("../templates/brief-verify.md")),
 ];
 
 // --------------------------------------------------------------------------

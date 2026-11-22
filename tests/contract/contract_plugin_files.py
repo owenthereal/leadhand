@@ -14,7 +14,7 @@ from harness import COMMANDS, ROOT
 AGENTS = ROOT / "agents"
 SUPERVISOR = AGENTS / "supervisor.md"
 SKILL = ROOT / "skills" / "run" / "SKILL.md"
-CONTRACT = ROOT / "scripts" / "lib" / "leadhand" / "templates" / "contract.md"
+CONTRACT = ROOT / "templates" / "contract.md"
 
 # The contract's names: the actions `next` prints, the kinds `record` takes, the end-of-run gates.
 ACTIONS = ("dispatch", "wait", "check_diff", "answer", "stop_worker", "done")

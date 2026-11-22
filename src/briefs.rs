@@ -284,10 +284,13 @@ mod tests {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use super::*;
-    use crate::wire::tests::python;
+    use crate::wire::tests::{python, read_reference};
 
+    /// `worker-prompts/<role>.txt`: the reference's `worker_prompt` for each role, for each of
+    /// these brief and report paths in turn, as the OS gets it (`os.fsencode`), the prompts
+    /// joined by NUL.
     #[test]
-    fn worker_prompt_matches_python() {
+    fn worker_prompts_match_reference() {
         let paths: [(&[u8], &[u8]); 4] = [
             (
                 b"/ws/.leadhand/1/c1-a1-implement-1/brief.md",
@@ -306,31 +309,25 @@ mod tests {
             // Spelled as pathlib spells it.
             (b"rel//./ws/brief.md", b"./rel/report.md/"),
         ];
-        let code = "import os, sys\nfrom pathlib import Path\nfrom leadhand import briefs\n\
-                    roles, rest = sys.argv[1].split(','), sys.argv[2:]\n\
-                    out = [os.fsencode(briefs.worker_prompt(role, Path(b), Path(r)))\n\
-                    \x20      for role in roles for b, r in zip(rest[::2], rest[1::2])]\n\
-                    sys.stdout.buffer.write(b'\\0'.join(out))\n";
         let roles: Vec<&str> = ROLE_AGENT.iter().map(|(role, _)| *role).collect();
-        let joined = roles.join(",");
-        let mut args: Vec<&OsStr> = vec![OsStr::new(&joined)];
-        for (b, r) in &paths {
-            args.push(OsStr::from_bytes(b));
-            args.push(OsStr::from_bytes(r));
-        }
-        let theirs = python(code, &args);
         let mut ours: Vec<Vec<u8>> = Vec::new();
         for role in &roles {
-            for (b, r) in &paths {
-                let prompt = worker_prompt(
-                    role,
-                    Path::new(OsStr::from_bytes(b)),
-                    Path::new(OsStr::from_bytes(r)),
-                );
-                ours.push(prompt.unwrap().into_vec());
-            }
+            let mine: Vec<Vec<u8>> = paths
+                .iter()
+                .map(|(b, r)| {
+                    worker_prompt(
+                        role,
+                        Path::new(OsStr::from_bytes(b)),
+                        Path::new(OsStr::from_bytes(r)),
+                    )
+                    .unwrap()
+                    .into_vec()
+                })
+                .collect();
+            let theirs = read_reference(&format!("worker-prompts/{role}.txt"));
+            assert_eq!(mine.join(&b"\0"[..]), theirs, "{role}");
+            ours.extend(mine);
         }
-        assert_eq!(ours.join(&b"\0"[..]), theirs);
         assert_eq!(ours.len(), 7 * 4);
         // The implementer's prompt carries the no-commit rule; the reviewer's does not.
         let has = |p: &[u8], s: &[u8]| p.windows(s.len()).any(|w| w == s);

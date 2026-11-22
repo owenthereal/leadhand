@@ -739,37 +739,67 @@ pub(crate) mod tests {
         out.stdout
     }
 
+    /// A file of `tests/fixtures/reference/`: what the reference wrote, recorded by the generator
+    /// there and read at run time.
+    pub(crate) fn reference_fixture(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/reference")
+            .join(name)
+    }
+
+    /// The bytes of the reference fixture `name`, failing the test when it is missing.
+    #[track_caller]
+    pub(crate) fn read_reference(name: &str) -> Vec<u8> {
+        let path = reference_fixture(name);
+        fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+    }
+
     #[derive(Debug, Serialize, Deserialize)]
     struct Rec {
         path: PyStr,
     }
 
+    /// `python-events.jsonl`: records the reference's `append_jsonl` wrote, with a surrogate
+    /// escape (`b'a\xffb'`), non-ASCII text, an astral character, a path of every kind at once
+    /// and a lone surrogate. Rust reads each one, and its rewrite of them is the same bytes.
     #[test]
-    fn python_written_surrogate_escape_round_trips() {
+    fn reference_events_with_raw_bytes_round_trip() {
+        let written = read_reference("python-events.jsonl");
+        let first = written.split_inclusive(|&b| b == b'\n').next().unwrap();
+        assert_eq!(first, b"{\"path\":\"a\\udcffb\"}\n");
+
         let tmp = tempfile::tempdir().unwrap();
         let run = tmp.path();
         let file = run.join("records.jsonl");
-        let write = "import sys\nfrom pathlib import Path\nfrom leadhand import state\n\
-                     run = Path(sys.argv[1])\n\
-                     state.append_jsonl(state.run_paths(run), run / 'records.jsonl',\n\
-                     \x20   {'path': b'a\\xffb'.decode('utf-8', 'surrogateescape')})\n";
-        python(write, &[run.as_os_str()]);
-        assert_eq!(fs::read(&file).unwrap(), b"{\"path\":\"a\\udcffb\"}\n");
-
+        fs::write(&file, &written).unwrap();
         let read: Vec<(Rec, RawLine)> = read_jsonl(run, &file).unwrap();
-        assert_eq!(read.len(), 1);
+        assert_eq!(read.len(), 5);
         let rec = &read[0].0;
         assert_eq!(rec.path.as_wtf8(), b"\x61\xed\xb3\xbf\x62");
         assert_eq!(rec.path.to_os().unwrap().into_vec(), b"\x61\xff\x62");
         assert_eq!(to_line(rec).unwrap(), r#"{"path":"a\udcffb"}"#);
+        assert_eq!(read[1].0.path.as_wtf8(), "caf\u{e9} \u{2615}".as_bytes());
+        assert_eq!(read[2].0.path.as_wtf8(), "\u{1f600}/x".as_bytes());
+        assert_eq!(
+            read[3].0.path.to_os().unwrap().into_vec(),
+            b"/ws/caf\xc3\xa9/\xfe\xff/\xf0\x9f\x98\x80"
+        );
+        assert_eq!(read[4].0.path.as_wtf8(), b"x\xed\xa0\x80y");
 
-        // Written back through the store, Python reads the string it wrote.
-        append_jsonl(run, &file, rec).unwrap();
-        let check = "import json, sys\n\
-                     lines = [json.loads(l) for l in open(sys.argv[1], encoding='ascii')]\n\
-                     want = b'a\\xffb'.decode('utf-8', 'surrogateescape')\n\
-                     print([l['path'] == want for l in lines])\n";
-        assert_eq!(python(check, &[file.as_os_str()]), b"[True, True]\n");
+        // Written back through the store, line by line, the records are the reference's bytes,
+        // and read again they are the same strings.
+        let again = run.join("again.jsonl");
+        for (rec, _) in &read {
+            append_jsonl(run, &again, rec).unwrap();
+        }
+        assert_eq!(fs::read(&again).unwrap(), written);
+        let reread: Vec<(Rec, RawLine)> = read_jsonl(run, &again).unwrap();
+        let paths = |recs: &[(Rec, RawLine)]| -> Vec<Vec<u8>> {
+            recs.iter()
+                .map(|(r, _)| r.path.as_wtf8().to_vec())
+                .collect()
+        };
+        assert_eq!(paths(&reread), paths(&read));
     }
 
     #[test]

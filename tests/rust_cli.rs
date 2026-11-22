@@ -45,14 +45,15 @@ fn require_release_bin() -> PathBuf {
     bin
 }
 
-/// The Python reference CLI, for the version it prints.
-fn python_bin() -> PathBuf {
-    common::plugin::root().join("scripts").join("leadhand")
+/// What the reference CLI printed for `version`, recorded by the generator in
+/// `tests/fixtures/reference/`.
+fn reference_version() -> String {
+    common::plugin::read(&common::plugin::root().join("tests/fixtures/reference/cli-version.txt"))
 }
 
 mod version {
     use super::*;
-    use crate::common::{Env, TIMEOUT, TempRoot, cli, run_argv};
+    use crate::common::{Env, TempRoot, cli};
 
     #[test]
     fn test_version_matches_reference() {
@@ -64,15 +65,8 @@ mod version {
         let r = cli(&os_args!["version"], &env, &tmp).ok();
         assert_eq!(r.stdout_text(), "leadhand 0.1.0\n", "{r}");
         assert_eq!(r.stderr_text(), "", "{r}");
-        let reference = run_argv(
-            &os_args![python_bin(), "version"],
-            &env,
-            &tmp,
-            None,
-            TIMEOUT,
-        )
-        .ok();
-        assert_eq!(r.stdout, reference.stdout, "{reference}");
+        let reference = reference_version();
+        assert_eq!(r.stdout, reference.as_bytes(), "{reference}");
     }
 
     #[test]

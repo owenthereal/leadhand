@@ -34,7 +34,7 @@ ROLE_AGENT: Mapping[str, str] = MappingProxyType({
     "scout": "leadhand:scout",
 })
 CODEX_AGENT = "leadhand:codex"
-TEMPLATES = Path(__file__).resolve().parent / "templates"
+TEMPLATES = Path(__file__).resolve().parents[3] / "templates"
 AGENTS_DIR = Path(__file__).resolve().parents[3] / "agents"
 SCRATCH = ".leadhand"
 TEST_FIRST = ("when-cheap", "always", "off")

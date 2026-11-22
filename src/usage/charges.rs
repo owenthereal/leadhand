@@ -905,50 +905,46 @@ mod tests {
         assert_eq!(c.implementer_total(), total);
     }
 
-    /// Charges a transcript and a thread from the Python reference.
-    const PY_CHARGE: &str = "import sys\nfrom pathlib import Path\nfrom leadhand import state, usage as u\n\
-        root, cid, transcript, sessions = sys.argv[1:5]\n\
-        p = state.run_paths(Path(root))\n\
-        u.charge(p, charge_id=cid + ':claude', source='claude', key='agent1', dispatch_id='d1',\n\
-        \x20        role='implementer', path_or_thread=Path(transcript))\n\
-        u.charge(p, charge_id=cid + ':codex', source='codex', key='thr1', dispatch_id='d1',\n\
-        \x20        role='implementer', path_or_thread='thr1', sessions_dir=Path(sessions))\n";
+    /// The lines of the reference fixture `name`.
+    fn reference_lines(name: &str) -> Vec<String> {
+        String::from_utf8(wire::tests::read_reference(name))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
 
+    /// Rust continues the checkpoints of the charges the reference wrote
+    /// (`charge-checkpoint/charges.jsonl`) for the first half of a transcript and a rollout,
+    /// charging only the rest; charging again finds nothing new; and the totals are the
+    /// reference's own for the whole (`charge-checkpoint/totals-by-source.json`).
     #[test]
-    fn charge_after_python_charge_continues_checkpoint() {
+    fn charge_continues_reference_checkpoint() {
         let c = Case::new();
         let f = c.tmp.join("projects/p/s/subagents/agent-agent1.jsonl");
-        // Python charges the start: m1 mid-stream, m2 whole; and the killed Codex turn.
-        append_lines(
-            &f,
-            &[
-                &claude_line("m1", 5, 100, 1000, 50, 0),
-                &claude_line("m2", 7, 3, 0, 0, 4),
-            ],
-        );
-        c.place_rollout(Some(18));
-        let args = |cid: &str| -> Vec<std::ffi::OsString> {
-            vec![
-                c.paths.root.clone().into(),
-                cid.into(),
-                f.clone().into(),
-                c.sessions.clone().into(),
+        let transcript = reference_lines("charge-checkpoint/transcript.jsonl");
+        assert_eq!(
+            transcript,
+            [
+                claude_line("m1", 5, 100, 1000, 50, 0),
+                claude_line("m2", 7, 3, 0, 0, 4),
+                claude_line("m1", 40, 100, 1000, 50, 0),
+                claude_line("m3", 9, 1, 2, 0, 0),
             ]
-        };
-        let a = args("py1");
-        python(
-            PY_CHARGE,
-            &a.iter().map(|s| s.as_os_str()).collect::<Vec<_>>(),
         );
+        let lines: Vec<&str> = transcript.iter().map(String::as_str).collect();
+        // The reference charged the start: m1 mid-stream, m2 whole; and the killed Codex turn.
+        append_lines(&f, &lines[..2]);
+        c.place_rollout(Some(18));
+        fs::write(
+            &c.paths.charges,
+            wire::tests::read_reference("charge-checkpoint/charges.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(c.charges().len(), 2);
         // The transcript grows (m1 tops up, m3 is new) and the resumed turn lands; Rust
         // charges the rest.
-        append_lines(
-            &f,
-            &[
-                &claude_line("m1", 40, 100, 1000, 50, 0),
-                &claude_line("m3", 9, 1, 2, 0, 0),
-            ],
-        );
+        append_lines(&f, &lines[2..]);
         c.place_rollout(None);
         let claude = c.claude_as("rs1:claude", "agent1", 2, &f);
         let codex = charge(
@@ -965,11 +961,12 @@ mod tests {
             false,
         )
         .unwrap();
-        // Only what Python had not charged: m1's extra 35 output, m3 whole; the resumed turn.
+        // Only what the reference had not charged: m1's extra 35 output, m3 whole; the
+        // resumed turn.
         let t = claude.usage.tokens;
         assert_eq!((t.input, t.cached, t.output), (1, 2, 35 + 9));
         assert_eq!(codex.checkpoint.responses, Some(ids(&["resp_fixture_2"])));
-        // Rust's charges and Python's sum to the whole transcript and the whole rollout.
+        // Rust's charges and the reference's sum to the whole transcript and the whole rollout.
         let all = c.charges();
         assert_eq!(all.len(), 4);
         let by_source = totals(&all, Group::Source);
@@ -977,30 +974,43 @@ mod tests {
         assert_eq!(by_source.get(&"claude".into()).unwrap(), &whole);
         let t = by_source.get(&"codex".into()).unwrap().tokens;
         assert_eq!((t.input, t.cached, t.output), (39874 - 26112, 26112, 64));
-        // And Python, charging again after Rust, finds nothing new: it reads Rust's records
-        // and continues from their checkpoints.
-        let b = args("py2");
-        python(
-            PY_CHARGE,
-            &b.iter().map(|s| s.as_os_str()).collect::<Vec<_>>(),
-        );
+        // Charging again finds nothing new: it continues from the checkpoints of every record.
+        // (The stage-2 test charged again in the reference, which retires with it.)
+        let again = c.claude_as("rs2:claude", "agent1", 3, &f);
+        let again_codex = charge(
+            &c.paths,
+            &"rs2:codex".into(),
+            &"thr1".into(),
+            "d3",
+            "implementer",
+            ChargeSource::Codex {
+                thread: Some(&"thr1".into()),
+                sessions_dir: &c.sessions,
+                stream: None,
+            },
+            false,
+        )
+        .unwrap();
         let last = c.charges();
+        assert_eq!(last.len(), 6);
         let after: Vec<(u64, u64)> = last[4..].iter().map(|x| io(&x.usage)).collect();
         assert_eq!(after, [(0, 0), (0, 0)]);
-        let code = "import json, sys\nfrom pathlib import Path\nfrom leadhand import state, usage as u\n\
-                    cs = u.read_charges(state.run_paths(Path(sys.argv[1])))\n\
-                    t = u.totals(cs, by='source')\n\
-                    print(json.dumps({k: u.usage_to_dict(v) for k, v in t.items()}, separators=(',', ':')))\n";
-        let theirs = python(code, &[c.paths.root.as_os_str()]);
+        assert_eq!([io(&again.usage), io(&again_codex.usage)], [(0, 0), (0, 0)]);
+        // The totals by source are the reference's, for the same charges made by the
+        // reference alone.
+        let theirs = String::from_utf8(wire::tests::read_reference(
+            "charge-checkpoint/totals-by-source.json",
+        ))
+        .unwrap();
         let ours = format!(
             "{}\n",
             wire::to_line(&totals(&last, Group::Source)).unwrap()
         );
-        assert_eq!(String::from_utf8(theirs).unwrap(), ours);
+        assert_eq!(theirs, ours);
     }
 
     #[test]
-    fn mixed_model_usage_keeps_by_model_and_prices_each() {
+    fn mixed_model_usage_matches_reference_dict() {
         let c = Case::new();
         let opus_file = c.tmp.join("opus.jsonl");
         let sonnet_file = c.tmp.join("sonnet.jsonl");
@@ -1036,18 +1046,18 @@ mod tests {
         let cost = crate::usage::estimate_cost(&total, None, &table).unwrap();
         let each = |u: &Usage| crate::usage::estimate_cost(u, u.model.as_ref(), &table).unwrap();
         assert_eq!(cost, each(&opus.usage) + each(&sonnet.usage));
-        // The serialized record is the Python's for the same sum, and so is its price.
-        let code = "import json\nfrom leadhand import state, usage as u\n\
-                    a = u.Usage(input=1000, output=1000, model='claude-opus-4-1')\n\
-                    b = u.Usage(input=2000, output=2000, model='claude-sonnet-4-5')\n\
-                    p = lambda i, o: {'input': i, 'output': o, 'cache_read': i / 10, 'cache_write_5m': i * 1.25, 'cache_write_1h': i * 2.0}\n\
-                    s = u.add(a, b)\n\
-                    print(json.dumps(u.usage_to_dict(s), separators=(',', ':')))\n\
-                    print(repr(u.estimate_cost(s, None, {'opus': p(15.0, 75.0), 'sonnet': p(3.0, 15.0)})))\n";
-        let theirs = String::from_utf8(python(code, &[])).unwrap();
-        let mut theirs = theirs.lines();
-        assert_eq!(theirs.next().unwrap(), wire::to_line(&total).unwrap());
-        assert_eq!(theirs.next().unwrap(), crate::pytext::py_float(cost));
+        // The serialized record is the reference's for the same sum (`usage-mixed.json`: its
+        // `usage_to_dict`, and the `repr` of its price).
+        #[derive(Deserialize)]
+        struct Reference<'a> {
+            #[serde(borrow)]
+            usage: &'a serde_json::value::RawValue,
+            cost: String,
+        }
+        let recorded = wire::tests::read_reference("usage-mixed.json");
+        let theirs: Reference = serde_json::from_slice(&recorded).unwrap();
+        assert_eq!(theirs.usage.get(), wire::to_line(&total).unwrap());
+        assert_eq!(theirs.cost, crate::pytext::py_float(cost));
         // A charge reading one transcript of both models keeps the split itself.
         let both = c.tmp.join("both.jsonl");
         let (opus_text, sonnet_text) = (

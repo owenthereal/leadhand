@@ -120,7 +120,6 @@ pub fn signal_if_same(id: &ProcId, sig: Signal) -> bool {
 mod tests {
     use std::io::{BufRead, BufReader};
     use std::os::unix::process::ExitStatusExt;
-    use std::path::Path;
     use std::process::{ChildStdin, Command, Stdio};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -298,35 +297,113 @@ mod tests {
     // ----------------------------------------------------------------------
     // The brief's own tests
 
-    /// A start time Rust reads is byte-identical to the one `procs.py` reads for the same
-    /// process, so either implementation can verify the other's recorded identities.
+    /// `procs-start-times.json`: process-table records of a `sleep` child, with what the
+    /// reference's parser derives from each (`info`) and the start string it reports
+    /// (`start_time`, none for a zombie or an unreadable record).
+    #[derive(Deserialize)]
+    struct Samples {
+        // Each platform reads its own samples.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        linux_stat: Vec<Sample>,
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        macos_kinfo: Vec<Sample>,
+    }
+
+    #[derive(Deserialize)]
+    struct Sample {
+        name: String,
+        pid: i32,
+        /// A `/proc/<pid>/stat` line, a surrogate escape for each byte that is not UTF-8.
+        #[serde(default)]
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        stat: Option<crate::wire::PyStr>,
+        /// A `KERN_PROC_PID` buffer, in hex.
+        #[serde(default)]
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        kinfo: Option<String>,
+        info: Option<Derived>,
+        start_time: Option<String>,
+    }
+
+    #[derive(Debug, PartialEq, Deserialize)]
+    struct Derived {
+        pid: i32,
+        ppid: i32,
+        pgid: i32,
+        start: String,
+        zombie: bool,
+    }
+
+    /// The samples of this platform's format, as the bytes the platform gives.
+    fn platform_samples(samples: &Samples) -> Vec<(&Sample, Vec<u8>)> {
+        #[cfg(target_os = "linux")]
+        let (mine, raw) = (&samples.linux_stat, |s: &Sample| {
+            use std::os::unix::ffi::OsStringExt;
+            s.stat
+                .as_ref()
+                .expect("a stat line")
+                .to_os()
+                .unwrap()
+                .into_vec()
+        });
+        #[cfg(target_os = "macos")]
+        let (mine, raw) = (&samples.macos_kinfo, |s: &Sample| {
+            let hex = s.kinfo.as_deref().expect("a kinfo buffer");
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<u8>>()
+        });
+        mine.iter().map(|s| (s, raw(s))).collect()
+    }
+
+    /// The start string's form on this platform: `"<sec>.<usec:06>"` on macOS,
+    /// `"ticks:<n>"` on Linux.
+    fn start_has_platform_form(start: &str) -> bool {
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if cfg!(target_os = "linux") {
+            start.strip_prefix("ticks:").is_some_and(digits)
+        } else {
+            start
+                .split_once('.')
+                .is_some_and(|(sec, usec)| digits(sec) && usec.len() == 6 && digits(usec))
+        }
+    }
+
+    /// A start time Rust reads is byte-identical to the one the reference reads from the same
+    /// record, so either implementation can verify the other's recorded identities: Rust's
+    /// pure parser derives, from each recorded sample of this platform's format, what the
+    /// reference derived from it. And a live child's start time, so read, identifies it.
     #[test]
-    fn start_time_string_matches_python() {
-        let kid = sleeper(false);
-        let lib = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/lib");
-        let out = Command::new("python3")
-            .args([
-                "-B",
-                "-c",
-                "import sys\n\
-                 from leadhand import procs\n\
-                 print(procs.process_start_time(int(sys.argv[1])))\n",
-                &kid.pid().to_string(),
-            ])
-            .env("PYTHONPATH", &lib)
-            .stdin(Stdio::null())
-            .output()
-            .expect("run python3");
+    fn start_time_parsers_match_reference_samples() {
+        let samples: Samples = serde_json::from_slice(&crate::wire::tests::read_reference(
+            "procs-start-times.json",
+        ))
+        .unwrap();
+        let mine = platform_samples(&samples);
+        assert!(mine.len() >= 5, "too few samples for this platform");
         assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
+            mine.iter().any(|(s, _)| s.start_time.is_some()),
+            "no sample the reference could read"
         );
-        let stdout = String::from_utf8(out.stdout).unwrap();
-        let python = stdout.trim_end_matches('\n');
-        let rust = identify(kid.pid()).expect("the child is alive").start;
-        assert_ne!(python, "None", "Python could not read the child");
-        assert_eq!(python, rust);
+        for (s, raw) in &mine {
+            let got = sys::parse_record(s.pid, raw);
+            let derived = got.as_ref().map(|i| Derived {
+                pid: i.pid,
+                ppid: i.ppid,
+                pgid: i.pgid,
+                start: i.start.clone(),
+                zombie: i.zombie,
+            });
+            assert_eq!(derived, s.info, "{}", s.name);
+            let start = got.filter(|i| !i.zombie).map(|i| i.start);
+            assert_eq!(start, s.start_time, "{}", s.name);
+        }
+
+        let kid = sleeper(false);
+        let id = identify(kid.pid()).expect("the child is alive");
+        assert!(start_has_platform_form(&id.start), "{}", id.start);
+        assert!(same_process(Some(kid.pid()), Some(&id.start)));
     }
 
     #[test]

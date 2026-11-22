@@ -82,6 +82,14 @@ pub fn env_has(pid: i32, entry: &[u8]) -> Option<bool> {
     }
 }
 
+/// One process's record as the platform gives it (a `/proc/<pid>/stat` line on Linux, a
+/// `KERN_PROC_PID` buffer on macOS), parsed as `proc_info` parses it: for the reference
+/// samples of `procs::tests::start_time_parsers_match_reference_samples`.
+#[cfg(test)]
+pub(crate) fn parse_record(pid: i32, raw: &[u8]) -> Option<ProcInfo> {
+    platform::parse_record(pid, raw)
+}
+
 /// The variable a launcher sets to the run-lock descriptor it passes `claude` (R41a).
 pub(crate) const LOCK_FD_VAR: &str = "LEADHAND_LOCK_FD";
 

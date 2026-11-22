@@ -3,7 +3,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 AGENTS = ROOT / "agents"
-CONTRACT = ROOT / "scripts" / "lib" / "leadhand" / "templates" / "contract.md"
+CONTRACT = ROOT / "templates" / "contract.md"
 
 TOOLS_READ_BASH = "Read, Grep, Glob, Bash"
 EXPECTED = {

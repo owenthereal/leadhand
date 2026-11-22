@@ -126,10 +126,16 @@ pub(super) fn proc_info(pid: i32) -> Option<ProcInfo> {
         &mut [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid],
         Some(KINFO_SIZE),
     )?;
+    parse_record(pid, &raw)
+}
+
+/// The `KERN_PROC_PID` answer `raw` for `pid`, read as `procs._darwin_pid` reads it: `None`
+/// when it is shorter than one record (no such pid) or names another pid.
+pub(super) fn parse_record(pid: i32, raw: &[u8]) -> Option<ProcInfo> {
     if raw.len() < KINFO_SIZE {
         return None;
     }
-    let info = kinfo(&raw, 0);
+    let info = kinfo(raw, 0);
     (info.pid == pid).then_some(info)
 }
 

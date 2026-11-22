@@ -24,12 +24,7 @@ pub fn skill() -> PathBuf {
 }
 
 pub fn contract() -> PathBuf {
-    root()
-        .join("scripts")
-        .join("lib")
-        .join("leadhand")
-        .join("templates")
-        .join("contract.md")
+    root().join("templates/contract.md")
 }
 
 /// The commands the binary has (`harness.COMMANDS`).

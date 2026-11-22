@@ -204,10 +204,10 @@ mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::wire::tests::python;
+    use crate::wire::tests::{python, read_reference};
     use crate::wire::to_line;
 
     fn os(b: &[u8]) -> OsString {
@@ -400,8 +400,26 @@ mod tests {
         }
     }
 
+    /// One row of `codex-argv.json`: a case of `table()` as the reference read it, and the
+    /// argv its `codex_argv` made of it (`shown`'s form: `ok` and each argument's bytes in hex,
+    /// or `err` and the `ValueError`'s text).
+    #[derive(Deserialize)]
+    struct Recorded {
+        case: RecordedCase,
+        argv: String,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct RecordedCase {
+        req: DispatchRequest,
+        last: PyStr,
+        git_common: PyStr,
+        overrides: Vec<(PyStr, PyStr)>,
+        extra: Vec<PyStr>,
+    }
+
     #[test]
-    fn argv_matches_python_for_every_role_and_resume() {
+    fn argv_matches_reference_table() {
         let cases = table();
         let py: Vec<PyCase> = cases
             .iter()
@@ -421,26 +439,18 @@ mod tests {
                     .collect(),
             })
             .collect();
-        // The Python's argv as the OS gets it (`os.fsencode`, as `subprocess` encodes it).
-        let code = "import json, os, sys\nfrom pathlib import Path\n\
-                    os.environ.pop('LEADHAND_TESTING', None)\n\
-                    from leadhand import dispatch as d\n\
-                    out = []\n\
-                    for c in json.loads(sys.argv[1]):\n\
-                    \x20 req = d.request_from_json(c['req'])\n\
-                    \x20 try:\n\
-                    \x20   argv = d.codex_argv(req, Path(c['last']), Path(c['git_common']),\n\
-                    \x20                       dict(c['overrides']), [Path(e) for e in c['extra']])\n\
-                    \x20   out.append('ok ' + ' '.join(os.fsencode(a).hex() for a in argv))\n\
-                    \x20 except ValueError as e:\n\
-                    \x20   out.append('err ' + str(e))\n\
-                    print(json.dumps(out))\n";
-        let arg = to_line(&py).unwrap();
-        let out = python(code, &[OsStr::new(&arg)]);
-        let theirs: Vec<String> = serde_json::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
+        // The reference's argv as the OS gets it (`os.fsencode`, as `subprocess` encodes it),
+        // for each case as `request.json` gives it.
+        let theirs: Vec<Recorded> =
+            serde_json::from_slice(&read_reference("codex-argv.json")).unwrap();
         assert_eq!(theirs.len(), cases.len());
         let mut refused = 0;
-        for (c, want) in cases.iter().zip(&theirs) {
+        for ((c, mine), want) in cases.iter().zip(&py).zip(&theirs) {
+            assert_eq!(
+                to_line(&want.case).unwrap(),
+                to_line(mine).unwrap(),
+                "the recorded case is not the table's"
+            );
             let ours = shown(argv_for(
                 OsString::from("codex"),
                 &c.req,
@@ -449,12 +459,12 @@ mod tests {
                 &c.overrides,
                 &c.extra,
             ));
-            assert_eq!(&ours, want, "{:?}", c.req);
-            refused += usize::from(want.starts_with("err "));
+            assert_eq!(ours, want.argv, "{:?}", c.req);
+            refused += usize::from(want.argv.starts_with("err "));
         }
         // The table reaches each refusal: the resume ID, four names, the mixed case, and
         // the two encodings.
-        assert_eq!(refused, 8, "{theirs:#?}");
+        assert_eq!(refused, 8);
     }
 
     #[test]

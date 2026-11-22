@@ -41,6 +41,13 @@ fn parse_stat(pid: i32, raw: &[u8], uid: u32) -> Option<ProcInfo> {
     })
 }
 
+/// A `/proc/<pid>/stat` line, read as `procs._proc_stat` reads it; the owner, which the line
+/// does not hold, is 0.
+#[cfg(test)]
+pub(super) fn parse_record(pid: i32, raw: &[u8]) -> Option<ProcInfo> {
+    parse_stat(pid, raw, 0)
+}
+
 /// `procs._proc_all`: every numeric entry of `/proc`.
 pub(super) fn all_procs() -> Option<Vec<ProcInfo>> {
     let entries = fs::read_dir("/proc").ok()?;
