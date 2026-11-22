@@ -102,10 +102,21 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           bin=target/$RUST_TARGET/release/leadhand
-          if readelf --program-headers "$bin" | grep -q INTERP; then
-            echo "::error::$bin asks for a dynamic loader; the Linux binaries must be static"
-            exit 1
-          fi
+          # Read whole first, so a readelf that fails fails the step.
+          headers=$(readelf --program-headers "$bin")
+          case $headers in
+            *LOAD*) ;;
+            *)
+              echo "::error::readelf shows no program headers for $bin"
+              exit 1
+              ;;
+          esac
+          case $headers in
+            *INTERP*)
+              echo "::error::$bin asks for a dynamic loader; the Linux binaries must be static"
+              exit 1
+              ;;
+          esac
 
       # As assemble-dist.sh takes them: <binaries dir>/<target>/leadhand.
       - name: Stage the binary
@@ -204,9 +215,13 @@ jobs:
             exit 1
           fi
 
-      # The commit's tree is exactly the assembled tree, staged through an index of its own. Its
-      # parent is dist's head; the first release starts dist as an orphan branch. The push is a
-      # plain one, so it can only add a commit on top of dist, never replace one.
+      # The commit's tree is exactly the assembled tree, staged through an index of its own.
+      # The first release starts dist as an orphan branch. After that, dist's head decides:
+      # - a higher version: one commit on top of it;
+      # - the same version and the same tree: a re-run, which publishes nothing;
+      # - the same version with another tree, or a lower version (by version order: sort -V,
+      #   under which 0.3.0-rc1 sorts after 0.3.0), or a head with no readable version: refused.
+      # The push is a plain one, so it can only add a commit on top of dist, never replace one.
       - name: Commit the tree onto dist and push it
         env:
           REF_NAME: ${{ github.ref_name }}
@@ -217,9 +232,10 @@ jobs:
         run: |
           export GIT_DIR="$GITHUB_WORKSPACE/.git" GIT_INDEX_FILE="$RUNNER_TEMP/dist.index"
           cd "$RUNNER_TEMP/dist"
+          version=$(jq -er '.version | strings' .claude-plugin/plugin.json)
           git --work-tree=. add --all --force .
           tree=$(git write-tree)
-          subject="leadhand ${REF_NAME#v}"
+          subject="leadhand $version"
           body="Built from $GITHUB_SHA ($REF_NAME) by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
           if git ls-remote --exit-code --heads origin refs/heads/dist > /dev/null; then
@@ -231,9 +247,23 @@ jobs:
             0)
               git fetch --no-tags --depth=1 origin refs/heads/dist
               parent=$(git rev-parse FETCH_HEAD)
-              if [ "$(git rev-parse "$parent^{tree}")" = "$tree" ]; then
-                echo "dist already holds this tree, at $parent; nothing to publish"
-                exit 0
+              if ! head_json=$(git show "$parent:.claude-plugin/plugin.json" 2> /dev/null) ||
+                ! head_version=$(printf '%s\n' "$head_json" | jq -er '.version | strings' 2> /dev/null); then
+                echo "::error::dist's head $parent has no readable .claude-plugin/plugin.json version; not publishing version $version on top of it"
+                exit 1
+              fi
+              if [ "$version" = "$head_version" ]; then
+                if [ "$(git rev-parse "$parent^{tree}")" = "$tree" ]; then
+                  echo "dist already holds version $version with this tree, at $parent; nothing to publish"
+                  exit 0
+                fi
+                echo "::error::version $version is already on dist, at $parent, with another tree (dist's head is version $head_version); a release is one commit, so tag a new version"
+                exit 1
+              fi
+              highest=$(printf '%s\n%s\n' "$head_version" "$version" | sort -V | tail -n 1)
+              if [ "$highest" != "$version" ]; then
+                echo "::error::version $version is lower than dist's head, version $head_version at $parent; refusing to roll dist back"
+                exit 1
               fi
               commit=$(git commit-tree "$tree" -p "$parent" -m "$subject" -m "$body")
               ;;

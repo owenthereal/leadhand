@@ -57,6 +57,33 @@ names() {
     done
 }
 
+default_ifs=$IFS
+newline='
+'
+
+# Reports each name in folder $1 that isn't one of the names after $2, as
+# "unexpected $2<name>". Each name is compared whole: not split, and not expanded as a glob.
+only() {
+    folder=$1 prefix=$2
+    shift 2
+    list=$(names "$folder")
+    set -f
+    IFS=$newline
+    for entry in $list; do
+        allowed=no
+        for name in "$@"; do
+            if [ "$entry" = "$name" ]; then
+                allowed=yes
+            fi
+        done
+        if [ "$allowed" = no ]; then
+            problem "unexpected $prefix$entry"
+        fi
+    done
+    IFS=$default_ifs
+    set +f
+}
+
 problems=0
 problem() {
     echo "assemble-dist: $dir: $*" >&2
@@ -75,25 +102,17 @@ check() {
             problem "$path is empty"
         fi
     done
-    if [ -e "$dir/bin/leadhand" ] && [ ! -x "$dir/bin/leadhand" ]; then
-        problem "bin/leadhand is not executable"
+    if [ -e "$dir/bin/leadhand" ] && ! { [ -f "$dir/bin/leadhand" ] && [ -x "$dir/bin/leadhand" ]; }; then
+        problem "bin/leadhand is not an executable file"
     fi
 
     # Nothing else: at the top, the plugin paths (and .git, in a checkout of the branch); in
-    # bin/, the script and the targets. (No name here holds a space.)
-    for entry in $(names "$dir"); do
-        case " $plugin_paths bin .git " in
-            *" $entry "*) ;;
-            *) problem "unexpected $entry" ;;
-        esac
-    done
+    # bin/, the script and the targets.
+    # shellcheck disable=SC2086 # the lists are words
+    only "$dir" '' $plugin_paths bin .git
     if [ -d "$dir/bin" ]; then
-        for entry in $(names "$dir/bin"); do
-            case " leadhand $targets " in
-                *" $entry "*) ;;
-                *) problem "unexpected bin/$entry" ;;
-            esac
-        done
+        # shellcheck disable=SC2086
+        only "$dir/bin" bin/ leadhand $targets
     fi
 
     for target in $targets; do
@@ -107,8 +126,9 @@ check() {
 
     version='' first=''
     for manifest in $manifests; do
-        [ -f "$dir/$manifest" ] || continue # reported above, with its folder
-        if ! jq empty "$dir/$manifest" >/dev/null 2>&1; then
+        if [ ! -f "$dir/$manifest" ]; then
+            problem "missing $manifest"
+        elif ! jq empty "$dir/$manifest" >/dev/null 2>&1; then
             problem "$manifest is not valid JSON"
         elif ! v=$(manifest_version "$dir/$manifest"); then
             problem "$manifest has no leadhand version"

@@ -288,6 +288,25 @@ fn check_refuses_an_incomplete_tree() {
     case("bin/leadhand not executable", "bin/leadhand", &|dir| {
         fs::set_permissions(dir.join("bin/leadhand"), fs::Permissions::from_mode(0o644)).unwrap()
     });
+    case("bin/leadhand a folder", "bin/leadhand", &|dir| {
+        fs::remove_file(dir.join("bin/leadhand")).unwrap();
+        // Not empty, so only the file check can catch it.
+        fs::create_dir(dir.join("bin/leadhand")).unwrap();
+        fs::write(dir.join("bin/leadhand/leadhand"), "").unwrap();
+    });
+    // A manifest gone from a folder that is still there.
+    for manifest in &VERSIONED[1..] {
+        case(
+            &format!("without {manifest}"),
+            &format!("missing {manifest}"),
+            &|dir| fs::remove_file(dir.join(manifest)).unwrap(),
+        );
+    }
+    // A stray name that is also a glob matching an expected name (in the package root, the
+    // cwd): the check must compare names, not expand them.
+    case("a stray [a]gents", "unexpected [a]gents", &|dir| {
+        fs::write(dir.join("[a]gents"), "").unwrap()
+    });
     case("an empty agents folder", "agents", &|dir| {
         fs::remove_dir_all(dir.join("agents")).unwrap();
         fs::create_dir(dir.join("agents")).unwrap();
@@ -595,6 +614,14 @@ fn release_workflow_pins_actions_and_checks_the_tree() {
     let build = jobs["build"].join("\n");
     assert!(build.contains("cargo build --locked --release"));
     assert!(!build.contains("testing"));
+    // The static-link check reads readelf's output whole, so a failing readelf fails the step,
+    // and no pipe can end early and pass it vacuously.
+    assert!(build.contains("headers=$(readelf --program-headers \"$bin\")"));
+    assert!(
+        !build
+            .lines()
+            .any(|l| l.contains("readelf") && l.contains('|'))
+    );
     for target in [
         "aarch64-apple-darwin",
         "x86_64-unknown-linux-musl",
@@ -606,4 +633,252 @@ fn release_workflow_pins_actions_and_checks_the_tree() {
     let test = jobs["test"].join("\n");
     assert!(test.contains("cargo test --locked --features testing"));
     assert!(test.contains("cargo test --locked --lib"));
+}
+
+// --------------------------------------------------------------------------
+// The publish step, run as the workflow's own text against temporary repositories.
+
+/// The step that commits the tree onto dist.
+const PUBLISH_STEP: &str = "Commit the tree onto dist and push it";
+
+/// The `run: |` body of the step named `name`, its indentation removed, as bash gets it.
+fn step_script(text: &str, name: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.trim() == format!("- name: {name}"))
+        .unwrap_or_else(|| panic!("no step {name:?}"));
+    let step = indent(lines[at]);
+    let rest = &lines[at + 1..];
+    let end = rest
+        .iter()
+        .position(|l| !l.trim().is_empty() && indent(l) <= step)
+        .unwrap_or(rest.len());
+    let own = &rest[..end];
+    let run = own
+        .iter()
+        .position(|l| indent(l) == step + 2 && l.trim() == "run: |")
+        .unwrap_or_else(|| panic!("step {name:?} has no `run: |`"));
+    let body = step + 4;
+    let mut out = String::new();
+    for line in own[run + 1..]
+        .iter()
+        .take_while(|l| l.trim().is_empty() || indent(l) >= body)
+    {
+        out.push_str(line.get(body..).unwrap_or(""));
+        out.push('\n');
+    }
+    assert!(out.contains("git push"), "{name:?}'s body: {out}");
+    out
+}
+
+/// A checkout of the tagged sources with an `origin`, as the publish job has, and the step's
+/// script.
+struct Publisher {
+    tmp: TempRoot,
+    source: PathBuf,
+    origin: PathBuf,
+    script: String,
+    runs: usize,
+}
+
+impl Publisher {
+    fn new() -> Publisher {
+        let tmp = TempRoot::new("leadhand publish");
+        let source = common::git::make_repo(&tmp);
+        let origin = common::git::make_origin(&source);
+        let script = step_script(&workflow(), PUBLISH_STEP);
+        Publisher {
+            tmp,
+            source,
+            origin,
+            script,
+            runs: 0,
+        }
+    }
+
+    /// Runs the step for the tag `v<version>` on a copy of `tree`, as the job would after
+    /// unpacking it into `$RUNNER_TEMP/dist`.
+    fn publish(&mut self, tree: &Path, version: &str) -> (Option<i32>, String) {
+        self.runs += 1;
+        let runner = self.tmp.join(format!("runner {}", self.runs));
+        copy_tree(tree, &runner.join("dist"));
+        let bot = "github-actions[bot]";
+        let email = "41898282+github-actions[bot]@users.noreply.github.com";
+        let mut cmd = Command::new("bash");
+        cmd.args(["--noprofile", "--norc", "-e", "-c", &self.script])
+            .current_dir(&self.source)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", self.tmp.path())
+            .envs(common::git::HERMETIC_ENV)
+            .env("GITHUB_WORKSPACE", &self.source)
+            .env("RUNNER_TEMP", &runner)
+            .env("REF_NAME", format!("v{version}"))
+            .env("GITHUB_SHA", "0123456789abcdef0123456789abcdef01234567")
+            .env("GITHUB_SERVER_URL", "https://example.invalid")
+            .env("GITHUB_REPOSITORY", "example/leadhand")
+            .env("GITHUB_RUN_ID", "1")
+            .envs([
+                ("GIT_AUTHOR_NAME", bot),
+                ("GIT_AUTHOR_EMAIL", email),
+                ("GIT_COMMITTER_NAME", bot),
+                ("GIT_COMMITTER_EMAIL", email),
+            ]);
+        let out = cmd
+            .stdin(Stdio::null())
+            .output()
+            .expect("running the publish step");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), text)
+    }
+
+    /// dist's commits in the origin, newest first: (commit, parents, subject).
+    fn dist(&self) -> Vec<(String, String, String)> {
+        if !common::git::git_ok(
+            &self.origin,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/dist"],
+        ) {
+            return Vec::new();
+        }
+        common::git::run_git(
+            &self.origin,
+            &["log", "--format=%H|%P|%s", "refs/heads/dist"],
+        )
+        .lines()
+        .map(|l| {
+            let mut parts = l.splitn(3, '|').map(str::to_string);
+            (
+                parts.next().unwrap(),
+                parts.next().unwrap(),
+                parts.next().unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    /// Asserts the step refused: exit 1, one `::error::` line naming each of `named`, and dist
+    /// left as it was.
+    #[track_caller]
+    fn refused(&mut self, tree: &Path, version: &str, named: &[&str]) {
+        let before = self.dist();
+        let (code, out) = self.publish(tree, version);
+        assert_eq!(code, Some(1), "{version}: {out}");
+        let errors: Vec<&str> = out.lines().filter(|l| l.starts_with("::error::")).collect();
+        assert_eq!(errors.len(), 1, "{version}: {out}");
+        for name in named {
+            assert!(
+                errors[0].contains(name),
+                "{version}: {name:?} not in {}",
+                errors[0]
+            );
+        }
+        assert_eq!(self.dist(), before, "{version}: dist changed");
+    }
+}
+
+/// The assembled tree at `version`, `<tmp>/trees/<name>`, from `base` (at `VERSION`), with
+/// README.md changed when `changed`.
+fn tree_at(tmp: &Path, base: &Path, name: &str, version: &str, changed: bool) -> PathBuf {
+    let tree = tmp.join(format!("trees/{name}"));
+    copy_tree(base, &tree);
+    for file in &VERSIONED[1..] {
+        set_version(&tree, file, version);
+    }
+    if changed {
+        let readme = tree.join("README.md");
+        fs::write(&readme, format!("{}\nchanged\n", read(&readme))).unwrap();
+    }
+    assert_eq!(check(&tree).code, Some(0), "{name}");
+    tree
+}
+
+/// The publish step (ruling for Task 11 fix round 1): no dist yet starts it as an orphan; a
+/// higher version adds one commit on top; the same version with the same tree is a no-op; the
+/// same version with another tree, a lower version (by version order, not text: 0.2.9 is lower
+/// than 0.2.10), and a dist head with no readable version are refused, naming both versions,
+/// and leave dist as it was.
+#[test]
+fn publish_step_adds_one_commit_per_higher_release_and_never_rolls_back() {
+    let trees = TempRoot::new("leadhand dist");
+    let base = assembled(&trees);
+    let v020 = tree_at(&trees, &base, "0.2.0", "0.2.0", false);
+    let v020_rebuilt = tree_at(&trees, &base, "0.2.0 rebuilt", "0.2.0", true);
+    let v021 = tree_at(&trees, &base, "0.2.1", "0.2.1", false);
+    let v019 = tree_at(&trees, &base, "0.1.9", "0.1.9", false);
+    let v0210 = tree_at(&trees, &base, "0.2.10", "0.2.10", false);
+    let v029 = tree_at(&trees, &base, "0.2.9", "0.2.9", false);
+
+    let mut p = Publisher::new();
+    // No dist yet: an orphan commit.
+    let (code, out) = p.publish(&v020, "0.2.0");
+    assert_eq!(code, Some(0), "{out}");
+    let dist = p.dist();
+    assert_eq!(dist.len(), 1, "{dist:?}");
+    assert_eq!(
+        (dist[0].1.as_str(), dist[0].2.as_str()),
+        ("", "leadhand 0.2.0")
+    );
+    // The commit's tree is the assembled tree, executable bits included.
+    let modes = common::git::run_git(&p.origin, &["ls-tree", "-r", "refs/heads/dist", "bin"]);
+    for path in TARGETS
+        .map(|t| format!("bin/{t}/leadhand"))
+        .into_iter()
+        .chain(["bin/leadhand".to_string()])
+    {
+        assert!(
+            modes
+                .lines()
+                .any(|l| l.starts_with("100755 ") && l.ends_with(&format!("\t{path}"))),
+            "{path} is not 100755: {modes}"
+        );
+    }
+
+    // The same version with the same tree: a re-run, which succeeds and adds nothing.
+    let (code, out) = p.publish(&v020, "0.2.0");
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(p.dist(), dist);
+
+    // The same version with another tree: refused.
+    p.refused(&v020_rebuilt, "0.2.0", &["0.2.0"]);
+
+    // A higher version: one commit on top.
+    let (code, out) = p.publish(&v021, "0.2.1");
+    assert_eq!(code, Some(0), "{out}");
+    let dist = p.dist();
+    assert_eq!(dist.len(), 2, "{dist:?}");
+    assert_eq!(dist[0].1, dist[1].0, "0.2.1's parent is 0.2.0");
+    assert_eq!(dist[0].2, "leadhand 0.2.1");
+
+    // A lower version: refused, naming both.
+    p.refused(&v019, "0.1.9", &["0.1.9", "0.2.1"]);
+    p.refused(&v020, "0.2.0", &["0.2.0", "0.2.1"]);
+
+    // Version order, not text order.
+    let (code, out) = p.publish(&v0210, "0.2.10");
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(p.dist().len(), 3);
+    p.refused(&v029, "0.2.9", &["0.2.9", "0.2.10"]);
+
+    // A dist head with no readable version: refused rather than published.
+    let mut p = Publisher::new();
+    let stray = common::git::run_git(
+        &p.source,
+        &["commit-tree", "HEAD^{tree}", "-m", "not a release"],
+    );
+    common::git::run_git(
+        &p.source,
+        &[
+            "push",
+            "--quiet",
+            "origin",
+            &format!("{stray}:refs/heads/dist"),
+        ],
+    );
+    p.refused(&v021, "0.2.1", &["0.2.1", "version"]);
+    assert_eq!(p.dist().len(), 1);
 }
