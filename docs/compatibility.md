@@ -1,12 +1,19 @@
 # Compatibility
 
+What was observed of Claude Code, Codex and the operating system, and the decisions taken from
+it. Most of it was observed with the Python reference implementation, by runtime probes and
+live runs, before the Rust binary replaced it; the Rust binary keeps every decision below. The
+runtime probes, a fake plugin and the Python scripts that drove it, left the repository with
+the Python at the cut-over: commit ff07282 is the last that holds them, in `tests/runtime/`
+(`git show ff07282:tests/runtime/` lists them). The live runs are now `tests/live.rs`.
+
 ## Supervisor launch
 
 Tested with Claude Code 2.1.322 and tmux 3.8 on macOS.
 
 - `claude --agent leadhand:supervisor` accepts the plugin-scoped agent name, in print mode
   (`-p --output-format stream-json --verbose`) and interactively. Decision:
-  `SUPERVISOR_AGENT = "leadhand:supervisor"`.
+  the agent is `leadhand:supervisor` (`launch::argv::SUPERVISOR_AGENT`).
 - For the main-session agent, frontmatter `model` is applied but frontmatter `effort` is not
   (the session ran at medium effort although the frontmatter said low; where medium came
   from was not established), and `skills` preloading did not put the skill body
@@ -100,9 +107,10 @@ Codex workers and the runner:
 
 - A process started by a worker's Bash command survived a SIGKILL of `claude` (it was
   orphaned, not signalled), but not SIGTERM or TaskStop (observed); an orderly exit is
-  inferred to behave like SIGTERM. A runner detached into a new session (double fork,
-  `start_new_session`) is not a descendant of `claude`; it survived the SIGKILL, kept running
-  and wrote its result. That it also survives SIGTERM, an orderly exit and TaskStop is
+  inferred to behave like SIGTERM. A runner detached into a new session (in the Python
+  reference a double fork with `start_new_session`; the Rust runner starts in its own session
+  through `setsid`, `sys::detach_session`) is not a descendant of `claude`; it survived the
+  SIGKILL, kept running and wrote its result. That it also survives SIGTERM, an orderly exit and TaskStop is
   inferred from it not being a descendant, not observed. Decision: the dispatcher hands
   each Codex worker to a detached runner. The runner writes `runner.json` (runner pid, pgid
   and process start time; Codex pid and pgid) before starting Codex and `result.json` when
@@ -113,10 +121,10 @@ Codex workers and the runner:
   in those groups. Signalling Codex's process group does not reach them. On SIGINT Codex
   shut them all down itself. On SIGKILL it cannot, and they would be orphaned.
 - Decision: the runner confirms that Codex and its tool processes have all stopped. It
-  snapshots Codex's descendants by walking parent pids from the process table (`ps` on
-  macOS, `/proc` on Linux; the runner runs outside Claude Code's sandbox, where `ps` is
-  allowed). It records each as (pid, pgid, start time), before the first signal and again
-  before each escalation, because orphans are reparented to init and can no longer be found
+  snapshots Codex's descendants by walking parent pids from the process table (`sysctl`
+  `kern.proc` on macOS, `/proc` on Linux, in `sys::macos` and `sys::linux`; never `ps`). It
+  records each as (pid, pgid, start time), before the first signal and again before each
+  escalation, because orphans are reparented to init and can no longer be found
   by the walk. The ladder is SIGINT to Codex's group, up to 5 s, SIGTERM to Codex's group
   and to each recorded descendant's group (never the runner's own), 5 s, then SIGKILL to
   whatever remains. Stopped means Codex has been reaped and no recorded (pid, start time) is
@@ -200,7 +208,8 @@ Codex workers (`codex exec --json`):
   `turn.completed`. Shell commands complete as `command_execution` items (`command`,
   `aggregated_output`, `exit_code`, `status`); edits as `file_change` items (`changes` with
   `path` and `kind`, `status`). Decision:
-  `STEP_ITEM_TYPES = ("command_execution", "file_change")`, counted on `item.completed`.
+  the step items are `command_execution` and `file_change` (`dispatch::STEP_ITEM_TYPES`),
+  counted on `item.completed`.
   A sanitized recorded stream is in `tests/fixtures/codex-exec-stream.jsonl`.
 - `turn.completed.usage` fields: `input_tokens`, `cached_input_tokens`,
   `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`.
@@ -319,6 +328,12 @@ Known limits, until Plan 2's run guard (a caller check on the CLI):
   (`env -i`, or a daemon that drops `LEADHAND_DISPATCH_TAG`) after leaving Codex's process
   tree, or one whose environment cannot be read (recorded in `procs.json` as
   `tag_unreadable`), is found only by the process-tree snapshot, and can outlive "stopped".
+- The tagged-process sweep on macOS (R51, P10, P14; found while converting the tests to Rust): the
+  macOS process table does not show the environment of SIP-protected platform binaries such
+  as `/bin/sh`, `/bin/zsh` and `/bin/bash`, so the sweep for `LEADHAND_DISPATCH_TAG` cannot
+  see a shell that escaped Codex's tree. Only the descendant snapshot (the ppid walk) covers
+  such a shell, and only while it is still a descendant. The Python reference had the same
+  limit.
 - Credentials (M5): Claude workers get no stripping at all; they share the supervisor's
   environment (tokens, `SSH_AUTH_SOCK`, the keychain helper through Git) and only the
   operator's sandbox network policy stands in the way. A Codex worker can read credential
@@ -335,13 +350,16 @@ Known limits, until Plan 2's run guard (a caller check on the CLI):
   in-place run's checkout claim (a lock on the checkout's directory that keeps `start` and
   `run` of any other in-place run of the repository out while its supervisor lives) is
   inherited the same way, and unlocking it lets an in-place run from another runs folder in.
-- Test hooks (L4): `LEADHAND_TESTING=1` turns on test-only behaviour (crash points, a fake
-  Codex binary through `LEADHAND_TEST_CODEX_BIN`) that an environment-prefixed command could
-  reach if the exclusion matched it.
+- Test hooks (L4, closed): in the Python reference, `LEADHAND_TESTING=1` turned on test-only
+  behaviour (crash points, a fake Codex binary through `LEADHAND_TEST_CODEX_BIN`) that an
+  environment-prefixed command could reach if the exclusion matched it. Closed by deliberate
+  change 5: a release build ignores `LEADHAND_TESTING`, `LEADHAND_CRASH_AT` and every
+  `LEADHAND_TEST_*` variable. Only a build with the `testing` feature, which is never shipped,
+  honours them.
 - The exclusion matcher (L5): whether `"<cli> *"` also matches prefixed or compound commands
   (`VAR=x <cli> …`, `env -u LEADHAND_RUN_DIR <cli> …`, `<cli> …; x`) is not established. If
   it ever matched an environment-prefixed command, a worker could unset or replace
-  `LEADHAND_RUN_DIR` (or set the L4 test variables) on a command that still runs outside the
+  `LEADHAND_RUN_DIR` on a command that still runs outside the
   sandbox, which clears the run anchor and re-opens the escapes fixed above: a Codex binary
   of its choosing, a writable root in another repository, signals to any process, commits in
   any repository. This must be checked end to end before Plan 2 relies on the exclusion.
@@ -436,3 +454,17 @@ Claude:
   file, so charging both does not double-count. The session transcript's `cost-state` record
   and the `<usage>` summary in task notifications already include worker usage, so they are
   never added to the charges.
+
+## Linux: not yet observed live
+
+Everything above was observed on macOS. CI builds and tests the Rust binary on Linux
+(x86_64 and arm64), but these behaviours have not been observed in a live run there:
+
+- Claude Code's Linux sandbox, and whether the CLI's sandbox exclusion (`"<cli path> *"`)
+  works there.
+- Whether Codex's Linux sandbox keeps the repository's `.git` read-only, which R39 relies on.
+- Keep-awake through `systemd-inhibit`.
+- Sweeping tagged processes (`LEADHAND_DISPATCH_TAG`, from `/proc/<pid>/environ`) under the
+  real Codex.
+
+A live Linux run is a prerequisite for Plan 2's unattended mode.

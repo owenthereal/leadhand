@@ -54,8 +54,9 @@ macro_rules! os_args {
 }
 
 /// Evaluates `expr`, which must panic (a failed assertion inside the harness), and gives the
-/// panic's message; panics itself if `expr` returns. An assertion, so it counts as one in
-/// the Python conversion check.
+/// panic's message; panics itself if `expr` returns. An assertion: a macro, so that the
+/// conversion check, which compared assertion counts with the Python tests' until the
+/// cut-over, counted it as one.
 macro_rules! assert_panics {
     ($e:expr) => {
         $crate::common::panic_message(|| {

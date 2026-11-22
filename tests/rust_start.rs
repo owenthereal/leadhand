@@ -5,8 +5,8 @@
 //!
 //! The Rust form of the Python contract suite's `contract_rust_start`. `start` keeps its contract
 //! output: `run: <dir>` for a new run, or its note naming the existing unfinished run. The
-//! reference-only test `contract_layouts.InPlace` pins the Python's acceptance of `run.worktree =
-//! false`, and is not converted.
+//! reference-only test `contract_layouts.InPlace` pinned the Python's acceptance of
+//! `run.worktree = false`, and was not converted.
 
 #[macro_use]
 mod common;

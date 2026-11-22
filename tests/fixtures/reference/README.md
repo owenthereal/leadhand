@@ -4,10 +4,13 @@ What the Python reference CLI did, recorded so that the Rust tests that once cal
 can still check their assertions against it. The Rust tests read these files at run time
 (from `CARGO_MANIFEST_DIR`), never through `include_str!`.
 
-These files were made by the generator in this folder. It imports the reference's library,
-writes every file below and prints each one with its size. Every input is fixed: no
-timestamps, process IDs, random values or host paths reach a fixture, and a temporary path is
-replaced by a neutral stand-in. Running it again reproduces every file byte for byte.
+These files were made by a generator that imported the reference's library, wrote every file
+below and printed each one with its size. Every input was fixed: no timestamps, process IDs,
+random values or host paths reach a fixture, and a temporary path is replaced by a neutral
+stand-in, so running it again reproduced every file byte for byte. The generator left the
+repository with the reference at the cut-over. Commit ff07282 is the last that holds it:
+`git show ff07282:tests/fixtures/reference/` lists this folder as it stood then, generator
+included.
 
 Text that is not UTF-8, or holds a lone surrogate, is written the way the reference writes
 JSON: ASCII escapes, an undecodable byte as its surrogate escape (`\udcff` for the byte
@@ -35,7 +38,6 @@ given as its JSON literal.
 | `worker-prompts/agents/<name>.md` | An input, not an output: frozen copies of the four worker agent files (`implementer`, `reviewer`, `scout`, `verifier`), frontmatter included, byte for byte as `agents/` held them when the prompts were recorded. The generator reads them in place of `agents/`, and the Rust test builds its prompts from them too, so a later edit to an agent file changes neither side. `config/config.json` was recorded with them too (their `maxTurns`), and the configuration tests read them. | `briefs::tests::worker_prompts_match_reference`, `config::tests` |
 | `worker-prompts/<role>.txt` | For each of the seven worker roles, the reference's Codex worker prompt for four brief and report path pairs (plain, a non-UTF-8 byte, non-ASCII text with a space, and an unnormalized path), as the OS gets it, the four joined by NUL bytes. Made from the frozen agent files above. | the same |
 | `codex-argv.json` | A JSON array, one row per line: each `case` of the Rust argv test's table (`req` as `request.json` gives it, `last`, `git_common`, `overrides` as name and value pairs, `extra`) and the `argv` the reference made of it: `ok` and each argument's bytes in hex, or `err` and the refusal's text. | `dispatch::argv::tests::argv_matches_reference_table` |
-| `cli-version.txt` | What the reference printed for `version`. | `rust_cli::version::test_version_matches_reference` |
 | `pytext.json` | The Python text and path functions the crate emulates, each on the inputs its test gives the Rust: `str(PurePosixPath(x))`, `f"{x:.1f}"`/`.2f`/`.6f`, `repr` of text and of floats, `strip`/`split`/`splitlines`, a surrogate-escaped `strip` and `splitlines` of OS bytes, `os.path.realpath` over a set of links, `shutil.which`, `os.path.expanduser` under five `HOME` values, `os.path.normpath`, and `os.path.abspath` in two working directories. `realpath` and `which` ran in a temporary root laid out as the test lays out its own, written `{root}`. | `pytext::tests` |
 | `wire.json` | How the reference writes and reads JSON text: surrogate-escape decoding of byte strings, ASCII-escaped dumps of text and a small dict, a dict read back from a line with a repeated key, a line of floats, `repr` and strict UTF-8 encoding of strings given as JSON literals, and a ruling the reference appended with a surrogate-escaped path, with the action line the Rust test prints for it and whether the reference reads that line back to the same path. | `wire::tests` |
 | `deck.json` | What the deck parser's patterns (requirement, header split, field, card heading, `Hard:` value) make of each test line: the match's groups, `null` for no match, or the split. | `deck::tests` |

@@ -1078,8 +1078,8 @@ mod tests {
     }
 
     #[test]
-    fn version_is_the_python_version() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0");
+    fn version_is_the_release_version() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
     }
 
     fn caller(vars: &[(&str, &str)]) -> Result<Caller> {

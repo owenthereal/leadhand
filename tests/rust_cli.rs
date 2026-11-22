@@ -45,28 +45,25 @@ fn require_release_bin() -> PathBuf {
     bin
 }
 
-/// What the reference CLI printed for `version`, recorded by the generator in
-/// `tests/fixtures/reference/`.
-fn reference_version() -> String {
-    common::plugin::read(&common::plugin::root().join("tests/fixtures/reference/cli-version.txt"))
-}
-
 mod version {
     use super::*;
     use crate::common::{Env, TempRoot, cli};
 
+    /// The version line is `leadhand <the package version>` and nothing else. Until the
+    /// cut-over it was also compared with the Python reference's recorded output; the version
+    /// changes at the cut-over by design (deliberate change 6).
     #[test]
-    fn test_version_matches_reference() {
+    fn test_version_matches_the_package_version() {
         if common::rust_only() {
             return;
         }
         let tmp = TempRoot::new("lh rust cli ");
         let env = Env::new(&tmp);
         let r = cli(&os_args!["version"], &env, &tmp).ok();
-        assert_eq!(r.stdout_text(), "leadhand 0.1.0\n", "{r}");
+        assert_eq!(r.stdout_text(), "leadhand 0.2.0\n", "{r}");
         assert_eq!(r.stderr_text(), "", "{r}");
-        let reference = reference_version();
-        assert_eq!(r.stdout, reference.as_bytes(), "{reference}");
+        let package = format!("leadhand {}\n", env!("CARGO_PKG_VERSION"));
+        assert_eq!(r.stdout, package.as_bytes(), "{package}");
     }
 
     #[test]
@@ -342,7 +339,7 @@ mod release_build {
         };
         let plain_out = run_release(&os_args!["version"], &plain);
         let hooked_out = run_release(&os_args!["version"], &hooked);
-        assert_eq!(plain_out.stdout_text(), "leadhand 0.1.0\n", "{plain_out}");
+        assert_eq!(plain_out.stdout_text(), "leadhand 0.2.0\n", "{plain_out}");
         assert_eq!(
             (hooked_out.code, &hooked_out.stdout, &hooked_out.stderr),
             (plain_out.code, &plain_out.stdout, &plain_out.stderr),

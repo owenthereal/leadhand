@@ -4,8 +4,9 @@
 //! end-to-end driver, its fixture builder and the Codex push probe).
 //!
 //! Both tests are `#[ignore]`: they need network access, a logged-in `claude` and `codex`,
-//! and real money, so they run only when asked for, from an ordinary terminal outside
-//! Claude Code (they refuse to start when CLAUDECODE is set):
+//! real money, and a Python 3 interpreter on PATH for the fixture project's own build and
+//! tests (`tests/live/fixture.rs`), so they run only when asked for, from an ordinary
+//! terminal outside Claude Code (they refuse to start when CLAUDECODE is set):
 //!
 //! ```text
 //! LEADHAND_BIN="$PWD/target/release/leadhand" LEADHAND_LIVE_OUT=<folder> \

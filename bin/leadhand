@@ -1,0 +1,16 @@
+#!/bin/sh
+# leadhand's entry point: Claude Code puts the plugin's bin/ folder on the Bash tool's PATH.
+# It runs the leadhand binary that belongs to this plugin folder, with the same arguments.
+set -eu
+
+# <root>, the plugin folder: this script's parent folder.
+root=$(cd "$(dirname "$0")/.." && pwd -P)
+
+# In a source checkout: the release build.
+bin=$root/target/release/leadhand
+if [ -x "$bin" ]; then
+    exec "$bin" "$@"
+fi
+
+echo "leadhand: no binary at $bin; build it with \`cargo build --release\` in $root" >&2
+exit 1
