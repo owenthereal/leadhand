@@ -1,0 +1,5 @@
+{"exit":0,
+"request":"{\n  \"model\": \"gpt-6-luna\",\n  \"effort\": \"low\",\n  \"role\": \"implementer\",\n  \"brief\": \"{root}/work space/.leadhand/1/d1/brief.md\",\n  \"report\": \"{root}/work space/.leadhand/1/d1/report.md\",\n  \"cwd\": \"{root}/work space\",\n  \"run_dir\": \"{root}/run dir\",\n  \"card\": 1,\n  \"attempt\": 1,\n  \"dispatch_id\": \"d1\",\n  \"steps\": 50,\n  \"minutes\": 5,\n  \"network\": false,\n  \"writable_dirs\": [],\n  \"resume\": null,\n  \"kind\": null,\n  \"branch\": null\n}",
+"env":[["CODEX_HOME","{root}/codex home"],["FAKE_CODEX_LOG","{root}/codex log.jsonl"],["FAKE_CODEX_SCENARIO","{frozen}/ready.jsonl"],["GIT_CONFIG_GLOBAL","/dev/null"],["GIT_CONFIG_NOSYSTEM","1"],["HOME","{root}/home"],["LEADHAND_TESTING","1"],["LEADHAND_TEST_CODEX_BIN","{root}/probe codex"],["PATH","{root}/bin:/usr/bin:/bin"],["PROBE_FD","{fd}"],["PROBE_OUT","{root}/probe.out"],["TMPDIR","{tmpdir}"]],
+"probe_codex":"#!/bin/sh\nif [ -e \"/dev/fd/$PROBE_FD\" ]; then echo 'fd open' > \"$PROBE_OUT\"; else echo 'fd closed' > \"$PROBE_OUT\"; fi\nkill -HUP $$\necho 'survived SIGHUP' >> \"$PROBE_OUT\"\n",
+"probe":"fd closed\nsurvived SIGHUP\n"}

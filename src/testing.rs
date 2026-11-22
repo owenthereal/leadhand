@@ -45,7 +45,7 @@ pub fn now() -> SystemTime {
 }
 
 /// The path that names this binary wherever it names or runs itself: `LEADHAND_TEST_CLI`
-/// (the contract router), else the running executable's resolved path.
+/// (a test's stand-in path), else the running executable's resolved path.
 pub fn self_path() -> PathBuf {
     self_path_in(&process_env)
 }

@@ -1,4 +1,4 @@
-//! Codex usage (`usage.py`): the session rollout and the `--json` stream.
+//! Codex usage (the Python `usage` module): the session rollout and the `--json` stream.
 //!
 //! The rollout (`<sessions>/YYYY/MM/DD/rollout-<time>-<thread>.jsonl`) is append-only across
 //! resumes. Its source is the top-level `token_usage_record` events written after every model
@@ -281,6 +281,7 @@ pub(crate) mod tests {
     use std::os::unix::ffi::OsStrExt;
 
     use super::*;
+    use crate::wire::tests::read_reference_text;
 
     pub(crate) const ROLLOUT: &str = "codex-rollout-interrupted.jsonl";
 
@@ -290,6 +291,15 @@ pub(crate) mod tests {
             .join(name);
         fs::read_to_string(path)
             .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The lines of the frozen copy of `ROLLOUT` that the reference fixtures were recorded
+    /// from (S3-R30): a later edit of the live fixture changes neither side.
+    pub(crate) fn frozen_rollout_lines() -> Vec<String> {
+        read_reference_text("usage/codex-rollout/codex-rollout-interrupted.jsonl")
             .lines()
             .map(str::to_string)
             .collect()
@@ -334,7 +344,7 @@ pub(crate) mod tests {
         (t.input, t.cached, t.output, t.reasoning)
     }
 
-    // CATALOG: test_usage.py::CodexTests::test_codex_cumulative_takes_last_token_count_and_maps_fields
+    // CATALOG: test_usage::CodexTests::test_codex_cumulative_takes_last_token_count_and_maps_fields
     #[test]
     fn codex_cumulative_takes_last_token_count_and_maps_fields() {
         let dir = tempfile::tempdir().unwrap();
@@ -355,7 +365,7 @@ pub(crate) mod tests {
         assert!(u.known);
     }
 
-    // CATALOG: test_usage.py::CodexTests::test_codex_cumulative_unknown_when_missing_or_without_token_count
+    // CATALOG: test_usage::CodexTests::test_codex_cumulative_unknown_when_missing_or_without_token_count
     #[test]
     fn codex_cumulative_unknown_when_missing_or_without_token_count() {
         let dir = tempfile::tempdir().unwrap();
@@ -370,7 +380,7 @@ pub(crate) mod tests {
         assert!(!codex_cumulative(&"../thr2".into(), &sessions).known);
     }
 
-    // CATALOG: test_usage.py::CodexTests::test_codex_stream_usage_sums_turn_completed
+    // CATALOG: test_usage::CodexTests::test_codex_stream_usage_sums_turn_completed
     #[test]
     fn codex_stream_usage_sums_turn_completed() {
         let dir = tempfile::tempdir().unwrap();
@@ -395,7 +405,7 @@ pub(crate) mod tests {
         assert!(!codex_stream_usage(&dir.path().join("missing.jsonl")).known);
     }
 
-    // CATALOG: test_usage.py::CodexStreamFixtureTests::test_stream_usage_sums_turn_completed
+    // CATALOG: test_usage::CodexStreamFixtureTests::test_stream_usage_sums_turn_completed
     #[test]
     fn stream_fixture_usage_sums_turn_completed() {
         let dir = tempfile::tempdir().unwrap();
@@ -411,7 +421,7 @@ pub(crate) mod tests {
         assert_eq!(u.tokens.cache_write_5m, 0);
     }
 
-    // CATALOG: test_usage.py::CodexStreamFixtureTests::test_stream_cache_write_tokens_are_kept_as_five_minute_writes
+    // CATALOG: test_usage::CodexStreamFixtureTests::test_stream_cache_write_tokens_are_kept_as_five_minute_writes
     #[test]
     fn stream_cache_write_tokens_are_kept_as_five_minute_writes() {
         let dir = tempfile::tempdir().unwrap();
@@ -440,7 +450,9 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions");
         let f = rollout_path(&sessions, "thr1");
-        let mut lines = fixture_lines(ROLLOUT);
+        // The rollout fixture as the reference read it: a frozen copy, so a later edit of the
+        // fixture changes neither side.
+        let mut lines = frozen_rollout_lines();
         // A repeated response, a record whose response_id is not a string, a payload that is
         // not an object, and a response ID with a lone surrogate.
         lines.push(lines[16].clone());
@@ -463,16 +475,9 @@ pub(crate) mod tests {
             crate::wire::to_line(&r.thread_total).unwrap(),
             crate::wire::to_line(&r.token_count_total).unwrap(),
         );
-        let code = "import json, sys\nfrom leadhand import usage as u\n\
-                    d = lambda x: None if x is None else u.usage_to_dict(x)\n\
-                    j = lambda x: json.dumps(x, separators=(',', ':'))\n\
-                    r = u._codex_rollout(sys.argv[1])\n\
-                    for rid, x in r.responses.items():\n\
-                    \x20   print(j(rid), j(d(x)))\n\
-                    print(j(d(r.thread_total)))\n\
-                    print(j(d(r.token_count_total)))\n";
-        let theirs = crate::wire::tests::python(code, &[f.as_os_str()]);
-        assert_eq!(ours, String::from_utf8(theirs).unwrap());
+        // The reference read the same lines as these responses (ID and usage), then its thread
+        // total and its last token count's total.
+        assert_eq!(ours, read_reference_text("usage/codex-rollout/read.txt"));
         assert_eq!(r.responses.len(), 3);
         // The session file is found by its thread ID, as the Python finds it.
         assert_eq!(

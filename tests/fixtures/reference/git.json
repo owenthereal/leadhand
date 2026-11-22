@@ -1,0 +1,61 @@
+{"pinned_settings":[
+[["-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false","-c","diff.ignoreSubmodules=all","-c","diff.relative=false","-c","diff.noprefix=false","-c","diff.mnemonicPrefix=false","-c","diff.srcPrefix=a/","-c","diff.dstPrefix=b/"],[["GIT_LFS_SKIP_SMUDGE","1"],["GIT_TERMINAL_PROMPT","0"]],["GIT_DIR","GIT_WORK_TREE","GIT_INDEX_FILE","GIT_COMMON_DIR","GIT_OBJECT_DIRECTORY"]]
+],
+"env":[
+[["GIT_AUTHOR_EMAIL","fixture@example.invalid"],["GIT_AUTHOR_NAME","Fixture User"],["GIT_CEILING_DIRECTORIES","{parent}"],["GIT_COMMITTER_EMAIL","fixture@example.invalid"],["GIT_COMMITTER_NAME","Fixture User"],["GIT_CONFIG_GLOBAL","/dev/null"],["GIT_CONFIG_NOSYSTEM","1"],["GIT_TERMINAL_PROMPT","0"],["HOME","{root}"]]
+],
+"git_common_dir":[
+{"in":"{root}/my repo","out":"{root}/my repo/.git"},
+{"in":"{root}/my repo/src","out":"{root}/my repo/.git"},
+{"in":"{root}/my repo/.worktrees/my slug","out":"{root}/my repo/.git"},
+{"in":"{root}/my repo/.worktrees/my slug/src","out":"{root}/my repo/.git"}
+],
+"test_or_doc_path":[
+{"in":"tests/test_x.py","out":true},
+{"in":"test/a.c","out":true},
+{"in":"spec/a_spec.rb","out":true},
+{"in":"docs/guide.html","out":true},
+{"in":"tests/deep/helper.py","out":true},
+{"in":"test_foo.py","out":true},
+{"in":"src/foo_test.go","out":true},
+{"in":"src/foo.test.ts","out":true},
+{"in":"src/foo.spec.js","out":true},
+{"in":"README.md","out":true},
+{"in":"notes/usage.rst","out":true},
+{"in":"notes/todo.txt","out":true},
+{"in":"src/main.py","out":false},
+{"in":"scripts/build.sh","out":false},
+{"in":"src/contest.py","out":false},
+{"in":"src/latest.py","out":false},
+{"in":"docs","out":false},
+{"in":"tests","out":false},
+{"in":"src/tester.py","out":false},
+{"in":"pkg/tests/helper.py","out":false},
+{"in":"pkg/spec/x.py","out":false},
+{"in":"app/docs/views.py","out":false},
+{"in":"requirements.txt","out":false},
+{"in":"requirements-dev.txt","out":false},
+{"in":"tests/requirements.txt","out":false},
+{"in":"constraints.txt","out":false},
+{"in":"CMakeLists.txt","out":false},
+{"in":"src/CMakeLists.txt","out":false},
+{"in":"NOTES.MD","out":true},
+{"in":"src/Test_x.py","out":false},
+{"in":"./tests//a.py","out":true},
+{"in":"/tests/a.py","out":false},
+{"in":"tests/","out":false},
+{"in":"","out":false},
+{"in":"src/caf\u00e9.TXT","out":true},
+{"in":"src/x.spec","out":false},
+{"in":"a.test.","out":true}
+],
+"resolves_in_place":[
+{"in":["{root}/root","{root}/root/real/inner"],"out":true},
+{"in":["{root}/root","{root}/root/link/inner"],"out":false},
+{"in":["{root}/root","{root}/root/link"],"out":false},
+{"in":["{root}/root","{root}/root/missing/x"],"out":true},
+{"in":["{root}/root","{root}/root"],"out":true},
+{"in":["{root}/root","{root}/outside"],"out":false},
+{"in":["{root}/root/real","{root}/root/real/../link"],"out":false},
+{"in":["{root}/root link","{root}/root link/real/inner"],"out":true}
+]}

@@ -1,6 +1,6 @@
 [package]
 name = "leadhand"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.99"
 publish = false
@@ -27,3 +27,15 @@ libc = "0.2.191"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The fake `codex` and `claude` the integration tests run (tests/common), built only with the
+# testing feature, so the release package still ships one binary.
+[[bin]]
+name = "leadhand-fake-codex"
+path = "tests/fakes/codex.rs"
+required-features = ["testing"]
+
+[[bin]]
+name = "leadhand-fake-claude"
+path = "tests/fakes/claude.rs"
+required-features = ["testing"]

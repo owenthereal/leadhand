@@ -547,13 +547,15 @@ pub(crate) fn budget_seconds(req: &events::DispatchRequested, minute_seconds: f6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::tests::python;
+    use crate::wire::tests::reference_for;
+
+    /// The reference fixture of the tests here.
+    const FIXTURE: &str = "engine.json";
 
     #[test]
     fn deadlines_are_written_and_read_as_the_python_does() {
-        let code = "import sys\nfrom leadhand import engine\n\
-                    for a in sys.argv[1:]:\n\
-                    \x20   print(engine._format_time(float(a)))\n";
+        // `engine.json`: the reference's `_format_time` of each stamp, and `repr` of its
+        // `_parse_time` of each text.
         let stamps = [
             "0",
             "1794268800",
@@ -561,24 +563,25 @@ mod tests {
             "1794268859.5",
             "951782400.25",
         ];
-        let args: Vec<&std::ffi::OsStr> = stamps.iter().map(std::ffi::OsStr::new).collect();
-        let theirs = String::from_utf8(python(code, &args)).unwrap();
+        let theirs: String = reference_for::<String>(FIXTURE, "format_time", &stamps)
+            .iter()
+            .map(|out| format!("{out}\n"))
+            .collect();
         let ours: String = stamps
             .iter()
             .map(|s| format!("{}\n", format_time(s.parse().unwrap())))
             .collect();
         assert_eq!(ours, theirs);
-        for text in [
+        let times = [
             "2026-11-14T10:20:30Z",
             "2026-11-14T10:20:30.250000+00:00",
             "2026-11-14T03:20:30-07:00",
-        ] {
-            let code = "import sys\nfrom leadhand import engine\nprint(repr(engine._parse_time(sys.argv[1])))";
-            let theirs: f64 = String::from_utf8(python(code, &[std::ffi::OsStr::new(text)]))
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+        ];
+        for (text, out) in times
+            .iter()
+            .zip(reference_for::<String>(FIXTURE, "parse_time", &times))
+        {
+            let theirs: f64 = out.trim().parse().unwrap();
             assert_eq!(parse_time(text).unwrap(), theirs, "{text}");
         }
         assert_eq!(
@@ -594,10 +597,10 @@ mod tests {
     #[test]
     fn records_read_back_print_as_the_python_prints_them() {
         let line = r#"{"seq":3,"ts":"t","kind":"ruling","card":1,"text":"a, b: \"c\" \\ x","x":[1,{"y":null}],"f":1e-05}"#;
-        let code =
-            "import json, sys\nprint(json.dumps(json.loads(sys.argv[1]), ensure_ascii=True))";
-        let theirs = String::from_utf8(python(code, &[std::ffi::OsStr::new(line)])).unwrap();
-        assert_eq!(format!("{}\n", spaced(line)), theirs);
+        // `engine.json`: the reference's `json.dumps(json.loads(line), ensure_ascii=True)`,
+        // printed.
+        let theirs: Vec<serde_json::Value> = reference_for(FIXTURE, "records_read_back", &[line]);
+        assert_eq!(format!("{}\n", spaced(line)), theirs[0].as_str().unwrap());
     }
 
     #[test]
@@ -607,8 +610,7 @@ mod tests {
 
     #[test]
     fn voided_notes_add_the_warning_once_as_the_python_does() {
-        let code = "import json, sys\nfrom leadhand import engine\n\
-                    print(json.dumps([engine._voided_notes(n) for n in sys.argv[1:]]))";
+        // `engine.json`: the reference's `_voided_notes` of each note.
         let notes = [
             "",
             "## The operator's note\n\nGo on.",
@@ -617,8 +619,7 @@ mod tests {
             "caf\u{e9}",
             "already voided\n\n## An earlier run of this check was voided\n\nkeep",
         ];
-        let args: Vec<&std::ffi::OsStr> = notes.iter().map(std::ffi::OsStr::new).collect();
-        let theirs: Vec<PyStr> = serde_json::from_slice(&python(code, &args)).unwrap();
+        let theirs: Vec<PyStr> = reference_for(FIXTURE, "voided_notes", &notes);
         let ours: Vec<PyStr> = notes.iter().map(|n| voided_notes(&(*n).into())).collect();
         assert_eq!(ours, theirs);
         // Again on its own result: unchanged.
@@ -628,22 +629,21 @@ mod tests {
 
     #[test]
     fn continue_notes_add_the_note_once_as_the_python_does() {
-        let code = "import json, sys\nfrom leadhand import engine\n\
-                    class D:\n\
-                    \x20   kind = 'final_fix'\n\
-                    \x20   id = 'run-w1-final_fix-1'\n\
-                    \x20   result = {'files': {'brief': '/run/cards/run/run-w1-final_fix-1/brief.md'}}\n\
-                    \x20   req = {'brief': '/ws/brief.md'}\n\
-                    print(json.dumps([engine._continue_notes(n, D()) for n in sys.argv[1:]]))";
+        // `engine.json`: the reference's `_continue_notes` of each note, for a dispatch of
+        // this kind and ID whose result names this brief (its request, `/ws/brief.md`).
         let notes = [
             "",
             "## Fix wave\n\nkeep\n\n",
             "caf\u{e9}",
             "x\n\n## The interrupted step\n",
         ];
-        let args: Vec<&std::ffi::OsStr> = notes.iter().map(std::ffi::OsStr::new).collect();
-        let theirs: Vec<PyStr> = serde_json::from_slice(&python(code, &args)).unwrap();
         let brief = PyStr::from("/run/cards/run/run-w1-final_fix-1/brief.md");
+        let shown = brief.lossy();
+        let inputs: Vec<[&str; 4]> = notes
+            .iter()
+            .map(|n| [*n, "final_fix", "run-w1-final_fix-1", shown.as_ref()])
+            .collect();
+        let theirs: Vec<PyStr> = reference_for(FIXTURE, "continue_notes", &inputs);
         let ours: Vec<PyStr> = notes
             .iter()
             .map(|n| continue_notes(&(*n).into(), "final_fix", "run-w1-final_fix-1", &brief))

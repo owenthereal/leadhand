@@ -234,7 +234,7 @@ mod tests {
         )
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_all_accepted_and_current_is_complete
+    // CATALOG: test_state::OutcomeTests::test_all_accepted_and_current_is_complete
     #[test]
     fn all_accepted_and_current_is_complete() {
         let c = accepted(&[1, 2]);
@@ -245,7 +245,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_removed_cards_count_as_done
+    // CATALOG: test_state::OutcomeTests::test_removed_cards_count_as_done
     #[test]
     fn removed_cards_count_as_done() {
         let c = cards(vec![card(1, CardStage::Accepted), parked(2, "x")]);
@@ -256,7 +256,7 @@ mod tests {
         assert_eq!(d.outcome, Outcome::Complete);
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_complete_requires_current_gates
+    // CATALOG: test_state::OutcomeTests::test_complete_requires_current_gates
     #[test]
     fn complete_requires_current_gates() {
         let c = accepted(&[1]);
@@ -269,7 +269,7 @@ mod tests {
         assert!(texts(&d)[0].contains("gate"));
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_parked_card_makes_incomplete
+    // CATALOG: test_state::OutcomeTests::test_parked_card_makes_incomplete
     #[test]
     fn parked_card_makes_incomplete() {
         let c = cards(vec![
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(reasons[0], "card 2 parked: stuck");
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_unfinished_card_makes_incomplete
+    // CATALOG: test_state::OutcomeTests::test_unfinished_card_makes_incomplete
     #[test]
     fn unfinished_card_makes_incomplete() {
         let c = cards(vec![card(1, CardStage::Reviewing)]);
@@ -296,7 +296,7 @@ mod tests {
         assert_eq!(texts(&d)[0], "card 1 not accepted (state: reviewing)");
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_open_findings_make_incomplete
+    // CATALOG: test_state::OutcomeTests::test_open_findings_make_incomplete
     #[test]
     fn open_findings_make_incomplete() {
         let c = accepted(&[1]);
@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(d.reasons.len(), 1);
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_holds_make_incomplete
+    // CATALOG: test_state::OutcomeTests::test_holds_make_incomplete
     #[test]
     fn holds_make_incomplete() {
         let c = accepted(&[1]);
@@ -324,7 +324,7 @@ mod tests {
         assert!(texts(&d)[0].contains("no evidence"));
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_reasons_accumulate
+    // CATALOG: test_state::OutcomeTests::test_reasons_accumulate
     #[test]
     fn reasons_accumulate() {
         let c = cards(vec![parked(1, "p")]);
@@ -338,7 +338,7 @@ mod tests {
         assert_eq!(d.reasons.len(), 4);
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_cancel_is_incomplete_cancelled
+    // CATALOG: test_state::OutcomeTests::test_cancel_is_incomplete_cancelled
     #[test]
     fn cancel_is_incomplete_cancelled() {
         let c = accepted(&[1]);
@@ -353,7 +353,7 @@ mod tests {
         assert!(!d.reasons.is_empty());
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_pause_is_blocked_paused
+    // CATALOG: test_state::OutcomeTests::test_pause_is_blocked_paused
     #[test]
     fn pause_is_blocked_paused() {
         let c = cards(vec![card(1, CardStage::Pending)]);
@@ -367,7 +367,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_blocked_qualifiers
+    // CATALOG: test_state::OutcomeTests::test_blocked_qualifiers
     #[test]
     fn blocked_qualifiers() {
         let none = BTreeMap::new();
@@ -389,7 +389,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_unreconciled_is_failed
+    // CATALOG: test_state::OutcomeTests::test_unreconciled_is_failed
     #[test]
     fn unreconciled_is_failed() {
         let c = accepted(&[1]);
@@ -405,7 +405,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_verification_failed_is_failed
+    // CATALOG: test_state::OutcomeTests::test_verification_failed_is_failed
     #[test]
     fn verification_failed_is_failed() {
         let c = accepted(&[1]);
@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(d.outcome, Outcome::Failed);
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_first_match_wins
+    // CATALOG: test_state::OutcomeTests::test_first_match_wins
     #[test]
     fn first_match_wins() {
         let one = accepted(&[1]);
@@ -452,7 +452,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_outcome_values
+    // CATALOG: test_state::OutcomeTests::test_outcome_values
     #[test]
     fn outcome_values() {
         let values: Vec<&str> = Outcome::ALL.iter().map(|o| o.as_str()).collect();
@@ -460,7 +460,7 @@ mod tests {
         assert_eq!(Outcome::Complete.as_str(), "complete");
     }
 
-    // CATALOG: test_state.py::OutcomeTests::test_allowed_next_step_matrix
+    // CATALOG: test_state::OutcomeTests::test_allowed_next_step_matrix
     #[test]
     fn allowed_next_step_matrix() {
         let decision = |outcome| OutcomeDecision {

@@ -1,4 +1,4 @@
-//! Deck parsing and validation (`deck.py`; docs/deck-format.md).
+//! Deck parsing and validation (the Python `deck` module; docs/deck-format.md).
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -777,7 +777,7 @@ Profile: standard                 Finish: none
 Context: pointers to the plan section and files, not copies.
 ";
 
-    /// `test_deck.py`'s `deck_text`: cards are (number, role, hard, depends on).
+    /// Python's `test_deck`'s `deck_text`: cards are (number, role, hard, depends on).
     fn deck_text(cards: &[(u32, &str, &str, &str)]) -> String {
         let mut text = String::from(
             "# Deck: T\nSource: s\nBase: main @ abc1234\nBranch: b\nBuild: make build\n\
@@ -807,15 +807,11 @@ Context: pointers to the plan section and files, not copies.
         }
     }
 
-    /// The Python's regex applied to `inputs` by `python3`: `expr` over `x`, with the deck
-    /// module's patterns in scope.
-    fn python(expr: &str, inputs: &[&str]) -> Vec<serde_json::Value> {
+    /// What the reference's deck pattern of `section` made of each of `inputs`: its groups (or
+    /// `null` for no match), or its split.
+    fn reference(section: &str, inputs: &[&str]) -> Vec<serde_json::Value> {
         let inputs: Vec<serde_json::Value> = inputs.iter().map(|s| serde_json::json!(s)).collect();
-        crate::pytext::tests::python_eval(
-            "from leadhand.deck import _REQ, _HEADER_SPLIT, _FIELD, _HARD, _CARD",
-            expr,
-            &inputs,
-        )
+        crate::wire::tests::reference_outputs("deck.json", section, &inputs)
     }
 
     #[test]
@@ -840,10 +836,8 @@ Context: pointers to the plan section and files, not copies.
             "-R1 a \u{2192} cards 1",
             "- R1 caf\u{e9} \u{2192} cards 1,2 ,3",
         ];
-        let theirs = python(
-            "(lambda m: [m.group(1), m.group(2).strip(), m.group(3)] if m else None)(_REQ.match(x))",
-            &cases,
-        );
+        // `_REQ.match`: groups 1, 2 (stripped) and 3.
+        let theirs = reference("requirement", &cases);
         for (case, want) in cases.iter().zip(theirs) {
             let ours = requirement(case).map(|(id, text, list)| [id, py_strip(text), list]);
             assert_eq!(serde_json::json!(ours), want, "{case:?}");
@@ -865,7 +859,7 @@ Context: pointers to the plan section and files, not copies.
             "Source: a \u{a0}Branch: y",
             "Source: a   Branch : y",
         ];
-        let theirs = python("_HEADER_SPLIT.split(x)", &cases);
+        let theirs = reference("header_split", &cases);
         for (case, want) in cases.iter().zip(theirs) {
             assert_eq!(serde_json::json!(split_header(case)), want, "{case:?}");
         }
@@ -887,10 +881,8 @@ Context: pointers to the plan section and files, not copies.
             "- R\u{e9}le: x",
             "- : x",
         ];
-        let theirs = python(
-            "(lambda m: [m.group(1), m.group(2)] if m else None)(_FIELD.match(x))",
-            &fields,
-        );
+        // `_FIELD.match`: groups 1 and 2.
+        let theirs = reference("field", &fields);
         for (case, want) in fields.iter().zip(theirs) {
             assert_eq!(serde_json::json!(field_line(case)), want, "{case:?}");
         }
@@ -904,10 +896,8 @@ Context: pointers to the plan section and files, not copies.
             "##  Card 3: y",
             "## Card 007: y",
         ];
-        let theirs = python(
-            "(lambda m: [m.group(1), m.group(2)] if m else None)(_CARD.match(x))",
-            &cards,
-        );
+        // `_CARD.match`: groups 1 and 2.
+        let theirs = reference("card", &cards);
         for (case, want) in cards.iter().zip(theirs) {
             assert_eq!(serde_json::json!(card_heading(case)), want, "{case:?}");
         }
@@ -924,10 +914,8 @@ Context: pointers to the plan section and files, not copies.
             "yes \u{2014}   spaced  ",
             "Yes - x",
         ];
-        let theirs = python(
-            "(lambda m: (m.group(1) or '').strip() if m else None)(_HARD.match(x))",
-            &hards,
-        );
+        // `_HARD.match`: group 1 (or `''`), stripped.
+        let theirs = reference("hard", &hards);
         for (case, want) in hards.iter().zip(theirs) {
             assert_eq!(
                 serde_json::json!(hard_yes(case).map(py_strip)),
@@ -937,7 +925,7 @@ Context: pointers to the plan section and files, not copies.
         }
     }
 
-    // CATALOG: test_deck.py::DeckTests::test_spec_example_header_parses
+    // CATALOG: test_deck::DeckTests::test_spec_example_header_parses
     #[test]
     fn spec_example_header_parses() {
         let dir = Dir::new();
@@ -965,7 +953,7 @@ Context: pointers to the plan section and files, not copies.
         );
     }
 
-    // CATALOG: test_deck.py::DeckTests::test_dependency_order_is_stable_topological
+    // CATALOG: test_deck::DeckTests::test_dependency_order_is_stable_topological
     #[test]
     fn dependency_order_is_stable_topological() {
         let dir = Dir::new();
@@ -979,7 +967,7 @@ Context: pointers to the plan section and files, not copies.
         assert_eq!(dependency_order(&d).unwrap(), [1, 2, 3, 4]);
     }
 
-    // CATALOG: test_deck.py::DeckTests::test_digest_changes_when_file_changes
+    // CATALOG: test_deck::DeckTests::test_digest_changes_when_file_changes
     #[test]
     fn digest_changes_when_file_changes() {
         let dir = Dir::new();

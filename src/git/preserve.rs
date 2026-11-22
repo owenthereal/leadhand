@@ -585,7 +585,7 @@ mod tests {
 
     const SAVED: &str = "refs/leadhand/saved/1";
 
-    // CATALOG: test_gitops.py::GitopsTests::test_preserve_refuses_a_ref_outside_refs
+    // CATALOG: test_gitops::GitopsTests::test_preserve_refuses_a_ref_outside_refs
     #[test]
     fn preserve_refuses_a_ref_outside_refs() {
         let f = Fixture::new();
@@ -608,7 +608,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_gitops.py::GitopsTests::test_preserve_drops_a_stale_branch_sibling
+    // CATALOG: test_gitops::GitopsTests::test_preserve_drops_a_stale_branch_sibling
     #[test]
     fn preserve_drops_a_stale_branch_sibling() {
         let f = Fixture::new();

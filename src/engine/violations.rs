@@ -1,7 +1,7 @@
 //! Violations: what the shell does for `decide` when a worker changed what its dispatch guards,
-//! or an implementer left something in the workspace (`engine.py`: `_find_violation`,
-//! `_engine_writes`, `_violation_paths`, `_void`, `_restore_violation`, `_ensure_clean`,
-//! `_finish_leftovers`; R14', R30, R33).
+//! or an implementer left something in the workspace (the Python `engine` module:
+//! `_find_violation`, `_engine_writes`, `_violation_paths`, `_void`, `_restore_violation`,
+//! `_ensure_clean`, `_finish_leftovers`; R14', R30, R33).
 //!
 //! - A check (review, rereview, verify) must leave the card tip, a clean workspace and every
 //!   ref of the run as it found them; an implementer-side worker the run branch. A change is
@@ -678,12 +678,10 @@ mod tests {
             "heads/no-prefix",
             "refs/heads/a_b.c",
         ];
-        let code = "import json, re, sys\n\
-                    print(json.dumps([re.sub(r'[^A-Za-z0-9_]+', '-', n.removeprefix('refs/')).strip('-') or 'ref'\n\
-                    \x20                 for n in sys.argv[1:]]))";
-        let args: Vec<&std::ffi::OsStr> = names.iter().map(std::ffi::OsStr::new).collect();
+        // `engine.json`: the reference's naming of each,
+        // `re.sub(r'[^A-Za-z0-9_]+', '-', n.removeprefix('refs/')).strip('-') or 'ref'`.
         let theirs: Vec<String> =
-            serde_json::from_slice(&crate::wire::tests::python(code, &args)).unwrap();
+            crate::wire::tests::reference_for("engine.json", "keep_ref_suffix", &names);
         let ours: Vec<String> = names.iter().map(|n| ref_slug(&(*n).into())).collect();
         assert_eq!(ours, theirs);
         // An undecodable byte is a character outside the class too.

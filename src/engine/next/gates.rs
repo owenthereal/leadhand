@@ -658,11 +658,9 @@ mod tests {
             "/",
             "src/permissions\n",
         ];
-        let code = "import json, sys\nfrom leadhand import engine\n\
-                    print(json.dumps([engine.is_sensitive_path(p) for p in sys.argv[1:]]))";
-        let args: Vec<&std::ffi::OsStr> = paths.iter().map(std::ffi::OsStr::new).collect();
+        // `engine.json`: the reference's `is_sensitive_path` of each path.
         let theirs: Vec<bool> =
-            serde_json::from_slice(&crate::wire::tests::python(code, &args)).unwrap();
+            crate::wire::tests::reference_for("engine.json", "sensitive_path", &paths);
         let ours: Vec<bool> = paths
             .iter()
             .map(|p| is_sensitive_path(&PyStr::from(*p)))

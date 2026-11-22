@@ -1,0 +1,2 @@
+{"charge_id":"d1:claude:agent1","source":"claude","key":"agent1","dispatch_id":"d1","role":"implementer","usage":{"input":3,"cached":0,"cache_write_5m":0,"cache_write_1h":0,"output":10,"reasoning":0,"known":true,"model":"claude-opus-4-1"},"checkpoint":{"messages":{"m1":10}},"ts":"2026-01-01T00:00:00.000Z"}
+{"messages": {"m1": 10}} {"messages": {}}

@@ -1,7 +1,7 @@
 //! Integration: rebasing a card branch onto the run tip when other cards were accepted while it
-//! waited (`engine.py`: `_accept`'s integration, `_rebase`, `_integration_step`'s rebase). The
-//! I/O the shell carries out for `decide`; which step is due, the integrate attempt after a
-//! conflict, the re-review and the verify that follow are `next`'s.
+//! waited (the Python `engine` module: `_accept`'s integration, `_rebase`, `_integration_step`'s
+//! rebase). The I/O the shell carries out for `decide`; which step is due, the integrate attempt
+//! after a conflict, the re-review and the verify that follow are `next`'s.
 //!
 //! The rebase runs in the run's worktree, on the card branch only: its commits are never signed,
 //! it never updates other branches and never autostashes (`git::cards::rebase_onto`). The

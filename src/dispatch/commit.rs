@@ -625,7 +625,7 @@ mod tests {
         }
     }
 
-    // CATALOG: test_dispatch.py::RunnerCommitTests::test_untracked_to_take_fails_closed_when_the_checkout_top_is_unknown
+    // CATALOG: test_dispatch::RunnerCommitTests::test_untracked_to_take_fails_closed_when_the_checkout_top_is_unknown
     #[test]
     fn untracked_to_take_fails_closed_when_the_checkout_top_is_unknown() {
         let w = World::new();
@@ -635,7 +635,7 @@ mod tests {
         assert!(got.is_err(), "{got:?}");
     }
 
-    // CATALOG: test_dispatch.py::RunnerCommitTests::test_unlocatable_git_path_is_an_error_not_an_operation
+    // CATALOG: test_dispatch::RunnerCommitTests::test_unlocatable_git_path_is_an_error_not_an_operation
     #[test]
     fn unlocatable_git_path_is_an_error_not_an_operation() {
         let w = World::new();

@@ -881,8 +881,9 @@ mod tests {
         assert!(matches!(decide(&st, &o), Decision::RecordGate(_)));
     }
 
-    // Carried from Task 14's review: `_work_branch` gives a fix wave's implementer the final
-    // branch (`engine.py:910`), which a run-level Codex dispatch's line and its cancel name.
+    // Carried from Task 14's review: the Python `engine` module's `_work_branch` gives a fix
+    // wave's implementer the final branch, which a run-level Codex dispatch's line and its
+    // cancel name.
     #[test]
     fn a_fix_waves_implementer_works_on_the_final_branch() {
         let w = world("");

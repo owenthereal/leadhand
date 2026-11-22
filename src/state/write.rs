@@ -139,7 +139,10 @@ mod tests {
     use crate::state::events::{self, CardRef, EVENT_KINDS};
     use crate::state::{decode_event, read_events, run_paths};
     use crate::usage::{Tokens, Usage};
-    use crate::wire::{self, tests::python};
+    use crate::wire::{
+        self,
+        tests::{mask_ts, read_reference, read_reference_text},
+    };
 
     fn run_dir() -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -180,12 +183,29 @@ mod tests {
         let (second, _) = append_event(&paths, ruling("two")).unwrap();
         assert_eq!(second.seq(), 2);
         assert_eq!(lines(&paths.events)[0], raw.get());
-        // After a Python writer, the next number is the Python's plus one.
-        let code = "import sys\nfrom pathlib import Path\nfrom leadhand import state\n\
-                    p = state.run_paths(Path(sys.argv[1]))\n\
-                    state.append_event(p, 'paused', by='operator')\n\
-                    print(len(state.read_events(p)))\n";
-        assert_eq!(python(code, &[tmp.path().as_os_str()]), b"3\n");
+        // After a Python writer, the next number is the Python's plus one. The reference
+        // appended a `paused` event after these two lines (their `ts` aside), and then read
+        // three events.
+        let recorded = read_reference_text("state/seq-after-two.jsonl");
+        let recorded: Vec<&str> = recorded.lines().collect();
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(
+            lines(&paths.events)
+                .iter()
+                .map(|l| mask_ts(l))
+                .collect::<Vec<_>>(),
+            recorded[..2].iter().map(|l| mask_ts(l)).collect::<Vec<_>>()
+        );
+        let theirs = decode_event(serde_json::from_str(recorded[2]).unwrap())
+            .unwrap()
+            .0;
+        assert_eq!((theirs.kind(), theirs.seq()), ("paused", 3));
+        assert_eq!(read_reference_text("state/seq-after-two-read.txt"), "3\n");
+        let mut log = fs::File::options()
+            .append(true)
+            .open(&paths.events)
+            .unwrap();
+        std::io::Write::write_all(&mut log, format!("{}\n", recorded[2]).as_bytes()).unwrap();
         let (fourth, _) = append_event(&paths, ruling("four")).unwrap();
         assert_eq!(fourth.seq(), 4);
         let read: Vec<u64> = read_events(&paths)
@@ -225,7 +245,7 @@ mod tests {
         assert_eq!(append_event(&paths, ruling("x")).unwrap().0.seq(), 42);
     }
 
-    // CATALOG: test_state.py::AppendTests::test_unknown_event_kind_rejected
+    // CATALOG: test_state::AppendTests::test_unknown_event_kind_rejected
     #[test]
     fn unknown_event_kind_rejected() {
         // An unknown kind cannot be built: an `Event` is one of `EVENT_KINDS`, read only from a
@@ -248,7 +268,7 @@ mod tests {
         assert_eq!(kinds, EVENT_KINDS);
     }
 
-    // CATALOG: test_state.py::AppendTests::test_reserved_field_names_rejected
+    // CATALOG: test_state::AppendTests::test_reserved_field_names_rejected
     #[test]
     fn reserved_field_names_rejected() {
         // `seq`, `ts` and `kind` are never the caller's: an event's own `seq` and `ts` are
@@ -274,7 +294,7 @@ mod tests {
         assert_eq!(raw.get().matches("\"kind\"").count(), 1);
     }
 
-    // CATALOG: test_state.py::AppendTests::test_append_attempt_and_read_attempts
+    // CATALOG: test_state::AppendTests::test_append_attempt_and_read_attempts
     #[test]
     fn append_attempt_and_read_attempts() {
         let tmp = run_dir();
@@ -288,10 +308,13 @@ mod tests {
         append_attempt(&paths, &attempt(1)).unwrap();
         append_attempt(&paths, &attempt(2)).unwrap();
         assert_eq!(read_attempts(&paths).unwrap(), [attempt(1), attempt(2)]);
-        // Python's records read as theirs, with every field it did not write missing.
-        let code = "import sys\nfrom pathlib import Path\nfrom leadhand import state\n\
-                    state.append_attempt(state.run_paths(Path(sys.argv[1])), {'card': 1, 'attempt': 3})\n";
-        python(code, &[tmp.path().as_os_str()]);
+        // Python's records read as theirs, with every field it did not write missing: the line
+        // the reference's `append_attempt` wrote for `{'card': 1, 'attempt': 3}`.
+        let mut log = fs::File::options()
+            .append(true)
+            .open(&paths.attempts)
+            .unwrap();
+        std::io::Write::write_all(&mut log, &read_reference("state/attempt-3.jsonl")).unwrap();
         assert_eq!(read_attempts(&paths).unwrap()[2], attempt(3));
     }
 
@@ -360,24 +383,17 @@ mod tests {
         };
         append_attempt(&paths, &claude).unwrap();
         append_attempt(&paths, &codex).unwrap();
-        let code = "import json, sys\nfrom pathlib import Path\nfrom leadhand import state\n\
-            claude = {'dispatch': 'c1-a1-implement-1', 'run': 'abc123', 'card': 1, 'attempt': 1,\n\
-            \x20   'role': 'implementer', 'vendor': 'claude', 'model': 'sonnet', 'effort': 'high',\n\
-            \x20   'agent': 'leadhand:implementer', 'worker_id': 'w\\u00e9', 'started_at': '2026-11-14T00:00:00.000Z',\n\
-            \x20   'ended_at': '2026-11-14T00:01:00.000Z', 'steps': None, 'charge_ids': ['c1-a1-implement-1:claude:w\\u00e9'],\n\
-            \x20   'usage': {'input': 3, 'cached': 0, 'cache_write_5m': 0, 'cache_write_1h': 0, 'output': 10,\n\
-            \x20             'reasoning': 0, 'known': True, 'model': 'claude-opus-4-1'},\n\
-            \x20   'usage_known': True, 'cost_estimate': 1e-05, 'exit_reason': 'completed', 'status': 'READY',\n\
-            \x20   'blocked_by': '', 'recorded_by': 'engine'}\n\
-            codex = {'dispatch': 'c1-a2-implement-1', 'run': None, 'card': None, 'attempt': 2,\n\
-            \x20   'role': 'implementer', 'vendor': 'codex', 'model': 'gpt-6.1-terra', 'effort': 'high',\n\
-            \x20   'worker_id': None, 'started_at': '2026-11-14T00:00:00.000Z', 'ended_at': '2026-11-14T00:01:00.000Z',\n\
-            \x20   'steps': 4, 'charge_ids': ['c1-a2-implement-1:codex:unknown'], 'usage': None, 'usage_known': False,\n\
-            \x20   'usage_source': 'unknown', 'cost_estimate': None, 'exit_reason': 'interrupted', 'status': 'SPENT',\n\
-            \x20   'blocked_by': '', 'generation': 1, 'possibly_incomplete': True}\n\
-            got = state.read_attempts(state.run_paths(Path(sys.argv[1])))\n\
-            print(got == [claude, codex], [list(a) for a in got] == [list(claude), list(codex)])\n";
-        assert_eq!(python(code, &[tmp.path().as_os_str()]), b"True True\n");
+        // The reference's `append_attempt` wrote the same two records, as its engine and runner
+        // give them, as these bytes, and its `read_attempts` read them back as those records,
+        // keys in their order. Ours are the same bytes, so it reads ours so.
+        assert_eq!(
+            fs::read(&paths.attempts).unwrap(),
+            read_reference("state/attempts.jsonl")
+        );
+        assert_eq!(
+            read_reference_text("state/attempts-read.txt"),
+            "True True\n"
+        );
         assert_eq!(read_attempts(&paths).unwrap(), [claude, codex]);
     }
 

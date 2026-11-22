@@ -1,0 +1,99 @@
+profile = "standard"           # lean | standard | thorough: every role's effort -1 / 0 / +1
+docs_dir = "~/.leadhand/{repo}"
+# docs_dir holds runs/<date>-<slug>/ (deck, events, status, ledger, attempts,
+# copied briefs and reports, report.md), runs.md and decisions.md.
+
+[run]
+worktree = true
+test_first = "when-cheap"
+evidence = "record"
+card_review = "always"
+cost_limit_usd = 0
+branch_prefix = "leadhand/"
+
+[after_run]
+step = "none"
+on_incomplete = "none"
+repeat_safe = false
+check = ""
+
+[capacity]
+codex_pause_percent = 95
+
+[codex]
+network = false
+writable_dirs = []
+
+[limits]
+implementer = { steps = 150, minutes = 60 }
+reviewer    = { steps = 60,  minutes = 20 }
+verifier    = { steps = 40,  minutes = 30 }
+scout       = { steps = 30,  minutes = 10 }
+
+[roles.implementer]
+claude = "sonnet medium"
+prefer = "claude"
+
+[roles.implementer_hard]
+claude = "opus high"
+prefer = "claude"
+
+[roles.reviewer]
+claude = "opus medium"
+prefer = "claude"
+
+[roles.reviewer_hard]
+claude = "opus high"
+prefer = "claude"
+
+[roles.final_reviewer]
+claude = "fable medium"
+prefer = "claude"
+
+[roles.verifier]
+claude = "sonnet medium"
+prefer = "claude"
+
+[roles.scout]
+claude = "haiku low"
+prefer = "claude"
+
+[roles.dealer]
+claude = "opus medium"
+prefer = "claude"
+
+[roles.supervisor]
+claude = "opus medium"
+prefer = "claude"
+
+[notify]
+command = ""
+
+[prices]                       # $/MTok for estimates; editable. Codex models are not priced.
+[prices.opus]
+input = 4
+output = 20
+cache_read = 0.20
+cache_write_5m = 5
+cache_write_1h = 8
+
+[prices.sonnet]
+input = 2
+output = 10
+cache_read = 0.10
+cache_write_5m = 2.5
+cache_write_1h = 4
+
+[prices.haiku]
+input = 0.10
+output = 0.50
+cache_read = 0.01
+cache_write_5m = 0.125
+cache_write_1h = 0.20
+
+[prices.fable]
+input = 8
+output = 40
+cache_read = 0.20
+cache_write_5m = 10
+cache_write_1h = 16

@@ -1,4 +1,4 @@
-//! Keep-awake beside the supervisor (`launch._keep_awake_argv`, R27): `caffeinate -i -w
+//! Keep-awake beside the supervisor (R27): `caffeinate -i -w
 //! <pid>` on macOS; on Linux with `systemd-inhibit` on PATH, `systemd-inhibit --what=idle
 //! --why="leadhand run" tail --pid=<pid> -f /dev/null`; nothing elsewhere. It never wraps the
 //! supervisor, which stays the launcher's direct child, and it never holds `run.lock`: every

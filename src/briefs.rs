@@ -1,5 +1,5 @@
-//! Worker briefs (`briefs.py`): where a dispatch's scratch folder is, the prompt a Codex
-//! worker gets, and the head of a worker's report.
+//! Worker briefs (the Python `briefs` module): where a dispatch's scratch folder is, the prompt a
+//! Codex worker gets, and the head of a worker's report.
 //!
 //! A brief is a Markdown file in the attempt's scratch folder inside the workspace
 //! (`<ws>/.leadhand/<card or "run">/<dispatch_id>/brief.md`); the worker writes its report
@@ -83,6 +83,12 @@ pub fn worker_prompt(role: &str, brief: &Path, report: &Path) -> Result<OsString
         .iter()
         .find(|(n, _)| *n == name)
         .map_or("", |(_, text)| *text);
+    Ok(worker_prompt_from(file, agent, brief, report))
+}
+
+/// `worker_prompt` for the worker agent `agent` (`leadhand:<name>`), whose agent file's text is
+/// `file`.
+fn worker_prompt_from(file: &str, agent: &str, brief: &Path, report: &Path) -> OsString {
     let body = match file
         .strip_prefix("---\n")
         .and_then(|rest| rest.split_once("\n---\n"))
@@ -100,7 +106,7 @@ pub fn worker_prompt(role: &str, brief: &Path, report: &Path) -> Result<OsString
     prompt.push("\n- Report file: ");
     prompt.push(pure_path(report.as_os_str()));
     prompt.push("\n\nRead the brief now, do the work, write the report, then reply.\n");
-    Ok(prompt)
+    prompt
 }
 
 /// What a report head is when it cannot be parsed (`briefs._UNPARSED`).
@@ -279,15 +285,24 @@ fn blocked_reason(line: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use super::*;
-    use crate::wire::tests::python;
+    use crate::wire::tests::{read_reference, reference_for};
 
+    /// The reference fixture of the tests here (besides the worker prompts).
+    pub(crate) const FIXTURE: &str = "briefs.json";
+
+    /// `worker-prompts/<role>.txt`: the reference's `worker_prompt` for each role, for each of
+    /// these brief and report paths in turn, as the OS gets it (`os.fsencode`), the prompts
+    /// joined by NUL. The reference read frozen copies of the agent files
+    /// (`worker-prompts/agents/<name>.md`), and Rust builds each prompt from the same copy, so
+    /// the check stays the reference's when an agent file changes. `worker_prompt` itself is
+    /// `worker_prompt_from` on the live agent file.
     #[test]
-    fn worker_prompt_matches_python() {
+    fn worker_prompts_match_reference() {
         let paths: [(&[u8], &[u8]); 4] = [
             (
                 b"/ws/.leadhand/1/c1-a1-implement-1/brief.md",
@@ -306,31 +321,33 @@ mod tests {
             // Spelled as pathlib spells it.
             (b"rel//./ws/brief.md", b"./rel/report.md/"),
         ];
-        let code = "import os, sys\nfrom pathlib import Path\nfrom leadhand import briefs\n\
-                    roles, rest = sys.argv[1].split(','), sys.argv[2:]\n\
-                    out = [os.fsencode(briefs.worker_prompt(role, Path(b), Path(r)))\n\
-                    \x20      for role in roles for b, r in zip(rest[::2], rest[1::2])]\n\
-                    sys.stdout.buffer.write(b'\\0'.join(out))\n";
         let roles: Vec<&str> = ROLE_AGENT.iter().map(|(role, _)| *role).collect();
-        let joined = roles.join(",");
-        let mut args: Vec<&OsStr> = vec![OsStr::new(&joined)];
-        for (b, r) in &paths {
-            args.push(OsStr::from_bytes(b));
-            args.push(OsStr::from_bytes(r));
-        }
-        let theirs = python(code, &args);
         let mut ours: Vec<Vec<u8>> = Vec::new();
         for role in &roles {
+            let agent = agent_for(role, "claude").unwrap();
+            let name = agent.trim_start_matches("leadhand:");
+            let frozen =
+                String::from_utf8(read_reference(&format!("worker-prompts/agents/{name}.md")))
+                    .unwrap();
+            let live = AGENTS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, text)| *text)
+                .expect("the role's agent file");
+            let mut mine: Vec<Vec<u8>> = Vec::new();
             for (b, r) in &paths {
-                let prompt = worker_prompt(
-                    role,
+                let (b, r) = (
                     Path::new(OsStr::from_bytes(b)),
                     Path::new(OsStr::from_bytes(r)),
                 );
-                ours.push(prompt.unwrap().into_vec());
+                let prompt = worker_prompt(role, b, r).unwrap();
+                assert_eq!(prompt, worker_prompt_from(live, agent, b, r), "{role}");
+                mine.push(worker_prompt_from(&frozen, agent, b, r).into_vec());
             }
+            let theirs = read_reference(&format!("worker-prompts/{role}.txt"));
+            assert_eq!(mine.join(&b"\0"[..]), theirs, "{role}");
+            ours.extend(mine);
         }
-        assert_eq!(ours.join(&b"\0"[..]), theirs);
         assert_eq!(ours.len(), 7 * 4);
         // The implementer's prompt carries the no-commit rule; the reviewer's does not.
         let has = |p: &[u8], s: &[u8]| p.windows(s.len()).any(|w| w == s);
@@ -372,18 +389,11 @@ mod tests {
             ("ws//a/.", Some(-2), "x"),
             (".", None, "d"),
         ];
-        let code = "import sys\nfrom leadhand import briefs\n\
-                    a = sys.argv[1:]\n\
-                    for ws, card, did in zip(a[::3], a[1::3], a[2::3]):\n\
-                    \x20   print(briefs.scratch_dir(ws, None if card == '-' else int(card), did))\n";
-        let mut args: Vec<OsString> = Vec::new();
-        for (ws, card, did) in cases {
-            args.push(ws.into());
-            args.push(card.map_or("-".to_string(), |c| c.to_string()).into());
-            args.push(did.into());
-        }
-        let args: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
-        let theirs = String::from_utf8(python(code, &args)).unwrap();
+        // `briefs.json`: the reference's `scratch_dir` of each case.
+        let theirs: String = reference_for::<String>(FIXTURE, "scratch_dir", &cases)
+            .iter()
+            .map(|out| format!("{out}\n"))
+            .collect();
         let ours: String = cases
             .iter()
             .map(|(ws, card, did)| {
@@ -433,24 +443,18 @@ mod tests {
             "status:ready\u{2028}Blocked by: environment",
         ];
         let cases: Vec<String> = cases.iter().map(|s| s.to_string()).collect();
-        let theirs = python_heads(&cases);
+        let theirs = reference_heads("report_head", &cases);
         assert!(theirs.iter().all(|r| r.is_ok()), "{theirs:?}");
         assert_same_heads(&cases, theirs);
     }
 
-    /// `briefs.parse_report_head` of each text: the triple, or the key its `KeyError` names.
-    fn python_heads(texts: &[String]) -> Vec<std::result::Result<Vec<String>, String>> {
-        let code = "import json, sys\nfrom leadhand import briefs\n\
-                    out = []\n\
-                    for t in json.loads(sys.argv[1]):\n\
-                    \x20   try:\n\
-                    \x20       out.append(['ok', *briefs.parse_report_head(t)])\n\
-                    \x20   except KeyError as e:\n\
-                    \x20       out.append(['KeyError', e.args[0]])\n\
-                    print(json.dumps(out))\n";
-        let arg = serde_json::to_string(texts).unwrap();
-        let out: Vec<Vec<String>> =
-            serde_json::from_slice(&python(code, &[OsStr::new(&arg)])).unwrap();
+    /// The reference's `briefs.parse_report_head` of each text, from section `section` of
+    /// `briefs.json`: the triple, or the key its `KeyError` names.
+    fn reference_heads(
+        section: &str,
+        texts: &[String],
+    ) -> Vec<std::result::Result<Vec<String>, String>> {
+        let out: Vec<Vec<String>> = reference_for(FIXTURE, section, texts);
         out.into_iter()
             .map(|mut r| match r[0].as_str() {
                 "ok" => Ok(r.split_off(1)),
@@ -490,7 +494,7 @@ mod tests {
                 }
             }
         }
-        let theirs = python_heads(&texts);
+        let theirs = reference_heads("report_head_folded", &texts);
         let raised = theirs.iter().filter(|r| r.is_err()).count();
         // `statuſ`, `verdıct`, `verdİct` and `reſult` raise (two texts each); `ſtatus` parses,
         // and a letter that folds to none of the key's is no match.
@@ -521,6 +525,6 @@ mod tests {
             parse_report_head(&texts[1]),
             Ok(("Status", "BLOCKED", "usage limit"))
         );
-        assert_same_heads(&texts, python_heads(&texts));
+        assert_same_heads(&texts, reference_heads("report_head_kelvin", &texts));
     }
 }

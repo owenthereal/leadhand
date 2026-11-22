@@ -669,7 +669,7 @@ mod tests {
         (name.into_string().unwrap(), sha)
     }
 
-    // CATALOG: test_gitops.py::GitopsTests::test_default_base_uses_origin_default_branch
+    // CATALOG: test_gitops::GitopsTests::test_default_base_uses_origin_default_branch
     #[test]
     fn default_base_uses_origin_default_branch() {
         let f = Fixture::new();
@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(base(&git), ("origin/develop".into(), upstream));
     }
 
-    // CATALOG: test_gitops.py::GitopsTests::test_default_base_without_origin_uses_local_default
+    // CATALOG: test_gitops::GitopsTests::test_default_base_without_origin_uses_local_default
     #[test]
     fn default_base_without_origin_uses_local_default() {
         let f = Fixture::new();
@@ -726,7 +726,7 @@ mod tests {
         refs.lines().any(|r| r == name)
     }
 
-    // CATALOG: test_gitops.py::GitopsTests::test_prepare_workspace_rejects_unsafe_slugs
+    // CATALOG: test_gitops::GitopsTests::test_prepare_workspace_rejects_unsafe_slugs
     #[test]
     fn prepare_workspace_rejects_unsafe_slugs() {
         let f = Fixture::new();
@@ -828,15 +828,16 @@ mod tests {
                 f.root().join("root link/real/inner"),
             ),
         ];
-        let code = "import json, sys\nfrom pathlib import Path\nfrom leadhand.gitops import resolves_in_place\n\
-                    a = sys.argv[1:]\n\
-                    print(json.dumps([resolves_in_place(Path(a[i]), Path(a[i + 1])) for i in range(0, len(a), 2)]))";
-        let args: Vec<&OsStr> = cases
+        // `git.json`: the reference's `resolves_in_place` of each case, on the same links under
+        // a root written `{root}`.
+        let top = f.root().to_str().unwrap();
+        let placeheld = |p: &Path| p.to_str().unwrap().replacen(top, "{root}", 1);
+        let inputs: Vec<[String; 2]> = cases
             .iter()
-            .flat_map(|(r, p)| [r.as_os_str(), p.as_os_str()])
+            .map(|(r, p)| [placeheld(r), placeheld(p)])
             .collect();
         let theirs: Vec<bool> =
-            serde_json::from_slice(&crate::wire::tests::python(code, &args)).unwrap();
+            crate::wire::tests::reference_for("git.json", "resolves_in_place", &inputs);
         let ours: Vec<bool> = cases.iter().map(|(r, p)| resolves_in_place(r, p)).collect();
         assert_eq!(ours, theirs);
         assert_eq!(ours[..3], [true, false, false]);

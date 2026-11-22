@@ -1,0 +1,41 @@
+{"surrogateescape":[
+{"in":"eda080","out":"\"\\udced\\udca0\\udc80\""},
+{"in":"e28241","out":"\"\\udce2\\udc82A\""},
+{"in":"f09f9841","out":"\"\\udcf0\\udc9f\\udc98A\""},
+{"in":"61c0af62","out":"\"a\\udcc0\\udcafb\""},
+{"in":"f4908080","out":"\"\\udcf4\\udc90\\udc80\\udc80\""},
+{"in":"6f6bf09f9880e9","out":"\"ok\\ud83d\\ude00\\udce9\""},
+{"in":"80bfc2","out":"\"\\udc80\\udcbf\\udcc2\""}
+],
+"lone_surrogate":[
+{"events":"{\"seq\":1,\"ts\":\"2026-01-01T00:00:00.000Z\",\"kind\":\"ruling\",\"path\":\"a\\udcffb\"}\n","printed":"{\"action\": \"dispatch\", \"path\": \"a\\udcffb\", \"event\": {\"seq\":1,\"ts\":\"2026-01-01T00:00:00.000Z\",\"kind\":\"ruling\",\"path\":\"a\\udcffb\"}}","reads_back":"True\n"}
+],
+"ascii_escapes":[
+{"in":"\u00e9","out":["\"\\u00e9\"","{\"s\":\"\\u00e9\",\"p\":\"\\u00e9\",\"n\":[1,2],\"e\":[],\"o\":{}}","{\"s\": \"\\u00e9\", \"p\": \"\\u00e9\", \"n\": [1, 2], \"e\": [], \"o\": {}}","{\n  \"s\": \"\\u00e9\",\n  \"p\": \"\\u00e9\",\n  \"n\": [\n    1,\n    2\n  ],\n  \"e\": [],\n  \"o\": {}\n}"]},
+{"in":"\ud83d\ude00","out":["\"\\ud83d\\ude00\"","{\"s\":\"\\ud83d\\ude00\",\"p\":\"\\ud83d\\ude00\",\"n\":[1,2],\"e\":[],\"o\":{}}","{\"s\": \"\\ud83d\\ude00\", \"p\": \"\\ud83d\\ude00\", \"n\": [1, 2], \"e\": [], \"o\": {}}","{\n  \"s\": \"\\ud83d\\ude00\",\n  \"p\": \"\\ud83d\\ude00\",\n  \"n\": [\n    1,\n    2\n  ],\n  \"e\": [],\n  \"o\": {}\n}"]},
+{"in":"a\"b\\c\n\t\r\b\f\u0001\u001f\u007f/","out":["\"a\\\"b\\\\c\\n\\t\\r\\b\\f\\u0001\\u001f\\u007f/\"","{\"s\":\"a\\\"b\\\\c\\n\\t\\r\\b\\f\\u0001\\u001f\\u007f/\",\"p\":\"a\\\"b\\\\c\\n\\t\\r\\b\\f\\u0001\\u001f\\u007f/\",\"n\":[1,2],\"e\":[],\"o\":{}}","{\"s\": \"a\\\"b\\\\c\\n\\t\\r\\b\\f\\u0001\\u001f\\u007f/\", \"p\": \"a\\\"b\\\\c\\n\\t\\r\\b\\f\\u0001\\u001f\\u007f/\", \"n\": [1, 2], \"e\": [], \"o\": {}}","{\n  \"s\": \"a\\\"b\\\\c\\n\\t\\r\\b\\f\\u0001\\u001f\\u007f/\",\n  \"p\": \"a\\\"b\\\\c\\n\\t\\r\\b\\f\\u0001\\u001f\\u007f/\",\n  \"n\": [\n    1,\n    2\n  ],\n  \"e\": [],\n  \"o\": {}\n}"]},
+{"in":"\u4e2d\u6587 \u2028","out":["\"\\u4e2d\\u6587 \\u2028\"","{\"s\":\"\\u4e2d\\u6587 \\u2028\",\"p\":\"\\u4e2d\\u6587 \\u2028\",\"n\":[1,2],\"e\":[],\"o\":{}}","{\"s\": \"\\u4e2d\\u6587 \\u2028\", \"p\": \"\\u4e2d\\u6587 \\u2028\", \"n\": [1, 2], \"e\": [], \"o\": {}}","{\n  \"s\": \"\\u4e2d\\u6587 \\u2028\",\n  \"p\": \"\\u4e2d\\u6587 \\u2028\",\n  \"n\": [\n    1,\n    2\n  ],\n  \"e\": [],\n  \"o\": {}\n}"]},
+{"in":"plain","out":["\"plain\"","{\"s\":\"plain\",\"p\":\"plain\",\"n\":[1,2],\"e\":[],\"o\":{}}","{\"s\": \"plain\", \"p\": \"plain\", \"n\": [1, 2], \"e\": [], \"o\": {}}","{\n  \"s\": \"plain\",\n  \"p\": \"plain\",\n  \"n\": [\n    1,\n    2\n  ],\n  \"e\": [],\n  \"o\": {}\n}"]}
+],
+"pymap_read_back":[
+{"in":"{\"refs/heads/a\\udcffb\":\"w\",\"\\u00e9\":\"y\",\"\\ud83d\\ude00\":\"z\"}","out":"True y\n"}
+],
+"floats":[
+{"in":["0000000000000000","3ff0000000000000","402e000000000000","3fb999999999999a","3f0b43526527a205","3e7ad7f29abcaf48","4341c37937e08000","40fe240c9fbe76c9","c004000000000000","4480f0cf064dd592"],"out":"[0.0,1.0,15.0,0.1,5.2e-05,1e-07,1e+16,123456.789,-2.5,1e+22]\n"}
+],
+"repr":[
+{"in":"\"N\\udcff\"","out":"'N\\udcff'"},
+{"in":"\"it's \\ud800\"","out":"\"it's \\ud800\""},
+{"in":"\"\\\"q\\\" and 'q' \\udfff\\n\"","out":"'\"q\" and \\'q\\' \\udfff\\n'"},
+{"in":"\"caf\u00e9 \ud83d\ude00 \\u0007\"","out":"'caf\u00e9 \ud83d\ude00 \\x07'"},
+{"in":"\"\"","out":"''"}
+],
+"encode_utf8":[
+{"in":"\"plain caf\u00e9 \ud83d\ude00\"","out":["ok","plain caf\u00e9 \ud83d\ude00"]},
+{"in":"\"ab\\udcff\\udcfecd\\udcffe\"","out":["err","'utf-8' codec can't encode characters in position 2-3: surrogates not allowed"]},
+{"in":"\"x\\udcffy\"","out":["err","'utf-8' codec can't encode character '\\udcff' in position 1: surrogates not allowed"]},
+{"in":"\"\u00e9\ud83d\ude00\\udcff\"","out":["err","'utf-8' codec can't encode character '\\udcff' in position 2: surrogates not allowed"]},
+{"in":"\"lone \\ud800 lead\"","out":["err","'utf-8' codec can't encode character '\\ud800' in position 5: surrogates not allowed"]},
+{"in":"\"\\udfff\"","out":["err","'utf-8' codec can't encode character '\\udfff' in position 0: surrogates not allowed"]},
+{"in":"\"\"","out":["ok",""]}
+]}

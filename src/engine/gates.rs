@@ -1,7 +1,7 @@
-//! The end-of-run gates' I/O (`engine.py`: `_request_run`, `_start_wave`'s cut, `_recut_final`,
-//! `_after_run_result`'s gate record and fix acceptance, `_base_worktree`): what the shell
-//! carries out for `decide`, which decides which gate, wave or re-run is due (`next::gates`,
-//! `next::run_level`).
+//! The end-of-run gates' I/O (the Python `engine` module: `_request_run`, `_start_wave`'s cut,
+//! `_recut_final`, `_after_run_result`'s gate record and fix acceptance, `_base_worktree`): what
+//! the shell carries out for `decide`, which decides which gate, wave or re-run is due
+//! (`next::gates`, `next::run_level`).
 //!
 //! Every Git call runs in the run's worktree (`Run::git`), or in the repository for the
 //! evidence base worktree's preparation (`git::base_worktree`). The writes are: the checkout

@@ -4,11 +4,10 @@
 //! `remove_scratch_file`).
 //!
 //! A brief's text lines are contract output (ruling S1-R10): the templates are compiled in from
-//! `scripts/lib/leadhand/templates/brief-<kind>.md` and filled as Python's `string.Template`
-//! fills them. A brief is text as the Python holds it (`PyStr`, a path with an undecodable
-//! byte carried as a surrogate escape) and is written as strict UTF-8, as the Python's
-//! `open(..., "w", encoding="utf-8")` writes it, so such a path fails the write with the
-//! Python's `UnicodeEncodeError` text.
+//! `templates/brief-<kind>.md` and filled as Python's `string.Template` fills them. A brief is
+//! text as the Python holds it (`PyStr`, a path with an undecodable byte carried as a surrogate
+//! escape) and is written as strict UTF-8, as the Python's `open(..., "w", encoding="utf-8")`
+//! writes it, so such a path fails the write with the Python's `UnicodeEncodeError` text.
 //!
 //! The scratch folder `<ws>/.leadhand/<card or run>/<dispatch id>/` is worker-writable, so it
 //! is reached only through `SafeDir` (spec, bug class 5): a symlink or a non-folder on the way
@@ -89,54 +88,21 @@ pub const TEST_FIRST: [&str; 3] = ["when-cheap", "always", "off"];
 
 /// Each kind's template (`templates/brief-<kind>.md`).
 const TEMPLATES: [(&str, &str); 12] = [
-    (
-        "implement",
-        include_str!("../scripts/lib/leadhand/templates/brief-implement.md"),
-    ),
-    (
-        "fix",
-        include_str!("../scripts/lib/leadhand/templates/brief-fix.md"),
-    ),
-    (
-        "answer",
-        include_str!("../scripts/lib/leadhand/templates/brief-answer.md"),
-    ),
-    (
-        "continue",
-        include_str!("../scripts/lib/leadhand/templates/brief-continue.md"),
-    ),
-    (
-        "integrate",
-        include_str!("../scripts/lib/leadhand/templates/brief-integrate.md"),
-    ),
-    (
-        "review",
-        include_str!("../scripts/lib/leadhand/templates/brief-review.md"),
-    ),
-    (
-        "rereview",
-        include_str!("../scripts/lib/leadhand/templates/brief-rereview.md"),
-    ),
+    ("implement", include_str!("../templates/brief-implement.md")),
+    ("fix", include_str!("../templates/brief-fix.md")),
+    ("answer", include_str!("../templates/brief-answer.md")),
+    ("continue", include_str!("../templates/brief-continue.md")),
+    ("integrate", include_str!("../templates/brief-integrate.md")),
+    ("review", include_str!("../templates/brief-review.md")),
+    ("rereview", include_str!("../templates/brief-rereview.md")),
     (
         "final_review",
-        include_str!("../scripts/lib/leadhand/templates/brief-final_review.md"),
+        include_str!("../templates/brief-final_review.md"),
     ),
-    (
-        "final_fix",
-        include_str!("../scripts/lib/leadhand/templates/brief-final_fix.md"),
-    ),
-    (
-        "security",
-        include_str!("../scripts/lib/leadhand/templates/brief-security.md"),
-    ),
-    (
-        "evidence",
-        include_str!("../scripts/lib/leadhand/templates/brief-evidence.md"),
-    ),
-    (
-        "verify",
-        include_str!("../scripts/lib/leadhand/templates/brief-verify.md"),
-    ),
+    ("final_fix", include_str!("../templates/brief-final_fix.md")),
+    ("security", include_str!("../templates/brief-security.md")),
+    ("evidence", include_str!("../templates/brief-evidence.md")),
+    ("verify", include_str!("../templates/brief-verify.md")),
 ];
 
 // --------------------------------------------------------------------------
@@ -628,6 +594,12 @@ pub fn write_brief(spec: &BriefSpec) -> Result<(PathBuf, PathBuf)> {
     let Some((_, template)) = TEMPLATES.iter().find(|(k, _)| *k == kind) else {
         return Err(Error::msg(format!("unknown brief kind {}", py_repr(kind))));
     };
+    write_brief_from(spec, template)
+}
+
+/// `write_brief` for a kind whose template's text is `template`.
+fn write_brief_from(spec: &BriefSpec, template: &str) -> Result<(PathBuf, PathBuf)> {
+    let kind = spec.kind;
     let card_kind = CARD_KINDS.contains(&kind);
     if card_kind && spec.card.is_none() {
         return Err(Error::msg(format!("a {kind} brief needs a card")));
@@ -811,6 +783,9 @@ mod tests {
     use super::*;
     use crate::config::Route;
     use crate::git::fixture::Fixture;
+    use crate::wire::tests::{
+        read_reference_text, reference_for, reference_json, reference_outputs,
+    };
 
     fn card() -> Card {
         Card {
@@ -856,6 +831,59 @@ mod tests {
             cards: vec![card()],
             digest: "0".repeat(64),
         }
+    }
+
+    /// Every field of `c`, as the reference's `dataclasses.asdict` of its card gives it.
+    fn card_json(c: &Card) -> serde_json::Value {
+        serde_json::json!({
+            "number": c.number,
+            "title": c.title,
+            "role": c.role,
+            "hard": c.hard,
+            "hard_reason": c.hard_reason,
+            "risk": c.risk,
+            "depends_on": c.depends_on,
+            "covers": c.covers,
+            "source": c.source,
+            "allowed_paths": c.allowed_paths,
+            "out_of_scope": c.out_of_scope,
+            "done_when": c.done_when,
+            "stop_if": c.stop_if,
+            "inferred": c.inferred,
+            "route_pin": c.route_pin.as_ref().map(|r| serde_json::json!({
+                "vendor": r.vendor, "model": r.model, "effort": r.effort,
+            })),
+            "context": c.context,
+            "missing": c.missing,
+            "line": c.line,
+            "unknown_keys": c.unknown_keys,
+        })
+    }
+
+    /// Every field of `d`, as the reference's `dataclasses.asdict` of its deck gives it, its
+    /// path with `root` written `{root}`.
+    fn deck_json(d: &Deck, root: &str) -> serde_json::Value {
+        let requirements: Vec<serde_json::Value> = d
+            .requirements
+            .iter()
+            .map(|r| serde_json::json!({"id": r.id, "text": r.text, "cards": r.cards}))
+            .collect();
+        let cards: Vec<serde_json::Value> = d.cards.iter().map(card_json).collect();
+        serde_json::json!({
+            "path": d.path.to_str().unwrap().replacen(root, "{root}", 1),
+            "title": d.title,
+            "source": d.source,
+            "base_ref": d.base_ref,
+            "base_sha": d.base_sha,
+            "branch": d.branch,
+            "build": d.build,
+            "test": d.test,
+            "profile": d.profile,
+            "finish": d.finish,
+            "requirements": requirements,
+            "cards": cards,
+            "digest": d.digest,
+        })
     }
 
     /// The pairs as a Python dict holds them: a repeated key keeps its first place and its
@@ -941,7 +969,7 @@ mod tests {
         }
     }
 
-    // CATALOG: test_briefs.py::BriefTests::test_evidence_requires_cards
+    // CATALOG: test_briefs::BriefTests::test_evidence_requires_cards
     #[test]
     fn evidence_requires_cards() {
         let w = world();
@@ -976,7 +1004,7 @@ mod tests {
         }
     }
 
-    // CATALOG: test_briefs.py::BriefTests::test_verify_says_skip_for_empty_commands
+    // CATALOG: test_briefs::BriefTests::test_verify_says_skip_for_empty_commands
     #[test]
     fn verify_says_skip_for_empty_commands() {
         let mut w = world();
@@ -989,7 +1017,7 @@ mod tests {
         assert!(text.contains("- Test: make test"), "{text}");
     }
 
-    // CATALOG: test_briefs.py::BriefTests::test_missing_extra_and_unknown_kind_raise
+    // CATALOG: test_briefs::BriefTests::test_missing_extra_and_unknown_kind_raise
     #[test]
     fn missing_extra_and_unknown_kind_raise() {
         let w = world();
@@ -1005,30 +1033,11 @@ mod tests {
     #[test]
     fn every_kind_matches_the_python_brief() {
         // Every kind, written by both from the same values, with notes and a path that has a
-        // space: byte for byte the same file.
+        // space: byte for byte the same file. `briefs/write-brief.json` holds the reference's
+        // brief for each spec, written in a workspace `{root}/work space` from the frozen
+        // templates in `briefs/templates/`, from which Rust writes them too. `write_brief`
+        // itself is `write_brief_from` on the compiled-in template.
         let w = world();
-        let code = "import json, sys\nfrom pathlib import Path\nfrom leadhand.briefs import write_brief\n\
-            from leadhand.deck import Card, Deck\nfrom leadhand.config import Route\n\
-            ws, deck_path, specs = Path(sys.argv[1]), Path(sys.argv[2]), json.loads(sys.argv[3])\n\
-            card = Card(number=3, title='Parse the widget header', role='implementer', hard=True,\n\
-            \x20   hard_reason='touches the on-disk format', risk='high', depends_on=(1, 2), covers=('R1', 'R4'),\n\
-            \x20   source='docs/plan.md#task-3', allowed_paths=('src/widget/**', 'tests/test_widget.py'),\n\
-            \x20   out_of_scope='Rendering; the CLI flags.',\n\
-            \x20   done_when='`test_header_roundtrip` passes and `make check` is clean.',\n\
-            \x20   stop_if='the header needs a new version byte.',\n\
-            \x20   inferred=('\"Done when\" test name (plan named no test)',),\n\
-            \x20   route_pin=Route('codex', 'gpt-6.1-sol', 'xhigh'),\n\
-            \x20   context='The header is 16 bytes, little-endian.\\nKeep the parser pure.',\n\
-            \x20   missing=('SENTINEL-missing',), line=4242, unknown_keys=((77, 'SENTINEL-unknown'),))\n\
-            deck = Deck(path=deck_path, title='Widget work', source='docs/plan.md', base_ref='main',\n\
-            \x20   base_sha='a' * 40, branch='leadhand/widget', build='make build', test='make test',\n\
-            \x20   profile=None, finish=None, requirements=(), cards=(card,), digest='0' * 64)\n\
-            out = []\n\
-            for kind, with_card, extra, notes in specs:\n\
-            \x20   brief, _ = write_brief(kind, ws=ws, deck=deck, card=card if with_card else None, attempt=2,\n\
-            \x20                          dispatch_id=f'py-{kind}-1', extra=extra, notes=notes)\n\
-            \x20   out.append(brief.read_text(encoding='utf-8'))\n\
-            print(json.dumps(out))\n";
         let mut specs = Vec::new();
         for kind in BRIEF_KINDS {
             let with_card = CARD_KINDS.contains(&kind);
@@ -1061,25 +1070,39 @@ mod tests {
                 serde_json::json!([k, c, map, notes])
             })
             .collect();
-        let arg = serde_json::to_string(&json).unwrap();
-        let theirs: Vec<String> = serde_json::from_slice(&crate::wire::tests::python(
-            code,
-            &[w.ws.as_os_str(), w.deck.path.as_os_str(), OsStr::new(&arg)],
-        ))
-        .unwrap();
+        assert_eq!(w.ws, w.f.root().join("work space"));
+        assert_eq!(w.deck.path, w.ws.join("docs/my deck.md"));
+        let root = w.f.root().to_str().unwrap();
+        // The deck (its one card included) the reference was given, every field, before any
+        // brief is compared: a field that no brief shows is pinned too.
+        assert_eq!(
+            reference_json("briefs/write-brief.json")["given"],
+            serde_json::json!([{"deck": deck_json(&w.deck, root)}]),
+            "briefs/write-brief.json: recorded on another card or deck"
+        );
+        let theirs = reference_outputs("briefs/write-brief.json", "briefs", &json);
         for ((kind, with_card, pairs, notes), want) in specs.iter().zip(theirs) {
+            let want = want.as_str().unwrap().replace("{root}", root);
             let card = w.deck.cards[0].clone();
-            let (brief, report) = write_brief(&BriefSpec {
+            let (extra, notes) = (extra(pairs), PyStr::from(*notes));
+            let dispatch_id = format!("rs-{kind}-1");
+            let spec = BriefSpec {
                 kind,
                 ws: &w.ws,
                 deck: &w.deck,
                 card: with_card.then_some(&card),
                 attempt: 2,
-                dispatch_id: &format!("rs-{kind}-1"),
-                extra: &extra(pairs),
-                notes: &PyStr::from(*notes),
-            })
-            .unwrap();
+                dispatch_id: &dispatch_id,
+                extra: &extra,
+                notes: &notes,
+            };
+            let written = write_brief(&spec).unwrap();
+            let live = fs::read_to_string(&written.0).unwrap();
+            let compiled = TEMPLATES.iter().find(|(k, _)| k == kind).unwrap().1;
+            assert_eq!(write_brief_from(&spec, compiled).unwrap(), written);
+            assert_eq!(fs::read_to_string(&written.0).unwrap(), live, "{kind}");
+            let frozen = read_reference_text(&format!("briefs/templates/brief-{kind}.md"));
+            let (brief, report) = write_brief_from(&spec, &frozen).unwrap();
             assert_eq!(report, brief.with_file_name("report.md"));
             let ours = fs::read_to_string(&brief).unwrap();
             assert_eq!(
@@ -1094,6 +1117,17 @@ mod tests {
             w.f.git(&w.ws, &["status", "--porcelain", "--untracked-files=all"]),
             ""
         );
+    }
+
+    /// The platform's own strerror text for `errno`, as the standard library
+    /// words it without its " (os error N)" suffix.
+    fn os_wording(errno: i32) -> String {
+        let shown = std::io::Error::from_raw_os_error(errno).to_string();
+        let suffix = format!(" (os error {errno})");
+        shown
+            .strip_suffix(&suffix)
+            .unwrap_or_else(|| panic!("{shown:?} does not end with {suffix:?}"))
+            .to_string()
     }
 
     #[test]
@@ -1129,10 +1163,7 @@ mod tests {
         let folder = w.ws.join(".leadhand/run/d-1");
         std::os::unix::fs::symlink(outside.join("x"), folder.join("report.md")).unwrap();
         let read = read_scratch_file(&w.ws, None, "d-1", "report.md").unwrap_err();
-        assert_eq!(
-            read.reason(),
-            PyStr::from("Too many levels of symbolic links")
-        );
+        assert_eq!(read.reason(), PyStr::from(os_wording(libc::ELOOP)));
         remove_scratch_file(&w.ws, None, "d-1", "report.md").unwrap();
         assert!(!folder.join("report.md").exists());
         assert_eq!(
@@ -1152,18 +1183,17 @@ mod tests {
                 .map(Into::into)
                 .collect();
         let codex = dispatch_message(CODEX_AGENT, &brief, &report, Some(&argv)).unwrap();
-        let code = "import json, sys\nfrom pathlib import Path\nfrom leadhand.briefs import dispatch_message\n\
-                    b, r = Path(sys.argv[1]), Path(sys.argv[2])\n\
-                    print(json.dumps([dispatch_message('leadhand:implementer', b, r),\n\
-                    \x20   dispatch_message('leadhand:codex', b, r, codex_command=sys.argv[3:])]))";
-        let mut args = vec![
-            OsStr::new(brief.lossy().as_ref()).to_os_string(),
-            report.lossy().as_ref().into(),
-        ];
-        args.extend(argv.iter().cloned());
-        let args: Vec<&OsStr> = args.iter().map(|a| a.as_os_str()).collect();
-        let theirs: Vec<String> =
-            serde_json::from_slice(&crate::wire::tests::python(code, &args)).unwrap();
+        // `briefs.json`: the reference's two messages for these paths and this command.
+        let mut args = vec![brief.lossy().into_owned(), report.lossy().into_owned()];
+        args.extend(argv.iter().map(|a| a.to_str().unwrap().to_string()));
+        let theirs: Vec<String> = reference_for::<Vec<String>>(
+            crate::briefs::tests::FIXTURE,
+            "dispatch_message",
+            &[args],
+        )
+        .into_iter()
+        .flatten()
+        .collect();
         assert_eq!(
             [claude.lossy().into_owned(), codex.lossy().into_owned()].to_vec(),
             theirs

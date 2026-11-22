@@ -336,13 +336,21 @@ pub fn abspath(path: &Path) -> std::io::Result<PathBuf> {
     if path.as_os_str().as_bytes().starts_with(b"/") {
         return Ok(normpath(path.as_os_str()));
     }
-    let mut joined = std::env::current_dir()?.into_os_string().into_vec();
+    Ok(abspath_in(&std::env::current_dir()?, path))
+}
+
+/// `abspath` with `cwd` as the working directory.
+fn abspath_in(cwd: &Path, path: &Path) -> PathBuf {
+    if path.as_os_str().as_bytes().starts_with(b"/") {
+        return normpath(path.as_os_str());
+    }
+    let mut joined = cwd.as_os_str().as_bytes().to_vec();
     // `os.path.join`: a separator only where the working directory does not end with one.
     if !joined.ends_with(b"/") {
         joined.push(b'/');
     }
     joined.extend_from_slice(path.as_os_str().as_bytes());
-    Ok(normpath(OsStr::from_bytes(&joined)))
+    normpath(OsStr::from_bytes(&joined))
 }
 
 /// `~` and `~/…` expanded to the home directory (`os.path.expanduser`). `~user` forms are
@@ -355,6 +363,15 @@ pub fn expand_user(path: &OsStr) -> OsString {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::home_dir().map(PathBuf::into_os_string))
         .unwrap_or_default();
+    expand_user_in(path, &home)
+}
+
+/// `expand_user` with `home` as the home directory.
+fn expand_user_in(path: &OsStr, home: &OsStr) -> OsString {
+    let bytes = path.as_bytes();
+    if !(bytes == b"~" || bytes.starts_with(b"~/")) {
+        return path.to_os_string();
+    }
     let mut out = home.as_bytes().to_vec();
     while out.last() == Some(&b'/') {
         out.pop();
@@ -452,7 +469,11 @@ pub fn py_fixed(x: f64, digits: usize) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::wire::tests::{float_bits, hex, reference_outputs};
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    /// The reference fixture the tests here read.
+    const FIXTURE: &str = "pytext.json";
 
     #[test]
     fn pure_path_is_pathlib_spelling() {
@@ -469,10 +490,7 @@ pub(crate) mod tests {
             "a//b",
             "/runs/2026-11-10-retry uploads/",
         ];
-        let theirs = python_map(
-            "__import__('pathlib').PurePosixPath(x).__str__()",
-            &strings(&cases),
-        );
+        let theirs = reference_outputs(FIXTURE, "pure_path", &strings(&cases));
         for (case, want) in cases.iter().zip(theirs) {
             assert_eq!(
                 pure_path(OsStr::new(case)),
@@ -507,56 +525,12 @@ pub(crate) mod tests {
             31.0,
             1e21,
         ];
-        let inputs: Vec<serde_json::Value> = xs.iter().map(|x| serde_json::json!(x)).collect();
-        let theirs = python_map("[f'{x:.1f}', f'{x:.2f}', f'{x:.6f}']", &inputs);
+        let inputs: Vec<serde_json::Value> = xs.iter().map(|x| float_bits(*x)).collect();
+        let theirs = reference_outputs(FIXTURE, "fixed_point", &inputs);
         for (x, want) in xs.iter().zip(theirs) {
             let ours = serde_json::json!([py_fixed(*x, 1), py_fixed(*x, 2), py_fixed(*x, 6)]);
             assert_eq!(ours, want, "{x:e}");
         }
-    }
-
-    /// `expr` (a Python expression over `x`) applied by `python3` to each input; the results
-    /// as JSON values.
-    pub(crate) fn python_map(expr: &str, inputs: &[serde_json::Value]) -> Vec<serde_json::Value> {
-        python_eval("", expr, inputs)
-    }
-
-    /// `python_map`, after `prelude` (Python statements, with the reference's `leadhand`
-    /// package importable).
-    pub(crate) fn python_eval(
-        prelude: &str,
-        expr: &str,
-        inputs: &[serde_json::Value],
-    ) -> Vec<serde_json::Value> {
-        let script = format!(
-            "import json, sys\n{prelude}\n\
-             print(json.dumps([(lambda x: {expr})(x) for x in json.load(sys.stdin)]))"
-        );
-        let mut child = std::process::Command::new("python3")
-            .args(["-B", "-c", &script])
-            .env(
-                "PYTHONPATH",
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/lib"),
-            )
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("python3 runs");
-        {
-            use std::io::Write;
-            let mut stdin = child.stdin.take().unwrap();
-            stdin
-                .write_all(serde_json::to_string(inputs).unwrap().as_bytes())
-                .unwrap();
-        }
-        let out = child.wait_with_output().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        serde_json::from_slice(&out.stdout).unwrap()
     }
 
     fn strings(items: &[&str]) -> Vec<serde_json::Value> {
@@ -584,7 +558,7 @@ pub(crate) mod tests {
 
     #[test]
     fn repr_matches_python() {
-        let theirs = python_map("repr(x)", &strings(&TEXTS));
+        let theirs = reference_outputs(FIXTURE, "repr", &strings(&TEXTS));
         for (text, want) in TEXTS.iter().zip(theirs) {
             assert_eq!(py_repr(text), want.as_str().unwrap(), "{text:?}");
         }
@@ -592,7 +566,7 @@ pub(crate) mod tests {
 
     #[test]
     fn strip_split_and_splitlines_match_python() {
-        let theirs = python_map("[x.strip(), x.split(), x.splitlines()]", &strings(&TEXTS));
+        let theirs = reference_outputs(FIXTURE, "strip_split_splitlines", &strings(&TEXTS));
         for (text, want) in TEXTS.iter().zip(theirs) {
             let ours = serde_json::json!([
                 py_strip(text),
@@ -613,13 +587,9 @@ pub(crate) mod tests {
             b"\xe2\x80\n".to_vec(),
             b"\xc2".to_vec(),
         ]);
-        // Each case as its bytes; Python decodes, strips and encodes back.
+        // Each case as its bytes; the reference decoded, stripped and encoded them back.
         let inputs: Vec<serde_json::Value> = cases.iter().map(|c| serde_json::json!(c)).collect();
-        let theirs = python_map(
-            "list(bytes(x).decode('utf-8', 'surrogateescape').strip()\
-             .encode('utf-8', 'surrogateescape'))",
-            &inputs,
-        );
+        let theirs = reference_outputs(FIXTURE, "strip_bytes", &inputs);
         for (case, want) in cases.iter().zip(theirs) {
             assert_eq!(serde_json::json!(py_strip_bytes(case)), want, "{case:?}");
         }
@@ -638,21 +608,15 @@ pub(crate) mod tests {
             b"\n\n",
             b"no end",
         ];
-        let code = "import json, os, sys\n\
-                    print(json.dumps([[os.fsencode(l).hex() for l in os.fsdecode(bytes.fromhex(a)).splitlines()]\n\
-                    \x20 for a in sys.argv[1:]]))\n";
-        let hexes: Vec<String> = cases
-            .iter()
-            .map(|c| c.iter().map(|b| format!("{b:02x}")).collect())
+        // Each case in hex; the reference split it as OS text and gave each line's bytes.
+        let hexes: Vec<serde_json::Value> =
+            cases.iter().map(|c| serde_json::json!(hex(c))).collect();
+        let theirs: Vec<Vec<String>> = reference_outputs(FIXTURE, "splitlines_bytes", &hexes)
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
             .collect();
-        let args: Vec<&OsStr> = hexes.iter().map(OsStr::new).collect();
-        let out = crate::wire::tests::python(code, &args);
-        let theirs: Vec<Vec<String>> = serde_json::from_slice(&out).unwrap();
         for (case, want) in cases.iter().zip(theirs) {
-            let ours: Vec<String> = py_splitlines_bytes(case)
-                .iter()
-                .map(|l| l.iter().map(|b| format!("{b:02x}")).collect())
-                .collect();
+            let ours: Vec<String> = py_splitlines_bytes(case).iter().map(|l| hex(l)).collect();
             assert_eq!(ours, want, "{case:?}");
         }
     }
@@ -678,8 +642,8 @@ pub(crate) mod tests {
             1.5e300,
             5e-324,
         ];
-        let inputs: Vec<serde_json::Value> = xs.iter().map(|x| serde_json::json!(x)).collect();
-        let theirs = python_map("repr(float(x))", &inputs);
+        let inputs: Vec<serde_json::Value> = xs.iter().map(|x| float_bits(*x)).collect();
+        let theirs = reference_outputs(FIXTURE, "float_repr", &inputs);
         for (x, want) in xs.iter().zip(theirs) {
             assert_eq!(py_float(*x), want.as_str().unwrap(), "{x:e}");
         }
@@ -715,15 +679,15 @@ pub(crate) mod tests {
             "missing/../repo",
             "repo/sub/up/sub/up",
         ];
-        let inputs: Vec<serde_json::Value> = cases
-            .iter()
-            .map(|c| serde_json::json!(root.join(c).to_str().unwrap()))
-            .collect();
-        let theirs = python_map("__import__('os').path.realpath(x)", &inputs);
+        // The reference resolved each case under a root it laid out the same way; the fixture
+        // writes that root `{root}`.
+        let theirs = reference_outputs(FIXTURE, "real_path", &strings(&cases));
         for (case, want) in cases.iter().zip(theirs) {
             assert_eq!(
                 real_path(&root.join(case)).to_str().unwrap(),
-                want.as_str().unwrap(),
+                want.as_str()
+                    .unwrap()
+                    .replacen("{root}", root.to_str().unwrap(), 1),
                 "{case}"
             );
         }
@@ -746,46 +710,32 @@ pub(crate) mod tests {
         exec(&bin.join("in-bin"));
         exec(&cwd.join("in-cwd"));
         std::fs::write(bin.join("not-exec"), "x").unwrap();
-        let b = bin.display().to_string();
-        let cases: Vec<(String, &str)> = vec![
-            (format!("/nonexistent:{b}"), "in-bin"),
-            (b.clone(), "not-exec"),
-            (b.clone(), "in-cwd"),
+        // `{root}` is this root; the reference searched a root it laid out the same way, from
+        // its `cwd`, and the fixture writes that root `{root}` too.
+        let fill = |s: &str| s.replacen("{root}", root.to_str().unwrap(), 1);
+        let cases: [(&str, &str); 9] = [
+            ("/nonexistent:{root}/bin", "in-bin"),
+            ("{root}/bin", "not-exec"),
+            ("{root}/bin", "in-cwd"),
             // An empty entry inside a non-empty PATH is the current directory (S2-R28).
-            (format!("/nonexistent::{b}"), "in-cwd"),
-            (format!("{b}:"), "in-cwd"),
-            (":".into(), "in-cwd"),
-            (format!(":{b}"), "in-bin"),
+            ("/nonexistent::{root}/bin", "in-cwd"),
+            ("{root}/bin:", "in-cwd"),
+            (":", "in-cwd"),
+            (":{root}/bin", "in-bin"),
             // An empty PATH searches nothing, not even the current directory.
-            (String::new(), "in-cwd"),
-            (String::new(), "in-bin"),
+            ("", "in-cwd"),
+            ("", "in-bin"),
         ];
-        let script = "import json, shutil, sys\n\
-                      print(json.dumps([shutil.which(n, path=p) for p, n in json.load(sys.stdin)]))";
-        let mut child = std::process::Command::new("python3")
-            .args(["-B", "-c", script])
-            .current_dir(&cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        {
-            use std::io::Write;
-            let input = serde_json::to_string(&cases).unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(input.as_bytes())
-                .unwrap();
-        }
-        let out = child.wait_with_output().unwrap();
-        let theirs: Vec<Option<String>> = serde_json::from_slice(&out.stdout).unwrap();
+        let inputs: Vec<serde_json::Value> = cases
+            .iter()
+            .map(|(p, n)| serde_json::json!([p, n]))
+            .collect();
+        let theirs = reference_outputs(FIXTURE, "which", &inputs);
         for ((path, name), want) in cases.iter().zip(theirs) {
-            let ours = which_in(Some(OsStr::new(path)), name, &cwd);
+            let ours = which_in(Some(OsStr::new(&fill(path))), name, &cwd);
             assert_eq!(
                 ours.map(|p| p.to_str().unwrap().to_string()),
-                want,
+                want.as_str().map(fill),
                 "PATH={path:?} {name}"
             );
         }
@@ -798,12 +748,17 @@ pub(crate) mod tests {
                 PathBuf::from("/bin")
             ]
         );
-        // An unset PATH is the OS default (`os.confstr("CS_PATH")`).
-        let theirs = python_map(
-            "__import__('os').confstr('CS_PATH')",
-            &[serde_json::json!(0)],
+        // An unset PATH is the OS default (`os.confstr("CS_PATH")`, which `getconf PATH`
+        // prints).
+        let cs_path = std::process::Command::new("getconf")
+            .arg("PATH")
+            .output()
+            .unwrap();
+        assert!(cs_path.status.success());
+        assert_eq!(
+            String::from_utf8(cs_path.stdout).unwrap().trim_end(),
+            DEFAULT_PATH
         );
-        assert_eq!(theirs[0].as_str(), Some(DEFAULT_PATH));
         assert_eq!(
             search_dirs(None),
             DEFAULT_PATH
@@ -815,11 +770,16 @@ pub(crate) mod tests {
 
     #[test]
     fn expand_user_is_expanduser_for_tilde_forms() {
-        let home = std::env::var_os("HOME").unwrap_or_default();
         let cases = ["~", "~/runs/{repo}", "/abs/~", "rel", "~other/x"];
-        let inputs = strings(&cases);
-        let theirs = python_map("__import__('os').path.expanduser(x)", &inputs);
-        for (case, want) in cases.iter().zip(theirs) {
+        // The reference expanded each case with `HOME` set to each of these.
+        let homes = ["/home/fixture", "/home/fixture//", "/", "//", ""];
+        let inputs: Vec<serde_json::Value> = homes
+            .iter()
+            .flat_map(|h| cases.iter().map(move |c| serde_json::json!([h, c])))
+            .collect();
+        let theirs = reference_outputs(FIXTURE, "expand_user", &inputs);
+        for (input, want) in inputs.iter().zip(theirs) {
+            let (home, case) = (input[0].as_str().unwrap(), input[1].as_str().unwrap());
             if case.starts_with("~other") {
                 // `~user` is left as it is (no passwd lookup); Python expands it when the user
                 // exists, and there is no user `other` here.
@@ -827,8 +787,21 @@ pub(crate) mod tests {
                 continue;
             }
             assert_eq!(
-                expand_user(OsStr::new(case)).to_str().unwrap(),
+                expand_user_in(OsStr::new(case), OsStr::new(home))
+                    .to_str()
+                    .unwrap(),
                 want.as_str().unwrap(),
+                "{case} (HOME={home:?})"
+            );
+        }
+        // `expand_user` is that, with this process's home: `HOME`, else its passwd entry.
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::home_dir().map(PathBuf::into_os_string))
+            .unwrap_or_default();
+        for case in cases {
+            assert_eq!(
+                expand_user(OsStr::new(case)),
+                expand_user_in(OsStr::new(case), &home),
                 "{case} (HOME={home:?})"
             );
         }
@@ -855,18 +828,37 @@ pub(crate) mod tests {
             "caf\u{e9}/../d",
             "relative/dir",
         ];
-        let inputs = strings(&cases);
-        let norm = python_map("__import__('os').path.normpath(x)", &inputs);
-        let abs = python_map("__import__('os').path.abspath(x)", &inputs);
-        for ((case, want_norm), want_abs) in cases.iter().zip(norm).zip(abs) {
+        let norm = reference_outputs(FIXTURE, "normpath", &strings(&cases));
+        // The reference's `abspath` with its working directory each of these.
+        let cwds = ["/opt/fixture/work dir", "/"];
+        let inputs: Vec<serde_json::Value> = cwds
+            .iter()
+            .flat_map(|d| cases.iter().map(move |c| serde_json::json!([d, c])))
+            .collect();
+        let abs = reference_outputs(FIXTURE, "abspath", &inputs);
+        for (case, want_norm) in cases.iter().zip(norm) {
             assert_eq!(
                 normpath(OsStr::new(case)).to_str().unwrap(),
                 want_norm.as_str().unwrap(),
                 "normpath {case:?}"
             );
+        }
+        for (input, want_abs) in inputs.iter().zip(abs) {
+            let (cwd, case) = (input[0].as_str().unwrap(), input[1].as_str().unwrap());
             assert_eq!(
-                abspath(Path::new(case)).unwrap().to_str().unwrap(),
+                abspath_in(Path::new(cwd), Path::new(case))
+                    .to_str()
+                    .unwrap(),
                 want_abs.as_str().unwrap(),
+                "abspath {case:?} in {cwd:?}"
+            );
+        }
+        // `abspath` is that, in this process's working directory.
+        let here = std::env::current_dir().unwrap();
+        for case in cases {
+            assert_eq!(
+                abspath(Path::new(case)).unwrap(),
+                abspath_in(&here, Path::new(case)),
                 "abspath {case:?}"
             );
         }

@@ -1,5 +1,5 @@
-//! Linux: the process table from `/proc`, read as `procs.py` reads it, and this process's
-//! thread count. No `unsafe` here.
+//! Linux: the process table from `/proc`, read as the Python `procs` module reads it, and this
+//! process's thread count. No `unsafe` here.
 //!
 //! The start time is field 22 of `/proc/<pid>/stat` (clock ticks since boot), written
 //! `"ticks:<n>"` as the Python writes it; the owner is the owner of `/proc/<pid>`, as
@@ -39,6 +39,13 @@ fn parse_stat(pid: i32, raw: &[u8], uid: u32) -> Option<ProcInfo> {
         zombie: state == b"Z" || state == b"X",
         uid,
     })
+}
+
+/// A `/proc/<pid>/stat` line, read as `procs._proc_stat` reads it; the owner, which the line
+/// does not hold, is 0.
+#[cfg(test)]
+pub(super) fn parse_record(pid: i32, raw: &[u8]) -> Option<ProcInfo> {
+    parse_stat(pid, raw, 0)
 }
 
 /// `procs._proc_all`: every numeric entry of `/proc`.

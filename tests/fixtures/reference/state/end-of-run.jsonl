@@ -1,0 +1,12 @@
+{"seq":1,"ts":"2026-01-01T00:00:00.000Z","kind":"gate_started","gate":"evidence","examined_sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","dispatch_id":"run-evidence-1"}
+{"seq":2,"ts":"2026-01-01T00:00:00.000Z","kind":"gate_result","gate":"evidence","examined_sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","passed":false,"dispatch_id":"run-evidence-1","findings":"/r/cards/run/run-evidence-1/report.md"}
+{"seq":3,"ts":"2026-01-01T00:00:00.000Z","kind":"card_cut","card":"final","branch":"leadhand/r--card-final","base":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","wave":1}
+{"seq":4,"ts":"2026-01-01T00:00:00.000Z","kind":"card_cut","card":"final","branch":"leadhand/r--card-final","base":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","wave":1,"recut_after":"run-w1-final_fix-1"}
+{"seq":5,"ts":"2026-01-01T00:00:00.000Z","kind":"verdict_recorded","card":"final","wave":1,"verdict":"spent","reason":"changed nothing","findings":"/r/x.md","dispatch_id":"run-w1-final_fix-1"}
+{"seq":6,"ts":"2026-01-01T00:00:00.000Z","kind":"verdict_recorded","card":"final","wave":1,"verdict":"clean","findings":"/r/y.md","dispatch_id":"run-w1-final_review-1"}
+{"seq":7,"ts":"2026-01-01T00:00:00.000Z","kind":"accept_started","card":"final","wave":1,"target":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","dispatch_id":"run-w1-final_review-1"}
+{"seq":8,"ts":"2026-01-01T00:00:00.000Z","kind":"accepted","card":"final","wave":1,"sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","dispatch_id":"run-w1-final_review-1"}
+{"seq":9,"ts":"2026-01-01T00:00:00.000Z","kind":"outcome","outcome":"complete","qualifier":"","reasons":[],"next_step":"none","head":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
+{"seq":10,"ts":"2026-01-01T00:00:00.000Z","kind":"report_written","report":"/r/report.md","outcome":"complete","outcome_seq":10}
+{"seq":11,"ts":"2026-01-01T00:00:00.000Z","kind":"base_worktree_added","path":"/w/b--base"}
+{"seq":12,"ts":"2026-01-01T00:00:00.000Z","kind":"base_worktree_ready","path":"/w/b--base"}

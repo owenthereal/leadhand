@@ -1,4 +1,4 @@
-//! The launcher (`launch.py`): `leadhand run` owns a run and starts its Claude Code
+//! The launcher (the Python `launch` module): `leadhand run` owns a run and starts its Claude Code
 //! supervisor; `leadhand launch-line` prints the command that does.
 //!
 //! Ownership before mutation. `run` takes the run lock first (`lock`: the flock on

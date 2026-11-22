@@ -13,14 +13,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-env:
-  # The mixed contract suite's LEADHAND_RUST_COMMANDS: the commands it sends to the Rust binary,
-  # here command group G3 (the rest stay on Python). It has its own name here because the contract
-  # harness reads LEADHAND_RUST_COMMANDS in every suite: set for the all-Python run, it would skip
-  # that run's reference-only tests. The other mixed groups are local commands (see the pull
-  # request).
-  MIXED_RUST_COMMANDS: check,route,version,status,report,dispatch,dispatch-runner,stop-dispatch
-
 jobs:
   test:
     name: test (${{ matrix.os }})
@@ -31,7 +23,7 @@ jobs:
         # macOS arm64, Linux x86_64, Linux arm64.
         os: [macos-15, ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 240
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,18 +31,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # The image's own python3 differs by platform (Homebrew's latest on macOS); the suites
-      # need Python >= 3.11 and were measured on 3.12.
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.12"
-
       - name: Install Rust 1.99
         run: |
           rustup toolchain install 1.99 --profile minimal --component clippy,rustfmt
           rustup default 1.99
 
-      # For `claude plugin validate .`, which needs no login. Kept off PATH for the suites, which
+      # For `claude plugin validate .`, which needs no login. Kept off PATH for the tests, which
       # use the fakes in tests/fakes.
       - name: Install Claude Code
         run: npm install --prefix "$RUNNER_TEMP/claude-code" --no-audit --no-fund @anthropic-ai/claude-code@2.1.325
@@ -60,7 +46,6 @@ jobs:
           uname -m
           rustc --version
           cargo --version
-          python3 --version
           git --version
           "$RUNNER_TEMP/claude-code/node_modules/.bin/claude" --version
 
@@ -73,44 +58,23 @@ jobs:
       # so that this file, which the grep covers, doesn't match itself.
       - name: Hygiene grep
         run: |
-          ! grep -rnE '[O]wen|/Users/[o]wen|agent[-]docs|pipeline[/]' scripts agents skills presets docs .claude-plugin .codex-plugin tests/contract src .github
+          ! grep -rnE '[O]wen|/Users/[o]wen|agent[-]docs|pipeline[/]' agents skills presets templates docs .claude-plugin .codex-plugin bin scripts src tests .github
 
       # Build
       - run: cargo fmt --check
       - run: cargo build --locked
       - run: cargo build --locked --release
-      - run: cargo build --locked --features testing --target-dir target/testing
       - run: cargo clippy --locked --all-targets --features testing -- -D warnings
-      - run: python3 -B -m compileall -q scripts/lib tests
-      - run: |
-          python3 -c 'import json,sys;[json.load(open(p)) for p in sys.argv[1:]]' .claude-plugin/plugin.json .claude-plugin/marketplace.json .codex-plugin/plugin.json
       - name: claude plugin validate .
         run: |
           PATH="$RUNNER_TEMP/claude-code/node_modules/.bin:$PATH"
           claude plugin validate .
 
-      # Tests
+      # Tests. The contract tests (tests/*.rs) run against the testing build; tests/plugin_files.rs
+      # also checks the manifests. Measured locally on a developer Mac, the suite took about seven
+      # minutes; the cap bounds a hang.
       - run: cargo test --locked --features testing
+        timeout-minutes: 45
       # Without the feature: checks that the test hooks are compiled out.
       - run: cargo test --locked --lib
-      # The suites run one after another in this job, the three contract configurations included,
-      # so that each platform builds once. Measured locally on a developer Mac, running two suites
-      # at a time, the unit suite took about a quarter of an hour and a contract suite about half
-      # an hour; update these figures after the first hosted run. Each suite's cap bounds a hang;
-      # the caps and the builds fit the job's.
-      - name: Python unit suite
-        timeout-minutes: 45
-        run: |
-          PYTHONPATH=scripts/lib python3 -B -m unittest discover -s tests -p 'test_*.py'
-      - name: Contract suite, all Python
-        timeout-minutes: 60
-        run: |
-          LEADHAND_BIN=scripts/leadhand PYTHONPATH=tests python3 -B -m unittest discover -s tests/contract -p 'contract_*.py'
-      - name: Contract suite, mixed G3 (${{ env.MIXED_RUST_COMMANDS }} on Rust)
-        timeout-minutes: 60
-        run: |
-          LEADHAND_BIN=tests/contract/router LEADHAND_RUST_BIN=target/testing/debug/leadhand LEADHAND_RUST_COMMANDS="$MIXED_RUST_COMMANDS" LEADHAND_IMPL=mixed PYTHONPATH=tests python3 -B -m unittest discover -s tests/contract -p 'contract_*.py'
-      - name: Contract suite, all Rust
-        timeout-minutes: 60
-        run: |
-          LEADHAND_BIN=tests/contract/router LEADHAND_RUST_BIN=target/testing/debug/leadhand LEADHAND_RUST_COMMANDS=all LEADHAND_IMPL=rust PYTHONPATH=tests python3 -B -m unittest discover -s tests/contract -p 'contract_*.py'
+        timeout-minutes: 15

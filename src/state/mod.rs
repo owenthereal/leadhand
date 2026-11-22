@@ -1,5 +1,5 @@
-//! Run state (`state.py`): the run directory's files, the event log read into typed events,
-//! each card's state folded from them, and the run's outcome.
+//! Run state (the Python `state` module): the run directory's files, the event log read into typed
+//! events, each card's state folded from them, and the run's outcome.
 //!
 //! - `paths`: the run directory's file names (`RunPaths`), and a new run directory
 //!   (`new_run_dir`);

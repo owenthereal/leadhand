@@ -4,12 +4,15 @@ This is the written index of everything outside the leadhand binary that another
 depends on: the plugin's skills and agents, the Codex proxy, the detached runners, the
 operator's terminal, and any other leadhand binary sharing the same run directory.
 
-- **The executable truth is the contract suite**, `tests/contract/`. It drives any binary as a
-  subprocess at `LEADHAND_BIN`.
-- **The reference is the Python CLI**, `scripts/leadhand` with `scripts/lib/leadhand/`. Where
-  this document and the Python disagree, the Python is right and this document is a bug.
-- **`tests/contract/CATALOG.md`** maps every Python unit test to the contract test that converts
-  it, or to `internal: Rust unit test (<module>)` when it has no effect outside the binary.
+- **The reference is the contract tests**, the integration tests in `tests/*.rs`. They drive
+  the binary as a subprocess at `LEADHAND_BIN` (default: the `testing` build). Where this
+  document and the contract tests disagree, the tests are right and this document is a bug.
+- **History.** Until the cut-over, the reference was the Python implementation, and the
+  contract tests ran against both binaries; that is how the Rust binary was checked against it.
+  The Python left the repository at the cut-over.
+- **`docs/test-catalogue.md`** maps every unit test of the removed Python implementation to the
+  Rust test that now covers it, or to `internal: Rust unit test (<module>)` when it has no
+  effect outside the binary.
 
 The sections follow the thirteen contract items. Where a ruling settled a question, its
 number (`S1-R…`) is given. Paths are written generically: `<run>` is a run directory, `<ws>`
@@ -22,7 +25,7 @@ folder.
   written atomically: a temporary file in the same folder, `fsync`, then `rename`. They are
   indented by 2 and ASCII-only (see "Non-UTF-8 paths").
 - **JSON-lines files** (`events.jsonl`, `attempts.jsonl`, `charges.jsonl`) hold one compact
-  JSON object per line (`separators=(",", ":")`), ASCII-only, appended under `state.lock`.
+  JSON object per line (no space after `,` or `:`), ASCII-only, appended under `state.lock`.
   - A record is a line. A last line without its newline is an interrupted append: readers skip
     it, even when its JSON is whole, and the next append drops it before writing.
   - A complete line that is not JSON makes the reader fail (`next` exits 1); `status` shows it
@@ -33,11 +36,13 @@ folder.
   only for equality with a value made the same way on the same machine:
   - macOS: `<seconds>.<microseconds, 6 digits>` from `sysctl` (`KERN_PROC_PID`);
   - Linux: `ticks:<start time in clock ticks>` from `/proc/<pid>/stat`;
-  - elsewhere, or when those fail: `lstart:<ps lstart text>`.
-- **The binary's own path.** Python names itself `scripts/leadhand` by its fully resolved
-  absolute path. Under `LEADHAND_TESTING=1`, `LEADHAND_TEST_CLI` takes its place everywhere the
-  binary names itself. Tests compare that path by resolved file, never as a string (S1-R11).
-  This covers:
+  - elsewhere, or when those fail: none. The binary never runs `ps`, so a process whose
+    record it cannot read has no start time.
+- **The binary's own path.** The binary names itself by its fully resolved absolute path
+  (`std::env::current_exe`): the platform binary that `bin/leadhand` runs, never the
+  `bin/leadhand` script. Under `LEADHAND_TESTING=1`, `LEADHAND_TEST_CLI` takes its place
+  everywhere the binary names itself. Tests compare that path by resolved file, never as a
+  string (S1-R11). This covers:
   - the launch line, the first message and the sandbox exclusion;
   - a dispatch line's argv[0] and `LEADHAND_CLI`;
   - unpark hints, and the `run` command named by `pause` and `cancel`.
@@ -85,8 +90,8 @@ Hidden forms that work today, and so are contract:
 
 - **`route --installed LIST`** (S1-R9). A comma-separated vendor list (`claude`, `codex`) that
   replaces the `PATH` lookup of installed vendors. An unknown name is `error: --installed:
-  unknown vendor '<name>'`. Python honours it whatever `LEADHAND_TESTING` says: unlike the
-  `LEADHAND_*` test hooks, it is not gated.
+  unknown vendor '<name>'`. It is honoured whatever `LEADHAND_TESTING` says, in a release
+  build too: unlike the `LEADHAND_*` test hooks, it is not gated.
 - **`run --print`** appends `-p --output-format stream-json --verbose` to the `claude` argv,
   before the first message. It is for end-to-end drivers.
 - **`dispatch-runner WORKER_DIR`** is the detached runner that `dispatch` spawns.
@@ -128,7 +133,7 @@ there.
 
 | Command | Output |
 |---|---|
-| `version` | `leadhand 0.1.0`. The string changes at the cut-over (deliberate change 6). |
+| `version` | `leadhand <package version>`, currently `leadhand 0.2.0` (deliberate change 6: until the cut-over it was the Python's `leadhand 0.1.0`). |
 | `check` | One problem per line on **stdout**, `error: <message>` or `warning: <message>`, then `ok: <n> cards` when there are no errors. Exit 1 when there is an error. A deck or configuration that does not load prints its single `error: …` line on stdout too. |
 | `route` | The route line `<vendor> <model> <effort>`, then one line per reason. When the ladder is exhausted: `ladder exhausted: …` on stderr, exit 1. |
 | `start` | For a new run, `run: <run dir>`; when another run holds the deck's branch, a note before it, `run branch: <branch> (<requested> belongs to another run)`. For an unfinished run of the same deck: `existing run: <run dir>`. Unsupported settings give `warning: <message>` lines on stderr. |
@@ -140,7 +145,7 @@ there.
 | `unpark` | `card <n> unparked` |
 | `report` | Only the report's path. The branch release changes report.md's content, not this output, so it stays exact parity (S1-R15). |
 | `launch-line` | One line: `<cli> run <run>/deck.md`, plus `--plugin-dir <abs dir>` when one is given, or when the last launch recorded one in holder.json. Every word is shell-quoted. |
-| `status` | The rendered status (headline, attention lines, card rows, usage). Without `RUN_DIR`, Python shows the most recently updated unfinished run under the current repository's `docs_dir`; deliberate change 3 replaces that. |
+| `status` | The rendered status (headline, attention lines, card rows, usage). Without `RUN_DIR`, the run is the one the current directory belongs to (deliberate change 3; the Python reference showed the most recently updated unfinished run under the current repository's `docs_dir`). |
 | `run` | On stderr, the attended-use warning naming the sandbox exclusion. When the CLI path contains whitespace, also `leadhand: warning: the leadhand CLI path contains whitespace (<cli>); the sandbox exclusion may not match; install leadhand under a path without spaces.` |
 
 Other lines:
@@ -264,15 +269,15 @@ every second, stale after 60 s) is given above. So is the foreground wait (540 s
 contract test waits out: unit tests pin the 540 s default, and the contract suite shortens it
 with `LEADHAND_TEST_FOREGROUND_WAIT`.
 
-| Name in the Python | Value | What it times |
+| Name | Value | What it times |
 |---|---|---|
-| `HUNG_RECHECK` | 5 s | A live runner whose heartbeat is stale is looked at again for this long, its heartbeat unchanged, before it counts as hung. |
-| `SIGNAL_STEP` | 5 s | The stop ladder's spacing: SIGINT to Codex's group, SIGTERM 5 s later, SIGKILL 5 s after that. |
-| `KILL_RETRY` | 5 s | After SIGKILL, it is sent again this often until the processes are confirmed gone. |
-| `CANCEL_ACK` | 5 s | A runner that has not acknowledged a cancel (`stopping.json`) this long after the request is hung, and is killed. |
-| `SPAWN_GRACE` | 60 s | A runner `dispatch` spawned that has not yet written `runner.json` counts as starting for this long after `spawn.json`'s `at`. |
-| `CANCEL_FINISH_MARGIN` | 2 s | Kept back from a cancel's deadline for charging and writing the result. |
-| `TIMER_INTERVAL` (engine) | 10 s | How often `timer` looks for a result, a pause or cancel flag, or a finished runner; it never sleeps past the worker's deadline. |
+| `dispatch::own::HUNG_RECHECK` | 5 s | A live runner whose heartbeat is stale is looked at again for this long, its heartbeat unchanged, before it counts as hung. |
+| `dispatch::runner::SIGNAL_STEP` | 5 s | The stop ladder's spacing: SIGINT to Codex's group, SIGTERM 5 s later, SIGKILL 5 s after that. |
+| `dispatch::runner::KILL_RETRY` | 5 s | After SIGKILL, it is sent again this often until the processes are confirmed gone. |
+| `dispatch::cancel::CANCEL_ACK` | 5 s | A runner that has not acknowledged a cancel (`stopping.json`) this long after the request is hung, and is killed. |
+| `dispatch::own::SPAWN_GRACE` | 60 s | A runner `dispatch` spawned that has not yet written `runner.json` counts as starting for this long after `spawn.json`'s `at`. |
+| `dispatch::runner::CANCEL_FINISH_MARGIN` | 2 s | Kept back from a cancel's deadline for charging and writing the result. |
+| `engine::protocol::TIMER_INTERVAL` | 10 s | How often `timer` looks for a result, a pause or cancel flag, or a finished runner; it never sleeps past the worker's deadline. |
 
 ## 6. Lines in `<docs_dir>/runs.md`
 
@@ -350,14 +355,14 @@ run ends again (a resumed blocked run):
 ### Event kinds and their fields
 
 Every event line has `seq` (1, 2, … with no gap), `ts` and `kind`; those three names are
-reserved. The fields below are the ones the reference writes. A field marked *opt* is present
+reserved. The fields below are the ones the binary writes. A field marked *opt* is present
 only in some cases.
 
 | Kind | Fields |
 |---|---|
 | `run_started` | `run_id`, `base_sha`, `branch` |
 | `card_cut` | `card`, `branch`, `base`; *opt* `recut_after`, `wave` |
-| `brief_written` | Declared in the kind list; the reference never writes it. |
+| `brief_written` | Declared in the kind list; the binary never writes it. |
 | `dispatch_requested` | `dispatch_id`, `card`, `attempt`, `dispatch_kind`, `role`, `vendor`, `model`, `effort`, `brief`, `report`, `extra`, `notes`, `resumes`, `resume_worker`, `resume_session`, `minutes`. A check adds `expected_branch`, `expected_head` and `refs`. An implementer-side kind adds `refs`, `ref_scope`, `start_tip` and `untracked`. *opt* `continues`; a run-level dispatch adds `gate` and `wave`. |
 | `worker_started` | `dispatch_id`, `worker_id`, `card`, `deadline`, `session`; *opt* `reconciled` |
 | `result_recorded` | `dispatch_id`, `card`, `attempt`, `dispatch_kind`, `worker_id`, `tip`, `session_id`, `files`, `stopped`, `charge_ids`, plus the head: `status`, `blocked_by`, `head`, `verdict`, `result`, `source`, `raw_kept`. *opt*: `interrupted`, `reconciled`, `files_skipped`, `partial_commit`, `partial_commit_error`, `partial_gitlinks_skipped`; and for Codex, `committed`, `commit_error`, `commit_skipped` and `gitlinks_skipped` |
@@ -425,7 +430,7 @@ A testing build exits 97 at a crash point when `LEADHAND_CRASH_AT` names it:
 | `after_cancel_request` | a runner asked to stop, its stop not yet confirmed |
 | `before_gate_record` | before a gate's result is recorded |
 
-The contract suite's harness adds two of its own, `before_commit` and `after_commit`, in the
+The contract tests' harness (`tests/common`) adds two of its own, `before_commit` and `after_commit`, in the
 fake workers. They follow the same protocol.
 
 ## 9. Environment variables
@@ -489,7 +494,7 @@ clock offset, the self path, the Codex binary override, the foreground wait and 
 | `LEADHAND_TEST_CARD_LOOP_ONLY` | `1`: `next` returns `done` with a null outcome once the card loop ends (no gates). |
 | `LEADHAND_INSTALLED_VENDORS` | A comma-separated list that replaces the `PATH` lookup of installed vendors. |
 | `LEADHAND_MINUTE_SECONDS` | Seconds per "minute" of a worker's time limit. |
-| `LEADHAND_TEST_CLOCK_OFFSET` | Seconds added to the engine's clock, `engine._now`. That is the clock for dispatch deadlines (`next`'s `deadline`, `worker_started.deadline`), deadline checks and `timer`. It does not move `ts` stamps, file times, the runner's limits or the heartbeat. |
+| `LEADHAND_TEST_CLOCK_OFFSET` | Seconds added to the engine's clock, `testing::now`. That is the clock for dispatch deadlines (`next`'s `deadline`, `worker_started.deadline`), deadline checks and `timer`. It does not move `ts` stamps, file times, the runner's limits or the heartbeat. |
 | `LEADHAND_TEST_CLI` | The path the binary names itself by, everywhere (see "Conventions"). |
 | `LEADHAND_TEST_FOREGROUND_WAIT` | Seconds, read as a float, that replace `FOREGROUND_WAIT` (540 s) as how long `dispatch` waits in the foreground before exit 75. It does not change the runner's limits, the heartbeat or `LEADHAND_MINUTE_SECONDS`. |
 
@@ -517,7 +522,7 @@ The **dispatch line** that `next` gives the `leadhand:codex` proxy is one shell-
 <cli> dispatch --run <run> --dispatch-id <id> [--card <n>] --attempt <n> --role <role> --model <model> --effort <effort> --brief <brief> --report <report> --cwd <ws> --kind <kind> --branch <branch> [--resume <thread id>]
 ```
 
-The runner then runs Codex in a new session (`start_new_session`), in the workspace, with the
+The runner then runs Codex in a new session (`setsid`), in the workspace, with the
 prompt on stdin:
 
 ```
@@ -568,8 +573,8 @@ claude [--plugin-dir <abs dir>] --settings <overlay> --agent leadhand:supervisor
 
 ## 12. Locks
 
-Every lock is `flock(2)` on the same file the Python locks, so a Rust process and a Python
-process exclude each other.
+Every lock is `flock(2)`. They are the files the Python reference locked, so while both
+existed a Rust process and a Python process excluded each other.
 
 | File | Mode | Held |
 |---|---|---|
@@ -585,11 +590,11 @@ process exclude each other.
 
 - `run` refuses while holder.json names a supervisor whose pid and start time still match,
   before and after taking the lock.
-- The locked descriptor is passed to `claude` (`pass_fds`), and its number goes in
+- The locked descriptor is passed to `claude` (`sys::pass_fd_to_child`), and its number goes in
   `LEADHAND_LOCK_FD`.
 - The launcher never unlocks while the supervisor lives.
 
-**What every command does first** (`close_inherited_lock`):
+**What every command does first** (`sys::close_inherited_fd`):
 
 - It removes `LEADHAND_LOCK_FD` from its environment, so no child, and no worker, ever
   inherits it.
@@ -602,14 +607,14 @@ with in-place runs (deliberate change 1).
 
 ## 13. Non-UTF-8 paths
 
-The Python decodes Git's output as UTF-8 with `surrogateescape`, so an undecodable byte `0xXX`
-becomes the lone surrogate U+DCXX. It writes all JSON and JSON lines ASCII-only
-(`ensure_ascii=True`), so that byte appears in files and on stdout as the six characters
+The Python reference decoded Git's output as UTF-8 with `surrogateescape`, so an undecodable
+byte `0xXX` became the lone surrogate U+DCXX, and wrote all JSON and JSON lines ASCII-only
+(`ensure_ascii=True`), so that byte appeared in files and on stdout as the six characters
 `\udcXX` (lowercase hex). For example, the path bytes `notes-\xff.txt` are written as
 `"notes-\udcff.txt"`.
 
-Rust keeps paths as bytes and reads and writes the same encoding, so either implementation
-reads the other's files:
+The Rust binary keeps paths as bytes and reads and writes the same encoding, so it reads the
+files the Python wrote, and writes the same:
 
 - each `\udcXX` with `XX` ≥ `80` stands for the raw byte `0xXX`;
 - every other non-ASCII character is JSON's usual `\uXXXX` escape of its code point (a
@@ -617,19 +622,20 @@ reads the other's files:
 
 ## Deliberate changes and parity tests
 
-Parity tests pass unchanged on Rust. Python's behaviour that a deliberate change alters is
-pinned only in `@reference_only` tests:
+Until the cut-over, parity tests passed unchanged on both binaries. The Python's behaviour that
+a deliberate change alters was pinned only in reference-only tests, which left with the Python
+(`docs/test-catalogue.md` marks them `reference-only`):
 
 - in-place runs (change 1);
 - `status` with no argument (change 3);
 - usage-error wording (change 4).
 
-The version string (change 6) is the exception. Rust reports Python's version through stage 2,
-so a parity test pins `leadhand 0.1.0` (`contract_cli.Version`). Stage 3 changes that test at
-the cut-over.
+The version string (change 6) was the exception. Rust reported the Python's version,
+`leadhand 0.1.0`, through stage 2, pinned by a parity test (`cli::version`). At the cut-over
+the version became 0.2.0, and that test pins `leadhand 0.2.0`.
 
 **The branch release (change 2, S1-R15).** When a run ends `complete`, `incomplete` or
-`failed`, Rust (not Python) does three things:
+`failed`, the Rust binary (not the Python reference) does three things:
 
 - records `branch_release_started`, then `branch_released`, between `outcome` and the report;
 - detaches the run worktree at the run head;
@@ -641,6 +647,6 @@ So parity tests never pin any of these:
 - the run worktree still on the run branch after a terminal outcome;
 - the whole text of a terminal run's report.md.
 
-Python's exact versions of these are `@reference_only` tests. A blocked run keeps its branch
-in both implementations, so that stays parity. `report RUN_DIR`'s stdout is only the path, so
+The Python's exact versions of these were reference-only tests. A blocked run kept its branch
+in both implementations, so that was parity. `report RUN_DIR`'s stdout is only the path, so
 it stays exact parity.

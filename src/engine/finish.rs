@@ -1,6 +1,6 @@
-//! The end of a run (`engine.py`: `_end`, `_wrap_up`, `_write_handoff`, `_record_run_line`,
-//! `_done_action`): the outcome decided and recorded, then, once per outcome, the branch
-//! release (a terminal outcome: `release`), the handoff (a blocked run) or its removal,
+//! The end of a run (the Python `engine` module: `_end`, `_wrap_up`, `_write_handoff`,
+//! `_record_run_line`, `_done_action`): the outcome decided and recorded, then, once per outcome,
+//! the branch release (a terminal outcome: `release`), the handoff (a blocked run) or its removal,
 //! `report.md`, the run's line in `<docs_dir>/runs.md` and `report_written`; then `done`.
 //!
 //! The outcome's Git reads are in the run's worktree: the run branch's tip, and whether every
@@ -434,11 +434,9 @@ mod tests {
             "a\\|b",
             "",
         ];
-        let code = "import json, sys\nfrom leadhand import engine\n\
-                    print(json.dumps([engine._md_cell(t) for t in sys.argv[1:]]))";
-        let args: Vec<&std::ffi::OsStr> = texts.iter().map(std::ffi::OsStr::new).collect();
+        // `engine.json`: the reference's `_md_cell` of each text.
         let theirs: Vec<String> =
-            serde_json::from_slice(&crate::wire::tests::python(code, &args)).unwrap();
+            crate::wire::tests::reference_for("engine.json", "md_cell", &texts);
         let ours: Vec<String> = texts.iter().map(|t| md_cell(t)).collect();
         assert_eq!(ours, theirs);
     }

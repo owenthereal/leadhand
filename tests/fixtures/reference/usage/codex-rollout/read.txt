@@ -1,0 +1,5 @@
+"resp_fixture_1" {"input":11894,"cached":7168,"cache_write_5m":0,"cache_write_1h":0,"output":58,"reasoning":0,"known":true,"model":null}
+"resp_fixture_2" {"input":1868,"cached":18944,"cache_write_5m":0,"cache_write_1h":0,"output":6,"reasoning":0,"known":true,"model":null}
+"r\udcff" {"input":0,"cached":9,"cache_write_5m":0,"cache_write_1h":0,"output":0,"reasoning":0,"known":true,"model":null}
+{"input":11894,"cached":7168,"cache_write_5m":0,"cache_write_1h":0,"output":58,"reasoning":0,"known":true,"model":null}
+{"input":1868,"cached":18944,"cache_write_5m":0,"cache_write_1h":0,"output":6,"reasoning":0,"known":true,"model":null}

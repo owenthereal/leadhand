@@ -1,10 +1,10 @@
-//! Process identity, over the process table in `crate::sys` (`procs.py`).
+//! Process identity, over the process table in `crate::sys` (the Python `procs` module).
 //!
 //! A process's identity is (pid, start time): a pid alone can be reused, so code that
 //! signals a recorded process first checks that the pid still has the start time it was
 //! recorded with. The start time is opaque, only ever compared for equality, and
-//! byte-identical to `procs.py`'s, so a Rust process and a Python process can verify each
-//! other's recorded identities. Zombies (exited, not yet reaped) count as gone: they cannot
+//! byte-identical to the Python `procs` module's, so a Rust process and a Python process can verify
+//! each other's recorded identities. Zombies (exited, not yet reaped) count as gone: they cannot
 //! run or write anything.
 
 use std::collections::{HashMap, HashSet};
@@ -120,7 +120,6 @@ pub fn signal_if_same(id: &ProcId, sig: Signal) -> bool {
 mod tests {
     use std::io::{BufRead, BufReader};
     use std::os::unix::process::ExitStatusExt;
-    use std::path::Path;
     use std::process::{ChildStdin, Command, Stdio};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -179,38 +178,96 @@ mod tests {
         assert_eq!(distinct.len(), tags.len());
     }
 
-    /// A Python child in a new session that starts `sleep 30` in another new session, prints
-    /// its pid, and kills it when its stdin closes; with `tag` in its environment, if given.
-    /// Returns the child, its stdin, and the grandchild's pid.
+    /// Set in `detached_sleeper_parent_child`'s process only; unset in an ordinary run.
+    const SLEEPER_PARENT: &str = "LEADHAND_PROCS_TEST_SLEEPER_PARENT";
+
+    /// Not a test of its own: the child `parent_of_detached_sleeper` starts (this test binary,
+    /// running this test alone). It starts `sleep 30` in a new session, prints its pid, and
+    /// kills it when its stdin closes. Does nothing in an ordinary run.
+    #[test]
+    fn detached_sleeper_parent_child() {
+        if std::env::var_os(SLEEPER_PARENT).is_none() {
+            return;
+        }
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").stdin(Stdio::null());
+        detach_session(&mut cmd);
+        let mut sleeper = cmd.spawn().expect("spawn sleep");
+        // On a line of its own: libtest has printed `test <name> ... ` without a newline.
+        println!("\nsleeper {}", sleeper.id());
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+    }
+
+    /// What `kid` wrote on its stderr (a pipe), read to its end: for a failure's message only.
+    fn stderr_of(kid: &mut Kid) -> String {
+        let mut err = String::new();
+        if let Some(mut pipe) = kid.0.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut pipe, &mut err);
+        }
+        err
+    }
+
+    /// For a failure's message: how `kid` ended and its stderr when it has exited, or nothing
+    /// while it runs (its stderr would not end).
+    fn ending_of(kid: &mut Kid) -> String {
+        match kid.0.try_wait() {
+            Ok(Some(status)) => {
+                format!(
+                    "the child exited ({status}); its stderr:\n{}",
+                    stderr_of(kid)
+                )
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// A child in a new session (this test binary, as `detached_sleeper_parent_child`) that
+    /// starts `sleep 30` in another new session, prints its pid, and kills it when its stdin
+    /// closes; with `tag` in its environment, if given. Returns the child, its stdin, and the
+    /// grandchild's pid.
     fn parent_of_detached_sleeper(tag: Option<&str>) -> (Kid, ChildStdin, i32) {
-        let mut cmd = Command::new("python3");
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
         cmd.args([
-            "-c",
-            "import subprocess, sys\n\
-             p = subprocess.Popen(['sleep', '30'], start_new_session=True, stdin=subprocess.DEVNULL)\n\
-             print(p.pid, flush=True)\n\
-             sys.stdin.read()\n\
-             p.kill()\n\
-             p.wait()\n",
+            "procs::tests::detached_sleeper_parent_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
         ])
+        .env(SLEEPER_PARENT, "1")
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
         if let Some((name, value)) = tag.and_then(|t| t.split_once('=')) {
             cmd.env(name, value);
         }
         detach_session(&mut cmd);
-        let mut kid = Kid(cmd.spawn().expect("spawn python3"));
+        let mut kid = Kid(cmd.spawn().expect("spawn the test binary"));
         let stdin = kid.0.stdin.take().unwrap();
+        let mut out = BufReader::new(kid.0.stdout.take().unwrap());
         let mut line = String::new();
-        BufReader::new(kid.0.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let grandchild = line.trim().parse().expect("the grandchild's pid");
+        while !line.starts_with("sleeper ") {
+            line.clear();
+            if out.read_line(&mut line).unwrap() == 0 {
+                panic!(
+                    "no sleeper line; the child's stderr:\n{}",
+                    stderr_of(&mut kid)
+                );
+            }
+        }
+        let grandchild = line["sleeper ".len()..]
+            .trim()
+            .parse()
+            .expect("the grandchild's pid");
+        // The child's libtest summary is still to come: read it in the background so the
+        // child never blocks on a full pipe.
+        std::thread::spawn(move || std::io::copy(&mut out, &mut std::io::sink()));
         (kid, stdin, grandchild)
     }
 
     // ----------------------------------------------------------------------
-    // The catalogue's `procs` rows (test_procs.py::ProcsTests)
+    // The catalogue's `procs` rows (test_procs::ProcsTests)
 
     #[test]
     fn own_process_info() {
@@ -262,24 +319,43 @@ mod tests {
     // test_ps_fallback_parses_lstart_with_spaces is not ported (S2-R19): it tests the
     // Python's `ps` fallback, and Rust never runs `ps`.
 
+    /// Set in `waiting_child`'s process only; unset in an ordinary run.
+    const WAITING: &str = "LEADHAND_PROCS_TEST_WAITING";
+
+    /// Not a test of its own: the tagged process `tagged_processes_finds_a_process_by_an_
+    /// environment_entry` starts (this test binary, running this test alone). It waits for its
+    /// stdin to close, starting nothing. Does nothing in an ordinary run.
+    #[test]
+    fn waiting_child() {
+        if std::env::var_os(WAITING).is_some() {
+            let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+        }
+    }
+
     #[test]
     fn tagged_processes_finds_a_process_by_an_environment_entry() {
         let tag = unique_tag();
         let (name, value) = tag.split_once('=').unwrap();
-        let mut cmd = Command::new("python3");
+        // This test binary as `waiting_child`, with the entry also as an argument (a libtest
+        // filter that names no test).
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
         cmd.args([
-            "-c",
-            "import time; time.sleep(30)",
+            "procs::tests::waiting_child",
+            "--exact",
+            "--test-threads=1",
             &format!("{name}={value}-argv"),
         ])
+        .env(WAITING, "1")
         .env(name, value)
-        .stdin(Stdio::null());
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
         detach_session(&mut cmd);
-        let p = Kid(cmd.spawn().expect("spawn python3"));
+        let mut p = Kid(cmd.spawn().expect("spawn the test binary"));
         let other = sleeper(true);
         std::thread::sleep(Duration::from_millis(200));
         let (found, _) = tagged(&tag).expect("environments are readable on Linux and macOS");
-        assert_eq!(pids(&found), vec![p.pid()]);
+        assert_eq!(pids(&found), vec![p.pid()], "{}", ending_of(&mut p));
         assert_eq!(
             Some(found[0].start.clone()),
             identify(p.pid()).map(|i| i.start)
@@ -298,35 +374,113 @@ mod tests {
     // ----------------------------------------------------------------------
     // The brief's own tests
 
-    /// A start time Rust reads is byte-identical to the one `procs.py` reads for the same
-    /// process, so either implementation can verify the other's recorded identities.
+    /// `procs-start-times.json`: process-table records of a `sleep` child, with what the
+    /// reference's parser derives from each (`info`) and the start string it reports
+    /// (`start_time`, none for a zombie or an unreadable record).
+    #[derive(Deserialize)]
+    struct Samples {
+        // Each platform reads its own samples.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        linux_stat: Vec<Sample>,
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        macos_kinfo: Vec<Sample>,
+    }
+
+    #[derive(Deserialize)]
+    struct Sample {
+        name: String,
+        pid: i32,
+        /// A `/proc/<pid>/stat` line, a surrogate escape for each byte that is not UTF-8.
+        #[serde(default)]
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        stat: Option<crate::wire::PyStr>,
+        /// A `KERN_PROC_PID` buffer, in hex.
+        #[serde(default)]
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        kinfo: Option<String>,
+        info: Option<Derived>,
+        start_time: Option<String>,
+    }
+
+    #[derive(Debug, PartialEq, Deserialize)]
+    struct Derived {
+        pid: i32,
+        ppid: i32,
+        pgid: i32,
+        start: String,
+        zombie: bool,
+    }
+
+    /// The samples of this platform's format, as the bytes the platform gives.
+    fn platform_samples(samples: &Samples) -> Vec<(&Sample, Vec<u8>)> {
+        #[cfg(target_os = "linux")]
+        let (mine, raw) = (&samples.linux_stat, |s: &Sample| {
+            use std::os::unix::ffi::OsStringExt;
+            s.stat
+                .as_ref()
+                .expect("a stat line")
+                .to_os()
+                .unwrap()
+                .into_vec()
+        });
+        #[cfg(target_os = "macos")]
+        let (mine, raw) = (&samples.macos_kinfo, |s: &Sample| {
+            let hex = s.kinfo.as_deref().expect("a kinfo buffer");
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<u8>>()
+        });
+        mine.iter().map(|s| (s, raw(s))).collect()
+    }
+
+    /// The start string's form on this platform: `"<sec>.<usec:06>"` on macOS,
+    /// `"ticks:<n>"` on Linux.
+    fn start_has_platform_form(start: &str) -> bool {
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if cfg!(target_os = "linux") {
+            start.strip_prefix("ticks:").is_some_and(digits)
+        } else {
+            start
+                .split_once('.')
+                .is_some_and(|(sec, usec)| digits(sec) && usec.len() == 6 && digits(usec))
+        }
+    }
+
+    /// A start time Rust reads is byte-identical to the one the reference reads from the same
+    /// record, so either implementation can verify the other's recorded identities: Rust's
+    /// pure parser derives, from each recorded sample of this platform's format, what the
+    /// reference derived from it. And a live child's start time, so read, identifies it.
     #[test]
-    fn start_time_string_matches_python() {
-        let kid = sleeper(false);
-        let lib = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/lib");
-        let out = Command::new("python3")
-            .args([
-                "-B",
-                "-c",
-                "import sys\n\
-                 from leadhand import procs\n\
-                 print(procs.process_start_time(int(sys.argv[1])))\n",
-                &kid.pid().to_string(),
-            ])
-            .env("PYTHONPATH", &lib)
-            .stdin(Stdio::null())
-            .output()
-            .expect("run python3");
+    fn start_time_parsers_match_reference_samples() {
+        let samples: Samples = serde_json::from_slice(&crate::wire::tests::read_reference(
+            "procs-start-times.json",
+        ))
+        .unwrap();
+        let mine = platform_samples(&samples);
+        assert!(mine.len() >= 5, "too few samples for this platform");
         assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
+            mine.iter().any(|(s, _)| s.start_time.is_some()),
+            "no sample the reference could read"
         );
-        let stdout = String::from_utf8(out.stdout).unwrap();
-        let python = stdout.trim_end_matches('\n');
-        let rust = identify(kid.pid()).expect("the child is alive").start;
-        assert_ne!(python, "None", "Python could not read the child");
-        assert_eq!(python, rust);
+        for (s, raw) in &mine {
+            let got = sys::parse_record(s.pid, raw);
+            let derived = got.as_ref().map(|i| Derived {
+                pid: i.pid,
+                ppid: i.ppid,
+                pgid: i.pgid,
+                start: i.start.clone(),
+                zombie: i.zombie,
+            });
+            assert_eq!(derived, s.info, "{}", s.name);
+            let start = got.filter(|i| !i.zombie).map(|i| i.start);
+            assert_eq!(start, s.start_time, "{}", s.name);
+        }
+
+        let kid = sleeper(false);
+        let id = identify(kid.pid()).expect("the child is alive");
+        assert!(start_has_platform_form(&id.start), "{}", id.start);
+        assert!(same_process(Some(kid.pid()), Some(&id.start)));
     }
 
     #[test]

@@ -315,7 +315,6 @@ pub fn charge(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::fs;
     use std::process::Command;
 
@@ -323,10 +322,13 @@ mod tests {
     use crate::state::run_paths;
     use crate::usage::claude::tests::{OPUS, claude_line};
     use crate::usage::codex::tests::{
-        ROLLOUT, append_lines, codex_line, fixture_lines, rollout_path,
+        ROLLOUT, append_lines, codex_line, fixture_lines, frozen_rollout_lines, rollout_path,
     };
     use crate::usage::{Group, add, claude_usage, totals};
-    use crate::wire::{self, tests::python};
+    use crate::wire::{
+        self,
+        tests::{mask_ts, read_reference_text},
+    };
 
     /// A run directory and the vendor folders beside it (the Python tests' `UsageCase`).
     struct Case {
@@ -405,9 +407,22 @@ mod tests {
         }
 
         fn place_rollout(&self, count: Option<usize>) -> std::path::PathBuf {
+            self.place_rollout_lines(fixture_lines(ROLLOUT), count)
+        }
+
+        /// `place_rollout`, from the frozen copy of the rollout the reference fixtures were
+        /// recorded from.
+        fn place_frozen_rollout(&self, count: Option<usize>) -> std::path::PathBuf {
+            self.place_rollout_lines(frozen_rollout_lines(), count)
+        }
+
+        fn place_rollout_lines(
+            &self,
+            lines: Vec<String>,
+            count: Option<usize>,
+        ) -> std::path::PathBuf {
             let f = rollout_path(&self.sessions, "thr1");
             fs::create_dir_all(f.parent().unwrap()).unwrap();
-            let lines = fixture_lines(ROLLOUT);
             let lines = &lines[..count.unwrap_or(lines.len())];
             fs::write(&f, lines.join("\n") + "\n").unwrap();
             f
@@ -446,7 +461,7 @@ mod tests {
         v.iter().map(|s| PyStr::from(*s)).collect()
     }
 
-    // CATALOG: test_usage.py::ChargeClaudeTests::test_charge_claude_resumed_worker_counts_each_message_once
+    // CATALOG: test_usage::ChargeClaudeTests::test_charge_claude_resumed_worker_counts_each_message_once
     #[test]
     fn charge_claude_resumed_worker_counts_each_message_once() {
         let c = Case::new();
@@ -484,7 +499,7 @@ mod tests {
         assert!(c4.usage.known);
     }
 
-    // CATALOG: test_usage.py::ChargeClaudeTests::test_charge_record_is_durable_and_round_trips
+    // CATALOG: test_usage::ChargeClaudeTests::test_charge_record_is_durable_and_round_trips
     #[test]
     fn charge_record_is_durable_and_round_trips() {
         let c = Case::new();
@@ -493,15 +508,12 @@ mod tests {
         let one = c.claude(1, &f);
         let text = fs::read_to_string(&c.paths.charges).unwrap();
         assert_eq!(text.lines().count(), 1);
-        // The record as the Python writes it, field for field (its timestamp aside).
-        let code = "import json, sys\nfrom pathlib import Path\nfrom leadhand import state, usage as u\n\
-                    (c,) = u.read_charges(state.run_paths(Path(sys.argv[1])))\n\
-                    print(json.dumps(u._charge_to_record(c), separators=(',', ':')))\n\
-                    print(json.dumps(u.charged_checkpoint([c], 'claude', 'agent1')), \
-                    json.dumps(u.charged_checkpoint([c], 'claude', 'other')))\n";
-        let theirs = String::from_utf8(python(code, &[c.paths.root.as_os_str()])).unwrap();
+        // The record as the Python writes it, field for field (its timestamp aside): the
+        // reference's line for the same charge of the same transcript, then its checkpoints of
+        // that charge for `agent1` and for `other`.
+        let theirs = read_reference_text("usage/charge-record.txt");
         let mut theirs = theirs.lines();
-        assert_eq!(theirs.next().unwrap(), text.trim_end());
+        assert_eq!(mask_ts(theirs.next().unwrap()), mask_ts(text.trim_end()));
         assert!(text.contains("\"charge_id\":\"d1:claude:agent1\""));
         let one = std::slice::from_ref(&one);
         assert_eq!(c.charges(), one);
@@ -515,7 +527,7 @@ mod tests {
         assert_eq!(mine("agent1"), r#"{"messages": {"m1": 10}}"#);
     }
 
-    // CATALOG: test_usage.py::ChargeClaudeTests::test_charge_tops_up_message_charged_mid_stream
+    // CATALOG: test_usage::ChargeClaudeTests::test_charge_tops_up_message_charged_mid_stream
     #[test]
     fn charge_tops_up_message_charged_mid_stream() {
         let c = Case::new();
@@ -551,7 +563,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_usage.py::ChargeClaudeTests::test_charge_none_path_is_unknown_and_relative_path_is_rejected
+    // CATALOG: test_usage::ChargeClaudeTests::test_charge_none_path_is_unknown_and_relative_path_is_rejected
     #[test]
     fn charge_none_path_is_unknown_and_relative_path_is_rejected() {
         let c = Case::new();
@@ -603,7 +615,7 @@ mod tests {
         }
     }
 
-    // CATALOG: test_usage.py::ChargeClaudeTests::test_repeated_charge_id_is_harmless
+    // CATALOG: test_usage::ChargeClaudeTests::test_repeated_charge_id_is_harmless
     #[test]
     fn repeated_charge_id_is_harmless() {
         let c = Case::new();
@@ -628,7 +640,7 @@ mod tests {
         assert_eq!(c.charges().len(), 2);
     }
 
-    // CATALOG: test_usage.py::ChargeClaudeTests::test_charge_missing_file_is_unknown_and_moves_no_checkpoint
+    // CATALOG: test_usage::ChargeClaudeTests::test_charge_missing_file_is_unknown_and_moves_no_checkpoint
     #[test]
     fn charge_missing_file_is_unknown_and_moves_no_checkpoint() {
         let c = Case::new();
@@ -658,7 +670,7 @@ mod tests {
         assert!(!c.implementer_total().known);
     }
 
-    // CATALOG: test_usage.py::CodexTests::test_charge_codex_cumulative_deltas
+    // CATALOG: test_usage::CodexTests::test_charge_codex_cumulative_deltas
     #[test]
     fn charge_codex_cumulative_deltas() {
         let c = Case::new();
@@ -676,7 +688,7 @@ mod tests {
         assert_eq!(c.implementer_total().tokens.input, 250);
     }
 
-    // CATALOG: test_usage.py::CodexTests::test_codex_stream_fallback_charged_when_session_missing
+    // CATALOG: test_usage::CodexTests::test_codex_stream_fallback_charged_when_session_missing
     #[test]
     fn codex_stream_fallback_charged_when_session_missing() {
         let c = Case::new();
@@ -723,7 +735,7 @@ mod tests {
         assert_eq!((s.source.as_str(), s.usage.tokens.input), ("codex", 100));
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_rollout_charges_every_response_not_the_token_count_total
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_rollout_charges_every_response_not_the_token_count_total
     #[test]
     fn rollout_charges_every_response_not_the_token_count_total() {
         let c = Case::new();
@@ -747,7 +759,7 @@ mod tests {
         assert_eq!(cumulative.tokens.input, 39874 - 26112);
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_rollout_charged_twice_charges_nothing_new
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_rollout_charged_twice_charges_nothing_new
     #[test]
     fn rollout_charged_twice_charges_nothing_new() {
         let c = Case::new();
@@ -760,7 +772,7 @@ mod tests {
         assert_eq!(c.implementer_total(), first.usage);
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_rollout_truncated_before_resume_charges_only_the_killed_turn
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_rollout_truncated_before_resume_charges_only_the_killed_turn
     #[test]
     fn rollout_truncated_before_resume_charges_only_the_killed_turn() {
         let c = Case::new();
@@ -779,7 +791,7 @@ mod tests {
         assert_eq!((t.input, t.cached, t.output), (39874 - 26112, 26112, 64));
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_rollout_repeated_response_id_counts_once
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_rollout_repeated_response_id_counts_once
     #[test]
     fn rollout_repeated_response_id_counts_once() {
         let c = Case::new();
@@ -792,7 +804,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_rollout_thread_total_mismatch_is_recorded_not_fatal
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_rollout_thread_total_mismatch_is_recorded_not_fatal
     #[test]
     fn rollout_thread_total_mismatch_is_recorded_not_fatal() {
         let c = Case::new();
@@ -818,7 +830,7 @@ mod tests {
         assert_eq!(c.charges()[0], one);
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_possibly_incomplete_flag_is_recorded_on_the_charge
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_possibly_incomplete_flag_is_recorded_on_the_charge
     #[test]
     fn possibly_incomplete_flag_is_recorded_on_the_charge() {
         let c = Case::new();
@@ -835,7 +847,7 @@ mod tests {
         assert_eq!(text.matches("possibly_incomplete").count(), 1);
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_rollout_without_any_usable_record_is_unknown
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_rollout_without_any_usable_record_is_unknown
     #[test]
     fn rollout_without_any_usable_record_is_unknown() {
         let c = Case::new();
@@ -843,7 +855,7 @@ mod tests {
         assert!(!c.codex(1, "thr1").usage.known);
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_token_count_is_only_a_fallback_for_a_rollout_without_records
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_token_count_is_only_a_fallback_for_a_rollout_without_records
     #[test]
     fn token_count_is_only_a_fallback_for_a_rollout_without_records() {
         let c = Case::new();
@@ -857,7 +869,7 @@ mod tests {
         assert_eq!((t.input, t.cached, t.output), (20812 - 18944, 18944, 6));
     }
 
-    // CATALOG: test_usage.py::ClaudeFixtureTests::test_stopped_transcript_charges_its_one_message_once
+    // CATALOG: test_usage::ClaudeFixtureTests::test_stopped_transcript_charges_its_one_message_once
     #[test]
     fn stopped_transcript_charges_its_one_message_once() {
         let c = Case::new();
@@ -879,7 +891,7 @@ mod tests {
         assert_eq!(io(&again.usage), (0, 0));
     }
 
-    // CATALOG: test_usage.py::ClaudeFixtureTests::test_resumed_transcript_charges_each_message_once
+    // CATALOG: test_usage::ClaudeFixtureTests::test_resumed_transcript_charges_each_message_once
     #[test]
     fn resumed_transcript_charges_each_message_once() {
         let c = Case::new();
@@ -892,7 +904,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_usage.py::ClaudeFixtureTests::test_resumed_file_growth_is_charged_once
+    // CATALOG: test_usage::ClaudeFixtureTests::test_resumed_file_growth_is_charged_once
     #[test]
     fn resumed_file_growth_is_charged_once() {
         let c = Case::new();
@@ -905,51 +917,39 @@ mod tests {
         assert_eq!(c.implementer_total(), total);
     }
 
-    /// Charges a transcript and a thread from the Python reference.
-    const PY_CHARGE: &str = "import sys\nfrom pathlib import Path\nfrom leadhand import state, usage as u\n\
-        root, cid, transcript, sessions = sys.argv[1:5]\n\
-        p = state.run_paths(Path(root))\n\
-        u.charge(p, charge_id=cid + ':claude', source='claude', key='agent1', dispatch_id='d1',\n\
-        \x20        role='implementer', path_or_thread=Path(transcript))\n\
-        u.charge(p, charge_id=cid + ':codex', source='codex', key='thr1', dispatch_id='d1',\n\
-        \x20        role='implementer', path_or_thread='thr1', sessions_dir=Path(sessions))\n";
-
+    /// Rust continues the checkpoints of the charges the reference wrote
+    /// (`charge-checkpoint/charges.jsonl`) for the first half of a transcript and a rollout,
+    /// charging only the rest; charging again finds nothing new; and the totals are the
+    /// reference's own for the whole (`charge-checkpoint/totals-by-source.json`).
     #[test]
-    fn charge_after_python_charge_continues_checkpoint() {
+    fn charge_continues_reference_checkpoint() {
         let c = Case::new();
         let f = c.tmp.join("projects/p/s/subagents/agent-agent1.jsonl");
-        // Python charges the start: m1 mid-stream, m2 whole; and the killed Codex turn.
-        append_lines(
-            &f,
-            &[
-                &claude_line("m1", 5, 100, 1000, 50, 0),
-                &claude_line("m2", 7, 3, 0, 0, 4),
-            ],
-        );
-        c.place_rollout(Some(18));
-        let args = |cid: &str| -> Vec<std::ffi::OsString> {
-            vec![
-                c.paths.root.clone().into(),
-                cid.into(),
-                f.clone().into(),
-                c.sessions.clone().into(),
+        let transcript = read_reference_text("charge-checkpoint/transcript.jsonl");
+        let transcript: Vec<&str> = transcript.lines().collect();
+        assert_eq!(
+            transcript,
+            [
+                claude_line("m1", 5, 100, 1000, 50, 0),
+                claude_line("m2", 7, 3, 0, 0, 4),
+                claude_line("m1", 40, 100, 1000, 50, 0),
+                claude_line("m3", 9, 1, 2, 0, 0),
             ]
-        };
-        let a = args("py1");
-        python(
-            PY_CHARGE,
-            &a.iter().map(|s| s.as_os_str()).collect::<Vec<_>>(),
         );
+        let lines = &transcript;
+        // The reference charged the start: m1 mid-stream, m2 whole; and the killed Codex turn.
+        append_lines(&f, &lines[..2]);
+        c.place_frozen_rollout(Some(18));
+        fs::write(
+            &c.paths.charges,
+            wire::tests::read_reference("charge-checkpoint/charges.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(c.charges().len(), 2);
         // The transcript grows (m1 tops up, m3 is new) and the resumed turn lands; Rust
         // charges the rest.
-        append_lines(
-            &f,
-            &[
-                &claude_line("m1", 40, 100, 1000, 50, 0),
-                &claude_line("m3", 9, 1, 2, 0, 0),
-            ],
-        );
-        c.place_rollout(None);
+        append_lines(&f, &lines[2..]);
+        c.place_frozen_rollout(None);
         let claude = c.claude_as("rs1:claude", "agent1", 2, &f);
         let codex = charge(
             &c.paths,
@@ -965,11 +965,12 @@ mod tests {
             false,
         )
         .unwrap();
-        // Only what Python had not charged: m1's extra 35 output, m3 whole; the resumed turn.
+        // Only what the reference had not charged: m1's extra 35 output, m3 whole; the
+        // resumed turn.
         let t = claude.usage.tokens;
         assert_eq!((t.input, t.cached, t.output), (1, 2, 35 + 9));
         assert_eq!(codex.checkpoint.responses, Some(ids(&["resp_fixture_2"])));
-        // Rust's charges and Python's sum to the whole transcript and the whole rollout.
+        // Rust's charges and the reference's sum to the whole transcript and the whole rollout.
         let all = c.charges();
         assert_eq!(all.len(), 4);
         let by_source = totals(&all, Group::Source);
@@ -977,30 +978,53 @@ mod tests {
         assert_eq!(by_source.get(&"claude".into()).unwrap(), &whole);
         let t = by_source.get(&"codex".into()).unwrap().tokens;
         assert_eq!((t.input, t.cached, t.output), (39874 - 26112, 26112, 64));
-        // And Python, charging again after Rust, finds nothing new: it reads Rust's records
-        // and continues from their checkpoints.
-        let b = args("py2");
-        python(
-            PY_CHARGE,
-            &b.iter().map(|s| s.as_os_str()).collect::<Vec<_>>(),
-        );
+        // Charging again finds nothing new: it continues from the checkpoints of every record.
+        // (The stage-2 test charged again in the reference, which retires with it.)
+        let again = c.claude_as("rs2:claude", "agent1", 3, &f);
+        let again_codex = charge(
+            &c.paths,
+            &"rs2:codex".into(),
+            &"thr1".into(),
+            "d3",
+            "implementer",
+            ChargeSource::Codex {
+                thread: Some(&"thr1".into()),
+                sessions_dir: &c.sessions,
+                stream: None,
+            },
+            false,
+        )
+        .unwrap();
         let last = c.charges();
+        assert_eq!(last.len(), 6);
         let after: Vec<(u64, u64)> = last[4..].iter().map(|x| io(&x.usage)).collect();
         assert_eq!(after, [(0, 0), (0, 0)]);
-        let code = "import json, sys\nfrom pathlib import Path\nfrom leadhand import state, usage as u\n\
-                    cs = u.read_charges(state.run_paths(Path(sys.argv[1])))\n\
-                    t = u.totals(cs, by='source')\n\
-                    print(json.dumps({k: u.usage_to_dict(v) for k, v in t.items()}, separators=(',', ':')))\n";
-        let theirs = python(code, &[c.paths.root.as_os_str()]);
+        assert_eq!([io(&again.usage), io(&again_codex.usage)], [(0, 0), (0, 0)]);
+        // The totals by source are the reference's, for the same charges made by the
+        // reference alone.
+        let theirs = String::from_utf8(wire::tests::read_reference(
+            "charge-checkpoint/totals-by-source.json",
+        ))
+        .unwrap();
         let ours = format!(
             "{}\n",
             wire::to_line(&totals(&last, Group::Source)).unwrap()
         );
-        assert_eq!(String::from_utf8(theirs).unwrap(), ours);
+        assert_eq!(theirs, ours);
+        // And every line, checkpoints included, is the one the reference wrote when it made
+        // the same charges alone (`charge-checkpoint/charges-all.jsonl`), but for the time.
+        let written = fs::read_to_string(&c.paths.charges).unwrap();
+        let reference = read_reference_text("charge-checkpoint/charges-all.jsonl");
+        let reference: Vec<&str> = reference.lines().collect();
+        assert_eq!(reference.len(), 6);
+        assert_eq!(
+            written.lines().map(mask_ts).collect::<Vec<_>>(),
+            reference.iter().map(|l| mask_ts(l)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
-    fn mixed_model_usage_keeps_by_model_and_prices_each() {
+    fn mixed_model_usage_matches_reference_dict() {
         let c = Case::new();
         let opus_file = c.tmp.join("opus.jsonl");
         let sonnet_file = c.tmp.join("sonnet.jsonl");
@@ -1036,18 +1060,18 @@ mod tests {
         let cost = crate::usage::estimate_cost(&total, None, &table).unwrap();
         let each = |u: &Usage| crate::usage::estimate_cost(u, u.model.as_ref(), &table).unwrap();
         assert_eq!(cost, each(&opus.usage) + each(&sonnet.usage));
-        // The serialized record is the Python's for the same sum, and so is its price.
-        let code = "import json\nfrom leadhand import state, usage as u\n\
-                    a = u.Usage(input=1000, output=1000, model='claude-opus-4-1')\n\
-                    b = u.Usage(input=2000, output=2000, model='claude-sonnet-4-5')\n\
-                    p = lambda i, o: {'input': i, 'output': o, 'cache_read': i / 10, 'cache_write_5m': i * 1.25, 'cache_write_1h': i * 2.0}\n\
-                    s = u.add(a, b)\n\
-                    print(json.dumps(u.usage_to_dict(s), separators=(',', ':')))\n\
-                    print(repr(u.estimate_cost(s, None, {'opus': p(15.0, 75.0), 'sonnet': p(3.0, 15.0)})))\n";
-        let theirs = String::from_utf8(python(code, &[])).unwrap();
-        let mut theirs = theirs.lines();
-        assert_eq!(theirs.next().unwrap(), wire::to_line(&total).unwrap());
-        assert_eq!(theirs.next().unwrap(), crate::pytext::py_float(cost));
+        // The serialized record is the reference's for the same sum (`usage-mixed.json`: its
+        // `usage_to_dict`, and the `repr` of its price).
+        #[derive(Deserialize)]
+        struct Reference<'a> {
+            #[serde(borrow)]
+            usage: &'a serde_json::value::RawValue,
+            cost: String,
+        }
+        let recorded = wire::tests::read_reference("usage-mixed.json");
+        let theirs: Reference = serde_json::from_slice(&recorded).unwrap();
+        assert_eq!(theirs.usage.get(), wire::to_line(&total).unwrap());
+        assert_eq!(theirs.cost, crate::pytext::py_float(cost));
         // A charge reading one transcript of both models keeps the split itself.
         let both = c.tmp.join("both.jsonl");
         let (opus_text, sonnet_text) = (
@@ -1087,63 +1111,121 @@ mod tests {
         );
         let line = fs::read_to_string(&c.paths.charges).unwrap();
         assert!(!line.contains("by_model"), "{line}");
-        let code = "import json\nfrom leadhand import state, usage as u\n\
-                    s = u.Usage()\n\
-                    for x in (u.Usage(input=1, output=10, model='claude-opus-4-1'), u.Usage(input=2, output=20, model='claude-opus-4-1'), u.Usage(model='<synthetic>')):\n\
-                    \x20   s = u.add(s, x)\n\
-                    print(json.dumps(u.usage_to_dict(s), separators=(',', ':')))\n";
-        let theirs = String::from_utf8(python(code, &[])).unwrap();
+        // The reference's sum of the same three usages, from an empty one.
+        let theirs = read_reference_text("usage/single-model.json");
         assert_eq!(theirs.trim_end(), wire::to_line(&one.usage).unwrap());
     }
 
-    /// Charges from Rust and from the Python reference at once, each appending to the source
-    /// files as it goes (`test_concurrent_supervisor_and_runner_charges_keep_exact_totals`, one
-    /// writer in each implementation).
+    /// The run directory `concurrent_charges_from_two_processes_keep_exact_totals` charges in,
+    /// for `two_process_charge_child`; unset in an ordinary run.
+    const CHARGE_CHILD: &str = "LEADHAND_CHARGES_TEST_CHARGE_CHILD";
+    /// That test's Claude transcript, for the child.
+    const CHARGE_CHILD_TRANSCRIPT: &str = "LEADHAND_CHARGES_TEST_CHARGE_CHILD_TRANSCRIPT";
+    /// That test's Codex sessions folder, for the child.
+    const CHARGE_CHILD_SESSIONS: &str = "LEADHAND_CHARGES_TEST_CHARGE_CHILD_SESSIONS";
+
+    /// How many lines each writer of that test adds.
+    const RACE_LINES: u64 = 12;
+
+    /// Not a test of its own: writer A of `concurrent_charges_from_two_processes_keep_exact_
+    /// totals` (this test binary, running this test alone). It says it is ready, waits for the
+    /// word to go, then, `RACE_LINES` times, adds a Claude message to the transcript and charges
+    /// both sources as the supervisor. Does nothing in an ordinary run.
     #[test]
-    fn concurrent_rust_and_python_charges_keep_exact_totals() {
+    fn two_process_charge_child() {
+        let Some(root) = std::env::var_os(CHARGE_CHILD) else {
+            return;
+        };
+        let given = |name: &str| {
+            std::path::PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name}")))
+        };
+        let paths = run_paths(Path::new(&root));
+        let claude_file = given(CHARGE_CHILD_TRANSCRIPT);
+        let sessions = given(CHARGE_CHILD_SESSIONS);
+        // On a line of its own: libtest has printed `test <name> ... ` without a newline.
+        println!("\nready");
+        let mut go = String::new();
+        std::io::stdin().read_line(&mut go).unwrap();
+        let thread: PyStr = "thr1".into();
+        for i in 0..RACE_LINES {
+            let line = format!(
+                "{{\"type\": \"assistant\", \"message\": {{\"id\": \"A-{i}\", \"model\": \
+                 \"{OPUS}\", \"usage\": {{\"input_tokens\": 2, \"cache_read_input_tokens\": 7, \
+                 \"output_tokens\": {}}}}}}}",
+                i + 1
+            );
+            append_lines(&claude_file, &[&line]);
+            let did = format!("A{i}");
+            let claude = ChargeSource::ClaudeTranscript(Some(&claude_file));
+            charge(
+                &paths,
+                &format!("{did}:claude:S").into(),
+                &"S".into(),
+                &did,
+                "supervisor",
+                claude,
+                false,
+            )
+            .unwrap();
+            let codex = ChargeSource::Codex {
+                thread: Some(&thread),
+                sessions_dir: &sessions,
+                stream: None,
+            };
+            charge(
+                &paths,
+                &format!("{did}:codex:T").into(),
+                &thread,
+                &did,
+                "supervisor",
+                codex,
+                false,
+            )
+            .unwrap();
+        }
+    }
+
+    /// Charges from two processes at once, each appending to the source files as it goes
+    /// (`test_concurrent_supervisor_and_runner_charges_keep_exact_totals`). The stage-2 test's
+    /// writer A was the Python reference; here it is this test binary again.
+    #[test]
+    fn concurrent_charges_from_two_processes_keep_exact_totals() {
         let c = Case::new();
-        let n: u64 = 12;
+        let n = RACE_LINES;
         let claude_file = c.tmp.join("projects/p/S.jsonl");
         append_lines(&claude_file, &[&claude_line("seed", 3, 1, 0, 0, 0)]);
         append_lines(
             &rollout_path(&c.sessions, "thr1"),
             &[&codex_line(100, 20, 5, 0)],
         );
-        // Python is writer A: Claude messages; Rust is writer B: Codex totals. Each charges
-        // both sources after each line.
-        let code = "import sys, json\nfrom pathlib import Path\nfrom leadhand import state, usage as u\n\
-            root, claude_file, sessions, n = sys.argv[1:5]\n\
-            p = state.run_paths(Path(root))\n\
-            print('ready', flush=True)\n\
-            sys.stdin.readline()\n\
-            for i in range(int(n)):\n\
-            \x20   line = {'type': 'assistant', 'message': {'id': f'A-{i}', 'model': 'claude-opus-4-1', 'usage': {\n\
-            \x20       'input_tokens': 2, 'cache_read_input_tokens': 7, 'output_tokens': i + 1}}}\n\
-            \x20   with open(claude_file, 'a', encoding='utf-8') as f:\n\
-            \x20       f.write(json.dumps(line) + '\\n')\n\
-            \x20   u.charge(p, charge_id=f'A{i}:claude:S', source='claude', key='S', dispatch_id=f'A{i}',\n\
-            \x20            role='supervisor', path_or_thread=Path(claude_file))\n\
-            \x20   u.charge(p, charge_id=f'A{i}:codex:T', source='codex', key='thr1', dispatch_id=f'A{i}',\n\
-            \x20            role='supervisor', path_or_thread='thr1', sessions_dir=Path(sessions))\n";
-        let lib = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/lib");
-        let mut child = Command::new("python3")
-            .args(["-B", "-c", code])
-            .arg(&c.paths.root)
-            .arg(&claude_file)
-            .arg(&c.sessions)
-            .arg(n.to_string())
-            .env("PYTHONPATH", &lib)
+        // The child is writer A: Claude messages; this process is writer B: Codex totals. Each
+        // charges both sources after each line.
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "usage::charges::tests::two_process_charge_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHARGE_CHILD, &c.paths.root)
+            .env(CHARGE_CHILD_TRANSCRIPT, &claude_file)
+            .env(CHARGE_CHILD_SESSIONS, &c.sessions)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .expect("run python3");
+            .expect("run the test binary");
+        // Both writers start together: the child once it is running its test.
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut ready = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(child.stdout.as_mut().unwrap()),
-            &mut ready,
-        )
-        .unwrap();
+        loop {
+            ready.clear();
+            if std::io::BufRead::read_line(&mut stdout, &mut ready).unwrap() == 0
+                || ready == "ready\n"
+            {
+                break;
+            }
+        }
         assert_eq!(ready, "ready\n");
         std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"go\n").unwrap();
         let claude_source = ChargeSource::ClaudeTranscript(Some(&claude_file));
@@ -1207,14 +1289,22 @@ mod tests {
             (codex.input, codex.cached, codex.output),
             (100 + 10 * n - 20, 20, 5 * (n + 1))
         );
-        // Every line is whole, and the Python reads them all.
+        // A charged Codex too, from the same rollout: each of its n Codex charges found the
+        // session file (its usage is known), so the two writers raced on the Codex checkpoint.
+        let a_codex: Vec<&Charge> = charges
+            .iter()
+            .filter(|x| x.dispatch_id.starts_with('A') && x.source == "codex")
+            .collect();
+        assert_eq!(a_codex.len() as u64, n);
+        assert!(
+            a_codex.iter().all(|x| x.usage.known),
+            "{:?}",
+            a_codex.iter().map(|x| &x.charge_id).collect::<Vec<_>>()
+        );
+        // Every line is whole, and the reader reads them all.
         let text = fs::read_to_string(&c.paths.charges).unwrap();
         assert_eq!(text.lines().count(), charges.len());
-        let count = python(
-            "import sys\nfrom pathlib import Path\nfrom leadhand import state, usage as u\n\
-             print(len(u.read_charges(state.run_paths(Path(sys.argv[1])))))\n",
-            &[OsStr::new(&c.paths.root)],
-        );
-        assert_eq!(count, format!("{}\n", charges.len()).into_bytes());
+        let count = read_charges(&c.paths).unwrap().len();
+        assert_eq!(count, charges.len());
     }
 }

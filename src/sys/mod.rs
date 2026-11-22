@@ -47,8 +47,8 @@ pub struct ProcInfo {
     pub pid: i32,
     pub ppid: i32,
     pub pgid: i32,
-    /// An opaque start time, byte-identical to `procs.py`'s: `"<sec>.<usec:06>"` on macOS,
-    /// `"ticks:<field 22 of /proc/<pid>/stat>"` on Linux. Only ever compared for equality.
+    /// An opaque start time, byte-identical to the Python `procs` module's: `"<sec>.<usec:06>"` on
+    /// macOS, `"ticks:<field 22 of /proc/<pid>/stat>"` on Linux. Only ever compared for equality.
     pub start: String,
     /// Exited and not yet reaped: it cannot run or write anything, so it counts as gone.
     pub zombie: bool,
@@ -80,6 +80,14 @@ pub fn env_has(pid: i32, entry: &[u8]) -> Option<bool> {
     } else {
         platform::env_has(pid, entry)
     }
+}
+
+/// One process's record as the platform gives it (a `/proc/<pid>/stat` line on Linux, a
+/// `KERN_PROC_PID` buffer on macOS), parsed as `proc_info` parses it: for the reference
+/// samples of `procs::tests::start_time_parsers_match_reference_samples`.
+#[cfg(test)]
+pub(crate) fn parse_record(pid: i32, raw: &[u8]) -> Option<ProcInfo> {
+    platform::parse_record(pid, raw)
 }
 
 /// The variable a launcher sets to the run-lock descriptor it passes `claude` (R41a).
@@ -212,6 +220,8 @@ unsafe extern "C" {
 /// after `tzset(3)`, so `TZ` and the system's zone are read as the C library reads them.
 /// `None` when the C library cannot convert the time.
 pub fn local_date(secs: i64) -> Option<(i32, u32, u32)> {
+    // The `time_t` alias is deprecated on musl only, and both shipped musl targets are 64-bit.
+    #[allow(deprecated)]
     let t = libc::time_t::try_from(secs).ok()?;
     // SAFETY: `tzset` takes no arguments and only (re)reads `TZ` into the C library's zone
     // state. Reading the environment races only with a concurrent `setenv`/`unsetenv`, and
@@ -902,7 +912,8 @@ pub(crate) mod tests {
     #[test]
     fn local_date_is_pythons_local_date() {
         // The current time, and times around year and day ends, in this process's zone and in
-        // two fixed ones, as Python's date.fromtimestamp gives them.
+        // two fixed ones, as Python's date.fromtimestamp gives them: the C library's
+        // `localtime`, which `date` prints too.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -915,15 +926,29 @@ pub(crate) mod tests {
             1_767_225_600,
             1_794_268_800,
         ];
-        let code = "import sys, time\nfrom datetime import date\n\
-                    print(' '.join(date.fromtimestamp(int(t)).isoformat() for t in sys.argv[1:]))";
-        let args: Vec<String> = times.iter().map(i64::to_string).collect();
-        let theirs = Command::new("python3")
-            .args(["-B", "-c", code])
-            .args(&args)
-            .output()
-            .unwrap();
-        assert!(theirs.status.success());
+        let date = |t: i64| {
+            // BSD `date` takes the time with `-r`, GNU `date` with `-d @`.
+            let at = if cfg!(target_os = "macos") {
+                ["-r".to_string(), t.to_string()]
+            } else {
+                ["-d".to_string(), format!("@{t}")]
+            };
+            let out = Command::new("/bin/date")
+                .args(at)
+                .arg("+%Y-%m-%d")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .trim_end()
+                .to_string()
+        };
+        let theirs: Vec<String> = times.iter().map(|t| date(*t)).collect();
         let ours: Vec<String> = times
             .iter()
             .map(|t| {
@@ -931,10 +956,7 @@ pub(crate) mod tests {
                 format!("{y:04}-{m:02}-{d:02}")
             })
             .collect();
-        assert_eq!(
-            ours.join(" "),
-            String::from_utf8(theirs.stdout).unwrap().trim_end()
-        );
+        assert_eq!(ours.join(" "), theirs.join(" "));
         // In a child with TZ set, so this process's own zone is left alone: Tokyo is a day
         // ahead of UTC at 20:00 UTC, Honolulu a day behind at 05:00 UTC.
         for (tz, t, want) in [

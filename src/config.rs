@@ -1,6 +1,6 @@
-//! Configuration (`config.py`): the preset, the user file and the repository file, merged key
-//! by key and validated with the Python's messages; the settings this version refuses; and the
-//! snapshot `start` writes into a run.
+//! Configuration (the Python `config` module): the preset, the user file and the repository file,
+//! merged key by key and validated with the Python's messages; the settings this version refuses;
+//! and the snapshot `start` writes into a run.
 //!
 //! The files are TOML and must be UTF-8, as in the Python. Tables keep the order their keys
 //! first appear in, as Python's `dict` does, so iteration (the step-limit refusals, the first
@@ -235,6 +235,11 @@ pub fn load_config(repo_top: &Path) -> Result<Config> {
 
 /// `load_config` with the user file named.
 pub fn load_config_from(repo_top: &Path, user_file: &Path) -> Result<Config> {
+    load_config_with(repo_top, user_file, &PRESETS)
+}
+
+/// `load_config_from` with the presets given as (name, text) pairs.
+fn load_config_with(repo_top: &Path, user_file: &Path, presets: &[(&str, &str)]) -> Result<Config> {
     let user = read_file(user_file)?;
     let repo = read_file(&repo_top.join(".leadhand.toml"))?;
     let default = Val::Str(DEFAULT_PRESET.into());
@@ -245,7 +250,7 @@ pub fn load_config_from(repo_top: &Path, user_file: &Path) -> Result<Config> {
         Val::Str(n) if !n.is_empty() && !n.contains('/') && !n.starts_with('.') => n,
         other => return Err(cerr(format!("preset: invalid name {}", other.repr()))),
     };
-    let Some((_, text)) = PRESETS.iter().find(|(n, _)| n == name) else {
+    let Some((_, text)) = presets.iter().find(|(n, _)| n == name) else {
         return Err(cerr(format!("preset: unknown preset {}", py_repr(name))));
     };
     let preset = parse_toml(text).map_err(|e| cerr(format!("preset {name}: {e}")))?;
@@ -290,6 +295,14 @@ pub fn docs_dir_for(config: &Config, repo_top: &Path) -> PathBuf {
 /// The settings this version refuses whatever the repository (`config.unsupported_settings`
 /// without a repository), plus deliberate change 1: in-place runs.
 pub fn unsupported_settings(config: &Config) -> Vec<String> {
+    unsupported_settings_with(config, &agent_max_turns)
+}
+
+/// `unsupported_settings` with each agent's `maxTurns` from `max_turns`.
+fn unsupported_settings_with(
+    config: &Config,
+    max_turns: &dyn Fn(&str) -> Option<i64>,
+) -> Vec<String> {
     let mut out = Vec::new();
     if !config.run.worktree {
         out.push(format!("{NOT_SUPPORTED}run.worktree = false"));
@@ -316,7 +329,7 @@ pub fn unsupported_settings(config: &Config) -> Vec<String> {
         };
         out.push(format!("{NOT_SUPPORTED}run.cost_limit_usd = {shown}"));
     }
-    out.extend(unhonoured_step_limits(config, &agent_max_turns));
+    out.extend(unhonoured_step_limits(config, max_turns));
     out
 }
 
@@ -1130,6 +1143,10 @@ fn has_exactly(t: &Table, keys: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::tests::{read_reference_text, reference_outputs};
+
+    /// The reference fixture of the tests here.
+    const FIXTURE: &str = "config/config.json";
 
     /// A repository folder and a user file for `load_config_from`.
     struct Files {
@@ -1159,6 +1176,36 @@ mod tests {
         fn load(&self) -> Result<Config> {
             load_config_from(&self.repo, &self.user)
         }
+
+        /// `load`, with the frozen presets the reference's `config/config.json` was recorded
+        /// from.
+        fn load_frozen(&self) -> Result<Config> {
+            let presets: Vec<(&str, String)> = PRESETS
+                .iter()
+                .map(|(name, _)| {
+                    (
+                        *name,
+                        read_reference_text(&format!("config/presets/{name}.toml")),
+                    )
+                })
+                .collect();
+            let presets: Vec<(&str, &str)> =
+                presets.iter().map(|(n, t)| (*n, t.as_str())).collect();
+            load_config_with(&self.repo, &self.user, &presets)
+        }
+    }
+
+    /// An agent's `maxTurns` from the frozen copy of its file the reference read
+    /// (`worker-prompts/agents/<name>.md`).
+    fn frozen_max_turns(agent: &str) -> Option<i64> {
+        AGENTS
+            .iter()
+            .find(|(name, _)| *name == agent)
+            .and_then(|(name, _)| {
+                max_turns(&read_reference_text(&format!(
+                    "worker-prompts/agents/{name}.md"
+                )))
+            })
     }
 
     fn codex_only(spec: &RoleSpec) -> RoleSpec {
@@ -1168,7 +1215,7 @@ mod tests {
         }
     }
 
-    // CATALOG: test_config.py::ConfigTests::test_step_limits_follow_the_roles_routes_and_agent_files
+    // CATALOG: test_config::ConfigTests::test_step_limits_follow_the_roles_routes_and_agent_files
     #[test]
     fn step_limits_follow_the_roles_routes_and_agent_files() {
         let f = Files::new(
@@ -1220,7 +1267,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_config_snapshot.py::Snapshot::test_snapshot_round_trips
+    // CATALOG: test_config_snapshot::Snapshot::test_snapshot_round_trips
     #[test]
     fn snapshot_round_trips() {
         let f = Files::new(
@@ -1237,47 +1284,30 @@ mod tests {
         // TOML's inf and nan reach a price; Python's json.dump writes them as Infinity and NaN
         // and json.loads reads them back. The snapshot is written as the Python writes it, and
         // each implementation reads the other's.
-        let f = Files::new(
+        let (user, repo) = (
             "docs_dir = \"/tmp/d\"\n[prices.x]\ninput = inf\noutput = -inf\ncache_read = nan\n\
              cache_write_5m = 1.5\ncache_write_1h = 0\n",
             "[notify]\ncommand = \"say NaN Infinity\"\n",
         );
-        let live = f.load().unwrap();
+        let f = Files::new(user, repo);
+        let live = f.load_frozen().unwrap();
         let ours = crate::wire::to_pretty(&ConfigSnapshot(&live)).unwrap();
-        let code = "import json, sys\nfrom pathlib import Path\nfrom leadhand import config as cfg\n\
-                    c = cfg.load_config(Path(sys.argv[1]), user_file=Path(sys.argv[2]))\n\
-                    print(json.dumps(cfg.config_to_dict(c), indent=2, ensure_ascii=True))\n\
-                    back = cfg.config_from_dict(json.loads(sys.argv[3]))\n\
-                    print(back.prices['x'], file=sys.stderr)\n";
-        let out = std::process::Command::new("python3")
-            .args(["-B", "-c", code])
-            .arg(&f.repo)
-            .arg(&f.user)
-            .arg(&ours)
-            .env(
-                "PYTHONPATH",
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/lib"),
-            )
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let theirs = String::from_utf8(out.stdout).unwrap();
-        assert_eq!(ours, theirs.trim_end());
+        // The reference's snapshot of the same files (`in`: the user and repository files),
+        // with the frozen presets, and its `prices['x']` once it read that snapshot back.
+        let recorded = reference_outputs(FIXTURE, "snapshot", &[serde_json::json!([user, repo])]);
+        let theirs = recorded[0]["snapshot"].as_str().unwrap();
+        assert_eq!(ours, theirs);
         assert!(ours.contains("\"input\": Infinity,"), "{ours}");
         assert!(ours.contains("\"output\": -Infinity,"), "{ours}");
         assert!(ours.contains("\"cache_read\": NaN,"), "{ours}");
-        // Python reads ours back with the same prices.
-        let back = String::from_utf8(out.stderr).unwrap();
+        // Python reads ours back with the same prices: ours is the snapshot it read.
+        let back = recorded[0]["back"].as_str().unwrap();
         assert!(
             back.contains("'input': inf, 'output': -inf, 'cache_read': nan"),
             "{back}"
         );
         // And Rust reads the Python's.
-        let read = config_from_snapshot(&theirs).unwrap();
+        let read = config_from_snapshot(theirs).unwrap();
         let (_, p) = read.prices.iter().find(|(k, _)| k == "x").unwrap();
         assert_eq!(
             (p.input, p.output, p.cache_write_5m),
@@ -1369,21 +1399,14 @@ mod tests {
             "preset = 'nope'\n",
             "preset = 3\n",
         ];
-        let prelude = "import tempfile\nfrom pathlib import Path\nfrom leadhand import config as cfg\n\
-            def load(text):\n\
-            \x20   d = Path(tempfile.mkdtemp()); (d / 'repo').mkdir(); u = d / 'user.toml'\n\
-            \x20   u.write_text(text, encoding='utf-8')\n\
-            \x20   try:\n\
-            \x20       c = cfg.load_config(d / 'repo', user_file=u)\n\
-            \x20   except cfg.ConfigError as e:\n\
-            \x20       return ['error', str(e)]\n\
-            \x20   return ['ok', cfg.unsupported_settings(c) + cfg.unsupported_warnings(c)]";
+        // What the reference made of each case as the user file, with the frozen presets and
+        // agent files: `['error', message]`, or `['ok', its refusals and warnings]`.
         let inputs: Vec<serde_json::Value> = cases.iter().map(|c| serde_json::json!(c)).collect();
-        let theirs = crate::pytext::tests::python_eval(prelude, "load(x)", &inputs);
+        let theirs = reference_outputs(FIXTURE, "messages", &inputs);
         for (case, want) in cases.iter().zip(theirs) {
-            let ours = match Files::new(case, "").load() {
+            let ours = match Files::new(case, "").load_frozen() {
                 Ok(c) => {
-                    let mut all = unsupported_settings(&c);
+                    let mut all = unsupported_settings_with(&c, &frozen_max_turns);
                     all.extend(unsupported_warnings(&c));
                     serde_json::json!(["ok", all])
                 }

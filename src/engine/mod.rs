@@ -1,5 +1,5 @@
-//! The run engine (`engine.py`): starting a run, and the card loop that `next` and `record`
-//! drive (Tasks 14–17).
+//! The run engine (the Python `engine` module): starting a run, and the card loop that `next` and
+//! `record` drive (Tasks 14–17).
 //!
 //! - `start`: the run directory and its records, the run branch and the run's worktree;
 //! - `protocol`: the actions `next` prints and what `record` prints, the dispatch ID format

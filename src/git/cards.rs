@@ -487,7 +487,7 @@ mod tests {
         (branch, base, tip)
     }
 
-    // CATALOG: test_gitops.py::GitopsTests::test_is_ancestor
+    // CATALOG: test_gitops::GitopsTests::test_is_ancestor
     #[test]
     fn is_ancestor_follows_history() {
         let f = Fixture::new();
@@ -730,11 +730,9 @@ mod tests {
             "src/x.spec",
             "a.test.",
         ];
-        let code = "import json, sys\nfrom leadhand.gitops import is_test_or_doc_path\n\
-                    print(json.dumps([is_test_or_doc_path(p) for p in sys.argv[1:]]))";
-        let args: Vec<&OsStr> = paths.iter().map(OsStr::new).collect();
+        // `git.json`: the reference's `is_test_or_doc_path` of each path.
         let theirs: Vec<bool> =
-            serde_json::from_slice(&crate::wire::tests::python(code, &args)).unwrap();
+            crate::wire::tests::reference_for("git.json", "test_or_doc_path", &paths);
         let ours: Vec<bool> = paths
             .iter()
             .map(|p| is_test_or_doc_path(&PyStr::from(*p)))

@@ -1,0 +1,1 @@
+{"usage":{"input":3000,"cached":0,"cache_write_5m":0,"cache_write_1h":0,"output":3000,"reasoning":0,"known":true,"model":null,"by_model":{"claude-opus-4-1":{"input":1000,"cached":0,"cache_write_5m":0,"cache_write_1h":0,"output":1000,"reasoning":0},"claude-sonnet-4-5":{"input":2000,"cached":0,"cache_write_5m":0,"cache_write_1h":0,"output":2000,"reasoning":0}}},"cost":"0.126"}

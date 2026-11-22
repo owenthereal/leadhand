@@ -7,7 +7,7 @@
 //!
 //! Nothing outside this module starts a `git` process: later modules call `Git` only. The
 //! one other place that runs `git` is the unit tests' fixture below, which plays the operator
-//! and the workers (the Python's `tests/gitfixture.py`), and exists only under `cfg(test)`.
+//! and the workers (the Python reference's `gitfixture` helper), and exists only under `cfg(test)`.
 
 pub mod base_worktree;
 pub mod cards;
@@ -27,8 +27,8 @@ pub use workspace::{default_base, prepare_worktree};
 
 #[cfg(test)]
 pub(crate) mod fixture {
-    //! Hermetic Git repositories for unit tests, as the Python's `tests/gitfixture.py` makes
-    //! them.
+    //! Hermetic Git repositories for unit tests, as the Python reference's `gitfixture` helper
+    //! makes them.
     //!
     //! - **Hermetic.** Every Git command the fixture runs shuts out the operator's global and
     //!   system configuration and `HOME`, and commits as a fixed identity without signing. So
@@ -289,7 +289,7 @@ pub(crate) mod fixture {
             catch_unwind(AssertUnwindSafe(f)).is_err()
         }
 
-        // CATALOG: test_gitops.py::GitopsTests::test_git_helpers_refuse_paths_outside_the_fixture
+        // CATALOG: test_gitops::GitopsTests::test_git_helpers_refuse_paths_outside_the_fixture
         #[test]
         fn git_helpers_refuse_paths_outside_the_fixture() {
             let f = Fixture::new();

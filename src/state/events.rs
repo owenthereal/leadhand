@@ -689,7 +689,7 @@ mod tests {
 
     use super::*;
     use crate::state::run_paths;
-    use crate::wire::tests::python;
+    use crate::wire::tests::{read_reference, read_reference_text};
 
     fn run_dir() -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -712,7 +712,7 @@ mod tests {
         }
     }
 
-    // CATALOG: test_state.py::CrashPointTests::test_event_kinds_listed
+    // CATALOG: test_state::CrashPointTests::test_event_kinds_listed
     #[test]
     fn event_kinds_listed() {
         let python_kinds = [
@@ -756,17 +756,8 @@ mod tests {
         unique.dedup();
         assert_eq!(unique.len(), EVENT_KINDS.len());
         // And the reference's own list, read from it.
-        let listed = python(
-            "from leadhand import state\nprint('\\n'.join(state.EVENT_KINDS))\n",
-            &[],
-        );
-        assert_eq!(
-            String::from_utf8(listed)
-                .unwrap()
-                .lines()
-                .collect::<Vec<_>>(),
-            python_kinds
-        );
+        let listed = read_reference_text("state/event-kinds.txt");
+        assert_eq!(listed.lines().collect::<Vec<_>>(), python_kinds);
         // Every kind decodes as itself, from a bare line.
         for kind in EVENT_KINDS {
             let line = format!(r#"{{"seq":1,"ts":"2026-11-10T00:00:00.000Z","kind":"{kind}"}}"#);
@@ -820,21 +811,9 @@ mod tests {
     fn event_reader_round_trips_python_written_events() {
         let dir = run_dir();
         let paths = run_paths(dir.path());
-        // The Python reference appends events carrying a non-UTF-8 path, a non-ASCII one and
+        // The Python reference appended events carrying a non-UTF-8 path, a non-ASCII one and
         // an astral one, in fields of several kinds (a list, a map key, a map value).
-        let write = "import sys\nfrom pathlib import Path\nfrom leadhand import state\n\
-                     paths = state.run_paths(Path(sys.argv[1]))\n\
-                     odd = b'src/a\\xffb.txt'.decode('utf-8', 'surrogateescape')\n\
-                     wide = 'src/caf\\u00e9 \\U0001f600.txt'\n\
-                     state.append_event(paths, 'card_cut', card=1, branch='leadhand/r\\u00e9', base='b' * 40)\n\
-                     state.append_event(paths, 'conflict', card=1, onto='c' * 40, paths=[odd, wide])\n\
-                     state.append_event(paths, 'violation', stage='found', by='check', dispatch_id='c1-a1-review-1',\n\
-                     \x20   card=1, dispatch_kind='review', n=1, ref='refs/leadhand/abc/violations/1',\n\
-                     \x20   paths=[odd], head_moved=False, index_dirty=False, expected_head=None,\n\
-                     \x20   expected_branch='leadhand/r', refs={'refs/heads/' + odd: {'old': None, 'new': 'd' * 40}},\n\
-                     \x20   preserved={'refs/heads/' + odd: 'refs/leadhand/abc/violations/1-' + wide})\n\
-                     state.append_event(paths, 'parked', card='final', reason=wide)\n";
-        python(write, &[dir.path().as_os_str()]);
+        fs::write(&paths.events, read_reference("state/round-trip.jsonl")).unwrap();
         let file = fs::read(&paths.events).unwrap();
         let events = read_events(&paths).unwrap();
         assert_eq!(
@@ -887,32 +866,7 @@ mod tests {
         // `_base_violation`, `_restore_base`). Mixed mode reads Rust's and Python's alike.
         let dir = run_dir();
         let paths = run_paths(dir.path());
-        let write = "import sys\nfrom pathlib import Path\nfrom leadhand import state\n\
-                     paths = state.run_paths(Path(sys.argv[1]))\n\
-                     a = state.append_event\n\
-                     odd = b'src/a\\xffb.txt'.decode('utf-8', 'surrogateescape')\n\
-                     v = 'refs/leadhand/abc/violations/1'\n\
-                     a(paths, 'violation', stage='found', by='check', dispatch_id='c1-a1-review-1', card=1,\n\
-                     \x20 dispatch_kind='review', n=1, ref=v, paths=[odd], head_moved=True, index_dirty=False,\n\
-                     \x20 expected_head='e' * 40, expected_branch='leadhand/r--card-1',\n\
-                     \x20 refs={'refs/heads/x': {'old': None, 'new': 'd' * 40}}, preserved={'refs/heads/x': v + '-heads-x'},\n\
-                     \x20 hidden=[odd])\n\
-                     a(paths, 'violation', stage='restored', by='check', dispatch_id='c1-a1-review-1', card=1, n=1,\n\
-                     \x20 ref=v, saved='f' * 40, siblings=[v + '-branch'], preserved={'refs/heads/x': v + '-heads-x'})\n\
-                     l = 'refs/leadhand/abc/leftovers/1'\n\
-                     a(paths, 'violation', stage='found', by='implementer', n=1, ref=l, paths=[odd], operation='merge',\n\
-                     \x20 head_moved=False, index_dirty=True, expected_head='e' * 40, expected_branch='leadhand/r--card-1',\n\
-                     \x20 after_dispatch='c1-a1-implement-1', why='before review c1-a1-review-1', untracked=[odd],\n\
-                     \x20 hidden=[odd])\n\
-                     a(paths, 'violation', stage='restored', by='implementer', n=1, ref=l, saved=None,\n\
-                     \x20 after_dispatch=None, siblings=[])\n\
-                     a(paths, 'violation', stage='found', by='check', dispatch_id='run-a1-evidence-1', card=None,\n\
-                     \x20 dispatch_kind='evidence', n=2, ref=None, base_worktree='/w/b--base', base_head='e' * 40,\n\
-                     \x20 paths=['x.txt'], head_moved=False, index_dirty=False, expected_head=None, expected_branch=None,\n\
-                     \x20 refs={}, preserved={})\n\
-                     a(paths, 'violation', stage='restored', by='check', dispatch_id='run-a1-evidence-1', card=None,\n\
-                     \x20 n=2, ref=None, saved='e' * 40, siblings=[], preserved={})\n";
-        python(write, &[dir.path().as_os_str()]);
+        fs::write(&paths.events, read_reference("state/violations.jsonl")).unwrap();
         let file = fs::read(&paths.events).unwrap();
         let events = read_events(&paths).unwrap();
         let lines: Vec<&[u8]> = file
@@ -936,27 +890,7 @@ mod tests {
         // `_recut_final`, `_end`, `_wrap_up`, `_base_worktree`).
         let dir = run_dir();
         let paths = run_paths(dir.path());
-        let write = "import sys\nfrom pathlib import Path\nfrom leadhand import state\n\
-                     paths = state.run_paths(Path(sys.argv[1]))\n\
-                     a = state.append_event\n\
-                     h = 'e' * 40\n\
-                     a(paths, 'gate_started', gate='evidence', examined_sha=h, dispatch_id='run-evidence-1')\n\
-                     a(paths, 'gate_result', gate='evidence', examined_sha=h, passed=False,\n\
-                     \x20 dispatch_id='run-evidence-1', findings='/r/cards/run/run-evidence-1/report.md')\n\
-                     a(paths, 'card_cut', card='final', branch='leadhand/r--card-final', base=h, wave=1)\n\
-                     a(paths, 'card_cut', card='final', branch='leadhand/r--card-final', base=h, wave=1,\n\
-                     \x20 recut_after='run-w1-final_fix-1')\n\
-                     a(paths, 'verdict_recorded', card='final', wave=1, verdict='spent', reason='changed nothing',\n\
-                     \x20 findings='/r/x.md', dispatch_id='run-w1-final_fix-1')\n\
-                     a(paths, 'verdict_recorded', card='final', wave=1, verdict='clean', findings='/r/y.md',\n\
-                     \x20 dispatch_id='run-w1-final_review-1')\n\
-                     a(paths, 'accept_started', card='final', wave=1, target=h, dispatch_id='run-w1-final_review-1')\n\
-                     a(paths, 'accepted', card='final', wave=1, sha=h, dispatch_id='run-w1-final_review-1')\n\
-                     a(paths, 'outcome', outcome='complete', qualifier='', reasons=[], next_step='none', head=h)\n\
-                     a(paths, 'report_written', report='/r/report.md', outcome='complete', outcome_seq=10)\n\
-                     a(paths, 'base_worktree_added', path='/w/b--base')\n\
-                     a(paths, 'base_worktree_ready', path='/w/b--base')\n";
-        python(write, &[dir.path().as_os_str()]);
+        fs::write(&paths.events, read_reference("state/end-of-run.jsonl")).unwrap();
         let file = fs::read(&paths.events).unwrap();
         let events = read_events(&paths).unwrap();
         let lines: Vec<&[u8]> = file

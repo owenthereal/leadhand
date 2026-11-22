@@ -1,5 +1,5 @@
-//! Deterministic route resolution (`route.py`): the vendor, model and effort for a card and
-//! role, with one reason line per rule that applied.
+//! Deterministic route resolution (the Python `route` module): the vendor, model and effort for a
+//! card and role, with one reason line per rule that applied.
 
 use std::ffi::OsStr;
 use std::fmt;
