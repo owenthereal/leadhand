@@ -2,11 +2,11 @@
 //! untracked files, as `start`, `next`, `record`, `timer`, `unpark`, `cancel`, `status`,
 //! `report`, `launch-line` and `dispatch` show them.
 //!
-//! The Rust form of `tests/contract/contract_cards.py` (converted from
-//! tests/test_engine_cards.py, test_engine_by_risk.py, test_engine_decisions.py,
-//! test_engine_reply_file.py, test_engine_codex_result.py, test_engine_codex_e2e.py,
-//! test_engine_run_branch.py and test_engine_untracked.py, with the clock offset of
-//! test_test_hooks.py). The happy path is `smoke::smoke::test_two_cards_accepted_in_order`.
+//! The Rust form of the Python contract suite's `contract_cards` (converted from the Python
+//! unit tests `test_engine_cards`, `test_engine_by_risk`, `test_engine_decisions`,
+//! `test_engine_reply_file`, `test_engine_codex_result`, `test_engine_codex_e2e`,
+//! `test_engine_run_branch` and `test_engine_untracked`, with the clock offset of
+//! `test_test_hooks`). The happy path is `smoke::smoke::test_two_cards_accepted_in_order`.
 //!
 //! `FakeSupervisor` plays the run skill. A refusal is exit code 1 with `error: ...` on stderr
 //! (`assert_fails!`). Codex routes run the dispatch action's own `dispatch` line with the fake
@@ -212,7 +212,7 @@ fn is_utc_ts(s: &str) -> bool {
 }
 
 // --------------------------------------------------------------------------
-// test_engine_cards.py
+// Python's `test_engine_cards`
 
 mod happy_path {
     use super::*;
@@ -552,10 +552,9 @@ mod loop_ {
 
     #[test]
     fn test_which_paths_make_a_fix_test_only() {
-        // Ruling R13 (test_gitops.py's is_test_or_doc_path): test and doc folders count at the
-        // top level only; test files and docs by name anywhere; dependency and build inputs
-        // are production. A fix touching only the first kind is a `check_diff`, else a
-        // rereview.
+        // Ruling R13 (Python's `test_gitops`'s is_test_or_doc_path): test and doc folders count at
+        // the top level only; test files and docs by name anywhere; dependency and build inputs are
+        // production. A fix touching only the first kind is a `check_diff`, else a rereview.
         let yes = [
             "tests/test_x.py",
             "test/a.c",
@@ -957,7 +956,7 @@ mod start {
 
     #[test]
     fn test_run_folders_are_dated_and_suffixed() {
-        // <docs_dir>/runs/<local date>-<slug>, then the first free -2, -3 (test_state.py).
+        // <docs_dir>/runs/<local date>-<slug>, then the first free -2, -3 (Python's `test_state`).
         let mut w = FakeSupervisor::new(&[card(1)]);
         let before = today();
         let first = w.start();
@@ -988,7 +987,7 @@ mod start {
     #[test]
     fn test_every_event_line_carries_seq_ts_and_kind() {
         // events.jsonl: one JSON object per line, numbered from 1 with no gap, each with its
-        // UTC time and its kind (test_state.py).
+        // UTC time and its kind (Python's `test_state`).
         let mut w = FakeSupervisor::new(&[card(1), card(2)]);
         w.start();
         w.run();
@@ -1010,8 +1009,8 @@ mod start {
     fn test_a_whole_run_leaves_no_temporary_files() {
         // Every JSON file and report is written through a temporary file in the same folder
         // (`.<name>.<random>`, `.tmp` for JSON) and renamed: none survives in the run
-        // directory, its card folders or a Codex worker folder (test_state.py). Read from the
-        // filesystem.
+        // directory, its card folders or a Codex worker folder (Python's `test_state`). Read from
+        // the filesystem.
         let mut w = codex_world(
             &[
                 card_with(
@@ -1775,7 +1774,7 @@ mod supervisor {
 }
 
 // --------------------------------------------------------------------------
-// test_engine_by_risk.py: `card_review = "by-risk"` never accepts a READY that changed
+// Python's `test_engine_by_risk`: `card_review = "by-risk"` never accepts a READY that changed
 // nothing without a review (final review I8).
 
 mod by_risk {
@@ -1830,7 +1829,7 @@ mod by_risk {
 }
 
 // --------------------------------------------------------------------------
-// test_engine_decisions.py: a run whose every remaining card waits on a decision ends
+// Python's `test_engine_decisions`: a run whose every remaining card waits on a decision ends
 // blocked (decision needed), and `unpark` continues it (final review I2, ruling R44).
 
 mod decision_needed {
@@ -2030,7 +2029,7 @@ mod decision_needed {
 }
 
 // --------------------------------------------------------------------------
-// test_engine_reply_file.py: R38, the supervisor records a worker's reply through a file,
+// Python's `test_engine_reply_file`: R38, the supervisor records a worker's reply through a file,
 // never a heredoc.
 
 mod reply_file {
@@ -2205,7 +2204,7 @@ mod reply_file {
 }
 
 // --------------------------------------------------------------------------
-// test_engine_codex_result.py: a Codex-route dispatch's result comes only from the runner's
+// Python's `test_engine_codex_result`: a Codex-route dispatch's result comes only from the runner's
 // result.json (final review I1). The proxy only runs `dispatch`; whatever text it returns is
 // never taken as the worker's result.
 
@@ -2354,7 +2353,7 @@ mod codex_result_from_runner {
 }
 
 // --------------------------------------------------------------------------
-// test_engine_codex_e2e.py: end to end with a Codex worker that never commits, as the real
+// Python's `test_engine_codex_e2e`: end to end with a Codex worker that never commits, as the real
 // one (ruling R39, final review I11, ruling R47): the runner commits its work and the run
 // completes.
 
@@ -2444,7 +2443,7 @@ mod non_committing_codex {
 }
 
 // --------------------------------------------------------------------------
-// test_engine_run_branch.py: the run branch moves only by acceptance (final review I4).
+// Python's `test_engine_run_branch`: the run branch moves only by acceptance (final review I4).
 
 mod implementer_guard {
     use super::*;
@@ -2576,8 +2575,8 @@ mod run_head_check {
 }
 
 // --------------------------------------------------------------------------
-// test_engine_untracked.py: untracked files a worker did not create never land in its card's
-// commits (final review I3).
+// Python's `test_engine_untracked`: untracked files a worker did not create never land in its
+// card's commits (final review I3).
 
 mod engine_side {
     use super::*;
@@ -2999,7 +2998,7 @@ mod paths {
 }
 
 // --------------------------------------------------------------------------
-// test_test_hooks.py: the clock offset
+// Python's `test_test_hooks`: the clock offset
 
 mod clock_offset_hook {
     use super::*;

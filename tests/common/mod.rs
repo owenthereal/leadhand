@@ -1,9 +1,9 @@
 //! The contract suite's harness: it reaches leadhand only as a subprocess at LEADHAND_BIN.
-//! The Rust form of `tests/contract/harness.py`.
+//! The Rust form of the Python contract suite's `harness`.
 //!
 //! - LEADHAND_BIN: the binary under test (default the testing build, `CARGO_BIN_EXE_leadhand`).
 //!   A relative value is resolved against the test process's working directory, the package
-//!   root (ruling S3-R5), so `LEADHAND_BIN=scripts/leadhand` works.
+//!   root (ruling S3-R5), so `LEADHAND_BIN=target/release/leadhand` works.
 //! - LEADHAND_IMPL: `rust` (the default) or `python`. Rust-only tests return early under
 //!   `python` (`rust_only`).
 //!
@@ -55,7 +55,7 @@ macro_rules! os_args {
 
 /// Evaluates `expr`, which must panic (a failed assertion inside the harness), and gives the
 /// panic's message; panics itself if `expr` returns. An assertion, so it counts as one in
-/// `check_conversion.py`.
+/// the Python conversion check.
 macro_rules! assert_panics {
     ($e:expr) => {
         $crate::common::panic_message(|| {

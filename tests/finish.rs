@@ -3,8 +3,8 @@
 //! line, as `start`, `next`, `record`, `unpark`, `run`, `pause`, `cancel`, `timer` and `check`
 //! show them.
 //!
-//! The Rust form of `tests/contract/contract_finish.py` (converted from
-//! tests/test_engine_finish.py and tests/test_final_review_minors.py). `FakeSupervisor` with
+//! The Rust form of the Python contract suite's `contract_finish` (converted from
+//! Python's `test_engine_finish` and `test_final_review_minors`). `FakeSupervisor` with
 //! `gates: true` plays the run skill through the real end of run. A refusal is exit code 1
 //! with `error: ...` on stderr. A run is relaunched with `run`, which records `resumed`. A
 //! crash inside a Git call is injected by making that call fail (a held ref lock); a crash
@@ -1841,7 +1841,7 @@ mod sparse_checkout {
 }
 
 // --------------------------------------------------------------------------
-// test_final_review_minors.py
+// Python's `test_final_review_minors`
 
 /// `timer RUN_DIR --dispatch ID` running in the background; the world's cleanup kills it
 /// (`TimerProc`).

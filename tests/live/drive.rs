@@ -1,5 +1,5 @@
 //! The live end-to-end run, with the real `claude` and `codex`: the Rust form of the Python
-//! driver of the same name. One test runs everything unattended:
+//! end-to-end driver it replaced. One test runs everything unattended:
 //!
 //! 1. Step 1 (complete run, unless LEADHAND_LIVE_SKIP_PUSH_PROBE): the push probe
 //!    (`push_probe.rs`) into the same output folder.

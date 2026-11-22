@@ -1,10 +1,10 @@
 //! Worker briefs: the brief and report files `next` writes for every dispatch, under
 //! <workspace>/.leadhand/<card or run>/<dispatch id>/, and the lines they render.
 //!
-//! The Rust form of `tests/contract/contract_briefs.py` (converted from tests/test_briefs.py).
-//! A brief's text lines are contract output (ruling S1-R10), so each test runs a deck to the
-//! dispatch and reads the brief that `next` wrote, asserting the rendered lines. The card
-//! section is read with `common::engine::card_section`.
+//! The Rust form of the Python contract suite's `contract_briefs` (converted from Python's
+//! `test_briefs`). A brief's text lines are contract output (ruling S1-R10), so each test runs a
+//! deck to the dispatch and reads the brief that `next` wrote, asserting the rendered lines. The
+//! card section is read with `common::engine::card_section`.
 //!
 //! `BriefWorld` is Python's FakeSupervisor subclass of that name: its `launch` override is the
 //! world's `before_launch` hook, keeping every dispatch's brief as it was when the worker

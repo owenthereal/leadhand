@@ -3,10 +3,10 @@
 //! repository and run a directory belongs to"), and the conventions for the commands a person
 //! types (`--json`, the fix command alone on the last line). Rust-only.
 //!
-//! The Rust form of `tests/contract/contract_rust_start.py`. `start` keeps its contract output:
-//! `run: <dir>` for a new run, or its note naming the existing unfinished run. The
-//! reference-only test `contract_layouts.InPlace` pins the Python's acceptance of
-//! `run.worktree = false`, and is not converted.
+//! The Rust form of the Python contract suite's `contract_rust_start`. `start` keeps its contract
+//! output: `run: <dir>` for a new run, or its note naming the existing unfinished run. The
+//! reference-only test `contract_layouts.InPlace` pins the Python's acceptance of `run.worktree =
+//! false`, and is not converted.
 
 #[macro_use]
 mod common;

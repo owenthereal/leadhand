@@ -1,8 +1,8 @@
 //! The operator's cancel and pause, and what follows a card worker that died with an earlier
-//! supervisor session (`engine.py`: `_cancel_step`, `_pause_step`, `_after_interrupted`,
-//! `_branch_progress`, `_tip_before`, `_continue_notes`). Pure, as the rest of `decide`.
-//! Reconciling a relaunched run, which records the interrupted results these act on, is the
-//! shell's (`engine::recover`); it judges an interrupted worker's branch with the same
+//! supervisor session (the Python `engine` module: `_cancel_step`, `_pause_step`,
+//! `_after_interrupted`, `_branch_progress`, `_tip_before`, `_continue_notes`). Pure, as the rest
+//! of `decide`. Reconciling a relaunched run, which records the interrupted results these act on,
+//! is the shell's (`engine::recover`); it judges an interrupted worker's branch with the same
 //! `branch_progress`.
 
 use super::{

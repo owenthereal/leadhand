@@ -3,7 +3,7 @@
 //! binary (its commands, flags and record kinds) is checked against `<bin> <name> --help` in
 //! `tests/cli.rs` (`cli::plugin_commands`).
 //!
-//! The Rust form of `tests/contract/contract_plugin_files.py`.
+//! The Rust form of the Python contract suite's `contract_plugin_files`.
 
 #[macro_use]
 mod common;

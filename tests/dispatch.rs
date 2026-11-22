@@ -1,8 +1,8 @@
 //! Dispatcher scenarios: `dispatch`, its detached runner, `stop-dispatch` and the worker
 //! folder.
 //!
-//! The Rust form of `tests/contract/contract_dispatch.py` (converted from
-//! tests/test_dispatch.py). Every scenario runs on a run that `start` made (one card, Claude
+//! The Rust form of the Python contract suite's `contract_dispatch` (converted from
+//! Python's `test_dispatch`). Every scenario runs on a run that `start` made (one card, Claude
 //! and Codex installed, so the workspace is a worktree and config.json is the run's
 //! snapshot), with the Rust fake Codex as Codex (LEADHAND_TEST_CODEX_BIN): the world is
 //! `common::dispatch_world::World`. It calls only `dispatch ...`, `stop-dispatch RUN_DIR

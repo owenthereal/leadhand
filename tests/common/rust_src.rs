@@ -159,7 +159,7 @@ fn matching(toks: &[String], mut j: usize, open: &str, close: &str) -> usize {
 
 /// The libtest names (`module::…::fn`) of the `#[test]` functions in a test file's source:
 /// functions with a body, in the file's top level or its inline modules (a function's body
-/// is not searched). The same reading as `check_conversion.py`'s `rust_functions`.
+/// is not searched). The same reading as the Python conversion check's `rust_functions`.
 pub fn test_names(src: &str) -> BTreeSet<String> {
     let toks = tokens(&code_only(src));
     let mut found = BTreeSet::new();

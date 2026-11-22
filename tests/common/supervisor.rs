@@ -1,5 +1,5 @@
 //! A scripted world for engine scenarios, driving the binary at LEADHAND_BIN only through its
-//! command line: the Rust form of `tests/contract/supervisor.py`.
+//! command line: the Rust form of the Python contract suite's `supervisor`.
 //!
 //! `FakeSupervisor` does what the run skill's supervisor does, with fake workers instead of
 //! real ones. Every engine step is a CLI call: `start`, `next`, and `record started|result|

@@ -1,7 +1,7 @@
 //! The Codex worker's environment (spec contract item 9), against real Git and `gh`.
 //!
-//! The Rust form of `tests/contract/contract_worker_env.py` (converted from
-//! tests/test_worker_env.py). Each scenario runs one `dispatch` with a parent environment the
+//! The Rust form of the Python contract suite's `contract_worker_env` (converted from
+//! Python's `test_worker_env`). Each scenario runs one `dispatch` with a parent environment the
 //! test chooses (credentials, Git configuration, SSH and askpass programs), and takes the
 //! environment the worker really got from the fake Codex's log (FAKE_CODEX_LOG). Git and `gh`
 //! then run with exactly that environment, so what they do is the evidence: a refused push

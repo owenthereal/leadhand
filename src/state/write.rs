@@ -245,7 +245,7 @@ mod tests {
         assert_eq!(append_event(&paths, ruling("x")).unwrap().0.seq(), 42);
     }
 
-    // CATALOG: test_state.py::AppendTests::test_unknown_event_kind_rejected
+    // CATALOG: test_state::AppendTests::test_unknown_event_kind_rejected
     #[test]
     fn unknown_event_kind_rejected() {
         // An unknown kind cannot be built: an `Event` is one of `EVENT_KINDS`, read only from a
@@ -268,7 +268,7 @@ mod tests {
         assert_eq!(kinds, EVENT_KINDS);
     }
 
-    // CATALOG: test_state.py::AppendTests::test_reserved_field_names_rejected
+    // CATALOG: test_state::AppendTests::test_reserved_field_names_rejected
     #[test]
     fn reserved_field_names_rejected() {
         // `seq`, `ts` and `kind` are never the caller's: an event's own `seq` and `ts` are
@@ -294,7 +294,7 @@ mod tests {
         assert_eq!(raw.get().matches("\"kind\"").count(), 1);
     }
 
-    // CATALOG: test_state.py::AppendTests::test_append_attempt_and_read_attempts
+    // CATALOG: test_state::AppendTests::test_append_attempt_and_read_attempts
     #[test]
     fn append_attempt_and_read_attempts() {
         let tmp = run_dir();

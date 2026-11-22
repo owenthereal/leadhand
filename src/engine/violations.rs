@@ -1,7 +1,7 @@
 //! Violations: what the shell does for `decide` when a worker changed what its dispatch guards,
-//! or an implementer left something in the workspace (`engine.py`: `_find_violation`,
-//! `_engine_writes`, `_violation_paths`, `_void`, `_restore_violation`, `_ensure_clean`,
-//! `_finish_leftovers`; R14', R30, R33).
+//! or an implementer left something in the workspace (the Python `engine` module:
+//! `_find_violation`, `_engine_writes`, `_violation_paths`, `_void`, `_restore_violation`,
+//! `_ensure_clean`, `_finish_leftovers`; R14', R30, R33).
 //!
 //! - A check (review, rereview, verify) must leave the card tip, a clean workspace and every
 //!   ref of the run as it found them; an implementer-side worker the run branch. A change is

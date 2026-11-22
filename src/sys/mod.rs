@@ -47,8 +47,8 @@ pub struct ProcInfo {
     pub pid: i32,
     pub ppid: i32,
     pub pgid: i32,
-    /// An opaque start time, byte-identical to `procs.py`'s: `"<sec>.<usec:06>"` on macOS,
-    /// `"ticks:<field 22 of /proc/<pid>/stat>"` on Linux. Only ever compared for equality.
+    /// An opaque start time, byte-identical to the Python `procs` module's: `"<sec>.<usec:06>"` on
+    /// macOS, `"ticks:<field 22 of /proc/<pid>/stat>"` on Linux. Only ever compared for equality.
     pub start: String,
     /// Exited and not yet reaped: it cannot run or write anything, so it counts as gone.
     pub zombie: bool,

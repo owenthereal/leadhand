@@ -1,8 +1,8 @@
 //! Configuration: presets, the user and repository files, validation, the settings this
 //! version refuses, and the snapshot `start` takes.
 //!
-//! The Rust form of `tests/contract/contract_config.py` (converted from tests/test_config.py
-//! and tests/test_config_snapshot.py). The effective configuration is read from the run's
+//! The Rust form of the Python contract suite's `contract_config` (converted from Python's
+//! `test_config` and `test_config_snapshot`). The effective configuration is read from the run's
 //! `config.json` snapshot after `start`, from `route`, or from `check`'s problem lines.
 
 #[macro_use]

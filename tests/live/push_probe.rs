@@ -1,5 +1,5 @@
 //! Step 1 of the complete run: can a Codex worker started by leadhand's real dispatcher
-//! publish anything? The Rust form of the Python driver's Codex push probe. Nothing here
+//! publish anything? The Rust form of the Python Codex push probe it replaced. Nothing here
 //! contacts a real host.
 //!
 //! The probe repo's remotes are publishable, but only locally. Its `core.sshCommand` is a

@@ -487,7 +487,7 @@ mod tests {
         (branch, base, tip)
     }
 
-    // CATALOG: test_gitops.py::GitopsTests::test_is_ancestor
+    // CATALOG: test_gitops::GitopsTests::test_is_ancestor
     #[test]
     fn is_ancestor_follows_history() {
         let f = Fixture::new();

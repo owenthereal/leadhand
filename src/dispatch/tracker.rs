@@ -419,7 +419,7 @@ mod tests {
         i32::try_from(child.id()).unwrap()
     }
 
-    // CATALOG: test_dispatch.py::FixRoundTests::test_unknown_codex_start_time_still_enforced
+    // CATALOG: test_dispatch::FixRoundTests::test_unknown_codex_start_time_still_enforced
     #[test]
     fn unknown_codex_start_time_still_enforced() {
         let tmp = tempfile::tempdir().unwrap();

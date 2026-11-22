@@ -1,4 +1,4 @@
-//! A fake `codex exec --json` for leadhand's tests: the Rust form of `tests/fakes/codex`,
+//! A fake `codex exec --json` for leadhand's tests: the Rust form of the Python fake it replaced,
 //! writing the same log lines byte for byte for the same inputs. Never touches the network.
 //!
 //! Logs one JSON line per run to $FAKE_CODEX_LOG: its argv, cwd, environment, the

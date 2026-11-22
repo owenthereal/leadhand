@@ -1,5 +1,5 @@
-//! `report.md` (`report.py`): the run's account of itself, rendered from recorded state only,
-//! and `leadhand report`, which writes it and prints its path.
+//! `report.md` (the Python `report` module): the run's account of itself, rendered from recorded
+//! state only, and `leadhand report`, which writes it and prints its path.
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;

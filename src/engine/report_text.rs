@@ -1,6 +1,6 @@
-//! What the engine reads in a worker's report or reply (`engine.py`'s report-text rules): the
-//! head of a result (`_head`: the status, verdict or result line, the turn-limit note), the
-//! verdict cross-check (`_FINDINGS_SECTION`, `_SEVERE_FINDING`), and the question a worker
+//! What the engine reads in a worker's report or reply (the Python `engine` module's report-text
+//! rules): the head of a result (`_head`: the status, verdict or result line, the turn-limit note),
+//! the verdict cross-check (`_FINDINGS_SECTION`, `_SEVERE_FINDING`), and the question a worker
 //! asked (`_QUESTION`), with the report reader they all start from (`_read_text`).
 //!
 //! The Python matches these with `re` (Unicode, `IGNORECASE`, `MULTILINE`, some `DOTALL`);

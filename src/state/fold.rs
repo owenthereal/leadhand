@@ -310,7 +310,7 @@ mod tests {
         pairs.iter().map(|(k, n)| (k.to_string(), *n)).collect()
     }
 
-    // CATALOG: test_state.py::FoldCardsTests::test_fold_cards_tracks_requested_started_and_accepting
+    // CATALOG: test_state::FoldCardsTests::test_fold_cards_tracks_requested_started_and_accepting
     #[test]
     fn fold_cards_tracks_requested_started_and_accepting() {
         let mut events = vec![
@@ -396,7 +396,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_state.py::FoldCardsTests::test_fold_cards_fix_round
+    // CATALOG: test_state::FoldCardsTests::test_fold_cards_fix_round
     #[test]
     fn fold_cards_fix_round() {
         let mut events = vec![
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!((c.state, c.tip.clone()), (CardStage::Reported, some("t2")));
     }
 
-    // CATALOG: test_state.py::FoldCardsTests::test_fold_cards_integration_resets_verdict
+    // CATALOG: test_state::FoldCardsTests::test_fold_cards_integration_resets_verdict
     #[test]
     fn fold_cards_integration_resets_verdict() {
         let mut events = vec![
@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(fold(&events, &[1])[&1].state, CardStage::Integrating);
     }
 
-    // CATALOG: test_state.py::FoldCardsTests::test_fold_cards_park_and_unpark
+    // CATALOG: test_state::FoldCardsTests::test_fold_cards_park_and_unpark
     #[test]
     fn fold_cards_park_and_unpark() {
         let mut events = vec![
@@ -494,7 +494,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_state.py::FoldCardsTests::test_fold_cards_unparked_without_branch_is_pending
+    // CATALOG: test_state::FoldCardsTests::test_fold_cards_unparked_without_branch_is_pending
     #[test]
     fn fold_cards_unparked_without_branch_is_pending() {
         let events = [
@@ -504,7 +504,7 @@ mod tests {
         assert_eq!(fold(&events, &[1])[&1].state, CardStage::Pending);
     }
 
-    // CATALOG: test_state.py::FoldCardsTests::test_fold_cards_accepted_is_terminal_and_unknown_cards_ignored
+    // CATALOG: test_state::FoldCardsTests::test_fold_cards_accepted_is_terminal_and_unknown_cards_ignored
     #[test]
     fn fold_cards_accepted_is_terminal_and_unknown_cards_ignored() {
         let events = [
@@ -519,7 +519,7 @@ mod tests {
         assert_eq!(cards[&1].park_reason, None);
     }
 
-    // CATALOG: test_state.py::FoldCardsTests::test_fold_cards_ignores_stale_dispatch_events
+    // CATALOG: test_state::FoldCardsTests::test_fold_cards_ignores_stale_dispatch_events
     #[test]
     fn fold_cards_ignores_stale_dispatch_events() {
         let events = [
@@ -551,7 +551,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_state.py::FoldCardsTests::test_fold_cards_parked_stays_parked_on_late_events
+    // CATALOG: test_state::FoldCardsTests::test_fold_cards_parked_stays_parked_on_late_events
     #[test]
     fn fold_cards_parked_stays_parked_on_late_events() {
         let mut events = vec![
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(fold(&events, &[1])[&1].state, CardStage::Cut);
     }
 
-    // CATALOG: test_state.py::FoldCardsTests::test_fold_cards_accepted_overrides_parked
+    // CATALOG: test_state::FoldCardsTests::test_fold_cards_accepted_overrides_parked
     #[test]
     fn fold_cards_accepted_overrides_parked() {
         // R12: the run branch is the truth; once the fast-forward is recorded the card is in.
@@ -614,7 +614,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_state.py::FoldCardsTests::test_fold_cards_exposes_dispatch_kind_for_phase_disambiguation
+    // CATALOG: test_state::FoldCardsTests::test_fold_cards_exposes_dispatch_kind_for_phase_disambiguation
     #[test]
     fn fold_cards_exposes_dispatch_kind_for_phase_disambiguation() {
         let mut events = vec![
@@ -655,7 +655,7 @@ mod tests {
         assert_eq!(fold(&[], &[1])[&1].dispatch_kind, None);
     }
 
-    // CATALOG: test_state.py::FoldCardsTests::test_card_states_constant
+    // CATALOG: test_state::FoldCardsTests::test_card_states_constant
     #[test]
     fn card_states_constant() {
         assert_eq!(

@@ -1,7 +1,7 @@
 //! `pause`, `cancel` and `unpark` in Rust: the conventions for the commands a person types.
 //! Rust-only.
 //!
-//! The Rust form of `tests/contract/contract_rust_control.py`. Each finds its run as
+//! The Rust form of the Python contract suite's `contract_rust_control`. Each finds its run as
 //! `status` does (spec, "Commands you type"): by its directory, its `deck.md`, its run ID,
 //! its directory's name or its slug, or with nothing named, the run whose worktree contains
 //! the current directory, else the only unfinished run of the repository containing it, else

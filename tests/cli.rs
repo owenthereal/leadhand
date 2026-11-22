@@ -1,7 +1,7 @@
 //! The command line itself: the version, usage errors, and the commands the run skill calls.
 //!
-//! The Rust form of `tests/contract/contract_cli.py` (converted from tests/test_cli.py, plus
-//! the binary's half of test_supervisor_files.test_run_skill_commands_match_cli).
+//! The Rust form of the Python contract suite's `contract_cli` (converted from Python's `test_cli`,
+//! plus the binary's half of test_supervisor_files.test_run_skill_commands_match_cli).
 
 #[macro_use]
 mod common;

@@ -1,13 +1,13 @@
 //! Recovery after a relaunch, pause and cancel, and the crash matrix: every crash point at
 //! every occurrence, a restart, and the same final state.
 //!
-//! The Rust form of `tests/contract/contract_recovery.py` (converted from tests/test_recovery.py
-//! and tests/test_engine_recovery.py). `FakeSupervisor` plays the run skill. Where a Python
-//! test appended `resumed` itself (its `resume`), the run is relaunched with `run` (the fake
-//! `claude` as Claude, which exits at once), which records it. Where it called an engine
-//! function, this calls the command that does it (`record`, `unpark`, `start`, `timer`, `run`);
-//! an EngineError is exit code 1 with `error: ...` on stderr (`assert_fails!`). A crash point
-//! is LEADHAND_CRASH_AT on the command, which then exits 97.
+//! The Rust form of the Python contract suite's `contract_recovery` (converted from Python's
+//! `test_recovery` and `test_engine_recovery`). `FakeSupervisor` plays the run skill. Where a
+//! Python test appended `resumed` itself (its `resume`), the run is relaunched with `run` (the fake
+//! `claude` as Claude, which exits at once), which records it. Where it called an engine function,
+//! this calls the command that does it (`record`, `unpark`, `start`, `timer`, `run`); an
+//! EngineError is exit code 1 with `error: ...` on stderr (`assert_fails!`). A crash point is
+//! LEADHAND_CRASH_AT on the command, which then exits 97.
 //!
 //! Recovery is judged from Git, the filesystem and the fakes' logs, beside the binary's events:
 //! whether a Codex process or its tool child is gone comes from the fake Codex's log (its pid
@@ -342,7 +342,7 @@ fn blocked(by: &str) -> Step {
 }
 
 // --------------------------------------------------------------------------
-// test_recovery.py
+// Python's `test_recovery`
 
 mod reconcile {
     use super::*;
@@ -385,7 +385,7 @@ mod reconcile {
     fn test_appends_repair_a_torn_last_line_in_any_record_file() {
         // A crash in the middle of an append leaves a partial last line: in charges.jsonl
         // after one whole record, and as the whole of attempts.jsonl. The next append drops it
-        // and stays line-aligned (test_state.py).
+        // and stays line-aligned (Python's `test_state`).
         let mut w = session_world(&[card(1)]);
         w.next(); // charges the supervisor's session
         let paths = w.paths();
@@ -2088,7 +2088,7 @@ mod every_crash_point {
 }
 
 // --------------------------------------------------------------------------
-// test_engine_recovery.py
+// Python's `test_engine_recovery`
 
 mod resume_after_blocked {
     use super::*;
@@ -2561,7 +2561,7 @@ mod untested {
 }
 
 // --------------------------------------------------------------------------
-// test_state.py: the crash protocol's gate
+// Python's `test_state`: the crash protocol's gate
 
 mod crash_protocol {
     use super::*;

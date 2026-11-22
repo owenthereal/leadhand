@@ -1,4 +1,4 @@
-//! Codex usage (`usage.py`): the session rollout and the `--json` stream.
+//! Codex usage (the Python `usage` module): the session rollout and the `--json` stream.
 //!
 //! The rollout (`<sessions>/YYYY/MM/DD/rollout-<time>-<thread>.jsonl`) is append-only across
 //! resumes. Its source is the top-level `token_usage_record` events written after every model
@@ -344,7 +344,7 @@ pub(crate) mod tests {
         (t.input, t.cached, t.output, t.reasoning)
     }
 
-    // CATALOG: test_usage.py::CodexTests::test_codex_cumulative_takes_last_token_count_and_maps_fields
+    // CATALOG: test_usage::CodexTests::test_codex_cumulative_takes_last_token_count_and_maps_fields
     #[test]
     fn codex_cumulative_takes_last_token_count_and_maps_fields() {
         let dir = tempfile::tempdir().unwrap();
@@ -365,7 +365,7 @@ pub(crate) mod tests {
         assert!(u.known);
     }
 
-    // CATALOG: test_usage.py::CodexTests::test_codex_cumulative_unknown_when_missing_or_without_token_count
+    // CATALOG: test_usage::CodexTests::test_codex_cumulative_unknown_when_missing_or_without_token_count
     #[test]
     fn codex_cumulative_unknown_when_missing_or_without_token_count() {
         let dir = tempfile::tempdir().unwrap();
@@ -380,7 +380,7 @@ pub(crate) mod tests {
         assert!(!codex_cumulative(&"../thr2".into(), &sessions).known);
     }
 
-    // CATALOG: test_usage.py::CodexTests::test_codex_stream_usage_sums_turn_completed
+    // CATALOG: test_usage::CodexTests::test_codex_stream_usage_sums_turn_completed
     #[test]
     fn codex_stream_usage_sums_turn_completed() {
         let dir = tempfile::tempdir().unwrap();
@@ -405,7 +405,7 @@ pub(crate) mod tests {
         assert!(!codex_stream_usage(&dir.path().join("missing.jsonl")).known);
     }
 
-    // CATALOG: test_usage.py::CodexStreamFixtureTests::test_stream_usage_sums_turn_completed
+    // CATALOG: test_usage::CodexStreamFixtureTests::test_stream_usage_sums_turn_completed
     #[test]
     fn stream_fixture_usage_sums_turn_completed() {
         let dir = tempfile::tempdir().unwrap();
@@ -421,7 +421,7 @@ pub(crate) mod tests {
         assert_eq!(u.tokens.cache_write_5m, 0);
     }
 
-    // CATALOG: test_usage.py::CodexStreamFixtureTests::test_stream_cache_write_tokens_are_kept_as_five_minute_writes
+    // CATALOG: test_usage::CodexStreamFixtureTests::test_stream_cache_write_tokens_are_kept_as_five_minute_writes
     #[test]
     fn stream_cache_write_tokens_are_kept_as_five_minute_writes() {
         let dir = tempfile::tempdir().unwrap();

@@ -3,7 +3,7 @@
 //! a CLI path with a space in it (R28), and the run-lock descriptor, which reaches `claude`
 //! alone. Rust-only.
 //!
-//! The Rust form of `tests/contract/contract_rust_launch.py`, on the launch world
+//! The Rust form of the Python contract suite's `contract_rust_launch`, on the launch world
 //! (`common::launch_world::World`).
 //!
 //! With no argument, the command takes the run whose worktree contains the current

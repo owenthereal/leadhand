@@ -1,10 +1,10 @@
 //! Helpers that several engine test files share: the module helpers of
-//! `tests/contract/contract_cards.py` that other contract files import (`codex_world`,
+//! the Python contract suite's `contract_cards` that other contract files import (`codex_world`,
 //! `record`, `recorded`, `result`, `run_line`, `relaunch_env`, `status_lines`, `commit_on` and
 //! the deck constants), with `contract_deck.card_section` and `contract_status.is_unpark_line`;
-//! those of `contract_integration.py` (`NOTE`, `parked_world`, `unpark`, with `requested`,
-//! `found_by` and `found`, which `contract_worktree_safety.py` defines again) and of
-//! `contract_finish.py` (`base_wt`, `marker`, `gate_names`, `drive_to_run`,
+//! those of the Python `contract_integration` (`NOTE`, `parked_world`, `unpark`, with `requested`,
+//! `found_by` and `found`, which the Python `contract_worktree_safety` defines again) and of
+//! the Python `contract_finish` (`base_wt`, `marker`, `gate_names`, `drive_to_run`,
 //! `drive_until_refused`, `to_last_step`) that later files import; and the step literals the
 //! files script (`with_status`, `with_verdict`, `files`, `tampering`), with the small helpers
 //! those files share (`gated`, `gated_with`, `run_id`, `seq`, `last`, `write_script`,
@@ -261,7 +261,7 @@ pub fn is_unpark_line(line: &str, n: i64, root: &Path, reason: &str) -> bool {
 }
 
 // --------------------------------------------------------------------------
-// contract_integration.py
+// the Python `contract_integration`
 
 /// The operator's note in an unpark.
 pub const NOTE: &str = "Use JSON; it is simpler.";
@@ -362,7 +362,7 @@ pub fn unpark(w: &FakeSupervisor, n: i64, note: &str) -> Out {
 }
 
 // --------------------------------------------------------------------------
-// contract_finish.py
+// the Python `contract_finish`
 
 /// In the evidence base worktree's admin folder: the run that added it (R60).
 pub const MARKER: &str = "leadhand-run";

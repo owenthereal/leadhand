@@ -3,8 +3,8 @@
 //! (deliberate changes 4 and 5, and the conventions for the commands a person types).
 //! Rust-only.
 //!
-//! The Rust form of `tests/contract/contract_rust_cli.py`. In stage 2 the surface tests ran
-//! the Rust binary behind the router (LEADHAND_RUST_BIN); here the binary under test is
+//! The Rust form of the Python contract suite's `contract_rust_cli`. In stage 2 the surface tests
+//! ran the Rust binary behind the router (LEADHAND_RUST_BIN); here the binary under test is
 //! `common::bin()` itself.
 
 #[macro_use]

@@ -1,6 +1,6 @@
 //! The run store: the append, read and atomic-write primitives behind every run file, under
-//! the same `flock(2)` on `<run>/state.lock` that `state.py` takes, so a Rust and a Python
-//! process acting on one run exclude each other (spec, contract item 12; Review Focus 1).
+//! the same `flock(2)` on `<run>/state.lock` that the Python `state` module takes, so a Rust and a
+//! Python process acting on one run exclude each other (spec, contract item 12; Review Focus 1).
 //!
 //! - `lock`: `state_lock`, re-entrant within the process (`state.state_lock`);
 //! - `jsonl`: append one line and read whole lines (`state._append`, `state._read_jsonl`);

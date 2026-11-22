@@ -1,14 +1,14 @@
 //! Usage accounting: what `record result` (Claude workers) and `dispatch` (Codex workers)
 //! charge, and how the run prices it.
 //!
-//! The Rust form of `tests/contract/contract_usage.py` (converted from tests/test_usage.py and
-//! tests/test_usage_models.py). A Claude charge is read from charges.jsonl after `record
-//! result`, with the worker's transcript written by the test under $CLAUDE_CONFIG_DIR/projects
-//! (a FakeSupervisor step's `transcript`); one worker's later charges come from answer
-//! dispatches that resume it. A Codex charge is read after a `dispatch` line, with the session
-//! file written by the test under $CODEX_HOME/sessions and the `--json` stream played by the
-//! fake Codex (`common::dispatch_world::World`). The attempt records (attempts.jsonl),
-//! status.json and report.md show the totals and the cost estimates.
+//! The Rust form of the Python contract suite's `contract_usage` (converted from Python's
+//! `test_usage` and `test_usage_models`). A Claude charge is read from charges.jsonl after `record
+//! result`, with the worker's transcript written by the test under $CLAUDE_CONFIG_DIR/projects (a
+//! FakeSupervisor step's `transcript`); one worker's later charges come from answer dispatches that
+//! resume it. A Codex charge is read after a `dispatch` line, with the session file written by the
+//! test under $CODEX_HOME/sessions and the `--json` stream played by the fake Codex
+//! (`common::dispatch_world::World`). The attempt records (attempts.jsonl), status.json and
+//! report.md show the totals and the cost estimates.
 //!
 //! Two invariants hold throughout: every token is charged exactly once (across resumed
 //! workers, repeated charges, a crash between a charge and its attempt record, and concurrent

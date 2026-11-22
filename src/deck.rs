@@ -1,4 +1,4 @@
-//! Deck parsing and validation (`deck.py`; docs/deck-format.md).
+//! Deck parsing and validation (the Python `deck` module; docs/deck-format.md).
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -777,7 +777,7 @@ Profile: standard                 Finish: none
 Context: pointers to the plan section and files, not copies.
 ";
 
-    /// `test_deck.py`'s `deck_text`: cards are (number, role, hard, depends on).
+    /// Python's `test_deck`'s `deck_text`: cards are (number, role, hard, depends on).
     fn deck_text(cards: &[(u32, &str, &str, &str)]) -> String {
         let mut text = String::from(
             "# Deck: T\nSource: s\nBase: main @ abc1234\nBranch: b\nBuild: make build\n\
@@ -925,7 +925,7 @@ Context: pointers to the plan section and files, not copies.
         }
     }
 
-    // CATALOG: test_deck.py::DeckTests::test_spec_example_header_parses
+    // CATALOG: test_deck::DeckTests::test_spec_example_header_parses
     #[test]
     fn spec_example_header_parses() {
         let dir = Dir::new();
@@ -953,7 +953,7 @@ Context: pointers to the plan section and files, not copies.
         );
     }
 
-    // CATALOG: test_deck.py::DeckTests::test_dependency_order_is_stable_topological
+    // CATALOG: test_deck::DeckTests::test_dependency_order_is_stable_topological
     #[test]
     fn dependency_order_is_stable_topological() {
         let dir = Dir::new();
@@ -967,7 +967,7 @@ Context: pointers to the plan section and files, not copies.
         assert_eq!(dependency_order(&d).unwrap(), [1, 2, 3, 4]);
     }
 
-    // CATALOG: test_deck.py::DeckTests::test_digest_changes_when_file_changes
+    // CATALOG: test_deck::DeckTests::test_digest_changes_when_file_changes
     #[test]
     fn digest_changes_when_file_changes() {
         let dir = Dir::new();

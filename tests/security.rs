@@ -1,8 +1,8 @@
 //! Attacks from the security review (docs/compatibility.md, Security), each reproduced with the
 //! fakes and scratch repositories; each must fail closed.
 //!
-//! The Rust form of `tests/contract/contract_security.py` (converted from
-//! tests/test_security.py). The dispatch scenarios (H1, H2, M1) run on a run that `start` made
+//! The Rust form of the Python contract suite's `contract_security` (converted from
+//! Python's `test_security`). The dispatch scenarios (H1, H2, M1) run on a run that `start` made
 //! (`common::dispatch_world::World`: a worktree workspace, Claude and Codex installed), with the
 //! fakes first on PATH and no LEADHAND_TEST_CODEX_BIN, so the `codex` found on PATH is the
 //! fake; a second repository, the victim, is what a forged request aims at. `dispatch`,
@@ -25,7 +25,7 @@
 //! The Python's fake git-lfs was a Python script; here it is a POSIX shell script that keeps
 //! the same store, log and calls files (`FAKE_LFS`).
 //!
-//! GitSafety, at the end, is converted from tests/test_git_safety.py: leadhand's own Git calls
+//! GitSafety, at the end, is converted from Python's `test_git_safety`: leadhand's own Git calls
 //! run no hook or fsmonitor command, and the runner never commits a gitlink.
 
 #[macro_use]
@@ -1445,7 +1445,7 @@ mod l6_tools_inside_the_workspace {
     #[test]
     fn test_run_refuses_a_cli_inside_the_workspace() {
         let w = LaunchWorld::new();
-        let cli = w.workspace.join("scripts/leadhand");
+        let cli = w.workspace.join("bin/leadhand");
         let r = w.run_with(
             &[],
             RunOpts {
@@ -1550,7 +1550,7 @@ fn marker_script(path: &Path, marker: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Converted from tests/test_git_safety.py. The operator's repository has hooks that log to a
+/// Converted from Python's `test_git_safety`. The operator's repository has hooks that log to a
 /// marker file (in its hooks folder, which the run's worktrees share) and an fsmonitor command
 /// that logs to it too, both in its own configuration and in a dirty nested repository
 /// committed as a gitlink, as in the Python test. A whole run (start, card cuts, a reviewer's

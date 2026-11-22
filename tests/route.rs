@@ -1,8 +1,8 @@
 //! Route resolution, as `route` prints it: the route line, then one reason per line.
 //!
-//! The Rust form of `tests/contract/contract_route.py` (converted from tests/test_route.py).
-//! The card comes from tests/fixtures/deck-basic.md (card 1: Hard: no, Risk: low), changed
-//! where a test changes the card. The installed vendors are passed as `--installed`, as the
+//! The Rust form of the Python contract suite's `contract_route` (converted from Python's
+//! `test_route`). The card comes from tests/fixtures/deck-basic.md (card 1: Hard: no, Risk: low),
+//! changed where a test changes the card. The installed vendors are passed as `--installed`, as the
 //! reference test does.
 
 #[macro_use]

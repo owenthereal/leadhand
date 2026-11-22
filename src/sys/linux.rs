@@ -1,5 +1,5 @@
-//! Linux: the process table from `/proc`, read as `procs.py` reads it, and this process's
-//! thread count. No `unsafe` here.
+//! Linux: the process table from `/proc`, read as the Python `procs` module reads it, and this
+//! process's thread count. No `unsafe` here.
 //!
 //! The start time is field 22 of `/proc/<pid>/stat` (clock ticks since boot), written
 //! `"ticks:<n>"` as the Python writes it; the owner is the owner of `/proc/<pid>`, as

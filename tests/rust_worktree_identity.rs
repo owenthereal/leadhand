@@ -1,7 +1,7 @@
 //! The run worktree, recognised by identity before leadhand runs Git there (ruling S2-R54;
 //! spec, bug classes 1 and 4). Rust-only.
 //!
-//! The Rust form of `tests/contract/contract_rust_worktree_identity.py`. The run worktree
+//! The Rust form of the Python contract suite's `contract_rust_worktree_identity`. The run worktree
 //! `<repo>/.worktrees/<slug>` lies inside the operator's checkout. Once its `.git` file is gone,
 //! Git run there finds the operator's repository, so every write meant for the workspace would
 //! land in the operator's checkout. Bug class 1: leadhand never checks out, resets, cleans,

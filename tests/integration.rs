@@ -3,8 +3,8 @@
 //! workspace or moves a ref it must leave alone is caught, preserved and re-run, as `start`,
 //! `next`, `record` and `unpark` show them.
 //!
-//! The Rust form of `tests/contract/contract_integration.py` (converted from
-//! tests/test_engine_integration.py). `FakeSupervisor` plays the run skill; workers misbehave
+//! The Rust form of the Python contract suite's `contract_integration` (converted from
+//! Python's `test_engine_integration`). `FakeSupervisor` plays the run skill; workers misbehave
 //! through a step's `tamper`, which runs in the harness against the workspace. A refusal is
 //! exit code 1 with `error: ...` on stderr.
 //!

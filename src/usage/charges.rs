@@ -461,7 +461,7 @@ mod tests {
         v.iter().map(|s| PyStr::from(*s)).collect()
     }
 
-    // CATALOG: test_usage.py::ChargeClaudeTests::test_charge_claude_resumed_worker_counts_each_message_once
+    // CATALOG: test_usage::ChargeClaudeTests::test_charge_claude_resumed_worker_counts_each_message_once
     #[test]
     fn charge_claude_resumed_worker_counts_each_message_once() {
         let c = Case::new();
@@ -499,7 +499,7 @@ mod tests {
         assert!(c4.usage.known);
     }
 
-    // CATALOG: test_usage.py::ChargeClaudeTests::test_charge_record_is_durable_and_round_trips
+    // CATALOG: test_usage::ChargeClaudeTests::test_charge_record_is_durable_and_round_trips
     #[test]
     fn charge_record_is_durable_and_round_trips() {
         let c = Case::new();
@@ -527,7 +527,7 @@ mod tests {
         assert_eq!(mine("agent1"), r#"{"messages": {"m1": 10}}"#);
     }
 
-    // CATALOG: test_usage.py::ChargeClaudeTests::test_charge_tops_up_message_charged_mid_stream
+    // CATALOG: test_usage::ChargeClaudeTests::test_charge_tops_up_message_charged_mid_stream
     #[test]
     fn charge_tops_up_message_charged_mid_stream() {
         let c = Case::new();
@@ -563,7 +563,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_usage.py::ChargeClaudeTests::test_charge_none_path_is_unknown_and_relative_path_is_rejected
+    // CATALOG: test_usage::ChargeClaudeTests::test_charge_none_path_is_unknown_and_relative_path_is_rejected
     #[test]
     fn charge_none_path_is_unknown_and_relative_path_is_rejected() {
         let c = Case::new();
@@ -615,7 +615,7 @@ mod tests {
         }
     }
 
-    // CATALOG: test_usage.py::ChargeClaudeTests::test_repeated_charge_id_is_harmless
+    // CATALOG: test_usage::ChargeClaudeTests::test_repeated_charge_id_is_harmless
     #[test]
     fn repeated_charge_id_is_harmless() {
         let c = Case::new();
@@ -640,7 +640,7 @@ mod tests {
         assert_eq!(c.charges().len(), 2);
     }
 
-    // CATALOG: test_usage.py::ChargeClaudeTests::test_charge_missing_file_is_unknown_and_moves_no_checkpoint
+    // CATALOG: test_usage::ChargeClaudeTests::test_charge_missing_file_is_unknown_and_moves_no_checkpoint
     #[test]
     fn charge_missing_file_is_unknown_and_moves_no_checkpoint() {
         let c = Case::new();
@@ -670,7 +670,7 @@ mod tests {
         assert!(!c.implementer_total().known);
     }
 
-    // CATALOG: test_usage.py::CodexTests::test_charge_codex_cumulative_deltas
+    // CATALOG: test_usage::CodexTests::test_charge_codex_cumulative_deltas
     #[test]
     fn charge_codex_cumulative_deltas() {
         let c = Case::new();
@@ -688,7 +688,7 @@ mod tests {
         assert_eq!(c.implementer_total().tokens.input, 250);
     }
 
-    // CATALOG: test_usage.py::CodexTests::test_codex_stream_fallback_charged_when_session_missing
+    // CATALOG: test_usage::CodexTests::test_codex_stream_fallback_charged_when_session_missing
     #[test]
     fn codex_stream_fallback_charged_when_session_missing() {
         let c = Case::new();
@@ -735,7 +735,7 @@ mod tests {
         assert_eq!((s.source.as_str(), s.usage.tokens.input), ("codex", 100));
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_rollout_charges_every_response_not_the_token_count_total
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_rollout_charges_every_response_not_the_token_count_total
     #[test]
     fn rollout_charges_every_response_not_the_token_count_total() {
         let c = Case::new();
@@ -759,7 +759,7 @@ mod tests {
         assert_eq!(cumulative.tokens.input, 39874 - 26112);
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_rollout_charged_twice_charges_nothing_new
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_rollout_charged_twice_charges_nothing_new
     #[test]
     fn rollout_charged_twice_charges_nothing_new() {
         let c = Case::new();
@@ -772,7 +772,7 @@ mod tests {
         assert_eq!(c.implementer_total(), first.usage);
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_rollout_truncated_before_resume_charges_only_the_killed_turn
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_rollout_truncated_before_resume_charges_only_the_killed_turn
     #[test]
     fn rollout_truncated_before_resume_charges_only_the_killed_turn() {
         let c = Case::new();
@@ -791,7 +791,7 @@ mod tests {
         assert_eq!((t.input, t.cached, t.output), (39874 - 26112, 26112, 64));
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_rollout_repeated_response_id_counts_once
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_rollout_repeated_response_id_counts_once
     #[test]
     fn rollout_repeated_response_id_counts_once() {
         let c = Case::new();
@@ -804,7 +804,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_rollout_thread_total_mismatch_is_recorded_not_fatal
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_rollout_thread_total_mismatch_is_recorded_not_fatal
     #[test]
     fn rollout_thread_total_mismatch_is_recorded_not_fatal() {
         let c = Case::new();
@@ -830,7 +830,7 @@ mod tests {
         assert_eq!(c.charges()[0], one);
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_possibly_incomplete_flag_is_recorded_on_the_charge
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_possibly_incomplete_flag_is_recorded_on_the_charge
     #[test]
     fn possibly_incomplete_flag_is_recorded_on_the_charge() {
         let c = Case::new();
@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(text.matches("possibly_incomplete").count(), 1);
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_rollout_without_any_usable_record_is_unknown
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_rollout_without_any_usable_record_is_unknown
     #[test]
     fn rollout_without_any_usable_record_is_unknown() {
         let c = Case::new();
@@ -855,7 +855,7 @@ mod tests {
         assert!(!c.codex(1, "thr1").usage.known);
     }
 
-    // CATALOG: test_usage.py::CodexRolloutFixtureTests::test_token_count_is_only_a_fallback_for_a_rollout_without_records
+    // CATALOG: test_usage::CodexRolloutFixtureTests::test_token_count_is_only_a_fallback_for_a_rollout_without_records
     #[test]
     fn token_count_is_only_a_fallback_for_a_rollout_without_records() {
         let c = Case::new();
@@ -869,7 +869,7 @@ mod tests {
         assert_eq!((t.input, t.cached, t.output), (20812 - 18944, 18944, 6));
     }
 
-    // CATALOG: test_usage.py::ClaudeFixtureTests::test_stopped_transcript_charges_its_one_message_once
+    // CATALOG: test_usage::ClaudeFixtureTests::test_stopped_transcript_charges_its_one_message_once
     #[test]
     fn stopped_transcript_charges_its_one_message_once() {
         let c = Case::new();
@@ -891,7 +891,7 @@ mod tests {
         assert_eq!(io(&again.usage), (0, 0));
     }
 
-    // CATALOG: test_usage.py::ClaudeFixtureTests::test_resumed_transcript_charges_each_message_once
+    // CATALOG: test_usage::ClaudeFixtureTests::test_resumed_transcript_charges_each_message_once
     #[test]
     fn resumed_transcript_charges_each_message_once() {
         let c = Case::new();
@@ -904,7 +904,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_usage.py::ClaudeFixtureTests::test_resumed_file_growth_is_charged_once
+    // CATALOG: test_usage::ClaudeFixtureTests::test_resumed_file_growth_is_charged_once
     #[test]
     fn resumed_file_growth_is_charged_once() {
         let c = Case::new();

@@ -1,5 +1,5 @@
-//! Claude transcripts (`usage.py`): where a worker's or a session's transcript is, and what
-//! its assistant messages used, once per message ID.
+//! Claude transcripts (the Python `usage` module): where a worker's or a session's transcript is,
+//! and what its assistant messages used, once per message ID.
 //!
 //! Each content block of one assistant message is its own line, all with the same
 //! `message.id`. Per message ID the record with the largest `output_tokens` is kept (ties keep
@@ -343,7 +343,7 @@ pub(crate) mod tests {
         v.iter().map(|s| PyStr::from(*s)).collect()
     }
 
-    // CATALOG: test_usage.py::ClaudeUsageTests::test_claude_usage_dedupes_by_message_id
+    // CATALOG: test_usage::ClaudeUsageTests::test_claude_usage_dedupes_by_message_id
     #[test]
     fn claude_usage_dedupes_by_message_id() {
         let (u, counted) = claude_usage(&fixture("claude-subagent-duplicates.jsonl"), &[]).unwrap();
@@ -353,7 +353,7 @@ pub(crate) mod tests {
         assert_eq!(u.model, Some(PyStr::from(OPUS)));
     }
 
-    // CATALOG: test_usage.py::ClaudeUsageTests::test_claude_usage_skips_excluded_ids
+    // CATALOG: test_usage::ClaudeUsageTests::test_claude_usage_skips_excluded_ids
     #[test]
     fn claude_usage_skips_excluded_ids() {
         let path = fixture("claude-subagent-duplicates.jsonl");
@@ -362,7 +362,7 @@ pub(crate) mod tests {
         assert_eq!(five(&u), (30, 500, 50, 0, 90));
     }
 
-    // CATALOG: test_usage.py::ClaudeUsageTests::test_claude_usage_ignores_partial_and_garbage_lines
+    // CATALOG: test_usage::ClaudeUsageTests::test_claude_usage_ignores_partial_and_garbage_lines
     #[test]
     fn claude_usage_ignores_partial_and_garbage_lines() {
         let dir = tempfile::tempdir().unwrap();
@@ -445,7 +445,7 @@ pub(crate) mod tests {
         assert_eq!(ours.len(), 6, "{ours:?}");
     }
 
-    // CATALOG: test_usage.py::LocatorTests::test_claude_transcript_locators
+    // CATALOG: test_usage::LocatorTests::test_claude_transcript_locators
     #[test]
     fn claude_transcript_locators() {
         let dir = tempfile::tempdir().unwrap();

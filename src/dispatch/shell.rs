@@ -851,7 +851,7 @@ mod tests {
         }
     }
 
-    // CATALOG: test_dispatch.py::FixRoundTests::test_launch_rechecks_cancel_immediately_before_starting
+    // CATALOG: test_dispatch::FixRoundTests::test_launch_rechecks_cancel_immediately_before_starting
     #[test]
     fn launch_rechecks_cancel_immediately_before_starting() {
         let w = World::new();

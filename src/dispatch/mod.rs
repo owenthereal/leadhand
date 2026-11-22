@@ -1,5 +1,5 @@
-//! Codex dispatch (`dispatch.py`): what starts a Codex worker, and what keeps a forged
-//! dispatch out.
+//! Codex dispatch (the Python `dispatch` module): what starts a Codex worker, and what keeps a
+//! forged dispatch out.
 //!
 //! - `request`: the typed `request.json` and `result.json` records (contract item 5);
 //! - `argv`: the exact `codex exec` command line (contract item 10);

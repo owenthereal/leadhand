@@ -1,5 +1,5 @@
 //! A run directory's layout, and a synthetic one for status and report tests: the Rust form
-//! of `tests/contract/rundir.py`.
+//! of the Python contract suite's `rundir`.
 //!
 //! `RunDir` is written from the file formats, not from the leadhand library: run.json,
 //! deck.md, and whatever events, attempts and charges a test appends. No engine, Git or

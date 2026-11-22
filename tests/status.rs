@@ -1,11 +1,11 @@
 //! What `status [RUN_DIR]` prints about a run directory, and the status.json and
 //! meter-start.json that the engine's checkpoints write.
 //!
-//! The Rust form of `tests/contract/contract_status.py` (converted from tests/test_status.py).
-//! Run directories are built with `RunDir`; the checkpoint files come from `FakeSupervisor`
-//! runs, since only `next` and `record` write them. `status` with no argument is
-//! reference-only (deliberate change 3) and is not converted; `tests/rust_status.rs` has the
-//! Rust behaviour.
+//! The Rust form of the Python contract suite's `contract_status` (converted from Python's
+//! `test_status`). Run directories are built with `RunDir`; the checkpoint files come from
+//! `FakeSupervisor` runs, since only `next` and `record` write them. `status` with no argument is
+//! reference-only (deliberate change 3) and is not converted; `tests/rust_status.rs` has the Rust
+//! behaviour.
 
 #[macro_use]
 mod common;
@@ -285,7 +285,7 @@ mod status {
     #[test]
     fn test_complete_json_without_a_newline_is_ignored() {
         // A record is a line: a last record without its newline is an interrupted append,
-        // unread even when its JSON is whole (test_state.py).
+        // unread even when its JSON is whole (Python's `test_state`).
         let w = RunDir::with_cards(2);
         w.accept(1);
         let mut f = OpenOptions::new()

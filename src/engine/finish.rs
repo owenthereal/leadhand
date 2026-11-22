@@ -1,6 +1,6 @@
-//! The end of a run (`engine.py`: `_end`, `_wrap_up`, `_write_handoff`, `_record_run_line`,
-//! `_done_action`): the outcome decided and recorded, then, once per outcome, the branch
-//! release (a terminal outcome: `release`), the handoff (a blocked run) or its removal,
+//! The end of a run (the Python `engine` module: `_end`, `_wrap_up`, `_write_handoff`,
+//! `_record_run_line`, `_done_action`): the outcome decided and recorded, then, once per outcome,
+//! the branch release (a terminal outcome: `release`), the handoff (a blocked run) or its removal,
 //! `report.md`, the run's line in `<docs_dir>/runs.md` and `report_written`; then `done`.
 //!
 //! The outcome's Git reads are in the run's worktree: the run branch's tip, and whether every

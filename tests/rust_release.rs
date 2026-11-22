@@ -1,6 +1,6 @@
 //! The branch release (deliberate change 2, spec "The branch release"). Rust-only.
 //!
-//! The Rust form of `tests/contract/contract_rust_release.py`. When a run ends complete,
+//! The Rust form of the Python contract suite's `contract_rust_release`. When a run ends complete,
 //! incomplete or failed, leadhand detaches the run worktree at the run head, between the
 //! `outcome` event and the report: `branch_release_started {worktree, branch, sha}`, the
 //! detach, then `branch_released` (with `skipped` and a reason when there was nothing to

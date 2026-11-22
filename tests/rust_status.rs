@@ -2,12 +2,12 @@
 //! 3) and the conventions for the commands a person types (`--json`, candidates listed with
 //! their commands). Rust-only.
 //!
-//! The Rust form of `tests/contract/contract_rust_status.py`. With no argument, the command
-//! takes the run whose worktree contains the current directory, else the only unfinished run
-//! of the repository containing it, else it lists the candidates, each with its exact
-//! command, and exits 1 (spec, "Commands you type"). The reference-only test
-//! `contract_status.StatusWithoutRunDir` pinned the Python's old choice (the newest
-//! unfinished run under `docs_dir`, from any repository); it is not converted.
+//! The Rust form of the Python contract suite's `contract_rust_status`. With no argument, the
+//! command takes the run whose worktree contains the current directory, else the only unfinished
+//! run of the repository containing it, else it lists the candidates, each with its exact command,
+//! and exits 1 (spec, "Commands you type"). The reference-only test
+//! `contract_status.StatusWithoutRunDir` pinned the Python's old choice (the newest unfinished run
+//! under `docs_dir`, from any repository); it is not converted.
 
 #[macro_use]
 mod common;

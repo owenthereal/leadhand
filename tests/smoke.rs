@@ -1,7 +1,7 @@
 //! The fake supervisor end to end: a two-card run, the cleanup that leaves no runner behind,
 //! and a crash drive whose group kill takes down every process the drive started.
 //!
-//! The Rust form of `tests/contract/contract_smoke.py` (itself converted from
+//! The Rust form of the Python contract suite's `contract_smoke` (itself converted from
 //! test_engine_cards.HappyPath.test_happy_path_two_cards_accepted_in_order).
 
 #[macro_use]

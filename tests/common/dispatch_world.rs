@@ -1,5 +1,5 @@
 //! A run `start` made, and the dispatch commands on it: the Rust form of
-//! `contract_dispatch.World` (contract_dispatch.py:104-241) and its module helpers
+//! the Python contract suite's `contract_dispatch.World` and its module helpers
 //! (`wait_for`, `alive`, `logged_alive`).
 //!
 //! Every scenario runs on a run that `start` made (one card, Claude and Codex installed, so

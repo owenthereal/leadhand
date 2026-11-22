@@ -1,5 +1,5 @@
 //! The live runs' fixture: a small Git repository, its bare origin, a deck and the config.
-//! The Rust form of the Python driver's `tests/e2e/make_fixture.py`.
+//! The Rust form of the Python live driver's fixture builder, which this replaced.
 //!
 //! The fixture repository is a tiny Python package: its deck's `Build:` and `Test:` lines
 //! run `python3`. That is the fixture project's own toolchain, made in a temporary folder at

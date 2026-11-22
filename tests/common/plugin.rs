@@ -1,6 +1,6 @@
 //! Reading the plugin files: the agents, the supervisor and the run skill, as
-//! `tests/contract/contract_plugin_files.py` reads them. `tests/plugin_files.rs` checks the
-//! files themselves; `tests/cli.rs` checks the run skill's commands against the binary.
+//! the Python contract suite's `contract_plugin_files` reads them. `tests/plugin_files.rs` checks
+//! the files themselves; `tests/cli.rs` checks the run skill's commands against the binary.
 
 use std::collections::BTreeMap;
 use std::fs;

@@ -1,13 +1,13 @@
-//! Hermetic Git repositories for tests: the Rust form of `tests/gitfixture.py`.
+//! Hermetic Git repositories for tests: the Rust form of the Python `gitfixture` helper.
 //!
 //! Every Git command here runs with the operator's global and system configuration shut
 //! out, so commits never sign, prompt or run the operator's hooks.
 //!
 //! Every helper is confined to the system temp dir, where every `TempRoot` lives: a helper
 //! given a path outside it (such as the project's own checkout) fails before running
-//! anything. gitfixture.py confines to the roots a test registered; without process-wide
-//! state (tests run in parallel), the Rust form confines to the folder those roots share.
-//! GIT_CEILING_DIRECTORIES is that folder, the roots' parent, so Git never discovers an
+//! anything. The Python `gitfixture` helper confines to the roots a test registered; without
+//! process-wide state (tests run in parallel), the Rust form confines to the folder those roots
+//! share. GIT_CEILING_DIRECTORIES is that folder, the roots' parent, so Git never discovers an
 //! enclosing repository.
 
 use std::ffi::OsStr;

@@ -539,7 +539,7 @@ mod tests {
             .unwrap();
     }
 
-    // CATALOG: test_recovery.py::RunnerHelpers::test_runner_state
+    // CATALOG: test_recovery::RunnerHelpers::test_runner_state
     #[test]
     fn runner_state() {
         let (tmp, wd) = worker_dir();
@@ -584,7 +584,7 @@ mod tests {
         );
     }
 
-    // test_recovery.py::RunnerHelpers::test_stop_strays_stops_what_a_dead_runner_left_and_
+    // test_recovery::RunnerHelpers::test_stop_strays_stops_what_a_dead_runner_left_and_
     // leaves_a_live_runner_alone (P14), against real processes.
     #[test]
     fn stop_strays_stops_what_a_dead_runner_left_and_leaves_a_live_runner_alone() {

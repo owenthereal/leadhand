@@ -1,13 +1,13 @@
 //! Launcher scenarios: `run`, which owns a run and starts its Claude Code supervisor, and
 //! `launch-line`, which prints the command that does.
 //!
-//! The Rust form of `tests/contract/contract_launch.py` (converted from tests/test_launch.py,
-//! with the self-path hook of tests/test_test_hooks.py). Every scenario runs on a run that
-//! `start` made (one card, a worktree workspace, the supervisor route `sonnet low` in the
+//! The Rust form of the Python contract suite's `contract_launch` (converted from Python's
+//! `test_launch`, with the self-path hook of Python's `test_test_hooks`). Every scenario runs on a
+//! run that `start` made (one card, a worktree workspace, the supervisor route `sonnet low` in the
 //! run's config.json), with the Rust fake `claude` as the `claude` found on PATH: the world is
 //! `common::launch_world::World`. It reads what the launch leaves: the fake's log (its argv,
-//! working directory, LEADHAND_* environment, pid and parent, and the signals it got),
-//! holder.json, events.jsonl, run.lock (by taking the flock itself), exit codes and stderr.
+//! working directory, LEADHAND_* environment, pid and parent, and the signals it got), holder.json,
+//! events.jsonl, run.lock (by taking the flock itself), exit codes and stderr.
 //!
 //! Spec contract item 11 (the `claude` argument order, environment, working directory, first
 //! message and settings overlay) and item 12 (every lock is flock(2) on the same files): a
@@ -246,7 +246,7 @@ mod argv {
         let r = w.run_with(
             &[],
             RunOpts {
-                env: &[("LEADHAND_TEST_CLI", "/opt/lead hand/scripts/leadhand")],
+                env: &[("LEADHAND_TEST_CLI", "/opt/lead hand/bin/leadhand")],
                 ..RunOpts::default()
             },
         );
@@ -256,14 +256,12 @@ mod argv {
         let i = argv.iter().position(|a| a == "--settings").unwrap();
         assert_json_eq!(
             common::jv(&argv[i + 1]),
-            common::jv(
-                r#"{"sandbox": {"excludedCommands": ["/opt/lead hand/scripts/leadhand *"]}}"#
-            )
+            common::jv(r#"{"sandbox": {"excludedCommands": ["/opt/lead hand/bin/leadhand *"]}}"#)
         );
         let r = w.run_with(
             &[],
             RunOpts {
-                env: &[("LEADHAND_TEST_CLI", "/opt/leadhand/scripts/leadhand")],
+                env: &[("LEADHAND_TEST_CLI", "/opt/leadhand/bin/leadhand")],
                 ..RunOpts::default()
             },
         );
@@ -273,9 +271,7 @@ mod argv {
         let i = argv.iter().position(|a| a == "--settings").unwrap();
         assert_json_eq!(
             common::jv(&argv[i + 1]),
-            common::jv(
-                r#"{"sandbox": {"excludedCommands": ["/opt/leadhand/scripts/leadhand *"]}}"#
-            )
+            common::jv(r#"{"sandbox": {"excludedCommands": ["/opt/leadhand/bin/leadhand *"]}}"#)
         );
     }
 }
@@ -472,7 +468,7 @@ mod launch_line {
     }
 }
 
-/// The testing hook LEADHAND_TEST_CLI (converted from tests/test_test_hooks.py): under
+/// The testing hook LEADHAND_TEST_CLI (converted from Python's `test_test_hooks`): under
 /// LEADHAND_TESTING=1 it takes the place of the binary's own path wherever the binary names
 /// itself; without LEADHAND_TESTING=1 it is ignored.
 mod self_path_hook {

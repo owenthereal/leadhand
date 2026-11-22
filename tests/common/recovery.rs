@@ -1,7 +1,7 @@
-//! `tests/contract/contract_recovery.py`'s pieces that more than one file uses: the module
-//! helpers `relaunch`, `resume`, `codex_log`, `codex_starts`, `codex_alive` and
-//! `card_states`, the fixed commit date, and `StableSupervisor`, the crash matrix's world,
-//! which `tests/rust_cli.rs` drives too.
+//! The Python contract suite's `contract_recovery`'s pieces that more than one file uses: the
+//! module helpers `relaunch`, `resume`, `codex_log`, `codex_starts`, `codex_alive` and
+//! `card_states`, the fixed commit date, and `StableSupervisor`, the crash matrix's world, which
+//! `tests/rust_cli.rs` drives too.
 //!
 //! **`StableSupervisor`** (Python's FakeSupervisor subclass) is a `FakeSupervisor` made by
 //! `stable_supervisor`, with its two overrides in the world's hooks (`stable_hooks`:

@@ -969,7 +969,7 @@ mod tests {
         }
     }
 
-    // CATALOG: test_briefs.py::BriefTests::test_evidence_requires_cards
+    // CATALOG: test_briefs::BriefTests::test_evidence_requires_cards
     #[test]
     fn evidence_requires_cards() {
         let w = world();
@@ -1004,7 +1004,7 @@ mod tests {
         }
     }
 
-    // CATALOG: test_briefs.py::BriefTests::test_verify_says_skip_for_empty_commands
+    // CATALOG: test_briefs::BriefTests::test_verify_says_skip_for_empty_commands
     #[test]
     fn verify_says_skip_for_empty_commands() {
         let mut w = world();
@@ -1017,7 +1017,7 @@ mod tests {
         assert!(text.contains("- Test: make test"), "{text}");
     }
 
-    // CATALOG: test_briefs.py::BriefTests::test_missing_extra_and_unknown_kind_raise
+    // CATALOG: test_briefs::BriefTests::test_missing_extra_and_unknown_kind_raise
     #[test]
     fn missing_extra_and_unknown_kind_raise() {
         let w = world();

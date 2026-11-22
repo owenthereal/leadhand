@@ -467,7 +467,7 @@ mod tests {
         assert!(Git::at(&repo).is_ok());
     }
 
-    // CATALOG: test_gitops.py::GitopsTests::test_git_refuses_a_missing_workspace_directory
+    // CATALOG: test_gitops::GitopsTests::test_git_refuses_a_missing_workspace_directory
     #[test]
     fn git_refuses_a_missing_workspace_directory() {
         let f = Fixture::new();
@@ -492,7 +492,7 @@ mod tests {
         }
     }
 
-    // CATALOG: test_gitops.py::GitopsTests::test_git_error_includes_stderr
+    // CATALOG: test_gitops::GitopsTests::test_git_error_includes_stderr
     #[test]
     fn git_error_includes_stderr() {
         let f = Fixture::new();

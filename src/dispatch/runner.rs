@@ -28,7 +28,8 @@ use crate::usage::meter::{Lenient, VendorStr, deserialize_leniently};
 use crate::wire::PyStr;
 
 // --------------------------------------------------------------------------
-// Timing (`dispatch.py:89-100`; `docs/cli-contract.md`, "Timing that parity tests depend on")
+// Timing (the Python `dispatch` module's timing constants; `docs/cli-contract.md`, "Timing
+// that parity tests depend on")
 
 /// Wall-clock time between heartbeat touches (S2-R31: every second).
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(1);
@@ -1466,7 +1467,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_dispatch.py::FixRoundTests::test_runner_exception_is_blocked_environment
+    // CATALOG: test_dispatch::FixRoundTests::test_runner_exception_is_blocked_environment
     #[test]
     fn runner_exception_is_blocked_environment() {
         assert_eq!(

@@ -1,7 +1,8 @@
-//! Recovery (`engine.py`): reconciling a relaunched run (`_reconcile`, `_unmatched`, `_settle`,
-//! `_reconcile_dispatch`, `_fail_reconciliation`, `_synth_started`, `_charge_earlier_sessions`),
-//! the operator's flags recorded (`_cancel_requested`, `_pause_requested`), and R42's commit of
-//! the partial work a stopped or interrupted Claude worker left (`_commit_partial`).
+//! Recovery (the Python `engine` module): reconciling a relaunched run (`_reconcile`, `_unmatched`,
+//! `_settle`, `_reconcile_dispatch`, `_fail_reconciliation`, `_synth_started`,
+//! `_charge_earlier_sessions`), the operator's flags recorded (`_cancel_requested`,
+//! `_pause_requested`), and R42's commit of the partial work a stopped or interrupted Claude worker
+//! left (`_commit_partial`).
 //!
 //! Reconciliation runs after a `resumed`, before anything new, and only records what really
 //! happened, so a pending cancel then ends the run on true state. It is repeat-safe: a crash part

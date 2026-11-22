@@ -91,7 +91,7 @@ pub fn new_run_dir(docs_dir: &Path, slug: &str, today: &str) -> Result<PathBuf> 
 mod tests {
     use super::*;
 
-    // CATALOG: test_state.py::RunPathsTests::test_new_run_dir_rejects_path_in_slug
+    // CATALOG: test_state::RunPathsTests::test_new_run_dir_rejects_path_in_slug
     #[test]
     fn new_run_dir_rejects_path_in_slug() {
         let tmp = tempfile::tempdir().unwrap();
@@ -108,7 +108,7 @@ mod tests {
         assert!(first.is_dir() && second.is_dir());
     }
 
-    // CATALOG: test_state.py::RunPathsTests::test_run_paths_names
+    // CATALOG: test_state::RunPathsTests::test_run_paths_names
     #[test]
     fn run_paths_names() {
         let root = Path::new("/tmp/run with spaces");

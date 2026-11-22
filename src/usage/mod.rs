@@ -1,5 +1,6 @@
-//! Usage accounting (`usage.py`): the token counts a charge carries, their sums, totals per
-//! group and the estimated cost; `charges.jsonl` read typed; and the Codex meter (`meter`).
+//! Usage accounting (the Python `usage` module): the token counts a charge carries, their sums,
+//! totals per group and the estimated cost; `charges.jsonl` read typed; and the Codex meter
+//! (`meter`).
 //!
 //! - `claude`: Claude transcripts, located, and read once per message ID;
 //! - `codex`: Codex rollouts (once per `response_id`) and `--json` streams;
@@ -481,7 +482,7 @@ mod tests {
         ]
     }
 
-    // CATALOG: test_usage.py::ArithmeticTests::test_add_sums_fields_and_known_is_conjunction
+    // CATALOG: test_usage::ArithmeticTests::test_add_sums_fields_and_known_is_conjunction
     #[test]
     fn add_sums_fields_and_known_is_conjunction() {
         let a = Usage {
@@ -523,7 +524,7 @@ mod tests {
         assert!(!add(&Usage::unknown(), &a).known);
     }
 
-    // CATALOG: test_usage.py::ArithmeticTests::test_subtract_is_field_wise_and_floored_at_zero
+    // CATALOG: test_usage::ArithmeticTests::test_subtract_is_field_wise_and_floored_at_zero
     #[test]
     fn subtract_is_field_wise_and_floored_at_zero() {
         let a = Usage {

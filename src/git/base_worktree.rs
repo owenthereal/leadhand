@@ -1,6 +1,6 @@
-//! The run's evidence base worktree, `<repo>/.worktrees/<workspace name>--base` (`engine.py`:
-//! `_base_worktree`, R60): detached at the run's base commit, so an evidence worker can check
-//! that what the run's tests prove did not hold before the run.
+//! The run's evidence base worktree, `<repo>/.worktrees/<workspace name>--base` (the Python
+//! `engine` module: `_base_worktree`, R60): detached at the run's base commit, so an evidence
+//! worker can check that what the run's tests prove did not hold before the run.
 //!
 //! Before every evidence request it is put back exactly: stale worktree records pruned
 //! (`git worktree prune`, as the Python prunes: the branch release, which never prunes, is

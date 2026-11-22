@@ -1,10 +1,10 @@
-//! Process identity, over the process table in `crate::sys` (`procs.py`).
+//! Process identity, over the process table in `crate::sys` (the Python `procs` module).
 //!
 //! A process's identity is (pid, start time): a pid alone can be reused, so code that
 //! signals a recorded process first checks that the pid still has the start time it was
 //! recorded with. The start time is opaque, only ever compared for equality, and
-//! byte-identical to `procs.py`'s, so a Rust process and a Python process can verify each
-//! other's recorded identities. Zombies (exited, not yet reaped) count as gone: they cannot
+//! byte-identical to the Python `procs` module's, so a Rust process and a Python process can verify
+//! each other's recorded identities. Zombies (exited, not yet reaped) count as gone: they cannot
 //! run or write anything.
 
 use std::collections::{HashMap, HashSet};
@@ -267,7 +267,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // The catalogue's `procs` rows (test_procs.py::ProcsTests)
+    // The catalogue's `procs` rows (test_procs::ProcsTests)
 
     #[test]
     fn own_process_info() {

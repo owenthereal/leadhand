@@ -1,9 +1,9 @@
 //! The deck format and its checks, as `check` (one problem per line) and `route` report them,
 //! and the parsed card as the worker's brief renders it ("The card, verbatim").
 //!
-//! The Rust form of `tests/contract/contract_deck.py` (converted from tests/test_deck.py).
-//! Dependency order, the digest and the spec example's header are catalogued as Rust unit
-//! tests.
+//! The Rust form of the Python contract suite's `contract_deck` (converted from Python's
+//! `test_deck`). Dependency order, the digest and the spec example's header are catalogued as Rust
+//! unit tests.
 
 #[macro_use]
 mod common;

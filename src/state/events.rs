@@ -712,7 +712,7 @@ mod tests {
         }
     }
 
-    // CATALOG: test_state.py::CrashPointTests::test_event_kinds_listed
+    // CATALOG: test_state::CrashPointTests::test_event_kinds_listed
     #[test]
     fn event_kinds_listed() {
         let python_kinds = [

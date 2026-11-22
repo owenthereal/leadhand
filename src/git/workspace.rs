@@ -669,7 +669,7 @@ mod tests {
         (name.into_string().unwrap(), sha)
     }
 
-    // CATALOG: test_gitops.py::GitopsTests::test_default_base_uses_origin_default_branch
+    // CATALOG: test_gitops::GitopsTests::test_default_base_uses_origin_default_branch
     #[test]
     fn default_base_uses_origin_default_branch() {
         let f = Fixture::new();
@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(base(&git), ("origin/develop".into(), upstream));
     }
 
-    // CATALOG: test_gitops.py::GitopsTests::test_default_base_without_origin_uses_local_default
+    // CATALOG: test_gitops::GitopsTests::test_default_base_without_origin_uses_local_default
     #[test]
     fn default_base_without_origin_uses_local_default() {
         let f = Fixture::new();
@@ -726,7 +726,7 @@ mod tests {
         refs.lines().any(|r| r == name)
     }
 
-    // CATALOG: test_gitops.py::GitopsTests::test_prepare_workspace_rejects_unsafe_slugs
+    // CATALOG: test_gitops::GitopsTests::test_prepare_workspace_rejects_unsafe_slugs
     #[test]
     fn prepare_workspace_rejects_unsafe_slugs() {
         let f = Fixture::new();

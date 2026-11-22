@@ -1,4 +1,4 @@
-//! A fake `claude` for leadhand's launcher tests: the Rust form of `tests/fakes/claude`,
+//! A fake `claude` for leadhand's launcher tests: the Rust form of the Python fake it replaced,
 //! writing the same log lines byte for byte for the same inputs. Never touches the network.
 //!
 //! Appends one JSON line to $FAKE_CLAUDE_LOG when it starts: its argv, cwd, pid, ppid and

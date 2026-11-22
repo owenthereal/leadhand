@@ -1,7 +1,7 @@
 //! The live end-to-end runs: the real `claude` and `codex` against a fixture repository,
 //! through the leadhand binary. They print PASS, FAIL, OBSERVED and INCONCLUSIVE check
-//! lines and write raw results; the Rust form of the Python live drivers (the end-to-end
-//! driver, its fixture builder and the Codex push probe in `tests/e2e/`).
+//! lines and write raw results; the Rust form of the Python live drivers they replaced (the
+//! end-to-end driver, its fixture builder and the Codex push probe).
 //!
 //! Both tests are `#[ignore]`: they need network access, a logged-in `claude` and `codex`,
 //! and real money, so they run only when asked for, from an ordinary terminal outside

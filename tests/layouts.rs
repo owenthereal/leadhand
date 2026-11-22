@@ -1,7 +1,7 @@
 //! Repository layouts this version refuses.
 //!
-//! The Rust form of `tests/contract/contract_layouts.py` (converted from
-//! tests/test_unsupported_layouts.py): in-repo docs dirs are not supported in this version
+//! The Rust form of the Python contract suite's `contract_layouts` (converted from
+//! Python's `test_unsupported_layouts`): in-repo docs dirs are not supported in this version
 //! (rulings R48, R48'), so `check` errors and `start` refuses before creating anything.
 //! `InPlace.test_python_accepts_run_worktree_false` is reference-only (deliberate change 1
 //! removes the in-place layout) and leaves with the Python.

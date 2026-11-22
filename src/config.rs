@@ -1,6 +1,6 @@
-//! Configuration (`config.py`): the preset, the user file and the repository file, merged key
-//! by key and validated with the Python's messages; the settings this version refuses; and the
-//! snapshot `start` writes into a run.
+//! Configuration (the Python `config` module): the preset, the user file and the repository file,
+//! merged key by key and validated with the Python's messages; the settings this version refuses;
+//! and the snapshot `start` writes into a run.
 //!
 //! The files are TOML and must be UTF-8, as in the Python. Tables keep the order their keys
 //! first appear in, as Python's `dict` does, so iteration (the step-limit refusals, the first
@@ -1215,7 +1215,7 @@ mod tests {
         }
     }
 
-    // CATALOG: test_config.py::ConfigTests::test_step_limits_follow_the_roles_routes_and_agent_files
+    // CATALOG: test_config::ConfigTests::test_step_limits_follow_the_roles_routes_and_agent_files
     #[test]
     fn step_limits_follow_the_roles_routes_and_agent_files() {
         let f = Files::new(
@@ -1267,7 +1267,7 @@ mod tests {
         );
     }
 
-    // CATALOG: test_config_snapshot.py::Snapshot::test_snapshot_round_trips
+    // CATALOG: test_config_snapshot::Snapshot::test_snapshot_round_trips
     #[test]
     fn snapshot_round_trips() {
         let f = Files::new(

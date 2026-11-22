@@ -543,7 +543,7 @@ mod tests {
     use super::*;
     use crate::dispatch::{BlockedBy, Status};
 
-    // CATALOG: test_test_hooks.py::ForegroundWait::test_default_is_540_seconds
+    // CATALOG: test_test_hooks::ForegroundWait::test_default_is_540_seconds
     #[test]
     fn foreground_wait_default_is_540_seconds() {
         assert_eq!(crate::testing::FOREGROUND_WAIT, Duration::from_secs(540));

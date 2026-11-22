@@ -1,13 +1,13 @@
 //! Safety behaviours of a worktree run, and the operator-checkout invariant (ruling S1-R16).
 //!
-//! The Rust form of `tests/contract/contract_worktree_safety.py` (written for stage 1 from
-//! tests/test_engine_in_place.py, the in-place cases of tests/test_gitops.py and the rulings
-//! they rest on: core run Codex round 10, R30, R54', R60, R63, R64; docs/compatibility.md,
-//! Security). In-place runs are gone (deliberate change 1); what they tested that also holds
-//! for a run in its own worktree is a worktree scenario here. SavedState and Workspace, at the
-//! end, convert the rest of tests/test_gitops.py's GitopsTests that a run shows from outside:
-//! a violation's saved commit and sibling refs, the run's worktree and the excludes, and
-//! leadhand's own commits made unsigned.
+//! The Rust form of the Python contract suite's `contract_worktree_safety` (written for stage 1
+//! from Python's `test_engine_in_place`, the in-place cases of `test_gitops` and the rulings they
+//! rest on: core run Codex round 10, R30, R54', R60, R63, R64; docs/compatibility.md, Security).
+//! In-place runs are gone (deliberate change 1); what they tested that also holds for a run in its
+//! own worktree is a worktree scenario here. SavedState and Workspace, at the end, convert the rest
+//! of Python's `test_gitops`'s GitopsTests that a run shows from outside: a violation's saved
+//! commit and sibling refs, the run's worktree and the excludes, and leadhand's own commits made
+//! unsigned.
 //!
 //! `FakeSupervisor` plays the run skill; a worker misbehaves through its step's `tamper`, which
 //! runs in the harness against the run's worktree. Every safety outcome is judged from Git and
@@ -1203,7 +1203,7 @@ mod operator_checkout {
 }
 
 // --------------------------------------------------------------------------
-// A violation's saved state: what tests/test_gitops.py checks of preserve_and_restore
+// A violation's saved state: what Python's `test_gitops` checks of preserve_and_restore
 
 /// The absolute path of `name` in the worktree's Git folders (`rev-parse --git-path`).
 #[track_caller]
@@ -1636,7 +1636,7 @@ mod saved_state {
     #[test]
     fn test_a_nested_repository_at_a_gitlink_is_not_a_violation() {
         // Leadhand's Git calls ignore submodules (diff.ignoreSubmodules=all,
-        // test_git_safety.py): a reviewer who checks out a nested repository at a gitlink
+        // Python's `test_git_safety`): a reviewer who checks out a nested repository at a gitlink
         // path, at another commit than the gitlink records, changes nothing leadhand checks.
         // Plain Git sees the gitlink as a tracked change, so a binary that drops the setting
         // finds a violation here.
@@ -1720,7 +1720,7 @@ mod saved_state {
 }
 
 // --------------------------------------------------------------------------
-// The run's worktree and the excludes `start` adds (test_gitops.py)
+// The run's worktree and the excludes `start` adds (Python's `test_gitops`)
 
 mod workspace {
     use super::*;

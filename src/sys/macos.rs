@@ -1,5 +1,5 @@
-//! macOS: the process table from `sysctl` `kern.proc`, read as `procs.py` reads it through
-//! ctypes (Claude Code's sandbox refuses `ps` but allows this).
+//! macOS: the process table from `sysctl` `kern.proc`, read as the Python `procs` module reads it
+//! through ctypes (Claude Code's sandbox refuses `ps` but allows this).
 //!
 //! - `KERN_PROC_PID` / `KERN_PROC_ALL` give `struct kinfo_proc` records; the start time is
 //!   `kp_proc.p_starttime` as `"<sec>.<usec:06>"`.
@@ -17,8 +17,9 @@ use libc::{CTL_KERN, KERN_ARGMAX, KERN_PROC, KERN_PROC_ALL, KERN_PROC_PID, KERN_
 use super::ProcInfo;
 
 // `struct kinfo_proc` (<sys/sysctl.h>: `struct extern_proc kp_proc` from <sys/proc.h>, then
-// `struct eproc kp_eproc`). The size and offsets are `procs.py`'s, and match `offsetof` and
-// `sizeof` compiled against the macOS SDK headers (arm64; x86_64 has the same LP64 layout).
+// `struct eproc kp_eproc`). The size and offsets are the Python `procs` module's, and match
+// `offsetof` and `sizeof` compiled against the macOS SDK headers (arm64; x86_64 has the same LP64
+// layout).
 /// `sizeof(struct kinfo_proc)` on 64-bit Darwin.
 const KINFO_SIZE: usize = 648;
 /// `kp_proc.p_un.__p_starttime`: `struct timeval { int64 tv_sec; int32 tv_usec }`.
@@ -221,7 +222,7 @@ mod tests {
     fn procargs_environment_follows_the_arguments() {
         let raw = procargs(
             2,
-            b"/usr/bin/python3\0\0\0\0python3\0A=1-argv\0A=1\0B=2\0\0\0junk\0",
+            b"/bin/sleep\0\0\0\0sleep\0A=1-argv\0A=1\0B=2\0\0\0junk\0",
         );
         assert_eq!(environment(&raw), Some(vec![&b"A=1"[..], b"B=2"]));
         // No environment at all.

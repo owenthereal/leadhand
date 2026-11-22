@@ -1,8 +1,8 @@
 //! `report RUN_DIR`: it writes report.md, the run's account of itself, and prints its path.
 //!
-//! The Rust form of `tests/contract/contract_report.py` (converted from tests/test_report.py),
-//! with run directories built by `RunDir`. The report's text is read from the report.md that
-//! `report` writes.
+//! The Rust form of the Python contract suite's `contract_report` (converted from Python's
+//! `test_report`), with run directories built by `RunDir`. The report's text is read from the
+//! report.md that `report` writes.
 
 #[macro_use]
 mod common;

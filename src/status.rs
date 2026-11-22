@@ -1,5 +1,5 @@
-//! `leadhand status` (`status.py`): what the operator sees while a run is going, built from the
-//! event log (the source of truth), and the `status.json` each checkpoint writes.
+//! `leadhand status` (the Python `status` module): what the operator sees while a run is going,
+//! built from the event log (the source of truth), and the `status.json` each checkpoint writes.
 //!
 //! Reading never fails on a live or crashed run: a log line that cannot be read is skipped
 //! and reported as an attention line, and a missing file is an empty log. Every text a run

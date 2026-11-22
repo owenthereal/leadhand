@@ -1,5 +1,5 @@
-//! Worker briefs (`briefs.py`): where a dispatch's scratch folder is, the prompt a Codex
-//! worker gets, and the head of a worker's report.
+//! Worker briefs (the Python `briefs` module): where a dispatch's scratch folder is, the prompt a
+//! Codex worker gets, and the head of a worker's report.
 //!
 //! A brief is a Markdown file in the attempt's scratch folder inside the workspace
 //! (`<ws>/.leadhand/<card or "run">/<dispatch_id>/brief.md`); the worker writes its report

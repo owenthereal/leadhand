@@ -5,7 +5,7 @@
 //! `check` keeps its contract output: one problem per line on stdout. The fix command, when
 //! one command fixes every error, follows on stderr, alone.
 //!
-//! The Rust form of `tests/contract/contract_rust_check.py`.
+//! The Rust form of the Python contract suite's `contract_rust_check`.
 
 #[macro_use]
 mod common;
