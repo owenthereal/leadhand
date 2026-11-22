@@ -1007,6 +1007,20 @@ mod tests {
             wire::to_line(&totals(&last, Group::Source)).unwrap()
         );
         assert_eq!(theirs, ours);
+        // And every line, checkpoints included, is the one the reference wrote when it made
+        // the same charges alone (`charge-checkpoint/charges-all.jsonl`), but for the time.
+        let mask_ts = |line: &str| -> String {
+            let (head, rest) = line.split_once(",\"ts\":\"").expect("a ts field");
+            let (_, tail) = rest.split_once('"').expect("the ts's closing quote");
+            format!("{head},\"ts\":\"<ts>\"{tail}")
+        };
+        let written = fs::read_to_string(&c.paths.charges).unwrap();
+        let reference = reference_lines("charge-checkpoint/charges-all.jsonl");
+        assert_eq!(reference.len(), 6);
+        assert_eq!(
+            written.lines().map(mask_ts).collect::<Vec<_>>(),
+            reference.iter().map(|l| mask_ts(l)).collect::<Vec<_>>()
+        );
     }
 
     #[test]

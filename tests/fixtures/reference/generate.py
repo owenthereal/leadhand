@@ -8,7 +8,9 @@ The Rust tests that once called into the Python reference read these fixtures in
 It imports `leadhand` from scripts/lib, writes every fixture under
 tests/fixtures/reference/, and prints each file with its size. It is deterministic: every
 input is fixed (no timestamps, pids, random values or host paths reach a fixture), so a
-rerun reproduces every fixture byte for byte. README.md says what each file is.
+rerun reproduces every fixture byte for byte. README.md says what each file is. One
+folder is an input, never written: worker-prompts/agents/, frozen copies of the agent files
+the worker prompts are made from.
 
 This file is the only one here that may name the Python reference; the fixtures and the
 README never do (each write is checked). It is deleted with the Python in Task 10.
@@ -126,7 +128,9 @@ def check_kinfo_layout() -> None:
         assert raw is not None and len(raw) == procs._KINFO_SIZE, "no record of the child"
         info = procs._kinfo(raw, 0)
         assert info.pid == child.pid and info.ppid == os.getpid(), info
-        assert info.start == procs.process_start_time(child.pid), info
+        assert info.pgid == os.getpgrp(), info
+        (stat,) = struct.unpack_from("b", raw, procs._OFF_STAT)
+        assert stat in (2, 3), stat  # SRUN, SSLEEP
         assert b"sleep\0" in raw[243:243 + 17], raw[243:243 + 17]
     finally:
         child.kill()
@@ -263,6 +267,7 @@ def charge_checkpoint() -> None:
         charge("rs2", "d3")
         charges = u.read_charges(paths)
         assert len(charges) == 6, charges
+        write("charge-checkpoint/charges-all.jsonl", paths.charges.read_bytes())
         t = u.totals(charges, by="source")
         totals = dumps({k: u.usage_to_dict(v) for k, v in t.items()}) + "\n"
     write("charge-checkpoint/transcript.jsonl", ("\n".join(transcript) + "\n").encode("utf-8"))
@@ -297,11 +302,20 @@ WORKER_PATHS = [
 ]
 
 
+FROZEN_AGENTS = OUT / "worker-prompts" / "agents"
+
+
 def worker_prompts() -> None:
-    for role in briefs.ROLE_AGENT:
-        prompts = [os.fsencode(briefs.worker_prompt(role, Path(fs(b)), Path(fs(r))))
-                   for b, r in WORKER_PATHS]
-        write(f"worker-prompts/{role}.txt", b"\0".join(prompts))
+    """The prompts, made from the frozen copies of the agent files in worker-prompts/agents/
+    (an input here, never written), so that the fixture does not follow later agent edits."""
+    for name in sorted(p.name for p in FROZEN_AGENTS.glob("*.md")):
+        same = (FROZEN_AGENTS / name).read_bytes() == (ROOT / "agents" / name).read_bytes()
+        print(f"frozen agents/{name}: {'identical to' if same else 'differs from'} agents/{name}")
+    with patched(briefs, AGENTS_DIR=FROZEN_AGENTS):
+        for role in briefs.ROLE_AGENT:
+            prompts = [os.fsencode(briefs.worker_prompt(role, Path(fs(b)), Path(fs(r))))
+                       for b, r in WORKER_PATHS]
+            write(f"worker-prompts/{role}.txt", b"\0".join(prompts))
 
 
 # --------------------------------------------------------------------------

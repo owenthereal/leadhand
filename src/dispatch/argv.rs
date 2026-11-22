@@ -400,22 +400,13 @@ mod tests {
         }
     }
 
-    /// One row of `codex-argv.json`: a case of `table()` as the reference read it, and the
-    /// argv its `codex_argv` made of it (`shown`'s form: `ok` and each argument's bytes in hex,
-    /// or `err` and the `ValueError`'s text).
+    /// One row of `codex-argv.json`: a case of `table()` as the reference read it, kept as its
+    /// JSON text, and the argv its `codex_argv` made of it (`shown`'s form: `ok` and each
+    /// argument's bytes in hex, or `err` and the `ValueError`'s text).
     #[derive(Deserialize)]
     struct Recorded {
-        case: RecordedCase,
+        case: Box<serde_json::value::RawValue>,
         argv: String,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct RecordedCase {
-        req: DispatchRequest,
-        last: PyStr,
-        git_common: PyStr,
-        overrides: Vec<(PyStr, PyStr)>,
-        extra: Vec<PyStr>,
     }
 
     #[test]
@@ -447,7 +438,7 @@ mod tests {
         let mut refused = 0;
         for ((c, mine), want) in cases.iter().zip(&py).zip(&theirs) {
             assert_eq!(
-                to_line(&want.case).unwrap(),
+                want.case.get(),
                 to_line(mine).unwrap(),
                 "the recorded case is not the table's"
             );

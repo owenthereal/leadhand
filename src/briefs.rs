@@ -83,6 +83,12 @@ pub fn worker_prompt(role: &str, brief: &Path, report: &Path) -> Result<OsString
         .iter()
         .find(|(n, _)| *n == name)
         .map_or("", |(_, text)| *text);
+    Ok(worker_prompt_from(file, agent, brief, report))
+}
+
+/// `worker_prompt` for the worker agent `agent` (`leadhand:<name>`), whose agent file's text is
+/// `file`.
+fn worker_prompt_from(file: &str, agent: &str, brief: &Path, report: &Path) -> OsString {
     let body = match file
         .strip_prefix("---\n")
         .and_then(|rest| rest.split_once("\n---\n"))
@@ -100,7 +106,7 @@ pub fn worker_prompt(role: &str, brief: &Path, report: &Path) -> Result<OsString
     prompt.push("\n- Report file: ");
     prompt.push(pure_path(report.as_os_str()));
     prompt.push("\n\nRead the brief now, do the work, write the report, then reply.\n");
-    Ok(prompt)
+    prompt
 }
 
 /// What a report head is when it cannot be parsed (`briefs._UNPARSED`).
@@ -288,7 +294,10 @@ mod tests {
 
     /// `worker-prompts/<role>.txt`: the reference's `worker_prompt` for each role, for each of
     /// these brief and report paths in turn, as the OS gets it (`os.fsencode`), the prompts
-    /// joined by NUL.
+    /// joined by NUL. The reference read frozen copies of the agent files
+    /// (`worker-prompts/agents/<name>.md`), and Rust builds each prompt from the same copy, so
+    /// the check stays the reference's when an agent file changes. `worker_prompt` itself is
+    /// `worker_prompt_from` on the live agent file.
     #[test]
     fn worker_prompts_match_reference() {
         let paths: [(&[u8], &[u8]); 4] = [
@@ -312,18 +321,26 @@ mod tests {
         let roles: Vec<&str> = ROLE_AGENT.iter().map(|(role, _)| *role).collect();
         let mut ours: Vec<Vec<u8>> = Vec::new();
         for role in &roles {
-            let mine: Vec<Vec<u8>> = paths
+            let agent = agent_for(role, "claude").unwrap();
+            let name = agent.trim_start_matches("leadhand:");
+            let frozen =
+                String::from_utf8(read_reference(&format!("worker-prompts/agents/{name}.md")))
+                    .unwrap();
+            let live = AGENTS
                 .iter()
-                .map(|(b, r)| {
-                    worker_prompt(
-                        role,
-                        Path::new(OsStr::from_bytes(b)),
-                        Path::new(OsStr::from_bytes(r)),
-                    )
-                    .unwrap()
-                    .into_vec()
-                })
-                .collect();
+                .find(|(n, _)| *n == name)
+                .map(|(_, text)| *text)
+                .expect("the role's agent file");
+            let mut mine: Vec<Vec<u8>> = Vec::new();
+            for (b, r) in &paths {
+                let (b, r) = (
+                    Path::new(OsStr::from_bytes(b)),
+                    Path::new(OsStr::from_bytes(r)),
+                );
+                let prompt = worker_prompt(role, b, r).unwrap();
+                assert_eq!(prompt, worker_prompt_from(live, agent, b, r), "{role}");
+                mine.push(worker_prompt_from(&frozen, agent, b, r).into_vec());
+            }
             let theirs = read_reference(&format!("worker-prompts/{role}.txt"));
             assert_eq!(mine.join(&b"\0"[..]), theirs, "{role}");
             ours.extend(mine);
