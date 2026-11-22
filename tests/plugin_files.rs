@@ -539,7 +539,7 @@ fn no_python_references_in_shipped_files() {
         Vec::<&str>::new()
     );
     let root = common::plugin::root();
-    let mut hits = Vec::new();
+    let (mut read, mut hits) = (0, Vec::new());
     for file in tracked_files() {
         if NO_PYTHON_EXEMPT.contains(&file.as_str()) {
             continue;
@@ -548,6 +548,7 @@ fn no_python_references_in_shipped_files() {
         if !path.is_file() {
             continue; // a tracked file deleted in the working tree, or a submodule
         }
+        read += 1;
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {file}: {e}"));
         for (n, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
             for found in python_references(line) {
@@ -566,6 +567,8 @@ fn no_python_references_in_shipped_files() {
         hits.len(),
         hits.join("\n")
     );
+    // A tracked path not on disk is skipped: a tree where most were would pass unchecked.
+    assert!(read > 100, "{read} tracked files read");
 }
 
 /// The `.rs` files under `dir`, recursively, relative to the package root.
@@ -607,8 +610,8 @@ fn normalized(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// The path argument of each `include_str!` and `include_bytes!` call in Rust source, with
-/// its line: the literal, or `Err` with what stands there instead. Comments and literals are
-/// not searched.
+/// its line: the literal, or `Err` with what stands there instead (a call with `[` or `{`, or
+/// an argument that is not a plain string literal). Comments and literals are not searched.
 fn include_paths(src: &str) -> Vec<(usize, Result<String, String>)> {
     let code: Vec<char> = common::rust_src::code_only(src).chars().collect();
     let text: Vec<char> = src.chars().collect();
@@ -631,8 +634,13 @@ fn include_paths(src: &str) -> Vec<(usize, Result<String, String>)> {
         };
         let mut i = at + name.len();
         skip_space(&mut i);
+        let line = text[..at].iter().filter(|c| **c == '\n').count() + 1;
         if text.get(i) != Some(&'(') {
-            continue; // the macro's name, not a call
+            let delimiter = text
+                .get(i)
+                .map_or("the end of the file".to_string(), |c| format!("{c:?}"));
+            out.push((line, Err(format!("called with {delimiter}, not `(`"))));
+            continue;
         }
         i += 1;
         skip_space(&mut i);
@@ -642,10 +650,14 @@ fn include_paths(src: &str) -> Vec<(usize, Result<String, String>)> {
             Some(_) => Err("not a plain string literal".to_string()),
             None => Err(format!(
                 "not a string literal: {:?}",
-                rest.chars().take(20).collect::<String>()
+                rest.lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(20)
+                    .collect::<String>()
             )),
         };
-        let line = text[..at].iter().filter(|c| **c == '\n').count() + 1;
         out.push((line, arg));
     }
     out
@@ -657,12 +669,16 @@ fn include_paths(src: &str) -> Vec<(usize, Result<String, String>)> {
 fn no_include_str_outside_kept_paths() {
     let sample = "// include_str!(\"../no.md\")\nlet s = \"include_str!(\\\"x\\\")\";\n\
                   const A: &str = include_str!(\n    \"../templates/a.md\");\n\
-                  const B: &[u8] = include_bytes!(P);\n";
+                  const B: &[u8] = include_bytes!(P);\n\
+                  const C: &str = include_str![\"../templates/c.md\"];\n\
+                  const D: &str = include_str! {\"../templates/d.md\"};\n";
     assert_eq!(
         include_paths(sample),
         [
             (3, Ok("../templates/a.md".to_string())),
-            (5, Err("not a string literal: \"P);\\n\"".to_string())),
+            (5, Err("not a string literal: \"P);\"".to_string())),
+            (6, Err("called with '[', not `(`".to_string())),
+            (7, Err("called with '{', not `(`".to_string())),
         ]
     );
     let root = common::plugin::root();

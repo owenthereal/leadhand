@@ -10,9 +10,9 @@ tested now. A disposition is one of:
   by that module's unit tests in `src/` (many carry a `// CATALOG: <key>` marker);
 - `dropped with in-place mode`, a behaviour of in-place runs, which the Rust binary refuses;
 - `plugin file check (plugin_files)`, a check of the plugin files in `tests/plugin_files.rs`;
-- `reference-only (removed with the Python reference)`, where the converting test pinned a
-  Python behaviour that the Rust binary changes on purpose; it left with the Python, and has
-  no Rust form.
+- `reference-only (removed with the Python reference)`, where the test (or the contract test
+  that converted it) pinned a Python behaviour that the Rust binary changes or removes on
+  purpose; it left with the Python, and has no Rust form.
 
 `tests/catalogue.rs` checks every row: a well-formed key, no key twice, and every Rust test a
 row names exists.
@@ -221,7 +221,7 @@ row names exists.
 | test_procs::ProcsTests::test_start_time_is_stable_and_differs_between_processes | internal: Rust unit test (procs) |
 | test_procs::ProcsTests::test_child_in_new_session_has_own_group_and_is_a_descendant | internal: Rust unit test (procs) |
 | test_procs::ProcsTests::test_same_process_checks_start_time_and_zombies | internal: Rust unit test (procs) |
-| test_procs::ProcsTests::test_ps_fallback_parses_lstart_with_spaces | internal: Rust unit test (procs) |
+| test_procs::ProcsTests::test_ps_fallback_parses_lstart_with_spaces | reference-only (removed with the Python reference) |
 | test_procs::ProcsTests::test_tagged_processes_finds_a_process_by_an_environment_entry | internal: Rust unit test (procs) |
 | test_procs::ProcsTests::test_missing_pid | internal: Rust unit test (procs) |
 | test_launch::ArgvTests::test_launch_argv_order_and_auto_mode | launch::argv::test_argv_order_and_auto_mode; launch::argv::test_no_supervisor_route_means_no_model_or_effort |

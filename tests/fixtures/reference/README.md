@@ -7,10 +7,10 @@ can still check their assertions against it. The Rust tests read these files at 
 These files were made by a generator that imported the reference's library, wrote every file
 below and printed each one with its size. Every input was fixed: no timestamps, process IDs,
 random values or host paths reach a fixture, and a temporary path is replaced by a neutral
-stand-in, so running it again reproduced every file byte for byte. The generator left the
-repository with the reference at the cut-over. Commit ff07282 is the last that holds it:
-`git show ff07282:tests/fixtures/reference/` lists this folder as it stood then, generator
-included.
+stand-in, so running it again reproduced every file byte for byte. The generator was written in
+stage 3 of the Rust rewrite and left the repository with the reference at the cut-over, so it
+never reached `main`. It lives in the history of the stage 3 pull request, which GitHub keeps;
+the squash commit on `main` names that pull request.
 
 Text that is not UTF-8, or holds a lone surrogate, is written the way the reference writes
 JSON: ASCII escapes, an undecodable byte as its surrogate escape (`\udcff` for the byte

@@ -180,8 +180,8 @@ impl Resolver {
 #[test]
 fn every_catalogue_key_is_well_formed_and_unique() {
     let rows = catalogue_rows();
-    // The catalogue holds 655 rows: a reader that found few would check little.
-    assert!(rows.len() > 600, "{} catalogue rows", rows.len());
+    // The catalogue is frozen history, one row per removed Python unit test: none may vanish.
+    assert_eq!(rows.len(), 655, "catalogue rows");
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for (key, _) in &rows {
         *counts.entry(key.as_str()).or_insert(0) += 1;

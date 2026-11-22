@@ -4,7 +4,7 @@
 set -eu
 
 # <root>, the plugin folder: this script's parent folder.
-root=$(cd "$(dirname "$0")/.." && pwd -P)
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 
 # In a source checkout: the release build.
 bin=$root/target/release/leadhand

@@ -25,7 +25,7 @@ folder.
   written atomically: a temporary file in the same folder, `fsync`, then `rename`. They are
   indented by 2 and ASCII-only (see "Non-UTF-8 paths").
 - **JSON-lines files** (`events.jsonl`, `attempts.jsonl`, `charges.jsonl`) hold one compact
-  JSON object per line (`separators=(",", ":")`), ASCII-only, appended under `state.lock`.
+  JSON object per line (no space after `,` or `:`), ASCII-only, appended under `state.lock`.
   - A record is a line. A last line without its newline is an interrupted append: readers skip
     it, even when its JSON is whole, and the next append drops it before writing.
   - A complete line that is not JSON makes the reader fail (`next` exits 1); `status` shows it
@@ -36,7 +36,8 @@ folder.
   only for equality with a value made the same way on the same machine:
   - macOS: `<seconds>.<microseconds, 6 digits>` from `sysctl` (`KERN_PROC_PID`);
   - Linux: `ticks:<start time in clock ticks>` from `/proc/<pid>/stat`;
-  - elsewhere, or when those fail: `lstart:<ps lstart text>`.
+  - elsewhere, or when those fail: none. The binary never runs `ps`, so a process whose
+    record it cannot read has no start time.
 - **The binary's own path.** The binary names itself by its fully resolved absolute path
   (`std::env::current_exe`): the platform binary that `bin/leadhand` runs, never the
   `bin/leadhand` script. Under `LEADHAND_TESTING=1`, `LEADHAND_TEST_CLI` takes its place
@@ -132,7 +133,7 @@ there.
 
 | Command | Output |
 |---|---|
-| `version` | `leadhand 0.1.0`. The string changes at the cut-over (deliberate change 6). |
+| `version` | `leadhand <package version>`, currently `leadhand 0.2.0` (deliberate change 6: until the cut-over it was the Python's `leadhand 0.1.0`). |
 | `check` | One problem per line on **stdout**, `error: <message>` or `warning: <message>`, then `ok: <n> cards` when there are no errors. Exit 1 when there is an error. A deck or configuration that does not load prints its single `error: …` line on stdout too. |
 | `route` | The route line `<vendor> <model> <effort>`, then one line per reason. When the ladder is exhausted: `ladder exhausted: …` on stderr, exit 1. |
 | `start` | For a new run, `run: <run dir>`; when another run holds the deck's branch, a note before it, `run branch: <branch> (<requested> belongs to another run)`. For an unfinished run of the same deck: `existing run: <run dir>`. Unsupported settings give `warning: <message>` lines on stderr. |
@@ -354,14 +355,14 @@ run ends again (a resumed blocked run):
 ### Event kinds and their fields
 
 Every event line has `seq` (1, 2, … with no gap), `ts` and `kind`; those three names are
-reserved. The fields below are the ones the reference writes. A field marked *opt* is present
+reserved. The fields below are the ones the binary writes. A field marked *opt* is present
 only in some cases.
 
 | Kind | Fields |
 |---|---|
 | `run_started` | `run_id`, `base_sha`, `branch` |
 | `card_cut` | `card`, `branch`, `base`; *opt* `recut_after`, `wave` |
-| `brief_written` | Declared in the kind list; the reference never writes it. |
+| `brief_written` | Declared in the kind list; the binary never writes it. |
 | `dispatch_requested` | `dispatch_id`, `card`, `attempt`, `dispatch_kind`, `role`, `vendor`, `model`, `effort`, `brief`, `report`, `extra`, `notes`, `resumes`, `resume_worker`, `resume_session`, `minutes`. A check adds `expected_branch`, `expected_head` and `refs`. An implementer-side kind adds `refs`, `ref_scope`, `start_tip` and `untracked`. *opt* `continues`; a run-level dispatch adds `gate` and `wave`. |
 | `worker_started` | `dispatch_id`, `worker_id`, `card`, `deadline`, `session`; *opt* `reconciled` |
 | `result_recorded` | `dispatch_id`, `card`, `attempt`, `dispatch_kind`, `worker_id`, `tip`, `session_id`, `files`, `stopped`, `charge_ids`, plus the head: `status`, `blocked_by`, `head`, `verdict`, `result`, `source`, `raw_kept`. *opt*: `interrupted`, `reconciled`, `files_skipped`, `partial_commit`, `partial_commit_error`, `partial_gitlinks_skipped`; and for Codex, `committed`, `commit_error`, `commit_skipped` and `gitlinks_skipped` |
@@ -429,7 +430,7 @@ A testing build exits 97 at a crash point when `LEADHAND_CRASH_AT` names it:
 | `after_cancel_request` | a runner asked to stop, its stop not yet confirmed |
 | `before_gate_record` | before a gate's result is recorded |
 
-The contract suite's harness adds two of its own, `before_commit` and `after_commit`, in the
+The contract tests' harness (`tests/common`) adds two of its own, `before_commit` and `after_commit`, in the
 fake workers. They follow the same protocol.
 
 ## 9. Environment variables
@@ -493,7 +494,7 @@ clock offset, the self path, the Codex binary override, the foreground wait and 
 | `LEADHAND_TEST_CARD_LOOP_ONLY` | `1`: `next` returns `done` with a null outcome once the card loop ends (no gates). |
 | `LEADHAND_INSTALLED_VENDORS` | A comma-separated list that replaces the `PATH` lookup of installed vendors. |
 | `LEADHAND_MINUTE_SECONDS` | Seconds per "minute" of a worker's time limit. |
-| `LEADHAND_TEST_CLOCK_OFFSET` | Seconds added to the engine's clock, `engine._now`. That is the clock for dispatch deadlines (`next`'s `deadline`, `worker_started.deadline`), deadline checks and `timer`. It does not move `ts` stamps, file times, the runner's limits or the heartbeat. |
+| `LEADHAND_TEST_CLOCK_OFFSET` | Seconds added to the engine's clock, `testing::now`. That is the clock for dispatch deadlines (`next`'s `deadline`, `worker_started.deadline`), deadline checks and `timer`. It does not move `ts` stamps, file times, the runner's limits or the heartbeat. |
 | `LEADHAND_TEST_CLI` | The path the binary names itself by, everywhere (see "Conventions"). |
 | `LEADHAND_TEST_FOREGROUND_WAIT` | Seconds, read as a float, that replace `FOREGROUND_WAIT` (540 s) as how long `dispatch` waits in the foreground before exit 75. It does not change the runner's limits, the heartbeat or `LEADHAND_MINUTE_SECONDS`. |
 
@@ -521,7 +522,7 @@ The **dispatch line** that `next` gives the `leadhand:codex` proxy is one shell-
 <cli> dispatch --run <run> --dispatch-id <id> [--card <n>] --attempt <n> --role <role> --model <model> --effort <effort> --brief <brief> --report <report> --cwd <ws> --kind <kind> --branch <branch> [--resume <thread id>]
 ```
 
-The runner then runs Codex in a new session (`start_new_session`), in the workspace, with the
+The runner then runs Codex in a new session (`setsid`), in the workspace, with the
 prompt on stdin:
 
 ```
@@ -589,11 +590,11 @@ existed a Rust process and a Python process excluded each other.
 
 - `run` refuses while holder.json names a supervisor whose pid and start time still match,
   before and after taking the lock.
-- The locked descriptor is passed to `claude` (`pass_fds`), and its number goes in
+- The locked descriptor is passed to `claude` (`sys::pass_fd_to_child`), and its number goes in
   `LEADHAND_LOCK_FD`.
 - The launcher never unlocks while the supervisor lives.
 
-**What every command does first** (`close_inherited_lock`):
+**What every command does first** (`sys::close_inherited_fd`):
 
 - It removes `LEADHAND_LOCK_FD` from its environment, so no child, and no worker, ever
   inherits it.

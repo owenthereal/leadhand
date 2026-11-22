@@ -4,8 +4,8 @@ What was observed of Claude Code, Codex and the operating system, and the decisi
 it. Most of it was observed with the Python reference implementation, by runtime probes and
 live runs, before the Rust binary replaced it; the Rust binary keeps every decision below. The
 runtime probes, a fake plugin and the Python scripts that drove it, left the repository with
-the Python at the cut-over: commit ff07282 is the last that holds them, in `tests/runtime/`
-(`git show ff07282:tests/runtime/` lists them). The live runs are now `tests/live.rs`.
+the Python at the cut-over. Commit 174165d on `main` still holds them, in `tests/runtime/`
+(`git show 174165d:tests/runtime/` lists them). The live runs are now `tests/live.rs`.
 
 ## Supervisor launch
 
