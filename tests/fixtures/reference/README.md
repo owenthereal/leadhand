@@ -55,3 +55,42 @@ given as its JSON literal.
 | `usage/claude-records/transcript.jsonl`, `usage/claude-records/messages.txt` | Odd Claude transcript records (the bytes the Rust test writes, built the same way by the generator), and each message ID and usage the reference read from them. | `usage::claude::tests::records_read_as_the_python_reads_them` |
 | `usage/codex-rollout/codex-rollout-interrupted.jsonl` | An input, not an output: a frozen copy of `tests/fixtures/codex-rollout-interrupted.jsonl`, so a later edit to that fixture changes neither side. The `charge-checkpoint/` files were recorded from it too. | `usage::codex::tests::rollout_reads_as_the_python_reads_it`, `usage::charges::tests::charge_continues_reference_checkpoint` |
 | `usage/codex-rollout/read.txt` | What the reference read from that rollout with four more lines: each response ID and usage, then the thread total and the last token count's total. | the same |
+
+## The dispatch files
+
+`dispatch/argv.json`, `dispatch/env.json`, `dispatch/request.json`, `dispatch/runner.json` and
+`dispatch/caller.json` are section files as above. Where an input or an output may hold a lone
+surrogate, the row gives the JSON text itself, as a JSON string (the text the Rust test's own
+JSON writer makes, or the reference's `json.dumps`), so a plain JSON reader reads every row.
+
+`dispatch/caller.json` ran on the world the Rust test lays out, built by the generator the same
+way under a temporary root that is a symlink. Its rows write that root `{root}`, its real path
+`{real}`, the generator's pid `{pid}`, and in the `evidence_dirs` outputs (paths in hex) the
+root's bytes in hex `{root_hex}`. The Rust test fills in its own.
+
+`dispatch/shell/<case>.json` are the reference runner's runs: the generator lays out the Rust
+test's world (a run with one worker folder whose workspace is a Git repository) under a
+resolved temporary root, writes the test's request, and runs the reference runner on it in a
+child process with only the test's environment, with the reference's own fake Codex (the one
+written in Python). The Rust test replays each case with its own runner and the Rust fake
+Codex, `leadhand-fake-codex`. Each file is a JSON object, one key per line: the runner's `exit`
+code, then what the test compares. Records are steadied as the test steadies its own:
+`result.json` with `confirmed_at` 0, no start or end time, and each stopped process as
+`{"pid": 0, "pgid": 0, "start": null}`; each attempt without its run ID (checked first to be
+the world's) or times; each charge with an empty `ts`. The root is written `{root}`.
+
+| File | What it is | Read by |
+|---|---|---|
+| `dispatch/argv.json` | `toml_string`: the reference's `_toml_string` of nine texts (control characters, non-ASCII text, an astral character as a surrogate pair, a surrogate escape), as JSON. | `dispatch::argv::tests::toml_string_is_python_json_dumps_without_ascii_escapes` |
+| `dispatch/env.json` | `environments`: for thirteen parent environments (each a list of name and value pairs, ordered by name), a GitHub CLI config folder (its JSON text), a run ID and a dispatch tag, the reference's `blocking_env`, its `worker_env` with the tag, and its Codex overrides, as JSON. | `dispatch::env::tests::environments_match_python` |
+| `dispatch/request.json` | `requests` and `results`: two `request.json`s and six `result.json`s, pretty, as the reference writes them. `request_read_back`: whether the reference reads the Rust test's line of each request as the request it read from its own text (`True`). `request_reads` and `result_reads`: what the reference made of hand-written documents. | `dispatch::request::tests` |
+| `dispatch/runner.json` | `stream`: the reference's stream summary (steps, thread ID, open turn, last agent message, error texts) of seven stream files, given in hex. `reply_checks`: its status-line check, usage-limit search and classification of 31 replies. `classify`: its classification of 18 runner outcomes. | `dispatch::runner::tests` |
+| `dispatch/caller.json` | `anchor`: the outcome (`ok ...` or `err:` and the refusal) of 64 anchor and request checks, each given as the function, the environment and its arguments. `evidence_dirs`: the evidence base worktree the reference finds, or its refusal, for 21 requests against worktrees laid out as the Rust test lays them out. | `dispatch::caller::tests` |
+| `dispatch/shell/scenarios/ready.jsonl`, `dispatch/shell/scenarios/many-steps.jsonl` | Inputs, not outputs: frozen copies of the fake Codex scenarios of `tests/fixtures/scenarios/`, as they stood when the runs were recorded. The generator's runs and the Rust test's replays both use them. | `dispatch::shell::tests` |
+| `dispatch/shell/ready.json` | The ready scenario: the result, attempts and charges, the stream as Codex wrote it, and `untracked.json`'s paths. | `dispatch::shell::tests::fake_codex_ready_scenario_writes_result_and_attempt` |
+| `dispatch/shell/step-limit.json` | The many-steps scenario with a 3-step limit: the result's status, exit reason and Codex exit code. | `dispatch::shell::tests::step_limit_scenario_stops_codex_with_sigint` |
+| `dispatch/shell/crafted-head.json` | A reply head the reference's report parser fails on: whether a result or the stop acknowledgement was written, and the attempts and charges. | `dispatch::shell::tests::crafted_report_head_kills_the_runner_before_charging` |
+| `dispatch/shell/prompt-not-utf8.json` | A brief path with bytes that are not UTF-8: the result, attempts and charges, and `codex.stderr`, the encoder's position written `{surrogates}` (where the prompt holds the surrogate escapes, which moves with the root's length and the agent file). | `dispatch::shell::tests::prompt_that_is_not_utf8_is_blocked_as_python_blocks_it` |
+| `dispatch/shell/unencodable-model.json` | A model with a lone surrogate: `runner.json`'s Codex and launch intent's `aborted`, the stream and `codex.stderr`, whether a result or the stop acknowledgement was written, the attempts, and how many lines the fake Codex logged. | `dispatch::shell::tests::argument_the_os_cannot_take_kills_the_runner_at_launch` |
+| `dispatch/shell/cancel-before-launch.json` | A cancel written before the runner started: the result, attempts and charges. | `dispatch::shell::tests::cancel_before_launch_finalizes_cancelled` |
+| `dispatch/shell/probe.json` | A probe in place of Codex, the runner given a descriptor without close-on-exec: what the probe reported. | `dispatch::shell::tests::codex_gets_sighup_ignored_and_no_inherited_descriptor` |

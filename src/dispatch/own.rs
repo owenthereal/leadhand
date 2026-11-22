@@ -455,29 +455,66 @@ mod tests {
         }
     }
 
-    fn python(code: &str) -> Kid {
-        let mut cmd = Command::new("python3");
-        cmd.args(["-c", code])
-            .stdin(Stdio::null())
+    /// `cmd` started in a session of its own, its stdout a pipe.
+    fn spawn_kid(mut cmd: Command) -> Kid {
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         detach_session(&mut cmd);
         Kid(cmd.spawn().unwrap())
     }
 
-    /// A process holding `runner.lock`, once it holds it.
-    fn holding_runner_lock(wd: &Path) -> Kid {
-        let lock = wd.join(RUNNER_LOCK);
-        let code = format!(
-            "import fcntl,os,sys,time\nfd=os.open({:?},os.O_RDWR|os.O_CREAT)\n\
-             fcntl.flock(fd,fcntl.LOCK_EX)\nprint('locked',flush=True)\ntime.sleep(120)",
-            lock.to_str().unwrap()
-        );
-        let mut kid = python(&code);
-        let mut line = String::new();
-        BufReader::new(kid.0.stdout.as_mut().unwrap())
-            .read_line(&mut line)
+    /// `sleep 120`, in a session of its own.
+    fn sleeper() -> Kid {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("120");
+        spawn_kid(cmd)
+    }
+
+    /// The lock file `lock_holder_child` takes; unset in an ordinary run.
+    const LOCK_HOLDER: &str = "LEADHAND_OWN_TEST_LOCK_HOLDER";
+
+    /// Not a test of its own: the process `holding_runner_lock` starts (this test binary,
+    /// running this test alone). It opens the file it was given (created if missing), takes an
+    /// exclusive `flock` on it, says so and sleeps. Does nothing in an ordinary run.
+    #[test]
+    fn lock_holder_child() {
+        let Some(lock) = std::env::var_os(LOCK_HOLDER) else {
+            return;
+        };
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock)
             .unwrap();
+        rustix::fs::flock(&file, FlockOperation::LockExclusive).unwrap();
+        // On a line of its own: libtest has printed `test <name> ... ` without a newline.
+        println!("\nlocked");
+        thread::sleep(Duration::from_secs(120));
+    }
+
+    /// A process holding `runner.lock`, once it holds it: this test binary again, in a
+    /// session of its own.
+    fn holding_runner_lock(wd: &Path) -> Kid {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "dispatch::own::tests::lock_holder_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(LOCK_HOLDER, wd.join(RUNNER_LOCK));
+        let mut kid = spawn_kid(cmd);
+        let mut stdout = BufReader::new(kid.0.stdout.as_mut().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if stdout.read_line(&mut line).unwrap() == 0 || line.trim() == "locked" {
+                break;
+            }
+        }
         assert_eq!(line.trim(), "locked");
         kid
     }
@@ -523,7 +560,7 @@ mod tests {
         age(&wd.join(HEARTBEAT), 600);
         assert_eq!(super::runner_state(&wd, short).unwrap(), RunnerState::Hung);
         runner.kill();
-        let codex = python("import time; time.sleep(120)");
+        let codex = sleeper();
         let record = format!(
             "{{\"runner\": {}, \"codex\": {}}}",
             codex.record(),
@@ -554,8 +591,8 @@ mod tests {
         let (_tmp, wd) = worker_dir();
         let timeout = Duration::from_secs(15);
         assert!(super::stop_strays(&wd, timeout).unwrap().is_empty());
-        let mut tool = python("import time; time.sleep(120)");
-        let mut codex = python("import time; time.sleep(120)");
+        let mut tool = sleeper();
+        let mut codex = sleeper();
         let record = format!(
             "{{\"runner\": {{\"pid\": 1, \"pgid\": 1, \"start\": \"gone\"}}, \"codex\": {}}}",
             codex.record()
@@ -608,7 +645,7 @@ mod tests {
     fn a_spawned_runner_counts_as_starting_until_runner_json() {
         let (_tmp, wd) = worker_dir();
         assert_eq!(owner_state(&wd).unwrap(), OwnerState::None);
-        let kid = python("import time; time.sleep(120)");
+        let kid = sleeper();
         let record = kid.record();
         let with_at = |at: f64| format!("{}, \"at\": {at}}}", record.trim_end_matches('}'));
         fs::write(wd.join(SPAWN), with_at(wall_now())).unwrap();
@@ -815,8 +852,8 @@ mod tests {
         // record without `pgid` still names a live Codex, so the runner is orphaned (stopped,
         // never replaced alongside it), not dead.
         let (_tmp, wd) = worker_dir();
-        let codex = python("import time; time.sleep(120)");
-        let tool = python("import time; time.sleep(120)");
+        let codex = sleeper();
+        let tool = sleeper();
         let without_group = |kid: &Kid| {
             let info = crate::sys::proc_info(kid.pid()).unwrap();
             format!("{{\"pid\": {}, \"start\": \"{}\"}}", info.pid, info.start)

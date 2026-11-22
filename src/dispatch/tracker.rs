@@ -371,7 +371,7 @@ pub fn stop(tracker: &mut Tracker, deadline: Option<Instant>) -> Vec<StoppedProc
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::process::ExitStatusExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -440,33 +440,62 @@ mod tests {
         assert!(tracker.0.exited().is_some());
     }
 
+    /// Set in `tool_parent_child`'s process only; unset in an ordinary run.
+    const TOOL_PARENT: &str = "LEADHAND_TRACKER_TEST_TOOL_PARENT";
+
+    /// Not a test of its own: the stand-in Codex `ladder_stops_a_tool_child_codex_left_in_its_
+    /// own_group` starts (this test binary, running this test alone). It starts `sleep 30` in a
+    /// process group of its own, prints its pid, and waits for its stdin to close. Does nothing
+    /// in an ordinary run.
+    // The tool is left behind on purpose, never waited for, as Codex leaves it.
+    #[allow(clippy::zombie_processes)]
+    #[test]
+    fn tool_parent_child() {
+        if std::env::var_os(TOOL_PARENT).is_none() {
+            return;
+        }
+        let tool = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // On a line of its own: libtest has printed `test <name> ... ` without a newline.
+        println!("\ntool {}", tool.id());
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+    }
+
     #[test]
     fn ladder_stops_a_tool_child_codex_left_in_its_own_group() {
         // Codex starts a tool command in a process group of its own and leaves it behind at
         // SIGINT: the snapshot recorded it, so SIGTERM to its group stops it.
         let tmp = tempfile::tempdir().unwrap();
-        let mut cmd = Command::new("python3");
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
         cmd.args([
-            "-c",
-            "import subprocess, sys\n\
-             p = subprocess.Popen(['sleep', '30'], start_new_session=True, stdin=subprocess.DEVNULL)\n\
-             print(p.pid, flush=True)\n\
-             sys.stdin.read()\n",
+            "dispatch::tracker::tests::tool_parent_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
         ])
+        .env(TOOL_PARENT, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
         detach_session(&mut cmd);
         let mut child = cmd.spawn().unwrap();
         let _stdin = child.stdin.take();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
-            &mut line,
-        )
-        .unwrap();
+        loop {
+            line.clear();
+            if std::io::BufRead::read_line(&mut stdout, &mut line).unwrap() == 0
+                || line.starts_with("tool ")
+            {
+                break;
+            }
+        }
         let pid = pid_of(&child);
-        let tool: i32 = line.trim().parse().unwrap();
+        let tool: i32 = line.trim().trim_start_matches("tool ").parse().unwrap();
         let _stray = procs::identify(tool).map(Stray);
         let start = procs::identify(pid).map(|id| id.start);
         let record = StoppedProc {

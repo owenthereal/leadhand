@@ -149,8 +149,8 @@ mod tests {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use super::*;
-    use crate::wire::tests::python;
-    use crate::wire::{PyStr, to_line};
+    use crate::wire::tests::reference_outputs;
+    use crate::wire::{PyStr, ascii_json, to_line};
 
     fn env(pairs: &[(&str, &[u8])]) -> Env {
         pairs
@@ -232,29 +232,23 @@ mod tests {
             .collect();
         // `str(gh_dir)` is the pathlib spelling.
         let gh = OsStr::from_bytes(b"/w s//r\xff/./workers/c1-a1/gh-config/");
-        let code = "import json, sys\nfrom pathlib import Path\n\
-                    from leadhand import dispatch as d\n\
-                    gh, run_id, tag = Path(sys.argv[2]), sys.argv[3], sys.argv[4]\n\
-                    out = []\n\
-                    for pairs in json.loads(sys.argv[1]):\n\
-                    \x20 parent = dict(pairs)\n\
-                    \x20 b = d.blocking_env(parent, gh_config_dir=gh)\n\
-                    \x20 w = {**d.worker_env(parent, run_id=run_id, gh_config_dir=gh), d.TAG_VAR: tag}\n\
-                    \x20 o = {**d.blocking_env(parent, gh_config_dir=gh), 'LEADHAND_RUN_ID': run_id, d.TAG_VAR: tag}\n\
-                    \x20 out.append([list(b.items()), list(w.items()), list(o.items())])\n\
-                    print(json.dumps(out))\n";
+        // The reference's `blocking_env`, `worker_env` with the tag and the Codex overrides of
+        // each parent, recorded for these parents (as JSON), this folder (its JSON text), the
+        // run ID and the tag.
         let arg = to_line(&cases).unwrap();
-        let out = python(
-            code,
-            &[
-                OsStr::new(&arg),
-                gh,
-                OsStr::new("r-1"),
-                OsStr::new("r-1:c1-a1:2"),
-            ],
+        let given = [
+            arg,
+            ascii_json(&PyStr::from_os(gh)),
+            "r-1".into(),
+            "r-1:c1-a1:2".into(),
+        ];
+        let out = reference_outputs(
+            "dispatch/env.json",
+            "environments",
+            &[serde_json::json!(given)],
         );
         let theirs: Vec<(Pairs, Pairs, Pairs)> =
-            serde_json::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
+            serde_json::from_str(out[0].as_str().unwrap()).unwrap();
         assert_eq!(theirs.len(), parents.len());
         let gh = Path::new(gh);
         for (parent, (b, w, o)) in parents.iter().zip(theirs) {

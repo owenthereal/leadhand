@@ -499,7 +499,7 @@ pub fn runner_worker(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{OsStr, OsString};
+    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::symlink;
 
@@ -507,7 +507,7 @@ mod tests {
 
     use super::*;
     use crate::cli::resolve_caller_in;
-    use crate::wire::tests::python;
+    use crate::wire::tests::reference_outputs;
     use crate::wire::{ascii_json, to_line};
 
     /// The run directories, workspaces and worker folders every scenario runs against.
@@ -792,49 +792,6 @@ mod tests {
             got.unwrap_or_else(|e| format!("err:{}", e.message))
         }
     }
-
-    /// Each scenario's Python outcome: `ok …` or `err:<the DispatchError's text>`. The
-    /// Python's `dispatch` check is `_request_from_args` without `request_for` (which reads
-    /// the run's configuration); `dispatch-runner`'s is `_cmd_runner` with `run_runner`
-    /// replaced, its `leadhand: ` prefix dropped.
-    const PY_SCENARIOS: &str = "import argparse, contextlib, io, json, os, sys\n\
-        from pathlib import Path\n\
-        os.environ.pop('LEADHAND_TESTING', None)\n\
-        from leadhand import dispatch as d\n\
-        seen = []\n\
-        d.run_runner = lambda wd: (seen.append(str(wd)), 0)[1]\n\
-        out = []\n\
-        for sc in json.loads(sys.argv[1]):\n\
-        \x20 for k in ('LEADHAND_RUN_DIR', 'LEADHAND_RUN_ID'):\n\
-        \x20   os.environ.pop(k, None)\n\
-        \x20 os.environ.update(dict(sc['env']))\n\
-        \x20 f = sc['fn']\n\
-        \x20 try:\n\
-        \x20   if f == 'anchored':\n\
-        \x20     real, meta = d.anchored_run(Path(sc['run']))\n\
-        \x20     res = 'ok ' + str(real)\n\
-        \x20   elif f == 'caller':\n\
-        \x20     d._check_dispatch_id(sc['id'])\n\
-        \x20     real, meta = d.anchored_run(Path(sc['run']))\n\
-        \x20     d._worker_dir(Path(sc['run']), real, sc['id'])\n\
-        \x20     res = 'ok ' + str(real)\n\
-        \x20   elif f == 'request':\n\
-        \x20     real, meta = d.anchored_run(Path(sc['run']))\n\
-        \x20     d.check_request(d.request_from_json(sc['req']), real, meta)\n\
-        \x20     res = 'ok'\n\
-        \x20   elif f == 'worker':\n\
-        \x20     wd, req = d._anchored_worker(Path(sc['run']), sc['id'])\n\
-        \x20     res = ('ok none ' if req is None else 'ok req ') + str(wd)\n\
-        \x20   else:\n\
-        \x20     err = io.StringIO()\n\
-        \x20     seen.clear()\n\
-        \x20     with contextlib.redirect_stderr(err):\n\
-        \x20       code = d._cmd_runner(argparse.Namespace(worker_dir=sc['wd']))\n\
-        \x20     res = ('ok ' + seen[0]) if code == 0 else 'err:' + err.getvalue().removeprefix('leadhand: ').rstrip('\\n')\n\
-        \x20 except d.DispatchError as e:\n\
-        \x20   res = 'err:' + str(e)\n\
-        \x20 out.append(res)\n\
-        print(json.dumps(out))\n";
 
     fn scenarios(w: &World) -> Vec<Scenario> {
         let real = |p: &Path| crate::pytext::real_path(p).display().to_string();
@@ -1175,14 +1132,41 @@ mod tests {
         out
     }
 
+    /// The reference fixture of the parity tests: the outcomes the reference gave on the same
+    /// world, laid out by the generator under a root it writes `{root}` (a symlink, whose real
+    /// path it writes `{real}`), its own pid written `{pid}`.
+    const FIXTURE: &str = "dispatch/caller.json";
+
+    /// `value` as JSON, `root` written `{root}`: an input as the reference was given it.
+    fn rooted<T: Serialize>(value: &T, root: &Path) -> serde_json::Value {
+        let text = to_line(value).unwrap();
+        let root = root.display().to_string();
+        serde_json::from_str(&text.replace(&root, "{root}")).unwrap()
+    }
+
     #[test]
     fn every_anchor_refusal_matches_python() {
         let w = world();
         let scenarios = scenarios(&w);
         let py: Vec<PyScenario> = scenarios.iter().map(Scenario::for_python).collect();
-        let arg = to_line(&py).unwrap();
-        let out = python(PY_SCENARIOS, &[OsStr::new(&arg)]);
-        let theirs: Vec<String> = serde_json::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
+        // Each scenario's Python outcome, recorded for these scenarios: `ok …` or
+        // `err:<the DispatchError's text>`. The Python's `dispatch` check is
+        // `_request_from_args` without `request_for` (which reads the run's configuration);
+        // `dispatch-runner`'s is `_cmd_runner` with `run_runner` replaced, its `leadhand: `
+        // prefix dropped.
+        let inputs: Vec<serde_json::Value> = py.iter().map(|s| rooted(s, &w.t)).collect();
+        let root = w.t.display().to_string();
+        let real = crate::pytext::real_path(&w.t).display().to_string();
+        let pid = std::process::id().to_string();
+        let theirs: Vec<String> = reference_outputs(FIXTURE, "anchor", &inputs)
+            .iter()
+            .map(|o| {
+                let o = o.as_str().unwrap();
+                o.replace("{real}", &real)
+                    .replace("{root}", &root)
+                    .replace("{pid}", &pid)
+            })
+            .collect();
         assert_eq!(theirs.len(), scenarios.len());
         for (s, want) in scenarios.iter().zip(&theirs) {
             let ours = s.ours();
@@ -1280,33 +1264,32 @@ mod tests {
                 reqs.push(req);
             }
         }
-        let code = "import json, os, sys\nfrom leadhand import dispatch as d\nout = []\n\
-                    for c in json.loads(sys.argv[1]):\n\
-                    \x20 try:\n\
-                    \x20   dirs = d.evidence_dirs(d.request_from_json(c))\n\
-                    \x20   out.append('ok ' + ' '.join(os.fsencode(p).hex() for p in dirs))\n\
-                    \x20 except d.DispatchError as e:\n\
-                    \x20   out.append('err ' + str(e))\n\
-                    print(json.dumps(out))\n";
-        let arg = to_line(&reqs).unwrap();
-        let theirs: Vec<String> =
-            serde_json::from_str(std::str::from_utf8(&python(code, &[OsStr::new(&arg)])).unwrap())
-                .unwrap();
+        let hex = |p: &Path| -> String {
+            p.as_os_str()
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        // The reference's `evidence_dirs` of each request, on the same layout under its own
+        // resolved root: `ok` and each folder's bytes in hex, or `err` and the DispatchError's
+        // text; the root written `{root}`, or `{root_hex}` in hex.
+        let inputs: Vec<serde_json::Value> = reqs.iter().map(|r| rooted(r, &root)).collect();
+        let (shown, shown_hex) = (root.display().to_string(), hex(&root));
+        let theirs: Vec<String> = reference_outputs(FIXTURE, "evidence_dirs", &inputs)
+            .iter()
+            .map(|o| {
+                let o = o.as_str().unwrap();
+                o.replace("{root_hex}", &shown_hex)
+                    .replace("{root}", &shown)
+            })
+            .collect();
         assert_eq!(theirs.len(), reqs.len());
         let mut found = 0;
         for (req, want) in reqs.iter().zip(&theirs) {
             let ours = match evidence_dirs(req) {
                 Ok(dirs) => {
-                    let hex: Vec<String> = dirs
-                        .iter()
-                        .map(|d| {
-                            d.as_os_str()
-                                .as_bytes()
-                                .iter()
-                                .map(|b| format!("{b:02x}"))
-                                .collect()
-                        })
-                        .collect();
+                    let hex: Vec<String> = dirs.iter().map(|d| hex(d)).collect();
                     format!("ok {}", hex.join(" "))
                 }
                 Err(e) => format!("err {}", e.message),

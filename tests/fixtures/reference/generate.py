@@ -12,8 +12,12 @@ rerun reproduces every fixture byte for byte. README.md says what each file is. 
 are inputs, never written: frozen copies of repository files the reference read, so that a
 later edit of those files changes neither side (ruling S3-R30). They are
 worker-prompts/agents/ (the agent files of the worker prompts and of the configuration's
-maxTurns), config/presets/ (the presets) and
-usage/codex-rollout/codex-rollout-interrupted.jsonl (a rollout fixture).
+maxTurns), config/presets/ (the presets),
+usage/codex-rollout/codex-rollout-interrupted.jsonl (a rollout fixture) and
+dispatch/shell/scenarios/ (the fake Codex scenarios the runner runs replay).
+
+The dispatch runs (dispatch/caller.json, dispatch/shell/) build temporary worlds whose
+paths and pids vary; what is recorded writes them as placeholders the Rust tests fill in.
 
 This file is the only one here that may name the Python reference; the fixtures and the
 README never do (each write is checked). It is deleted with the Python in Task 10.
@@ -21,6 +25,7 @@ README never do (each write is checked). It is deleted with the Python in Task 1
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -1048,6 +1053,834 @@ def usage_fixture() -> None:
     write("usage/codex-rollout/read.txt", read.encode("ascii"))
 
 
+# --------------------------------------------------------------------------
+# dispatch/: the dispatch module's pure functions (`dispatch::*::tests`)
+#
+# Text that may hold a lone surrogate is given as its JSON text (a JSON string here), as the
+# Rust tests' `to_line` writes it, so that a plain JSON reader can read every row.
+
+def dispatch_argv_fixture() -> None:
+    texts = ["", "medium", "a\"b\\c", "\n\r\t\x08\x0c", "\x00\x01\x1f\x20\x7f",
+             "caf\u00e9 \u2192 \U0001f600", "</script>/", json.loads('"\\ud800\\udcff"'),
+             fs(b"x\xffy")]
+
+    def tomls(line: str) -> str:
+        return json.dumps([d._toml_string(t) for t in json.loads(line)])
+
+    write("dispatch/argv.json", sections({"toml_string": mapped(tomls, [dumps(texts)])}))
+
+
+def dispatch_env_fixture() -> None:
+    def env(*pairs):
+        """A parent environment as the Rust test holds it: a map ordered by name."""
+        return [[k, fs(v)] for k, v in sorted(pairs)]
+
+    parents = [
+        [],
+        env(("HOME", b"/home/o"), ("PATH", b"/usr/bin:/bin"), ("GH_TOKEN", b"ghp_x"),
+            ("GITHUB_TOKEN", b"ghs_x"), ("GH_ENTERPRISE_TOKEN", b"e"),
+            ("GITHUB_ENTERPRISE_TOKEN", b"e"), ("SSH_AUTH_SOCK", b"/tmp/agent.sock"),
+            ("GIT_ASKPASS", b"/bin/askpass"), ("SSH_ASKPASS", b"/bin/ssh-askpass"),
+            ("OPENAI_API_KEY", b"sk-kept"), ("LEADHAND_RUN_ID", b"another-run"),
+            ("LEADHAND_DISPATCH_TAG", b"another:tag:1"), ("GIT_SSH_COMMAND", b"ssh -i key"),
+            ("GH_CONFIG_DIR", b"/home/o/.config/gh")),
+        env(("GIT_CONFIG_COUNT", b"2"), ("GIT_CONFIG_KEY_0", b"http.https://h/.extraHeader"),
+            ("GIT_CONFIG_VALUE_0", b"Authorization: x \xff"),
+            ("GIT_CONFIG_KEY_1", b"user.n\xc3\xa9"), ("GIT_CONFIG_KEY_5", b"stray.key"),
+            ("GIT_CONFIG_PARAMETERS", b"  'a.b=c'  ")),
+        env(("GIT_CONFIG_COUNT", b"-3")),
+        env(("GIT_CONFIG_COUNT", b"abc")),
+        env(("GIT_CONFIG_COUNT", b"")),
+        env(("GIT_CONFIG_COUNT", b" +1 "), ("GIT_CONFIG_KEY_0", b"k\xfe")),
+        env(("GIT_CONFIG_COUNT", b"1_0")),
+        env(("GIT_CONFIG_COUNT", b"\xc2\xa02\xe2\x80\x83")),
+        env(("GIT_CONFIG_COUNT", b"1\xff")),
+        env(("GIT_CONFIG_PARAMETERS", b"   ")),
+        env(("GIT_CONFIG_PARAMETERS", b"\xc2\xa0'x.y=z'\xe2\x80\x83\n")),
+        env(("GIT_CONFIG_PARAMETERS", b"\xff'u.v=w' \xfe")),
+    ]
+
+    def environments(given: list) -> str:
+        """`blocking_env`, `worker_env` with the tag, and the Codex overrides, per parent."""
+        cases, gh, run_id, tag = json.loads(given[0]), Path(json.loads(given[1])), given[2], given[3]
+        out = []
+        for pairs in cases:
+            parent = dict(pairs)
+            b = d.blocking_env(parent, gh_config_dir=gh)
+            w = {**d.worker_env(parent, run_id=run_id, gh_config_dir=gh), d.TAG_VAR: tag}
+            o = {**d.blocking_env(parent, gh_config_dir=gh), "LEADHAND_RUN_ID": run_id,
+                 d.TAG_VAR: tag}
+            out.append([list(b.items()), list(w.items()), list(o.items())])
+        return json.dumps(out)
+
+    gh = dumps(fs(b"/w s//r\xff/./workers/c1-a1/gh-config/"))
+    write("dispatch/env.json", sections({
+        "environments": mapped(environments, [[dumps(parents), gh, "r-1", "r-1:c1-a1:2"]]),
+    }))
+
+
+def dispatch_request_fixture() -> None:
+    esc = fs
+    reqs = [
+        d.DispatchRequest(model="gpt-6-luna", effort="medium", role="implementer",
+                          brief=Path("/ws/.leadhand/1/c1-a1/brief.md"),
+                          report=Path("/ws/.leadhand/1/c1-a1/report.md"), cwd=Path("/ws"),
+                          run_dir=Path("/runs/r1"), card=1, attempt=1, dispatch_id="c1-a1",
+                          steps=40, minutes=20, network=False, writable_dirs=()),
+        d.DispatchRequest(model="m", effort="h\u00e9", role="scout",
+                          brief=Path(esc(b"/w s//\xff/./brief.md")),
+                          report=Path("/w s/r\u00e9port.md/"), cwd=Path(esc(b"/w s/\xff")),
+                          run_dir=Path("//runs/r 2"), card=None, attempt=3,
+                          dispatch_id="run-a3-scout", steps=5, minutes=1, network=True,
+                          writable_dirs=(Path("/tmp/x/"), Path(esc(b"/d\xfe"))),
+                          resume="0f0f-thread", kind="final_fix", branch=esc(b"lh/r\xff")),
+    ]
+    texts = [json.dumps(d.request_to_json(r), indent=2, ensure_ascii=True) for r in reqs]
+
+    def same_request(pair: list) -> str:
+        """The reference reading the Rust test's line of a request against its own text."""
+        a = d.request_from_json(json.loads(pair[0]))
+        b = d.request_from_json(json.loads(pair[1]))
+        return f"{a == b}\n"
+
+    docs = [
+        '{"model": "m", "effort": "e", "role": "reviewer", "brief": "/w//.leadhand/./b.md",\n'
+        '               "report": "rel/r.md/", "cwd": "/w/", "run_dir": "", "card": 2, "attempt": 1,\n'
+        '               "dispatch_id": "c2-a1-review", "steps": 1, "minutes": 2, "network": false}',
+        '{"model": "m", "effort": "e", "role": "verifier", "brief": "/b", "report": "/r",\n'
+        '               "cwd": "/w", "run_dir": "/r", "card": null, "attempt": 1, "dispatch_id": "v",\n'
+        '               "steps": 1, "minutes": 2, "network": true, "writable_dirs": null,\n'
+        '               "resume": null, "kind": null, "branch": null, "unknown": [1]}',
+    ]
+
+    def result(commit, **kw):
+        r = {"dispatch_id": "c1-a1", "status": "READY", "blocked_by": "",
+             "session_id": "0f0f0f0f-0000-4000-8000-00000000c0de", "reply": "Status: READY\n",
+             "steps": 3, "usage": {"input": 10, "cached": 2, "cache_write_5m": 0,
+                                   "cache_write_1h": 0, "output": 5, "reasoning": 1,
+                                   "known": True, "model": "gpt-6"},
+             "usage_known": True, "usage_source": "session", "possibly_incomplete": False,
+             "exit_reason": "completed", "codex_exit": 0, "charge_ids": ["c1-a1:codex:t"],
+             "generation": 1, "stopped": [{"pid": 41, "pgid": 41, "start": "1767225600.000001"}],
+             "confirmed_at": 1767225600.25, "cancel_token": None,
+             "started_at": "2026-01-01T00:00:00.000Z", "ended_at": "2026-01-01T00:01:00.000Z"}
+        r.update(kw)
+        return {**r, **commit}
+
+    results = [
+        result({"committed": "a" * 40, "changes": True}),
+        result({"committed": "b" * 40, "changes": True, "gitlinks_skipped": [esc(b"sub\xff")]}),
+        result({"committed": None, "changes": False,
+                "commit_skipped": "implement dispatch does not commit"},
+               session_id=None, usage=None, usage_known=False, usage_source="unknown", steps=0,
+               status="SPENT", exit_reason="step_limit", possibly_incomplete=True, codex_exit=-15,
+               stopped=[{"pid": 7, "pgid": 7, "start": None},
+                        {"pid": 9, "pgid": 7, "start": "ticks:5"}]),
+        result({"committed": None, "changes": False,
+                "commit_skipped": esc(b"only nested repositories changed, and gitlinks are "
+                                      b"never committed: a\xff"),
+                "gitlinks_skipped": [esc(b"a\xff")]}),
+        result({"committed": None, "changes": True,
+                "commit_error": esc(b"git commit failed: \xfe"),
+                "worker_status": "QUESTION", "worker_exit_reason": "completed"},
+               status="BLOCKED", blocked_by="environment", exit_reason="error",
+               reply=esc(b"Status: BLOCKED\nBlocked by: environment\n\xff ") + "\u00e9 \U0001f600",
+               cancel_token="9f" * 16),
+        result({"committed": None, "changes": False, "commit_skipped": "Codex never ran"},
+               status="BLOCKED", blocked_by="usage limit", exit_reason="usage_limit",
+               codex_exit=None,
+               usage={"input": 0, "cached": 0, "cache_write_5m": 0, "cache_write_1h": 0,
+                      "output": 0, "reasoning": 0, "known": True, "model": None},
+               usage_source="none", charge_ids=[]),
+    ]
+    result_docs = [
+        '{"status": "QUESTION", "exit_reason": "completed"}',
+        '{"status": "READY", "exit_reason": "completed", "blocked_by": null,\n'
+        '               "reply": null, "steps": null, "usage": null, "session_id": null}',
+        '{"status": "SPENT", "exit_reason": "time_limit", "steps": 12, "reply": "r\\udcff",\n'
+        '               "session_id": "t-1", "usage": {"input": 1, "known": true}}',
+    ]
+
+    def result_read(doc: str) -> str:
+        r = d._result_from(json.loads(doc))
+        return json.dumps([r.status, r.blocked_by, r.session_id, r.reply, r.steps,
+                           d.usage_dict(r.usage), r.exit_reason])
+
+    write("dispatch/request.json", sections({
+        "requests": texts,
+        "request_read_back": mapped(same_request, [[dumps(json.loads(t)), t] for t in texts]),
+        "request_reads": mapped(
+            lambda doc: json.dumps(d.request_to_json(d.request_from_json(json.loads(doc))),
+                                   indent=2), docs),
+        "results": [json.dumps(r, indent=2, ensure_ascii=True) for r in results],
+        "result_reads": mapped(result_read, result_docs),
+    }))
+
+
+def dispatch_runner_fixture() -> None:
+    streams = [
+        b'{"type": "thread.started", "thread_id": "a"}\n'
+        b'{"type": "thread.started", "thread_id": "b"}\n'
+        b'{"type": "item.completed", "item": {"type": "command_execution"}}\n'
+        b'{"type": "item.completed", "item": {"type": "agent_message", "text": "one"}}\n'
+        b'{"type": "item.completed", "item": {"type": "agent_message", "text": "two"}}\n'
+        b'{"type": "item.completed", "item": {"type": "agent_message", "text": 3}}\n',
+        b'not json\n[1, 2]\n"text"\n{"type": 5}\n{"type": "thread.started", "thread_id": 7}\n'
+        b'{"type": "thread.started", "thread_id": "late"}\n'
+        b'{"type": "item.completed", "item": {"type": "file_change"}}\n'
+        b'{"type": "item.completed", "item": {"type": "file_change"}',
+        b'{"type": "item.completed", "type": "turn.started", "item": {"type": "file_change"}}\n'
+        b'{"type": "item.completed", "item": {"type": "file_change"}, "item": 5}\n'
+        b'{"type": "item.completed", "item": {"type": "x", "type": "command_execution"}}\n',
+        b'{"type": "error", "message": "one \xff"}\n'
+        b'{"type": "turn.failed", "error": "flat"}\n'
+        b'{"type": "turn.failed", "error": {"message": "two"}}\n'
+        b'{"type": "error", "message": {"text": "x"}}\n'
+        b'{"type": "turn.failed", "message": "not here", "error": {"message": 5}}\n'
+        b'{"type": "turn.started"}\n',
+        b'{"type": "error", "message": "lone \\ud800 one"}\n'
+        b'{"type": "item.completed", "item": {"type": "agent_message", '
+        b'"text": "caf\\u00e9 \\ud83d\\ude00"}}\n',
+        b"",
+        b'\n\n   \n{"type": "turn.started"}\r\n{"type": "turn.completed"}\n',
+    ]
+
+    def stream(h: str) -> str:
+        """`_Stream` over the stream file: steps, thread_id, turn_open, the last agent
+        message and the error texts, as JSON."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stream.jsonl"
+            path.write_bytes(bytes.fromhex(h))
+            s = d._Stream(path)
+            s.poll()
+            return json.dumps([s.steps, s.thread_id, s.turn_open,
+                               s.last_agent_message() or None, s.error_texts()])
+
+    texts = ["", "   \n\t\n", "Status: READY\nCommits: none\n",
+             "**Status:** BLOCKED\nBlocked by: usage limit\n", "Status: blocked (no reason)\n",
+             "> ## *Status*:`blocked`\nmore\n", "Status : Blocked\n", "Status: blockedx\n",
+             "Status: blocked_\n", "Status: blocked2\n", "Status: blocked\xe9\n",
+             "Status: blocked-now\n", "statu\u017f: blocked\n", "STATUS:BLOCKED",
+             "Status: \u212a\n", "Status: bloc\u212aed\n", "\n\nStatus: QUESTION\n",
+             "Verdict: clean\n", "Result: fail\n", "re\u017fult: pass\n",
+             "verd\u0130ct: clean\n", "I looked around and stopped.\nNothing else to say.\n",
+             "\u2028Status: READY", "usage limit", "USAGE_LIMIT reached", "usage - _ limit",
+             "u\u017fage\xa0lim\u0131t", "usagelimit", "usage. limit", "usage\nlimit",
+             "the usage\u2003LIMIT"]
+
+    def reply_checks(t: str) -> str:
+        """`has_status_line`, `_USAGE_LIMIT.search` and `_classify(None, 0, t, [], "")`."""
+        try:
+            h = d.has_status_line(t)
+        except KeyError:
+            h = "KeyError"
+        try:
+            c = list(d._classify(None, 0, t, [], ""))
+        except KeyError:
+            c = "KeyError"
+        return json.dumps([h, bool(d._USAGE_LIMIT.search(t)), c])
+
+    sharp = "re\u017fult: pass\n"
+    cases = [
+        [None, 0, "", [], ""], [None, 1, "", [], ""], [None, None, "", [], ""],
+        [None, -9, "", [], ""], [None, -9, "Status: READY\n", [], ""],
+        [None, 1, "Status: QUESTION\n", [], ""], [None, 1, "no status\n", [], ""],
+        [None, 1, "Status: READY\n", ["usage limit"], ""],
+        [None, 0, "no status\n", ["usage limit"], ""],
+        [None, 0, "Status: READY\n", ["usage limit"], "usage limit"],
+        [None, 1, sharp, ["usage limit"], ""], [None, 1, sharp, [], ""],
+        ["cancelled", -2, sharp, [], ""], ["time_limit", None, "", [], ""],
+        ["interrupted", None, "", [], ""], ["error", 0, "Status: READY\n", [], ""],
+        [None, 0, "Status: BLOCKED\nBlocked by: environment\n", [], ""],
+        [None, 0, "Verdict: defects\n", [], ""],
+    ]
+
+    def classified(case: list) -> str:
+        try:
+            return json.dumps(list(d._classify(*case)))
+        except KeyError:
+            return json.dumps("KeyError")
+
+    write("dispatch/runner.json", sections({
+        "stream": mapped(stream, [s.hex() for s in streams]),
+        "reply_checks": mapped(reply_checks, texts),
+        "classify": mapped(classified, cases),
+    }))
+
+
+# --------------------------------------------------------------------------
+# dispatch/caller.json: the anchor and request checks (`dispatch::caller::tests`)
+#
+# The reference runs on the world the Rust test lays out, built here the same way under a
+# root `{root}` that is a symlink (so its real path, `{real}`, differs from it, as a macOS
+# temporary folder's does). The recorded text writes the root `{root}`, its real path
+# `{real}` and this process's pid `{pid}`; the Rust test fills in its own.
+
+def caller_request(ws: str, run_dir: str, dispatch_id: str) -> dict:
+    """`World::request`: a request of the good run, as the Rust test writes it (raw paths)."""
+    scratch = f"{ws}/.leadhand/1/{dispatch_id}"
+    return {"model": "gpt-6-luna", "effort": "medium", "role": "implementer",
+            "brief": f"{scratch}/brief.md", "report": f"{scratch}/report.md", "cwd": ws,
+            "run_dir": run_dir, "card": 1, "attempt": 1, "dispatch_id": dispatch_id, "steps": 40,
+            "minutes": 20, "network": False, "writable_dirs": [], "resume": None,
+            "kind": "implement", "branch": "lh/good"}
+
+
+def caller_world(t: str) -> None:
+    """`world()` of `dispatch::caller::tests`, under `t`."""
+    def runs(name: str) -> str:
+        return f"{t}/runs/{name}"
+
+    def run_at(path: str, run_json: str | None, holder: str | None = None) -> None:
+        os.makedirs(path, exist_ok=True)
+        if run_json is not None:
+            Path(path, "run.json").write_text(run_json, encoding="utf-8")
+        if holder is not None:
+            Path(path, "holder.json").write_text(holder, encoding="utf-8")
+
+    def meta(run_id: str, ws: str) -> str:
+        return (f'{{"run_id": "{run_id}", "workspace": {json.dumps(ws)}, '
+                f'"repo": {json.dumps(t + "/repo")}}}')
+
+    repo = f"{t}/repo"
+    ws = f"{repo}/.worktrees/ws"
+    os.makedirs(f"{ws}/.leadhand/1/c1-a1")
+    os.makedirs(f"{t}/elsewhere")
+    os.makedirs(f"{t}/ws2/.leadhand")
+    os.symlink(f"{t}/elsewhere", f"{ws}/.leadhand/link")
+    me = os.getpid()
+    start = procs.process_start_time(me)
+    assert start, "no start time for this process"
+    ws2 = f"{t}/ws2"
+    run_at(runs("good"), meta("r-good", ws))
+    run_at(runs("inplace"), meta("r-inplace", ws2))
+    run_at(runs("norun"), None)
+    run_at(runs("emptyid"), meta("", ws))
+    run_at(runs("intid"), f'{{"run_id": 5, "workspace": {json.dumps(ws)}}}')
+    run_at(runs("listjson"), "[1]")
+    run_at(runs("badjson"), "{")
+    run_at(runs("relws"), '{"run_id": "r", "workspace": "rel/ws"}')
+    run_at(runs("nows"), '{"run_id": "r"}')
+    run_at(runs("intws"), '{"run_id": "r", "workspace": 5}')
+    run_at(f"{ws}/inside-run", meta("r-inws", ws))
+    run_at(f"{t}/repo/docs/runs/x", meta("r-inrepo", ws2))
+    ws3 = f"{t}/ws3"
+    run_at(ws3, meta("r-isws", ws3))
+
+    def holder(run_id: str, rest: str) -> str:
+        return f'{{"run_id": {run_id}{rest}}}'
+
+    live = f', "supervisor_pid": {me}, "supervisor_start": "{start}"'
+    run_at(runs("held-other"), meta("r-ho", ws), holder('"someone"', ""))
+    run_at(runs("held-int"), meta("r-hi", ws), holder("7", ""))
+    run_at(runs("held-live"), meta("r-hl", ws), holder('"r-hl"', live))
+    run_at(runs("held-null"), meta("r-hn", ws), holder("null", live))
+    dead = f', "supervisor_pid": {me}, "supervisor_start": "0.000001"'
+    run_at(runs("held-dead"), meta("r-hd", ws), holder('"r-hd"', dead))
+    as_bool = f', "supervisor_pid": true, "supervisor_start": "{start}"'
+    run_at(runs("held-bool"), meta("r-hb", ws), holder('"r-hb"', as_bool))
+    as_text = f', "supervisor_pid": "{me}", "supervisor_start": "{start}"'
+    run_at(runs("held-str"), meta("r-hs", ws), holder('"r-hs"', as_text))
+    run_at(runs("held-bad"), meta("r-hx", ws), "{")
+    run_at(runs("dup"), f'{{"run_id": "a", "workspace": {json.dumps(ws)}, "run_id": "r-dup"}}')
+    run_at(runs("escape"), meta("r-esc", ws))
+    os.symlink(f"{t}/elsewhere", f"{runs('escape')}/workers")
+    os.symlink(runs("good"), runs("goodlink"))
+
+    def write_request(folder: str, req: dict | None) -> None:
+        wd = f"{runs('good')}/workers/{folder}"
+        os.makedirs(wd, exist_ok=True)
+        if req is not None:
+            Path(wd, "request.json").write_text(dumps(req), encoding="ascii")
+
+    write_request("c1-a1", caller_request(ws, runs("good"), "c1-a1"))
+    write_request("mismatch", caller_request(ws, runs("good"), "c1-a1"))
+    far = caller_request(ws, runs("good"), "badcwd")
+    far["cwd"] = f"{t}/elsewhere"
+    write_request("badcwd", far)
+    write_request("broken", None)
+    Path(runs("good"), "workers/broken/request.json").write_text("{")
+    write_request("none", None)
+    os.symlink(f"{t}/elsewhere", f"{runs('good')}/workers/linked")
+
+
+def caller_scenarios(t: str) -> list:
+    """`scenarios()` of `dispatch::caller::tests`, as the Rust test gives them to the reference
+    (`PyScenario`): the function, the environment, and its arguments."""
+    def runs(name: str) -> str:
+        return f"{t}/runs/{name}"
+
+    def sc(env, fn, run=None, id_=None, req=None, wd=None):
+        return {"fn": fn, "env": env, "run": run, "id": id_, "req": req, "wd": wd}
+
+    def session(run: str) -> list:
+        return [["LEADHAND_RUN_DIR", runs(run)]]
+
+    good = runs("good")
+    ws = f"{t}/repo/.worktrees/ws"
+    base = f"{t}/repo/.worktrees/ws--base"
+    out = [
+        sc([["LEADHAND_RUN_DIR", ""]], "anchored", good),
+        sc([["LEADHAND_RUN_DIR", " \t"]], "anchored", good),
+        sc([["LEADHAND_RUN_DIR", "\x1c\x1f\xa0"]], "anchored", good),
+        sc(session("norun"), "anchored", good),
+        sc(session("goodlink"), "anchored", good),
+        sc(session("good"), "anchored", runs("goodlink")),
+        sc([["LEADHAND_RUN_DIR", good], ["LEADHAND_RUN_ID", "r-other"]], "anchored", good),
+        sc([["LEADHAND_RUN_DIR", good], ["LEADHAND_RUN_ID", ""]], "anchored", good),
+        sc([], "anchored", good),
+        sc([], "anchored", runs("held-other")),
+        sc([], "anchored", runs("held-int")),
+        sc([], "anchored", runs("held-live")),
+        sc([], "anchored", runs("held-null")),
+        sc(session("held-live"), "anchored", runs("held-live")),
+        sc([], "anchored", runs("dup")),
+        sc([["LEADHAND_RUN_DIR", runs("dup")], ["LEADHAND_RUN_ID", "r-dup"]], "anchored",
+           runs("dup")),
+    ]
+    out += [sc([], "anchored", runs(n)) for n in ("held-dead", "held-bool", "held-str", "held-bad")]
+    out += [sc([], "anchored", runs(n)) for n in ("norun", "emptyid", "intid", "listjson", "badjson")]
+    out += [sc([], "anchored", runs(n)) for n in ("relws", "nows", "intws")]
+    out += [sc([], "anchored", p) for p in (f"{ws}/inside-run", f"{t}/repo/docs/runs/x", f"{t}/ws3")]
+    out += [sc([["LEADHAND_RUN_DIR", ""]], "caller", good, i) for i in ("", "a/b", ".", "..", "a\0b")]
+    out.append(sc(session("good"), "caller", good, "c1-a1"))
+    out.append(sc(session("escape"), "caller", runs("escape"), "c1"))
+    out.append(sc(session("good"), "caller", good, "linked"))
+
+    def req(**changes) -> dict:
+        r = caller_request(ws, good, "c1-a1")
+        r.update(changes)
+        return r
+
+    def request(r: dict) -> dict:
+        return sc(session("good"), "request", good, req=r)
+
+    out.append(request(req()))
+    out.append(request(req(run_dir=runs("goodlink"))))
+    out.append(request(req(run_dir=runs("inplace"))))
+    out.append(request(req(cwd=f"{t}/elsewhere")))
+    out.append(request(req(cwd=base, brief=f"{base}/.leadhand/1/c1-a1/brief.md",
+                           report=f"{base}/.leadhand/1/c1-a1/report.md")))
+    # `<ws>/./`, which a request (a path's pathlib spelling) writes as `<ws>`.
+    out.append(request(req(cwd=str(PurePosixPath(ws + "/./")))))
+    out.append(request(req(brief=f"{t}/elsewhere/brief.md")))
+    out.append(request(req(report=f"{ws}/report.md")))
+    out.append(request(req(brief=f"{ws}/.leadhand")))
+    out.append(request(req(brief=f"{ws}/.leadhand/link/brief.md")))
+    out.append(request(req(dispatch_id="../x")))
+    inplace_base = f"{t}/repo/.worktrees/inplace--base"
+    r = req(run_dir=runs("inplace"), cwd=inplace_base, brief=f"{inplace_base}/.leadhand/b.md",
+            report=f"{inplace_base}/.leadhand/r.md")
+    out.append(sc(session("inplace"), "request", runs("inplace"), req=r))
+    r = dict(r, cwd=base, brief=f"{base}/.leadhand/b.md", report=f"{base}/.leadhand/r.md")
+    out.append(sc(session("inplace"), "request", runs("inplace"), req=r))
+    for i in ("none", "c1-a1", "mismatch", "badcwd", "broken"):
+        out.append(sc(session("good"), "worker", good, i))
+    out.append(sc([], "worker", runs("norun"), "c1-a1"))
+    wd = f"{good}/workers"
+    out.append(sc(session("good"), "runner", wd=f"{good}/other/c1-a1"))
+    out.append(sc(session("good"), "runner", wd=f"{wd}/c1-a1"))
+    out.append(sc(session("good"), "runner", wd=f"{wd}/none"))
+    out.append(sc(session("good"), "runner", wd=f"{wd}/badcwd"))
+    out.append(sc([["LEADHAND_RUN_DIR", ""]], "runner", wd=f"{wd}/c1-a1"))
+    out.append(sc(session("good"), "runner", wd="/"))
+    return out
+
+
+def caller_outcome(sc: dict) -> str:
+    """A scenario's outcome, `ok …` or `err:<the DispatchError's text>`. `dispatch`'s check is
+    `_request_from_args` without `request_for` (which reads the run's configuration);
+    `dispatch-runner`'s is `_cmd_runner` with `run_runner` replaced, its `leadhand: ` prefix
+    dropped."""
+    seen: list[str] = []
+    for k in ("LEADHAND_RUN_DIR", "LEADHAND_RUN_ID"):
+        os.environ.pop(k, None)
+    os.environ.update(dict(sc["env"]))
+    f = sc["fn"]
+    try:
+        if f == "anchored":
+            real, _meta = d.anchored_run(Path(sc["run"]))
+            return "ok " + str(real)
+        if f == "caller":
+            d._check_dispatch_id(sc["id"])
+            real, _meta = d.anchored_run(Path(sc["run"]))
+            d._worker_dir(Path(sc["run"]), real, sc["id"])
+            return "ok " + str(real)
+        if f == "request":
+            real, meta = d.anchored_run(Path(sc["run"]))
+            d.check_request(d.request_from_json(sc["req"]), real, meta)
+            return "ok"
+        if f == "worker":
+            wd, req = d._anchored_worker(Path(sc["run"]), sc["id"])
+            return ("ok none " if req is None else "ok req ") + str(wd)
+        import argparse
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+                patched(d, run_runner=lambda wd: (seen.append(str(wd)), 0)[1]):
+            code = d._cmd_runner(argparse.Namespace(worker_dir=sc["wd"]))
+        if code == 0:
+            return "ok " + seen[0]
+        return "err:" + err.getvalue().removeprefix("leadhand: ").rstrip("\n")
+    except d.DispatchError as e:
+        return "err:" + str(e)
+
+
+@contextlib.contextmanager
+def environment_kept():
+    """`os.environ` restored afterwards, whatever a step sets or removes."""
+    saved = dict(os.environ)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def placeheld(text: str, root: str, real: str) -> str:
+    """`text` with `real` written `{real}` and then `root` written `{root}`."""
+    return text.replace(real, "{real}").replace(root, "{root}")
+
+
+def caller_anchor_rows() -> list:
+    with tempfile.TemporaryDirectory() as tmp, environment_kept():
+        os.environ.pop("LEADHAND_TESTING", None)
+        top = os.path.realpath(tmp)
+        os.mkdir(f"{top}/real root")
+        t = f"{top}/root"
+        os.symlink(f"{top}/real root", t)
+        real = os.path.realpath(t)
+        assert real != t and t not in real and real not in t, (t, real)
+        caller_world(t)
+        pid = os.getpid()
+        rows = []
+        for sc in caller_scenarios(t):
+            out = caller_outcome(sc).replace(f"supervisor pid {pid} ", "supervisor pid {pid} ")
+            rows.append({"in": json.loads(placeheld(dumps(sc), t, real)),
+                         "out": placeheld(out, t, real)})
+        return rows
+
+
+def caller_evidence_rows() -> list:
+    """`evidence_dirs_match_python`'s requests, run against the worktrees it lays out under a
+    resolved root `{root}` (an output's paths are given in hex, the root's `{root_hex}`)."""
+    with tempfile.TemporaryDirectory() as tmp, environment_kept():
+        root = os.path.realpath(tmp)
+        env = {**hermetic_git_env(root), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        repo = make_repo(root, "my repo", env)
+        worktrees = f"{repo}/.worktrees"
+
+        def add(path: str) -> None:
+            git_in(repo, env, "worktree", "add", "--quiet", "--detach", path)
+
+        add(f"{worktrees}/ws")
+        add(f"{worktrees}/ws--base")
+        add(f"{worktrees}/run in place--base")
+        add(f"{root}/elsewhere")
+        os.mkdir(f"{worktrees}/plain")
+        os.mkdir(f"{worktrees}/plain--base")
+        add(f"{worktrees}/linked")
+        os.symlink(f"{root}/elsewhere", f"{worktrees}/linked--base")
+
+        def meta(ws: str) -> str:
+            return f'{{"run_id": "r", "repo": {json.dumps(repo)}, "workspace": {json.dumps(ws)}}}'
+
+        runs = [("no repo", '{"run_id": "r"}'),
+                ("relative repo", '{"run_id": "r", "repo": "my repo"}'),
+                ("worktree run", meta(f"{worktrees}/ws")), ("run in place", meta(repo)),
+                ("unregistered", meta(f"{worktrees}/plain")),
+                ("behind a link", meta(f"{worktrees}/linked")),
+                ("missing", meta(f"{worktrees}/gone"))]
+        reqs = []
+        for name, text in runs:
+            run = f"{root}/{name}"
+            os.mkdir(run)
+            Path(run, "run.json").write_text(text, encoding="utf-8")
+            for kind in ("evidence", "review", None):
+                r = caller_request(repo, f"{root}/runs/good", "c1-a1-evidence-1")
+                r.update(run_dir=run, kind=kind)
+                reqs.append(r)
+
+        def dirs(r: dict) -> str:
+            try:
+                found = d.evidence_dirs(d.request_from_json(r))
+                return "ok " + " ".join(os.fsencode(p).hex() for p in found)
+            except d.DispatchError as e:
+                return "err " + str(e)
+
+        hex_root = os.fsencode(root).hex()
+        return [{"in": json.loads(dumps(r).replace(root, "{root}")),
+                 "out": dirs(r).replace(hex_root, "{root_hex}").replace(root, "{root}")}
+                for r in reqs]
+
+
+GIT_NAME, GIT_EMAIL = "Fixture User", "fixture@example.invalid"
+
+
+def hermetic_git_env(root: str) -> dict:
+    """The Rust git fixture's sealed environment for its Git calls (`git::fixture`)."""
+    return {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0", "GIT_CEILING_DIRECTORIES": os.path.dirname(root),
+            "HOME": root, "GIT_AUTHOR_NAME": GIT_NAME, "GIT_AUTHOR_EMAIL": GIT_EMAIL,
+            "GIT_COMMITTER_NAME": GIT_NAME, "GIT_COMMITTER_EMAIL": GIT_EMAIL}
+
+
+def git_in(cwd: str, env: dict, *args: str) -> str:
+    out = subprocess.run(["git", "-c", f"user.name={GIT_NAME}", "-c", f"user.email={GIT_EMAIL}",
+                          "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *args],
+                         cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                         check=True)
+    return out.stdout.decode().rstrip("\n")
+
+
+def make_repo(parent: str, name: str, env: dict) -> str:
+    """`Fixture::make_repo`: `<parent>/<name>` with one commit (README.md) on `main`."""
+    repo = f"{parent}/{name}"
+    os.makedirs(repo)
+    git_in(repo, env, "init", "--quiet", "--initial-branch", "main")
+    for key, value in (("user.name", GIT_NAME), ("user.email", GIT_EMAIL),
+                       ("commit.gpgsign", "false"), ("tag.gpgsign", "false")):
+        git_in(repo, env, "config", key, value)
+    Path(repo, "README.md").write_text("hello\n")
+    git_in(repo, env, "add", "--", "README.md")
+    git_in(repo, env, "commit", "--quiet", "-m", "initial")
+    return repo
+
+
+def dispatch_caller_fixture() -> None:
+    write("dispatch/caller.json", sections({
+        "anchor": caller_anchor_rows(),
+        "evidence_dirs": caller_evidence_rows(),
+    }))
+
+
+# --------------------------------------------------------------------------
+# dispatch/shell/: the reference runner on the worlds of `dispatch::shell::tests`
+#
+# Each scenario lays out `World::new()` (a run with one worker folder, `d1`, whose workspace
+# is a Git repository), writes the test's request, and runs the reference's
+# `dispatch.run_runner` on it in a child process with only the test's environment, as the
+# Rust test ran it. The fake Codex is the reference's (`tests/fakes/codex`); the Rust test
+# replays the same scenarios with the Rust fake. What the test compares is recorded steadied:
+# the times and process identities cleared, as its `steady` functions clear them, and the
+# world's root (a resolved temporary folder) written `{root}`.
+
+FROZEN_SCENARIOS = OUT / "dispatch" / "shell" / "scenarios"
+FAKE_CODEX = ROOT / "tests" / "fakes" / "codex"
+RUNNER_CODE = ("import sys\nfrom pathlib import Path\nfrom leadhand import dispatch\n"
+               "sys.exit(dispatch.run_runner(Path(sys.argv[1])))\n")
+SHELL_RUN_ID = "r-reference"
+CRAFTED = ('{"type": "thread.started", "thread_id": "{thread}"}\n'
+           '{"action": "last_message", "text": "re\\u017fult: pass\\n"}\n')
+PROBE = ('#!/bin/sh\n'
+         'if [ -e "/dev/fd/$PROBE_FD" ]; then echo \'fd open\' > "$PROBE_OUT"; '
+         'else echo \'fd closed\' > "$PROBE_OUT"; fi\n'
+         'kill -HUP $$\n'
+         'echo \'survived SIGHUP\' >> "$PROBE_OUT"\n')
+
+
+class ShellWorld:
+    """`World::new()` of `dispatch::shell::tests`, under a fresh resolved temporary root."""
+
+    def __init__(self, tmp: str):
+        self.root = os.path.realpath(tmp)
+        self.git_env = {**hermetic_git_env(self.root), "PATH": os.environ.get("PATH", "")}
+        self.ws = make_repo(self.root, "work space", self.git_env)
+        self.run = f"{self.root}/run dir"
+        self.wd = f"{self.run}/workers/d1"
+        os.makedirs(self.wd)
+        Path(self.run, "run.json").write_text(
+            f'{{"run_id": "{SHELL_RUN_ID}", "workspace": {json.dumps(self.ws)}, '
+            f'"repo": {json.dumps(self.ws)}}}\n', encoding="ascii")
+        scratch = f"{self.ws}/.leadhand/1/d1"
+        os.makedirs(scratch)
+        Path(scratch, "brief.md").write_text("# Brief\n")
+        os.mkdir(f"{self.root}/bin")
+        for tool in ("python3", "git"):
+            os.symlink(shutil.which(tool), f"{self.root}/bin/{tool}")
+        os.mkdir(f"{self.root}/home")
+
+    def request(self) -> dict:
+        scratch = f"{self.ws}/.leadhand/1/d1"
+        return {"model": "gpt-6-luna", "effort": "low", "role": "implementer",
+                "brief": f"{scratch}/brief.md", "report": f"{scratch}/report.md", "cwd": self.ws,
+                "run_dir": self.run, "card": 1, "attempt": 1, "dispatch_id": "d1", "steps": 50,
+                "minutes": 5, "network": False, "writable_dirs": [], "resume": None,
+                "kind": None, "branch": None}
+
+    def write_request(self, req: dict) -> None:
+        Path(self.wd, "request.json").write_text(json.dumps(req, indent=2), encoding="ascii")
+
+    def env(self, scenario: Path) -> dict:
+        return {"PATH": f"{self.root}/bin:/usr/bin:/bin", "HOME": f"{self.root}/home",
+                "TMPDIR": tempfile.gettempdir(), "LEADHAND_TESTING": "1",
+                "LEADHAND_TEST_CODEX_BIN": str(FAKE_CODEX), "FAKE_CODEX_SCENARIO": str(scenario),
+                "FAKE_CODEX_LOG": f"{self.root}/codex log.jsonl",
+                "CODEX_HOME": f"{self.root}/codex home", "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": "/dev/null"}
+
+    def run_runner(self, env: dict, fd: int | None = None) -> int:
+        out = subprocess.run([sys.executable, "-B", "-c", RUNNER_CODE, self.wd],
+                             env={**env, "PYTHONPATH": str(ROOT / "scripts" / "lib")},
+                             stdin=subprocess.DEVNULL, capture_output=True,
+                             pass_fds=() if fd is None else (fd,))
+        return out.returncode
+
+    def text(self, name: str) -> str | None:
+        path = Path(self.wd, name)
+        return path.read_text(encoding="utf-8") if path.exists() else None
+
+    def placeheld(self, text: str | None) -> str | None:
+        if text is None:
+            return None
+        assert SHELL_RUN_ID not in text, text
+        return text.replace(self.root, "{root}")
+
+    def result(self) -> str | None:
+        """`result.json` steadied (`steady`): times and process identities cleared."""
+        text = self.text("result.json")
+        if text is None:
+            return None
+        r = json.loads(text)
+        r.update(confirmed_at=0.0, started_at=None, ended_at=None,
+                 stopped=[{"pid": 0, "pgid": 0, "start": None} for _ in r.get("stopped", [])])
+        return self.placeheld(dumps(r))
+
+    def attempts(self) -> list:
+        """The attempts steadied (`steady_attempts`): times cleared, the run's own ID checked
+        and cleared."""
+        path = state.run_paths(Path(self.run)).attempts
+        out = []
+        for line in path.read_text().splitlines() if path.exists() else []:
+            a = json.loads(line)
+            assert a["run"] == SHELL_RUN_ID, a
+            a.update(run=None, started_at=None, ended_at=None)
+            out.append(self.placeheld(dumps(a)))
+        return out
+
+    def charges(self) -> list:
+        """The charges steadied (`steady_charges`): `ts` cleared."""
+        path = state.run_paths(Path(self.run)).charges
+        lines = path.read_text().splitlines() if path.exists() else []
+        return [self.placeheld(dumps({**json.loads(line), "ts": ""})) for line in lines]
+
+    def records(self) -> int:
+        """The number of the fake Codex's log lines."""
+        path = Path(self.root, "codex log.jsonl")
+        return len(path.read_text().splitlines()) if path.exists() else 0
+
+    def records_of(self) -> dict:
+        return {"result": self.result(), "attempts": self.attempts(), "charges": self.charges()}
+
+
+def shell_case(name: str, change=None, setup=None, env_change=None, fd: bool = False):
+    """Runs the reference runner in a fresh world on the test's request; returns the world's
+    recorded snapshot made by `record(world, exit)`, written as `dispatch/shell/<name>.json`."""
+    def run(record) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            w = ShellWorld(tmp)
+            req = w.request()
+            if change:
+                change(w, req)
+            w.write_request(req)
+            if setup:
+                setup(w)
+            env = w.env(FROZEN_SCENARIOS / "ready.jsonl")
+            if env_change:
+                env = env_change(w, env)
+            held_fd = None
+            if fd:
+                held = open(f"{w.root}/held", "w")
+                held_fd = fcntl.fcntl(held.fileno(), fcntl.F_DUPFD_CLOEXEC, 60)
+                env = {**env, "PROBE_FD": str(held_fd), "PROBE_OUT": f"{w.root}/probe.out"}
+            try:
+                code = w.run_runner(env, held_fd)
+            finally:
+                if fd:
+                    os.close(held_fd)
+                    held.close()
+            snapshot = {"exit": code, **record(w)}
+            text = "{" + ",\n".join(dumps(k) + ":" + dumps(v) for k, v in snapshot.items()) + "}\n"
+            write(f"dispatch/shell/{name}.json", text.encode("ascii"))
+    return run
+
+
+def dispatch_shell_fixture() -> None:
+    report_frozen(FROZEN_SCENARIOS, ROOT / "tests" / "fixtures" / "scenarios", "*.jsonl")
+
+    def untracked(w: ShellWorld):
+        text = w.text("untracked.json")
+        return None if text is None else w.placeheld(dumps(json.loads(text).get("paths")))
+
+    # fake_codex_ready_scenario_writes_result_and_attempt
+    shell_case("ready")(lambda w: {**w.records_of(), "stream": w.text("stream.jsonl"),
+                                   "untracked": untracked(w)})
+
+    # step_limit_scenario_stops_codex_with_sigint
+    def many_steps(w, env):
+        return {**env, "FAKE_CODEX_SCENARIO": str(FROZEN_SCENARIOS / "many-steps.jsonl")}
+
+    def stop_of(w):
+        r = json.loads(w.text("result.json"))
+        return {"stop": [r["status"], r["exit_reason"], r["codex_exit"]]}
+
+    shell_case("step-limit", change=lambda w, req: req.update(steps=3),
+               env_change=many_steps)(stop_of)
+
+    # crafted_report_head_kills_the_runner_before_charging
+    def crafted(w, env):
+        Path(w.root, "crafted.jsonl").write_text(CRAFTED)
+        return {**env, "FAKE_CODEX_SCENARIO": f"{w.root}/crafted.jsonl"}
+
+    shell_case("crafted-head", env_change=crafted)(lambda w: {
+        "result_exists": Path(w.wd, "result.json").exists(), "attempts": w.attempts(),
+        "charges": w.charges(), "stopping_exists": Path(w.wd, "stopping.json").exists()})
+
+    # prompt_that_is_not_utf8_is_blocked_as_python_blocks_it
+    def not_utf8(w, req):
+        req["brief"] = f"{w.ws}/.leadhand/1/d1/" + fs(b"bri\xff\xfeef.md")
+
+    def not_utf8_stderr(w):
+        """`codex.stderr`, the encoder's position (that of the surrogate escapes in the prompt,
+        which moves with the root's length and the agent file) written `{surrogates}`."""
+        req = json.loads(w.text("request.json"))
+        prompt = briefs.worker_prompt(req["role"], Path(req["brief"]), Path(req["report"]))
+        at = [i for i, c in enumerate(prompt) if 0xdc80 <= ord(c) <= 0xdcff]
+        assert at == list(range(at[0], at[0] + 2)), at
+        text = w.text("codex.stderr")
+        shown = f" in position {at[0]}-{at[-1]}: "
+        assert shown in text, text
+        return w.placeheld(text.replace(shown, " in position {surrogates}: "))
+
+    shell_case("prompt-not-utf8", change=not_utf8)(lambda w: {
+        **w.records_of(), "stderr": not_utf8_stderr(w)})
+
+    # argument_the_os_cannot_take_kills_the_runner_at_launch
+    def launch_of(w):
+        runner = json.loads(w.text("runner.json"))
+        return {"codex": runner["codex"], "aborted": runner["launching"].get("aborted"),
+                "stream": w.text("stream.jsonl"), "stderr": w.text("codex.stderr"),
+                "result_exists": Path(w.wd, "result.json").exists(),
+                "stopping_exists": Path(w.wd, "stopping.json").exists(), "attempts": w.attempts(),
+                "records": w.records()}
+
+    shell_case("unencodable-model", change=lambda w, req: req.update(model="gpt\ud800"))(launch_of)
+
+    # cancel_before_launch_finalizes_cancelled
+    def cancel(w):
+        Path(w.wd, "cancel").write_text('{"requested_at": "earlier", "token": "tok"}')
+
+    shell_case("cancel-before-launch", setup=cancel)(lambda w: w.records_of())
+
+    # codex_gets_sighup_ignored_and_no_inherited_descriptor
+    def probe(w, env):
+        Path(w.root, "probe codex").write_text(PROBE)
+        os.chmod(f"{w.root}/probe codex", 0o755)
+        return {**env, "LEADHAND_TEST_CODEX_BIN": f"{w.root}/probe codex"}
+
+    shell_case("probe", env_change=probe, fd=True)(
+        lambda w: {"probe": Path(w.root, "probe.out").read_text()})
+
+
 def main() -> None:
     procs_samples()
     events_with_raw_bytes()
@@ -1063,6 +1896,12 @@ def main() -> None:
     cli_check_json()
     state_fixture()
     usage_fixture()
+    dispatch_argv_fixture()
+    dispatch_env_fixture()
+    dispatch_request_fixture()
+    dispatch_runner_fixture()
+    dispatch_caller_fixture()
+    dispatch_shell_fixture()
     for path in sorted(WRITTEN):
         print(f"{path.stat().st_size:>8}  {path.relative_to(OUT)}")
 

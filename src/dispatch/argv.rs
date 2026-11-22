@@ -201,13 +201,12 @@ pub fn toml_string(value: &PyStr) -> PyStr {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::wire::tests::{python, read_reference};
+    use crate::wire::tests::{read_reference, reference_outputs};
     use crate::wire::to_line;
 
     fn os(b: &[u8]) -> OsString {
@@ -572,11 +571,10 @@ mod tests {
             PyStr::from_os(&os(b"x\xffy")),
         ])
         .collect();
-        let code = "import json, sys\nfrom leadhand import dispatch as d\n\
-                    print(json.dumps([d._toml_string(t) for t in json.loads(sys.argv[1])]))\n";
+        // The reference's `_toml_string` of each text, as JSON, recorded for these texts.
         let arg = to_line(&texts).unwrap();
-        let out = python(code, &[OsStr::new(&arg)]);
-        let theirs: Vec<PyStr> = serde_json::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
+        let out = reference_outputs("dispatch/argv.json", "toml_string", &[arg.into()]);
+        let theirs: Vec<PyStr> = serde_json::from_str(out[0].as_str().unwrap()).unwrap();
         let ours: Vec<PyStr> = texts.iter().map(toml_string).collect();
         assert_eq!(ours, theirs);
         assert_eq!(

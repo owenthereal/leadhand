@@ -310,58 +310,44 @@ mod paths {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
     use super::*;
-    use crate::wire::tests::python;
+    use crate::wire::tests::{reference_json, reference_outputs};
     use crate::wire::{to_line, to_output, to_pretty};
 
-    /// Python's `request_to_json` of requests it builds, as `write_json_atomic` writes them,
-    /// one document per output line (as a JSON string).
-    const PY_REQUESTS: &str = "import json, sys\nfrom pathlib import Path\n\
-        from leadhand import dispatch as d\n\
-        esc = lambda b: b.decode('utf-8', 'surrogateescape')\n\
-        reqs = [\n\
-        \x20 d.DispatchRequest(model='gpt-6-luna', effort='medium', role='implementer',\n\
-        \x20   brief=Path('/ws/.leadhand/1/c1-a1/brief.md'), report=Path('/ws/.leadhand/1/c1-a1/report.md'),\n\
-        \x20   cwd=Path('/ws'), run_dir=Path('/runs/r1'), card=1, attempt=1, dispatch_id='c1-a1',\n\
-        \x20   steps=40, minutes=20, network=False, writable_dirs=()),\n\
-        \x20 d.DispatchRequest(model='m', effort='h\\u00e9', role='scout',\n\
-        \x20   brief=Path(esc(b'/w s//\\xff/./brief.md')), report=Path('/w s/r\\u00e9port.md/'),\n\
-        \x20   cwd=Path(esc(b'/w s/\\xff')), run_dir=Path('//runs/r 2'), card=None, attempt=3,\n\
-        \x20   dispatch_id='run-a3-scout', steps=5, minutes=1, network=True,\n\
-        \x20   writable_dirs=(Path('/tmp/x/'), Path(esc(b'/d\\xfe'))), resume='0f0f-thread',\n\
-        \x20   kind='final_fix', branch=esc(b'lh/r\\xff')),\n\
-        ]\n\
-        for r in reqs:\n\
-        \x20 print(json.dumps(json.dumps(d.request_to_json(r), indent=2, ensure_ascii=True)))\n";
+    /// The reference fixture of the tests here: the documents the reference wrote, and what it
+    /// read.
+    const FIXTURE: &str = "dispatch/request.json";
 
-    fn python_lines(code: &str, args: &[&OsStr]) -> Vec<String> {
-        let out = String::from_utf8(python(code, args)).unwrap();
-        out.lines()
-            .map(|l| serde_json::from_str::<String>(l).unwrap())
+    /// The documents of `section`, as the reference wrote them.
+    fn reference_texts(section: &str) -> Vec<String> {
+        reference_json(FIXTURE)[section]
+            .as_array()
+            .unwrap_or_else(|| panic!("{FIXTURE}: no section {section:?}"))
+            .iter()
+            .map(|t| t.as_str().unwrap().to_string())
             .collect()
     }
 
     #[test]
     fn request_json_round_trips_with_python() {
-        let texts = python_lines(PY_REQUESTS, &[]);
+        // Python's `request_to_json` of requests it builds, as `write_json_atomic` writes them.
+        let texts = reference_texts("requests");
         assert_eq!(texts.len(), 2);
+        let mut lines = Vec::new();
         for text in &texts {
             let req: DispatchRequest = serde_json::from_str(text).unwrap();
             // Written back exactly as the Python writes it.
             assert_eq!(&to_pretty(&req).unwrap(), text);
-            // And the Python reads what Rust writes as the request it wrote.
-            let check = "import json, sys\nfrom leadhand import dispatch as d\n\
-                         a = d.request_from_json(json.loads(sys.argv[1]))\n\
-                         b = d.request_from_json(json.loads(sys.argv[2]))\n\
-                         print(a == b)\n";
             let ours = to_line(&req).unwrap();
-            assert_eq!(
-                python(check, &[OsStr::new(&ours), OsStr::new(text)]),
-                b"True\n"
-            );
+            lines.push(serde_json::json!([ours, text]));
+        }
+        // And the Python reads what Rust writes as the request it wrote: the reference compared
+        // its reading of these very lines (the recorded inputs are checked to be them) with its
+        // reading of its own text.
+        for same in reference_outputs(FIXTURE, "request_read_back", &lines) {
+            assert_eq!(same, "True\n");
         }
         let second: DispatchRequest = serde_json::from_str(&texts[1]).unwrap();
         assert_eq!(second.cwd.as_os_str().as_bytes(), b"/w s/\xff");
@@ -386,59 +372,20 @@ mod tests {
                "steps": 1, "minutes": 2, "network": true, "writable_dirs": null,
                "resume": null, "kind": null, "branch": null, "unknown": [1]}"#,
         ];
-        let code = "import json, sys\nfrom leadhand import dispatch as d\n\
-                    for t in sys.argv[1:]:\n\
-                    \x20 r = d.request_from_json(json.loads(t))\n\
-                    \x20 print(json.dumps(json.dumps(d.request_to_json(r), indent=2)))\n";
-        let args: Vec<&OsStr> = docs.iter().map(OsStr::new).collect();
-        for (doc, want) in docs.iter().zip(python_lines(code, &args)) {
+        // Python's `request_to_json(request_from_json(doc))`, as `write_json_atomic` writes it.
+        let inputs: Vec<serde_json::Value> = docs.iter().map(|d| (*d).into()).collect();
+        let theirs = reference_outputs(FIXTURE, "request_reads", &inputs);
+        for (doc, want) in docs.iter().zip(theirs) {
             let req: DispatchRequest = serde_json::from_str(doc).unwrap();
             assert_eq!(to_pretty(&req).unwrap(), want, "{doc}");
         }
     }
 
     /// `result.json` as `_finalize_body` writes it, in its key order, for each shape of the
-    /// commit outcome `_commit_work` returns.
-    const PY_RESULTS: &str = "import json, sys\n\
-        esc = lambda b: b.decode('utf-8', 'surrogateescape')\n\
-        def result(commit, **kw):\n\
-        \x20 r = {'dispatch_id': 'c1-a1', 'status': 'READY', 'blocked_by': '',\n\
-        \x20   'session_id': '0f0f0f0f-0000-4000-8000-00000000c0de', 'reply': 'Status: READY\\n',\n\
-        \x20   'steps': 3, 'usage': {'input': 10, 'cached': 2, 'cache_write_5m': 0,\n\
-        \x20   'cache_write_1h': 0, 'output': 5, 'reasoning': 1, 'known': True, 'model': 'gpt-6'},\n\
-        \x20   'usage_known': True, 'usage_source': 'session', 'possibly_incomplete': False,\n\
-        \x20   'exit_reason': 'completed', 'codex_exit': 0, 'charge_ids': ['c1-a1:codex:t'],\n\
-        \x20   'generation': 1, 'stopped': [{'pid': 41, 'pgid': 41, 'start': '1767225600.000001'}],\n\
-        \x20   'confirmed_at': 1767225600.25, 'cancel_token': None,\n\
-        \x20   'started_at': '2026-01-01T00:00:00.000Z', 'ended_at': '2026-01-01T00:01:00.000Z'}\n\
-        \x20 r.update(kw)\n\
-        \x20 return {**r, **commit}\n\
-        rs = [\n\
-        \x20 result({'committed': 'a' * 40, 'changes': True}),\n\
-        \x20 result({'committed': 'b' * 40, 'changes': True, 'gitlinks_skipped': [esc(b'sub\\xff')]}),\n\
-        \x20 result({'committed': None, 'changes': False, 'commit_skipped': 'implement dispatch does not commit'},\n\
-        \x20        session_id=None, usage=None, usage_known=False, usage_source='unknown', steps=0,\n\
-        \x20        status='SPENT', exit_reason='step_limit', possibly_incomplete=True, codex_exit=-15,\n\
-        \x20        stopped=[{'pid': 7, 'pgid': 7, 'start': None}, {'pid': 9, 'pgid': 7, 'start': 'ticks:5'}]),\n\
-        \x20 result({'committed': None, 'changes': False,\n\
-        \x20         'commit_skipped': esc(b'only nested repositories changed, and gitlinks are never committed: a\\xff'),\n\
-        \x20         'gitlinks_skipped': [esc(b'a\\xff')]}),\n\
-        \x20 result({'committed': None, 'changes': True, 'commit_error': esc(b'git commit failed: \\xfe'),\n\
-        \x20         'worker_status': 'QUESTION', 'worker_exit_reason': 'completed'},\n\
-        \x20        status='BLOCKED', blocked_by='environment', exit_reason='error',\n\
-        \x20        reply=esc(b'Status: BLOCKED\\nBlocked by: environment\\n\\xff ') + '\\u00e9 \\U0001f600',\n\
-        \x20        cancel_token='9f' * 16),\n\
-        \x20 result({'committed': None, 'changes': False, 'commit_skipped': 'Codex never ran'},\n\
-        \x20        status='BLOCKED', blocked_by='usage limit', exit_reason='usage_limit', codex_exit=None,\n\
-        \x20        usage={'input': 0, 'cached': 0, 'cache_write_5m': 0, 'cache_write_1h': 0, 'output': 0,\n\
-        \x20               'reasoning': 0, 'known': True, 'model': None}, usage_source='none', charge_ids=[]),\n\
-        ]\n\
-        for r in rs:\n\
-        \x20 print(json.dumps(json.dumps(r, indent=2, ensure_ascii=True)))\n";
-
+    /// commit outcome `_commit_work` returns: the reference's documents.
     #[test]
     fn result_json_round_trips_with_python() {
-        let texts = python_lines(PY_RESULTS, &[]);
+        let texts = reference_texts("results");
         assert_eq!(texts.len(), 6);
         for text in &texts {
             let result: DispatchResult = serde_json::from_str(text).unwrap();
@@ -471,14 +418,11 @@ mod tests {
             r#"{"status": "SPENT", "exit_reason": "time_limit", "steps": 12, "reply": "r\udcff",
                "session_id": "t-1", "usage": {"input": 1, "known": true}}"#,
         ];
-        let code = "import json, sys\nfrom leadhand import dispatch as d\n\
-                    for t in sys.argv[1:]:\n\
-                    \x20 r = d._result_from(json.loads(t))\n\
-                    \x20 print(json.dumps([r.status, r.blocked_by, r.session_id, r.reply, r.steps,\n\
-                    \x20   d.usage_dict(r.usage), r.exit_reason]))\n";
-        let args: Vec<&OsStr> = docs.iter().map(OsStr::new).collect();
-        let out = String::from_utf8(python(code, &args)).unwrap();
-        let theirs: Vec<&str> = out.lines().collect();
+        // The reference's `_result_from` of each: `[status, blocked_by, session_id, reply,
+        // steps, usage_dict(usage), exit_reason]`, as JSON.
+        let inputs: Vec<serde_json::Value> = docs.iter().map(|d| (*d).into()).collect();
+        let out = reference_outputs(FIXTURE, "result_reads", &inputs);
+        let theirs: Vec<&str> = out.iter().map(|o| o.as_str().unwrap()).collect();
         assert_eq!(theirs.len(), docs.len());
         for (doc, want) in docs.iter().zip(theirs) {
             let r: DispatchResult = serde_json::from_str(doc).unwrap();

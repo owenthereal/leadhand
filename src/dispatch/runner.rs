@@ -940,11 +940,10 @@ pub fn return_code(status: ExitStatus) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::path::PathBuf;
 
     use super::*;
-    use crate::wire::tests::python;
+    use crate::wire::tests::reference_outputs;
 
     fn term() -> i32 {
         Signal::TERM.as_raw()
@@ -1668,17 +1667,16 @@ mod tests {
     // ----------------------------------------------------------------------
     // Parity with the Python reference
 
-    /// Python's `_Stream` over `bytes` (a stream file), as JSON: steps, thread_id,
-    /// turn_open, last_agent_message, error_texts.
-    fn python_stream(bytes: &[u8]) -> String {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("stream.jsonl");
-        std::fs::write(&path, bytes).unwrap();
-        let code = "import json, sys\nfrom pathlib import Path\nfrom leadhand import dispatch as d\n\
-                    s = d._Stream(Path(sys.argv[1]))\ns.poll()\n\
-                    print(json.dumps([s.steps, s.thread_id, s.turn_open, s.last_agent_message() or None,\n\
-                    \x20 s.error_texts()]))\n";
-        String::from_utf8(python(code, &[path.as_os_str()])).unwrap()
+    /// The reference fixture of the parity tests.
+    const FIXTURE: &str = "dispatch/runner.json";
+
+    /// The recorded `out` of each row of `section`, as text, once its inputs are checked to be
+    /// `inputs`.
+    fn reference_lines(section: &str, inputs: &[serde_json::Value]) -> Vec<String> {
+        reference_outputs(FIXTURE, section, inputs)
+            .into_iter()
+            .map(|o| o.as_str().unwrap().to_string())
+            .collect()
     }
 
     #[test]
@@ -1712,9 +1710,20 @@ mod tests {
             b"",
             b"\n\n   \n{\"type\": \"turn.started\"}\r\n{\"type\": \"turn.completed\"}\n",
         ];
-        for bytes in streams {
+        // Python's `_Stream` over each (a stream file), as JSON: steps, thread_id, turn_open,
+        // last_agent_message, error_texts. The inputs are the streams' bytes in hex.
+        let hex: Vec<serde_json::Value> = streams
+            .iter()
+            .map(|b| {
+                b.iter()
+                    .map(|x| format!("{x:02x}"))
+                    .collect::<String>()
+                    .into()
+            })
+            .collect();
+        let theirs = reference_lines("stream", &hex);
+        for (bytes, want) in streams.into_iter().zip(theirs) {
             let ours = StreamSummary::of(bytes);
-            let want = python_stream(bytes);
             let got = crate::wire::to_output(&(
                 ours.steps,
                 &ours.thread_id,
@@ -1750,21 +1759,11 @@ mod tests {
 
     /// Python's `dispatch.has_status_line`, `_USAGE_LIMIT.search` and `_classify` over
     /// `texts`: one JSON line each, `[has_status_line or "KeyError", usage, classify]`, where
-    /// `classify` is `_classify(None, 0, text, [], "")[:4]` or `"KeyError"`.
-    fn python_reply_checks(texts: &[&str]) -> Vec<String> {
-        let code = "import json, sys\nfrom leadhand import dispatch as d\n\
-                    for t in sys.argv[1:]:\n\
-                    \x20 try: h = d.has_status_line(t)\n\
-                    \x20 except KeyError: h = 'KeyError'\n\
-                    \x20 try: c = list(d._classify(None, 0, t, [], ''))\n\
-                    \x20 except KeyError: c = 'KeyError'\n\
-                    \x20 print(json.dumps([h, bool(d._USAGE_LIMIT.search(t)), c]))\n";
-        let args: Vec<&OsStr> = texts.iter().map(OsStr::new).collect();
-        String::from_utf8(python(code, &args))
-            .unwrap()
-            .lines()
-            .map(str::to_string)
-            .collect()
+    /// `classify` is `_classify(None, 0, text, [], "")[:4]` or `"KeyError"`: recorded for
+    /// `texts`.
+    fn reference_reply_checks(texts: &[&str]) -> Vec<String> {
+        let inputs: Vec<serde_json::Value> = texts.iter().map(|t| (*t).into()).collect();
+        reference_lines("reply_checks", &inputs)
     }
 
     #[test]
@@ -1802,7 +1801,7 @@ mod tests {
             "usage\nlimit",
             "the usage\u{2003}LIMIT",
         ];
-        let theirs = python_reply_checks(&texts);
+        let theirs = reference_reply_checks(&texts);
         assert_eq!(theirs.len(), texts.len());
         for (text, want) in texts.iter().zip(&theirs) {
             let has = match has_status_line(text) {
@@ -1873,12 +1872,12 @@ mod tests {
             ),
             (None, Some(0), "Verdict: defects\n", vec![], ""),
         ];
-        let code = "import json, sys\nfrom leadhand import dispatch as d\n\
-                    for case in json.loads(sys.argv[1]):\n\
-                    \x20 try: print(json.dumps(list(d._classify(*case))))\n\
-                    \x20 except KeyError: print(json.dumps('KeyError'))\n";
-        let arg = serde_json::to_string(&cases).unwrap();
-        let theirs = String::from_utf8(python(code, &[OsStr::new(&arg)])).unwrap();
+        // The reference's `_classify(*case)` of each, as JSON (or `"KeyError"`).
+        let inputs: Vec<serde_json::Value> = cases
+            .iter()
+            .map(|c| serde_json::to_value(c).unwrap())
+            .collect();
+        let theirs = reference_lines("classify", &inputs);
         let reason = |s: &str| match s {
             "cancelled" => StopReason::Cancelled,
             "step_limit" => StopReason::StepLimit,
@@ -1887,7 +1886,7 @@ mod tests {
             "interrupted" => StopReason::Interrupted,
             other => panic!("{other}"),
         };
-        for ((stopped, exit, reply, errors, stderr), want) in cases.iter().zip(theirs.lines()) {
+        for ((stopped, exit, reply, errors, stderr), want) in cases.iter().zip(&theirs) {
             let errors: Vec<PyStr> = errors.iter().map(|e| PyStr::from(*e)).collect();
             let ours = match classify(stopped.map(reason), *exit, reply, &errors, stderr) {
                 Ok(c) => format!(
@@ -1899,7 +1898,7 @@ mod tests {
                 ),
                 Err(_) => "\"KeyError\"".into(),
             };
-            assert_eq!(ours, want, "{stopped:?} {exit:?} {reply:?}");
+            assert_eq!(&ours, want, "{stopped:?} {exit:?} {reply:?}");
         }
     }
 
