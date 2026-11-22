@@ -159,12 +159,13 @@ mod tests {
     #[test]
     fn run_paths_are_spelled_as_python_spells_them() {
         let roots = [".", "", "./run dir/", "a//b/./c", "/runs/r 1", "//r"];
-        let code = "import json, sys\nfrom dataclasses import fields\nfrom leadhand import state\n\
-                    print(json.dumps([[str(getattr(state.run_paths(r), f.name)) \
-                    for f in fields(state.RunPaths)] for r in sys.argv[1:]]))\n";
-        let args: Vec<&std::ffi::OsStr> = roots.iter().map(std::ffi::OsStr::new).collect();
+        // Each field of the reference's `run_paths(root)`, in its order, as text.
+        let inputs: Vec<serde_json::Value> = roots.iter().map(|r| serde_json::json!(r)).collect();
         let theirs: Vec<Vec<String>> =
-            serde_json::from_slice(&crate::wire::tests::python(code, &args)).unwrap();
+            crate::wire::tests::reference_outputs("state/run-paths.json", "run_paths", &inputs)
+                .into_iter()
+                .map(|v| serde_json::from_value(v).unwrap())
+                .collect();
         for (root, want) in roots.iter().zip(theirs) {
             assert_eq!(fields(&run_paths(Path::new(root))), want, "{root:?}");
         }

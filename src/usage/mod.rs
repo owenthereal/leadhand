@@ -449,7 +449,7 @@ pub fn default_sessions_dir() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{self, tests::python};
+    use crate::wire::{self, tests::read_reference_text};
 
     fn tokens(input: u64, output: u64) -> Tokens {
         Tokens {
@@ -606,13 +606,9 @@ mod tests {
         let opus = usage(tokens(1000, 100), Some("claude-opus-4"));
         let sonnet = usage(tokens(2000, 200), Some("claude-sonnet-4-5"));
         let sum = add(&opus, &sonnet);
-        let code = "import json\nfrom leadhand import usage as u\n\
-                    a = u.Usage(input=1000, output=100, model='claude-opus-4')\n\
-                    b = u.Usage(input=2000, output=200, model='claude-sonnet-4-5')\n\
-                    print(json.dumps(u.usage_to_dict(a), separators=(',', ':')))\n\
-                    print(json.dumps(u.usage_to_dict(u.add(a, b)), separators=(',', ':')))\n\
-                    print(json.dumps(u.usage_to_dict(u.UNKNOWN), separators=(',', ':')))\n";
-        let want = String::from_utf8(python(code, &[])).unwrap();
+        // The reference's lines of the same opus usage, of its sum with the sonnet one, and of
+        // its unknown usage.
+        let want = read_reference_text("usage/serialized.jsonl");
         let got = [&opus, &sum, &Usage::unknown()]
             .map(|u| wire::to_line(u).unwrap())
             .join("\n");
@@ -640,13 +636,9 @@ mod tests {
             },
             ..Usage::default()
         };
-        let code = "from leadhand import usage as u\n\
-                    p = {'opus': {'input': 15.0, 'output': 75.0, 'cache_read': 1.5, \
-                    'cache_write_5m': 18.75, 'cache_write_1h': 30.0}}\n\
-                    x = u.Usage(input=1234, cached=56789, cache_write_5m=1011, cache_write_1h=1213, \
-                    output=1415, reasoning=99)\n\
-                    print(repr(u.estimate_cost(x, 'claude-Opus-4', p)), u.estimate_cost(x, 'gpt-5', p))\n";
-        let want = String::from_utf8(python(code, &[])).unwrap();
+        // The reference's estimates of the same usage at the same opus prices, for
+        // `claude-Opus-4` (its `repr`) and for `gpt-5`.
+        let want = read_reference_text("usage/estimate-cost.txt");
         let opus = Some(PyStr::from("claude-Opus-4"));
         let cost = estimate_cost(&u, opus.as_ref(), &prices()).unwrap();
         let gpt = estimate_cost(&u, Some(&PyStr::from("gpt-5")), &prices());

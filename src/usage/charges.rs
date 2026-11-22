@@ -315,7 +315,6 @@ pub fn charge(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::fs;
     use std::process::Command;
 
@@ -326,7 +325,10 @@ mod tests {
         ROLLOUT, append_lines, codex_line, fixture_lines, rollout_path,
     };
     use crate::usage::{Group, add, claude_usage, totals};
-    use crate::wire::{self, tests::python};
+    use crate::wire::{
+        self,
+        tests::{mask_ts, read_reference_text},
+    };
 
     /// A run directory and the vendor folders beside it (the Python tests' `UsageCase`).
     struct Case {
@@ -493,15 +495,12 @@ mod tests {
         let one = c.claude(1, &f);
         let text = fs::read_to_string(&c.paths.charges).unwrap();
         assert_eq!(text.lines().count(), 1);
-        // The record as the Python writes it, field for field (its timestamp aside).
-        let code = "import json, sys\nfrom pathlib import Path\nfrom leadhand import state, usage as u\n\
-                    (c,) = u.read_charges(state.run_paths(Path(sys.argv[1])))\n\
-                    print(json.dumps(u._charge_to_record(c), separators=(',', ':')))\n\
-                    print(json.dumps(u.charged_checkpoint([c], 'claude', 'agent1')), \
-                    json.dumps(u.charged_checkpoint([c], 'claude', 'other')))\n";
-        let theirs = String::from_utf8(python(code, &[c.paths.root.as_os_str()])).unwrap();
+        // The record as the Python writes it, field for field (its timestamp aside): the
+        // reference's line for the same charge of the same transcript, then its checkpoints of
+        // that charge for `agent1` and for `other`.
+        let theirs = read_reference_text("usage/charge-record.txt");
         let mut theirs = theirs.lines();
-        assert_eq!(theirs.next().unwrap(), text.trim_end());
+        assert_eq!(mask_ts(theirs.next().unwrap()), mask_ts(text.trim_end()));
         assert!(text.contains("\"charge_id\":\"d1:claude:agent1\""));
         let one = std::slice::from_ref(&one);
         assert_eq!(c.charges(), one);
@@ -1009,11 +1008,6 @@ mod tests {
         assert_eq!(theirs, ours);
         // And every line, checkpoints included, is the one the reference wrote when it made
         // the same charges alone (`charge-checkpoint/charges-all.jsonl`), but for the time.
-        let mask_ts = |line: &str| -> String {
-            let (head, rest) = line.split_once(",\"ts\":\"").expect("a ts field");
-            let (_, tail) = rest.split_once('"').expect("the ts's closing quote");
-            format!("{head},\"ts\":\"<ts>\"{tail}")
-        };
         let written = fs::read_to_string(&c.paths.charges).unwrap();
         let reference = reference_lines("charge-checkpoint/charges-all.jsonl");
         assert_eq!(reference.len(), 6);
@@ -1111,63 +1105,112 @@ mod tests {
         );
         let line = fs::read_to_string(&c.paths.charges).unwrap();
         assert!(!line.contains("by_model"), "{line}");
-        let code = "import json\nfrom leadhand import state, usage as u\n\
-                    s = u.Usage()\n\
-                    for x in (u.Usage(input=1, output=10, model='claude-opus-4-1'), u.Usage(input=2, output=20, model='claude-opus-4-1'), u.Usage(model='<synthetic>')):\n\
-                    \x20   s = u.add(s, x)\n\
-                    print(json.dumps(u.usage_to_dict(s), separators=(',', ':')))\n";
-        let theirs = String::from_utf8(python(code, &[])).unwrap();
+        // The reference's sum of the same three usages, from an empty one.
+        let theirs = read_reference_text("usage/single-model.json");
         assert_eq!(theirs.trim_end(), wire::to_line(&one.usage).unwrap());
     }
 
-    /// Charges from Rust and from the Python reference at once, each appending to the source
-    /// files as it goes (`test_concurrent_supervisor_and_runner_charges_keep_exact_totals`, one
-    /// writer in each implementation).
+    /// The folder `concurrent_charges_from_two_processes_keep_exact_totals` charges in (its
+    /// `Case`'s), for `two_process_charge_child`; unset in an ordinary run.
+    const CHARGE_CHILD: &str = "LEADHAND_CHARGES_TEST_CHARGE_CHILD";
+
+    /// How many lines each writer of that test adds.
+    const RACE_LINES: u64 = 12;
+
+    /// Not a test of its own: writer A of `concurrent_charges_from_two_processes_keep_exact_
+    /// totals` (this test binary, running this test alone). It says it is ready, waits for the
+    /// word to go, then, `RACE_LINES` times, adds a Claude message to the transcript and charges
+    /// both sources as the supervisor. Does nothing in an ordinary run.
     #[test]
-    fn concurrent_rust_and_python_charges_keep_exact_totals() {
+    fn two_process_charge_child() {
+        let Some(tmp) = std::env::var_os(CHARGE_CHILD) else {
+            return;
+        };
+        let tmp = Path::new(&tmp);
+        let paths = run_paths(&tmp.join("run with spaces"));
+        let (claude_file, sessions) = (tmp.join("projects/p/S.jsonl"), tmp.join("sessions"));
+        // On a line of its own: libtest has printed `test <name> ... ` without a newline.
+        println!("\nready");
+        let mut go = String::new();
+        std::io::stdin().read_line(&mut go).unwrap();
+        let thread: PyStr = "thr1".into();
+        for i in 0..RACE_LINES {
+            let line = format!(
+                "{{\"type\": \"assistant\", \"message\": {{\"id\": \"A-{i}\", \"model\": \
+                 \"{OPUS}\", \"usage\": {{\"input_tokens\": 2, \"cache_read_input_tokens\": 7, \
+                 \"output_tokens\": {}}}}}}}",
+                i + 1
+            );
+            append_lines(&claude_file, &[&line]);
+            let did = format!("A{i}");
+            let claude = ChargeSource::ClaudeTranscript(Some(&claude_file));
+            charge(
+                &paths,
+                &format!("{did}:claude:S").into(),
+                &"S".into(),
+                &did,
+                "supervisor",
+                claude,
+                false,
+            )
+            .unwrap();
+            let codex = ChargeSource::Codex {
+                thread: Some(&thread),
+                sessions_dir: &sessions,
+                stream: None,
+            };
+            charge(
+                &paths,
+                &format!("{did}:codex:T").into(),
+                &thread,
+                &did,
+                "supervisor",
+                codex,
+                false,
+            )
+            .unwrap();
+        }
+    }
+
+    /// Charges from two processes at once, each appending to the source files as it goes
+    /// (`test_concurrent_supervisor_and_runner_charges_keep_exact_totals`). The stage-2 test's
+    /// writer A was the Python reference; here it is this test binary again.
+    #[test]
+    fn concurrent_charges_from_two_processes_keep_exact_totals() {
         let c = Case::new();
-        let n: u64 = 12;
+        let n = RACE_LINES;
         let claude_file = c.tmp.join("projects/p/S.jsonl");
         append_lines(&claude_file, &[&claude_line("seed", 3, 1, 0, 0, 0)]);
         append_lines(
             &rollout_path(&c.sessions, "thr1"),
             &[&codex_line(100, 20, 5, 0)],
         );
-        // Python is writer A: Claude messages; Rust is writer B: Codex totals. Each charges
-        // both sources after each line.
-        let code = "import sys, json\nfrom pathlib import Path\nfrom leadhand import state, usage as u\n\
-            root, claude_file, sessions, n = sys.argv[1:5]\n\
-            p = state.run_paths(Path(root))\n\
-            print('ready', flush=True)\n\
-            sys.stdin.readline()\n\
-            for i in range(int(n)):\n\
-            \x20   line = {'type': 'assistant', 'message': {'id': f'A-{i}', 'model': 'claude-opus-4-1', 'usage': {\n\
-            \x20       'input_tokens': 2, 'cache_read_input_tokens': 7, 'output_tokens': i + 1}}}\n\
-            \x20   with open(claude_file, 'a', encoding='utf-8') as f:\n\
-            \x20       f.write(json.dumps(line) + '\\n')\n\
-            \x20   u.charge(p, charge_id=f'A{i}:claude:S', source='claude', key='S', dispatch_id=f'A{i}',\n\
-            \x20            role='supervisor', path_or_thread=Path(claude_file))\n\
-            \x20   u.charge(p, charge_id=f'A{i}:codex:T', source='codex', key='thr1', dispatch_id=f'A{i}',\n\
-            \x20            role='supervisor', path_or_thread='thr1', sessions_dir=Path(sessions))\n";
-        let lib = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/lib");
-        let mut child = Command::new("python3")
-            .args(["-B", "-c", code])
-            .arg(&c.paths.root)
-            .arg(&claude_file)
-            .arg(&c.sessions)
-            .arg(n.to_string())
-            .env("PYTHONPATH", &lib)
+        // The child is writer A: Claude messages; this process is writer B: Codex totals. Each
+        // charges both sources after each line.
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "usage::charges::tests::two_process_charge_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHARGE_CHILD, &c.tmp)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .expect("run python3");
+            .expect("run the test binary");
+        // Both writers start together: the child once it is running its test.
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut ready = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(child.stdout.as_mut().unwrap()),
-            &mut ready,
-        )
-        .unwrap();
+        loop {
+            ready.clear();
+            if std::io::BufRead::read_line(&mut stdout, &mut ready).unwrap() == 0
+                || ready == "ready\n"
+            {
+                break;
+            }
+        }
         assert_eq!(ready, "ready\n");
         std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"go\n").unwrap();
         let claude_source = ChargeSource::ClaudeTranscript(Some(&claude_file));
@@ -1231,14 +1274,10 @@ mod tests {
             (codex.input, codex.cached, codex.output),
             (100 + 10 * n - 20, 20, 5 * (n + 1))
         );
-        // Every line is whole, and the Python reads them all.
+        // Every line is whole, and the reader reads them all.
         let text = fs::read_to_string(&c.paths.charges).unwrap();
         assert_eq!(text.lines().count(), charges.len());
-        let count = python(
-            "import sys\nfrom pathlib import Path\nfrom leadhand import state, usage as u\n\
-             print(len(u.read_charges(state.run_paths(Path(sys.argv[1])))))\n",
-            &[OsStr::new(&c.paths.root)],
-        );
-        assert_eq!(count, format!("{}\n", charges.len()).into_bytes());
+        let count = read_charges(&c.paths).unwrap().len();
+        assert_eq!(count, charges.len());
     }
 }

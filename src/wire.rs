@@ -754,6 +754,56 @@ pub(crate) mod tests {
         fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
     }
 
+    /// The reference fixture of the tests here.
+    const FIXTURE: &str = "wire.json";
+
+    /// The reference fixture `name` as UTF-8 text.
+    #[track_caller]
+    pub(crate) fn read_reference_text(name: &str) -> String {
+        String::from_utf8(read_reference(name)).unwrap()
+    }
+
+    /// The reference fixture `name` as JSON (one whose strings hold no lone surrogate).
+    #[track_caller]
+    pub(crate) fn reference_json(name: &str) -> serde_json::Value {
+        serde_json::from_slice(&read_reference(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
+    }
+
+    /// The `out` of each row of `section` in the reference fixture `name` (a JSON object of
+    /// arrays of `{"in": .., "out": ..}` rows), once the rows' `in` are checked to be `inputs`,
+    /// in order: what the reference made of the inputs the test gives its own code.
+    #[track_caller]
+    pub(crate) fn reference_outputs(
+        name: &str,
+        section: &str,
+        inputs: &[serde_json::Value],
+    ) -> Vec<serde_json::Value> {
+        let all = reference_json(name);
+        let rows = all[section]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name}: no section {section:?}"));
+        let recorded: Vec<&serde_json::Value> = rows.iter().map(|r| &r["in"]).collect();
+        assert_eq!(
+            recorded,
+            inputs.iter().collect::<Vec<_>>(),
+            "{name} {section}: recorded on other inputs"
+        );
+        rows.iter().map(|r| r["out"].clone()).collect()
+    }
+
+    /// A record line with its `ts` written `<ts>`: a line the reference wrote at its fixed time,
+    /// beside one written now.
+    pub(crate) fn mask_ts(line: &str) -> String {
+        let (head, rest) = line.split_once(",\"ts\":\"").expect("a ts field");
+        let (_, tail) = rest.split_once('"').expect("the ts's closing quote");
+        format!("{head},\"ts\":\"<ts>\"{tail}")
+    }
+
+    /// A float as the reference fixtures give an input float: its bits, in hex.
+    pub(crate) fn float_bits(x: f64) -> serde_json::Value {
+        serde_json::json!(format!("{:016x}", x.to_bits()))
+    }
+
     #[derive(Debug, Serialize, Deserialize)]
     struct Rec {
         path: PyStr,
@@ -850,22 +900,15 @@ pub(crate) mod tests {
             b"ok\xf0\x9f\x98\x80\xe9",
             b"\x80\xbf\xc2",
         ];
-        let hex: Vec<OsString> = cases
+        // Each case in hex; the reference decoded it and wrote the string as JSON.
+        let hex: Vec<serde_json::Value> = cases
             .iter()
-            .map(|b| {
-                b.iter()
-                    .map(|x| format!("{x:02x}"))
-                    .collect::<String>()
-                    .into()
-            })
+            .map(|b| serde_json::json!(b.iter().map(|x| format!("{x:02x}")).collect::<String>()))
             .collect();
-        let args: Vec<&OsStr> = hex.iter().map(OsString::as_os_str).collect();
-        let decode = "import json, sys\nfor h in sys.argv[1:]:\n\
-                      \x20   print(json.dumps(bytes.fromhex(h).decode('utf-8', 'surrogateescape')))\n";
-        let python_out = String::from_utf8(python(decode, &args)).unwrap();
-        for (bytes, want) in cases.iter().zip(python_out.lines()) {
+        let decoded = reference_outputs(FIXTURE, "surrogateescape", &hex);
+        for (bytes, want) in cases.iter().zip(decoded) {
             let s = PyStr::from_os(OsStr::from_bytes(bytes));
-            assert_eq!(ascii_json(&s), want, "{bytes:x?}");
+            assert_eq!(ascii_json(&s), want.as_str().unwrap(), "{bytes:x?}");
             assert_eq!(s.to_os().unwrap().into_vec(), *bytes);
         }
     }
@@ -893,10 +936,13 @@ pub(crate) mod tests {
     fn lone_surrogate_survives_storage_action_and_output() {
         let tmp = tempfile::tempdir().unwrap();
         let run = tmp.path();
-        let write = "import sys\nfrom pathlib import Path\nfrom leadhand import state\n\
-                     state.append_event(state.run_paths(Path(sys.argv[1])), 'ruling',\n\
-                     \x20   path=b'a\\xffb'.decode('utf-8', 'surrogateescape'))\n";
-        python(write, &[run.as_os_str()]);
+        // The event the reference appended: a ruling whose path is `b'a\xffb'`.
+        let recorded = &reference_json(FIXTURE)["lone_surrogate"][0];
+        fs::write(
+            run.join("events.jsonl"),
+            recorded["events"].as_str().unwrap(),
+        )
+        .unwrap();
 
         // The event, read typed, with its raw line.
         #[derive(Deserialize)]
@@ -969,10 +1015,10 @@ pub(crate) mod tests {
         assert!(serde_json::from_str::<serde_json::Value>(raw.get()).is_err());
         assert!(serde_json::from_str::<serde_json::Value>(&printed).is_err());
 
-        // And Python reads the printed path as the string it wrote.
-        let check = "import json, sys\nv = json.loads(sys.argv[1])\n\
-                     print(v['path'] == b'a\\xffb'.decode('utf-8', 'surrogateescape') == v['event']['path'])\n";
-        assert_eq!(python(check, &[OsStr::new(&printed)]), b"True\n");
+        // And Python reads the printed path as the string it wrote: the reference read this
+        // text so.
+        assert_eq!(recorded["printed"].as_str().unwrap(), printed);
+        assert_eq!(recorded["reads_back"], "True\n");
     }
 
     #[test]
@@ -1004,16 +1050,12 @@ pub(crate) mod tests {
             "\u{4e2d}\u{6587} \u{2028}",
             "plain",
         ];
-        let dump = "import json, sys\nfor s in sys.argv[1:]:\n\
-                    \x20   d = {'s': s, 'p': s, 'n': [1, 2], 'e': [], 'o': {}}\n\
-                    \x20   print(json.dumps([json.dumps(s, ensure_ascii=True),\n\
-                    \x20       json.dumps(d, ensure_ascii=True, separators=(',', ':')),\n\
-                    \x20       json.dumps(d, ensure_ascii=True),\n\
-                    \x20       json.dumps(d, ensure_ascii=True, indent=2)]))\n";
-        let args: Vec<&OsStr> = strings.iter().map(OsStr::new).collect();
-        let out = String::from_utf8(python(dump, &args)).unwrap();
-        for (s, line) in strings.iter().zip(out.lines()) {
-            let want: Vec<String> = serde_json::from_str(line).unwrap();
+        // The reference's dumps of each string, and of `{'s': s, 'p': s, 'n': [1, 2], 'e': [],
+        // 'o': {}}` as a line, as output and pretty.
+        let inputs: Vec<serde_json::Value> = strings.iter().map(|s| serde_json::json!(s)).collect();
+        let dumped = reference_outputs(FIXTURE, "ascii_escapes", &inputs);
+        for (s, want) in strings.iter().zip(dumped) {
+            let want: Vec<String> = serde_json::from_value(want).unwrap();
             let doc = Doc {
                 s,
                 p: PyStr::from(*s),
@@ -1057,11 +1099,10 @@ pub(crate) mod tests {
         assert_eq!(map.get(&PyStr::from("\u{e9}")), Some(&PyStr::from("y")));
         let want = r#"{"refs/heads/a\udcffb":"w","\u00e9":"y","\ud83d\ude00":"z"}"#;
         assert_eq!(to_line(&map).unwrap(), want);
-        // Python reads it back as the same dict.
-        let check = "import json, sys\n\
-                     d = json.loads(sys.argv[1])\n\
-                     print(list(d) == ['refs/heads/a\\udcffb', '\\u00e9', '\\U0001f600'], d['\\u00e9'])\n";
-        assert_eq!(python(check, &[OsStr::new(want)]), b"True y\n");
+        // Python reads it back as the same dict: the reference read this text with the keys
+        // `['refs/heads/a\udcffb', 'é', '\U0001f600']`, in order, and `'é'` -> `y`.
+        let read_back = reference_outputs(FIXTURE, "pymap_read_back", &[serde_json::json!(want)]);
+        assert_eq!(read_back, ["True y\n"]);
         // With UTF-8 keys every layout is Python's own.
         let plain: PyMap<u32> = serde_json::from_str(r#"{"b": 1, "a": 2}"#).unwrap();
         assert_eq!(to_output(&plain).unwrap(), r#"{"b": 1, "a": 2}"#);
@@ -1094,10 +1135,13 @@ pub(crate) mod tests {
         let floats = vec![
             0.0, 1.0, 15.0, 0.1, 5.2e-05, 1e-07, 1e16, 123456.789, -2.5, 1e22,
         ];
-        let check = "import json\nprint(json.dumps([0.0, 1.0, 15.0, 0.1, 5.2e-05, 1e-07, 1e16, \
-                     123456.789, -2.5, 1e22], separators=(',', ':')))\n";
-        let want = python(check, &[]);
-        assert_eq!(format!("{}\n", to_line(&floats).unwrap()).as_bytes(), want);
+        // The reference's line of the same floats (given by their bits).
+        let bits: Vec<serde_json::Value> = floats.iter().map(|x| float_bits(*x)).collect();
+        let want = reference_outputs(FIXTURE, "floats", &[serde_json::json!(bits)]);
+        assert_eq!(
+            format!("{}\n", to_line(&floats).unwrap()),
+            want[0].as_str().unwrap()
+        );
     }
 
     #[test]
@@ -1108,29 +1152,31 @@ pub(crate) mod tests {
 
     #[test]
     fn repr_matches_python_with_lone_surrogates() {
-        let texts: Vec<PyStr> = [
+        let literals = [
             r#""N\udcff""#,
             r#""it's \ud800""#,
             r#""\"q\" and 'q' \udfff\n""#,
             r#""café 😀 \u0007""#,
             r#""""#,
-        ]
-        .iter()
-        .map(|t| serde_json::from_str(t).unwrap())
-        .collect();
-        let code =
-            "import json, sys\nprint(json.dumps([repr(t) for t in json.loads(sys.argv[1])]))\n";
-        let arg = to_line(&texts).unwrap();
-        let theirs: Vec<String> =
-            serde_json::from_str(std::str::from_utf8(&python(code, &[OsStr::new(&arg)])).unwrap())
-                .unwrap();
+        ];
+        let texts: Vec<PyStr> = literals
+            .iter()
+            .map(|t| serde_json::from_str(t).unwrap())
+            .collect();
+        // The reference's `repr` of each string, read from its JSON literal.
+        let inputs: Vec<serde_json::Value> =
+            literals.iter().map(|l| serde_json::json!(l)).collect();
+        let theirs: Vec<String> = reference_outputs(FIXTURE, "repr", &inputs)
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
         let ours: Vec<String> = texts.iter().map(PyStr::repr).collect();
         assert_eq!(ours, theirs);
     }
 
     #[test]
     fn encode_utf8_is_python_strict_encode() {
-        let texts: Vec<PyStr> = [
+        let literals = [
             r#""plain café 😀""#,
             r#""ab\udcff\udcfecd\udcffe""#,
             r#""x\udcffy""#,
@@ -1138,19 +1184,19 @@ pub(crate) mod tests {
             r#""lone \ud800 lead""#,
             r#""\udfff""#,
             r#""""#,
-        ]
-        .iter()
-        .map(|t| serde_json::from_str(t).unwrap())
-        .collect();
-        let code = "import json, sys\nout = []\n\
-                    for t in json.loads(sys.argv[1]):\n\
-                    \x20 try: out.append(['ok', t.encode('utf-8').decode('utf-8')])\n\
-                    \x20 except UnicodeEncodeError as e: out.append(['err', str(e)])\n\
-                    print(json.dumps(out))\n";
-        let arg = to_line(&texts).unwrap();
-        let theirs: Vec<(String, String)> =
-            serde_json::from_str(std::str::from_utf8(&python(code, &[OsStr::new(&arg)])).unwrap())
-                .unwrap();
+        ];
+        let texts: Vec<PyStr> = literals
+            .iter()
+            .map(|t| serde_json::from_str(t).unwrap())
+            .collect();
+        // The reference's strict encode of each string, read from its JSON literal: `ok` and
+        // the text, or `err` and the error's message.
+        let inputs: Vec<serde_json::Value> =
+            literals.iter().map(|l| serde_json::json!(l)).collect();
+        let theirs: Vec<(String, String)> = reference_outputs(FIXTURE, "encode_utf8", &inputs)
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
         assert_eq!(theirs.len(), texts.len());
         for (text, (kind, want)) in texts.iter().zip(&theirs) {
             let ours = match text.encode_utf8() {

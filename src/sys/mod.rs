@@ -910,7 +910,8 @@ pub(crate) mod tests {
     #[test]
     fn local_date_is_pythons_local_date() {
         // The current time, and times around year and day ends, in this process's zone and in
-        // two fixed ones, as Python's date.fromtimestamp gives them.
+        // two fixed ones, as Python's date.fromtimestamp gives them: the C library's
+        // `localtime`, which `date` prints too.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -923,15 +924,29 @@ pub(crate) mod tests {
             1_767_225_600,
             1_794_268_800,
         ];
-        let code = "import sys, time\nfrom datetime import date\n\
-                    print(' '.join(date.fromtimestamp(int(t)).isoformat() for t in sys.argv[1:]))";
-        let args: Vec<String> = times.iter().map(i64::to_string).collect();
-        let theirs = Command::new("python3")
-            .args(["-B", "-c", code])
-            .args(&args)
-            .output()
-            .unwrap();
-        assert!(theirs.status.success());
+        let date = |t: i64| {
+            // BSD `date` takes the time with `-r`, GNU `date` with `-d @`.
+            let at = if cfg!(target_os = "macos") {
+                ["-r".to_string(), t.to_string()]
+            } else {
+                ["-d".to_string(), format!("@{t}")]
+            };
+            let out = Command::new("/bin/date")
+                .args(at)
+                .arg("+%Y-%m-%d")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .trim_end()
+                .to_string()
+        };
+        let theirs: Vec<String> = times.iter().map(|t| date(*t)).collect();
         let ours: Vec<String> = times
             .iter()
             .map(|t| {
@@ -939,10 +954,7 @@ pub(crate) mod tests {
                 format!("{y:04}-{m:02}-{d:02}")
             })
             .collect();
-        assert_eq!(
-            ours.join(" "),
-            String::from_utf8(theirs.stdout).unwrap().trim_end()
-        );
+        assert_eq!(ours.join(" "), theirs.join(" "));
         // In a child with TZ set, so this process's own zone is left alone: Tokyo is a day
         // ahead of UTC at 20:00 UTC, Honolulu a day behind at 05:00 UTC.
         for (tz, t, want) in [

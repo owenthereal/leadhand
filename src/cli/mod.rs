@@ -1174,24 +1174,13 @@ mod tests {
             check_text(&report),
             "error: [Errno 2] No such file or directory: '/decks/d\u{fffd}.md'\n"
         );
-        // And Python reads the JSON back to the same path bytes.
-        let script = "import json,os,sys; r = json.loads(sys.stdin.read()); \
-                      sys.stdout.buffer.write(os.fsencode(r['problems'][0]['message']))";
-        let mut child = std::process::Command::new("python3")
-            .args(["-B", "-c", script])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(json.as_bytes())
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
+        // And Python reads the JSON back to the same path bytes: Python's `json.dumps` of this
+        // report is this JSON, and it read the message back from it as these bytes.
+        let recorded = crate::wire::tests::reference_json("cli-check-json.json");
+        assert_eq!(json, recorded["json"].as_str().unwrap());
+        let read_back: Vec<u8> = serde_json::from_value(recorded["read_back"].clone()).unwrap();
         assert_eq!(
-            out.stdout,
+            read_back,
             b"[Errno 2] No such file or directory: '/decks/d\xff.md'"
         );
     }

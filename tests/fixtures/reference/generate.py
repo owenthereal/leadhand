@@ -8,9 +8,12 @@ The Rust tests that once called into the Python reference read these fixtures in
 It imports `leadhand` from scripts/lib, writes every fixture under
 tests/fixtures/reference/, and prints each file with its size. It is deterministic: every
 input is fixed (no timestamps, pids, random values or host paths reach a fixture), so a
-rerun reproduces every fixture byte for byte. README.md says what each file is. One
-folder is an input, never written: worker-prompts/agents/, frozen copies of the agent files
-the worker prompts are made from.
+rerun reproduces every fixture byte for byte. README.md says what each file is. Some files
+are inputs, never written: frozen copies of repository files the reference read, so that a
+later edit of those files changes neither side (ruling S3-R30). They are
+worker-prompts/agents/ (the agent files of the worker prompts and of the configuration's
+maxTurns), config/presets/ (the presets) and
+usage/codex-rollout/codex-rollout-interrupted.jsonl (a rollout fixture).
 
 This file is the only one here that may name the Python reference; the fixtures and the
 README never do (each write is checked). It is deleted with the Python in Task 10.
@@ -21,11 +24,12 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[3]
 OUT = Path(__file__).resolve().parent
@@ -71,6 +75,38 @@ def dumps(value) -> str:
 def json_rows(rows: list) -> bytes:
     """A JSON array, one row per line."""
     return ("[\n" + ",\n".join(dumps(r) for r in rows) + "\n]\n").encode("ascii")
+
+
+def sections(parts: dict) -> bytes:
+    """A JSON object of arrays, one row per line."""
+    body = ",\n".join(dumps(k) + ":" + json_rows(rows).decode().rstrip("\n")
+                      for k, rows in parts.items())
+    return ("{" + body + "}\n").encode("ascii")
+
+
+def mapped(fn, inputs: list) -> list:
+    """`{"in": x, "out": fn(x)}` for each input, in order."""
+    return [{"in": x, "out": fn(x)} for x in inputs]
+
+
+def float_bits(x: float) -> str:
+    """An input float as the fixtures give it: its bits, in hex (exact, whatever reads it)."""
+    return struct.pack(">d", x).hex()
+
+
+def unbits(h: str) -> float:
+    return struct.unpack(">d", bytes.fromhex(h))[0]
+
+
+def rooted(text: str | None, root: Path) -> str | None:
+    """A path under a temporary root, with the root written `{root}`."""
+    if text is None:
+        return None
+    r = str(root)
+    if text == r or text.startswith(r + "/"):
+        return "{root}" + text[len(r):]
+    assert r not in text, text
+    return text
 
 
 @contextlib.contextmanager
@@ -454,6 +490,563 @@ def cli_version() -> None:
     write("cli-version.txt", out.getvalue().encode("utf-8"))
 
 
+# --------------------------------------------------------------------------
+# pytext.json: the Python text and path functions the Rust emulates (`pytext::tests`)
+
+TEXTS = [
+    "",
+    "plain",
+    "it's",
+    'say "hi"',
+    "both ' and \"",
+    "back\\slash",
+    "tab\tnew\nline\rret",
+    "\x00\x07\x1b\x7f",
+    "caf\u00e9 \u2192 \U0001f600",
+    "\x85\xa0\u2028\u3000",
+    "\xad\u200b\ufeff\ue000",
+    "  \t lead and trail \x1c\x1f ",
+    "a\r\nb\rc\nd\x0be\x0cf\x1cg\x1dh\x1ei\x85j\u2028k\u2029l",
+    "trailing newline\n",
+    "\n\nblank lines\n\n",
+    "x\x1fy z",
+]
+
+
+def floats(xs: list[float], fn) -> list:
+    return [{"in": float_bits(x), "x": x, "out": fn(x)} for x in xs]
+
+
+def real_paths() -> list:
+    """`os.path.realpath` over the links the Rust test lays out under its root."""
+    cases = ["dangling", "dangling/deeper", "relative", "relative/../x", "relative/up/sub",
+             "loop-a", "loop-a/x", "repo/./sub//", "missing/../repo", "repo/sub/up/sub/up"]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(os.path.realpath(tmp))
+        (root / "repo/sub").mkdir(parents=True)
+        os.symlink(root / "repo/notes/docs", root / "dangling")
+        os.symlink("repo/sub", root / "relative")
+        os.symlink(root / "loop-b", root / "loop-a")
+        os.symlink(root / "loop-a", root / "loop-b")
+        os.symlink("../repo", root / "repo/sub/up")
+        return mapped(lambda c: rooted(os.path.realpath(f"{root}/{c}"), root), cases)
+
+
+def which_rows() -> list:
+    """`shutil.which` over the PATHs the Rust test gives, `{root}` its root, from its `cwd`."""
+    cases = [
+        ["/nonexistent:{root}/bin", "in-bin"],
+        ["{root}/bin", "not-exec"],
+        ["{root}/bin", "in-cwd"],
+        ["/nonexistent::{root}/bin", "in-cwd"],
+        ["{root}/bin:", "in-cwd"],
+        [":", "in-cwd"],
+        [":{root}/bin", "in-bin"],
+        ["", "in-cwd"],
+        ["", "in-bin"],
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(os.path.realpath(tmp))
+        bin_, cwd = root / "bin", root / "cwd"
+        for d in (bin_, cwd):
+            d.mkdir()
+        for p in (bin_ / "in-bin", cwd / "in-cwd"):
+            p.write_text("#!/bin/sh\n")
+            p.chmod(0o755)
+        (bin_ / "not-exec").write_text("x")
+        with contextlib.chdir(cwd):
+            return mapped(lambda c: rooted(
+                shutil.which(c[1], path=c[0].replace("{root}", str(root), 1)), root), cases)
+
+
+def pytext_fixture() -> None:
+    pure = ["//a//b/./c/", "///a", "", "./a", "a/..", ".", "a/./", "/", "//", "a//b",
+            "/runs/2026-11-10-retry uploads/"]
+    fixed = [0.25, 0.125, 2.5, 0.35, 1.005, 0.045, 12.25, 0.0, -0.0, 1e-9, 123456.785, 99.95,
+             0.0001234567, 31.0, 1e21]
+    reprs = [0.1, 2.5, 1e-5, 1e-4, 0.00012, 5.0, 1e15, 1e16, 1e20, 123456.789, 1.0 / 3.0, -2.5,
+             -0.0, 0.0, 9.99e-5, 1.5e300, 5e-324]
+    raw = [t.encode() for t in TEXTS] + [b"\xff refs/x \n", b" \xc2\xa0main\xff\xc2\xa0\n",
+                                         b"\xe2\xc2\x85x\xe2\x80\x85", b"\xe2\x80\n", b"\xc2"]
+    os_lines = [b"worktree /a\nHEAD x\n\nworktree /b c\n", b"a\r\nb\rc\x0bd\x0ce\x1cf\x1dg\x1eh",
+                b"one \xc2\x85 two \xe2\x80\xa8 three \xe2\x80\xa9 four",
+                b"\xff\n\xfe\xc2\x85\xe2\x80", b"\xe2\x80\xe2\x80\xa8x", b"\xc2\xc2\x85", b"",
+                b"\n\n", b"no end"]
+    tildes = ["~", "~/runs/{repo}", "/abs/~", "rel", "~other/x"]
+    assert os.path.expanduser("~other/x") == "~other/x", "a user named other exists here"
+    homes = ["/home/fixture", "/home/fixture//", "/", "//", ""]
+
+    def expanded(c):
+        with patched(os, environ={**os.environ, "HOME": c[0]}):
+            return os.path.expanduser(c[1])
+
+    paths = ["", ".", "/", "//", "///", "////x", "//x/../y", "a/b/../../..", "../a/./b//c/",
+             "/../x", "/a/b/../../../c", "a/..", "./", "x/./y/.", "/runs/r 1/workers/c1-a1",
+             "café/../d", "relative/dir"]
+    cwds = ["/opt/fixture/work dir", "/"]
+
+    def absolute(c):
+        with patched(os, getcwd=lambda: c[0]):
+            return os.path.abspath(c[1])
+
+    write("pytext.json", sections({
+        "pure_path": mapped(lambda x: str(PurePosixPath(x)), pure),
+        "fixed_point": floats(fixed, lambda x: [f"{x:.1f}", f"{x:.2f}", f"{x:.6f}"]),
+        "repr": mapped(repr, TEXTS),
+        "strip_split_splitlines": mapped(lambda x: [x.strip(), x.split(), x.splitlines()], TEXTS),
+        "strip_bytes": mapped(lambda x: list(bytes(x).decode("utf-8", "surrogateescape").strip()
+                                             .encode("utf-8", "surrogateescape")),
+                              [list(b) for b in raw]),
+        "splitlines_bytes": mapped(lambda h: [os.fsencode(line).hex() for line in
+                                              os.fsdecode(bytes.fromhex(h)).splitlines()],
+                                   [b.hex() for b in os_lines]),
+        "float_repr": floats(reprs, repr),
+        "real_path": real_paths(),
+        "which": which_rows(),
+        "expand_user": mapped(expanded, [[h, t] for h in homes for t in tildes]),
+        "normpath": mapped(os.path.normpath, paths),
+        "abspath": mapped(absolute, [[d, p] for d in cwds for p in paths]),
+    }))
+
+
+# --------------------------------------------------------------------------
+# wire.json: how the reference writes and reads JSON text (`wire::tests`)
+
+def lone_surrogate_event() -> dict:
+    """A ruling appended with a surrogate-escaped path, and the reference reading back the
+    action the Rust test prints for it."""
+    with tempfile.TemporaryDirectory() as tmp, patched(state, utc_now=lambda: FIXED_TS):
+        paths = state.run_paths(Path(tmp))
+        state.append_event(paths, "ruling", path=fs(b"a\xffb"))
+        events = paths.events.read_text(encoding="ascii")
+    raw = events.rstrip("\n")
+    printed = '{"action": "dispatch", "path": "a\\udcffb", "event": ' + raw + "}"
+    v = json.loads(printed)
+    reads = f"{v['path'] == fs(b'a\xffb') == v['event']['path']}\n"
+    return {"events": events, "printed": printed, "reads_back": reads}
+
+
+def wire_fixture() -> None:
+    escapes = [b"\xed\xa0\x80", b"\xe2\x82A", b"\xf0\x9f\x98A", b"a\xc0\xafb", b"\xf4\x90\x80\x80",
+               b"ok\xf0\x9f\x98\x80\xe9", b"\x80\xbf\xc2"]
+    strings = ["\u00e9", "\U0001f600", "a\"b\\c\n\t\r\x08\x0c\x01\x1f\x7f/", "\u4e2d\u6587 \u2028",
+               "plain"]
+
+    def dumped(s: str) -> list:
+        d = {"s": s, "p": s, "n": [1, 2], "e": [], "o": {}}
+        return [json.dumps(s, ensure_ascii=True),
+                json.dumps(d, ensure_ascii=True, separators=(",", ":")),
+                json.dumps(d, ensure_ascii=True), json.dumps(d, ensure_ascii=True, indent=2)]
+
+    def read_back(text: str) -> str:
+        d = json.loads(text)
+        return f"{list(d) == ['refs/heads/a' + chr(0xdcff) + 'b', chr(0xe9), chr(0x1f600)]} {d[chr(0xe9)]}\n"
+
+    pymap = '{"refs/heads/a\\udcffb":"w","\\u00e9":"y","\\ud83d\\ude00":"z"}'
+    floats_ = [0.0, 1.0, 15.0, 0.1, 5.2e-05, 1e-07, 1e16, 123456.789, -2.5, 1e22]
+    reprs = ['"N\\udcff"', "\"it's \\ud800\"", '"\\"q\\" and \'q\' \\udfff\\n"',
+             '"caf\u00e9 \U0001f600 \\u0007"', '""']
+    encodes = ['"plain caf\u00e9 \U0001f600"', '"ab\\udcff\\udcfecd\\udcffe"', '"x\\udcffy"',
+               '"\u00e9\U0001f600\\udcff"', '"lone \\ud800 lead"', '"\\udfff"', '""']
+
+    def encoded(literal: str) -> list:
+        t = json.loads(literal)
+        try:
+            return ["ok", t.encode("utf-8").decode("utf-8")]
+        except UnicodeEncodeError as e:
+            return ["err", str(e)]
+
+    write("wire.json", sections({
+        "surrogateescape": mapped(lambda h: json.dumps(
+            bytes.fromhex(h).decode("utf-8", "surrogateescape")), [b.hex() for b in escapes]),
+        "lone_surrogate": [lone_surrogate_event()],
+        "ascii_escapes": mapped(dumped, strings),
+        "pymap_read_back": mapped(read_back, [pymap]),
+        "floats": mapped(lambda bits: dumps([unbits(b) for b in bits]) + "\n",
+                         [[float_bits(x) for x in floats_]]),
+        "repr": mapped(lambda literal: repr(json.loads(literal)), reprs),
+        "encode_utf8": mapped(encoded, encodes),
+    }))
+
+
+# --------------------------------------------------------------------------
+# deck.json: the deck parser's patterns (`deck::tests`)
+
+def deck_fixture() -> None:
+    from leadhand.deck import _CARD, _FIELD, _HARD, _HEADER_SPLIT, _REQ
+
+    reqs = ["- R1 Thing → cards 1", "- R1 Thing -> card 1",
+            "- R12 a → b → cards 1, 2", "- R1 a -> b → cards 3 -> card 4",
+            "- R1 a → cards 1 → nothing", "- R1 a → cards none",
+            "- R1 a →cards 1", "- R1 → cards 1", "- R1\t\tx→  card\t7",
+            "- R1 a cards 1", "- R1→ cards 1", "- R1 a → cardsx 1", "- R1 a → cards",
+            "- R1 a --> cards 2", "- Rx a → cards 1", "- R a → cards 1",
+            "-R1 a → cards 1", "- R1 café → cards 1,2 ,3"]
+    headers = ["Base: main @ abc  Branch: b", "Base: main @ abc      Branch: leadhand/x",
+               "Base: main @ abc Branch: b", "Base: main @ abc\t\tBranch: b",
+               "Build: make build                 Test: make test",
+               "Profile: standard                 Finish: none", "Source: a  b  c",
+               "Source: a  Nope: b", "Source: a  Base:x  Branch: y", "Source: a \xa0Branch: y",
+               "Source: a   Branch : y"]
+    fields = ["- Role: implementer", "- Done when:   tests pass  ", "- Done when : x",
+              "- Depends on:1", "- lower: x", "- Files: src/a.py", "- X1: y", "-  Role: x",
+              "- Role x", "- A:b:c", "- Réle: x", "- : x"]
+    cards = ["## Card 3: Retry uploads", "## Card 3:   spaced title   ", "## Card 3:",
+             "## Card 12:x", "## Card 3 : x", "## Card x: y", "##  Card 3: y", "## Card 007: y"]
+    hards = ["yes", "yes — no test can check it", "yes – x", "yes - x", "yes: x", "yes:x",
+             "yes -", "yes because", "yess", "yes —   spaced  ", "Yes - x"]
+
+    def groups(pattern, n: int):
+        def match(x):
+            m = pattern.match(x)
+            return [m.group(i) for i in range(1, n + 1)] if m else None
+        return match
+
+    def req(x):
+        m = _REQ.match(x)
+        return [m.group(1), m.group(2).strip(), m.group(3)] if m else None
+
+    def hard(x):
+        m = _HARD.match(x)
+        return (m.group(1) or "").strip() if m else None
+
+    write("deck.json", sections({
+        "requirement": mapped(req, reqs),
+        "header_split": mapped(_HEADER_SPLIT.split, headers),
+        "field": mapped(groups(_FIELD, 2), fields),
+        "card": mapped(groups(_CARD, 2), cards),
+        "hard": mapped(hard, hards),
+    }))
+
+
+# --------------------------------------------------------------------------
+# config/config.json: configuration loading (`config::tests`), from frozen presets
+
+FROZEN_PRESETS = OUT / "config" / "presets"
+
+
+def report_frozen(frozen: Path, live: Path, glob: str) -> None:
+    for name in sorted(p.name for p in frozen.glob(glob)):
+        same = (frozen / name).read_bytes() == (live / name).read_bytes()
+        print(f"frozen {live.name}/{name}: {'identical to' if same else 'differs from'} "
+              f"{live.name}/{name}")
+
+
+def config_fixture() -> None:
+    from leadhand import config as cfg
+
+    report_frozen(FROZEN_PRESETS, ROOT / "presets", "*.toml")
+
+    def load(user: str, repo: str = ""):
+        """The reference loading these files as the Rust test's `Files` lays them out."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "my repo").mkdir()
+            if repo:
+                (d / "my repo" / ".leadhand.toml").write_text(repo, encoding="utf-8")
+            (d / "user.toml").write_text(user, encoding="utf-8")
+            return cfg.load_config(d / "my repo", user_file=d / "user.toml",
+                                   presets_dir=FROZEN_PRESETS)
+
+    def snapshot(files):
+        text = json.dumps(cfg.config_to_dict(load(*files)), indent=2, ensure_ascii=True)
+        return {"snapshot": text, "back": str(cfg.config_from_dict(json.loads(text)).prices["x"])}
+
+    def messages(user: str):
+        try:
+            c = load(user)
+        except cfg.ConfigError as e:
+            return ["error", str(e)]
+        return ["ok", cfg.unsupported_settings(c) + cfg.unsupported_warnings(c)]
+
+    snapshot_files = [
+        "docs_dir = \"/tmp/d\"\n[prices.x]\ninput = inf\noutput = -inf\ncache_read = nan\n"
+        "cache_write_5m = 1.5\ncache_write_1h = 0\n",
+        "[notify]\ncommand = \"say NaN Infinity\"\n",
+    ]
+    cases = [
+        "[run]\ncost_limit_usd = 2.5\n",
+        "[run]\ncost_limit_usd = 1e-05\n",
+        "[run]\ncost_limit_usd = 0.1\n",
+        "[run]\ncost_limit_usd = 5\n",
+        "[run]\ncost_limit_usd = 2.0\n",
+        "[run]\ncost_limit_usd = 1e20\n",
+        "[run]\ncost_limit_usd = 123456.789\n",
+        "[run]\ncost_limit_usd = 'x'\n",
+        "[run]\nworktree = \"it's\"\n",
+        "[run]\nworktree = 'say \"hi\"'\n",
+        "[run]\nworktree = \"both ' and \\\"\"\n",
+        "[run]\nworktree = \"tab\\tbell\\u0007caf\\u00e9\\u00a0\"\n",
+        "[run]\nworktree = [1, 2.5, true, 'x', {a = 1}]\n",
+        "[run]\nworktree = 1.5\n",
+        "[run]\nzz = 1\naa = 2\n",
+        "profile = 'Lean'\n",
+        "zeta = 1\nalpha = 2\n",
+        "[capacity]\ncodex_pause_percent = 101\n",
+        "[capacity]\ncodex_pause_percent = 9.5\n",
+        "[codex]\nwritable_dirs = ['a', 1]\n",
+        "[limits]\nx = { steps = 1, minutes = 2, z = 3 }\n",
+        "[limits]\nverifier = { steps = 1, minutes = 2 }\nimplementer = { steps = 3, minutes = 2 }\n",
+        "[prices.x]\ninput = 1\n",
+        "[roles.zeta]\nclaude = 'x'\n[roles.alpha]\nclaude = 'y'\n",
+        "[roles.implementer]\nprefer = 3\n",
+        "[roles.implementer]\nclaude = ['a']\n",
+        "[roles.implementer]\nclaude = 'sonnet extreme'\n",
+        "[roles.dealer]\nprefer = 'codex'\n",
+        "[after_run]\nstep = 'merge'\n",
+        "[after_run]\nstep = 'pr'\non_incomplete = 'draft-pr'\n",
+        "[notify]\ncommand = 'say x'\n[capacity]\ncodex_pause_percent = 3\n",
+        "preset = '.x'\n",
+        "preset = 'nope'\n",
+        "preset = 3\n",
+    ]
+    with patched(briefs, AGENTS_DIR=FROZEN_AGENTS):
+        write("config/config.json", sections({
+            "snapshot": mapped(snapshot, [snapshot_files]),
+            "messages": mapped(messages, cases),
+        }))
+
+
+# --------------------------------------------------------------------------
+# cli-check-json.json: `check --json` of a deck that does not load (`cli::tests`)
+
+def cli_check_json() -> None:
+    """Python's `json.dumps` of the report the Rust test prints for a deck it cannot open (the
+    failure's lossless text, a surrogate escape for the byte), and the message's bytes as
+    Python reads them back from that JSON."""
+    message = fs(b"[Errno 2] No such file or directory: '/decks/d\xff.md'")
+    text = json.dumps({"ok": False, "cards": None,
+                       "problems": [{"level": "error", "card": None, "message": message}],
+                       "fix": None})
+    read_back = list(os.fsencode(json.loads(text)["problems"][0]["message"]))
+    write("cli-check-json.json", (dumps({"json": text, "read_back": read_back}) + "\n").encode())
+
+
+# --------------------------------------------------------------------------
+# state/: the run state the reference writes (`state::tests`)
+
+def appended(*events) -> bytes:
+    """The events file after the reference's `append_event` of each (kind, fields)."""
+    with tempfile.TemporaryDirectory() as tmp, patched(state, utc_now=lambda: FIXED_TS):
+        paths = state.run_paths(Path(tmp))
+        for kind, fields in events:
+            state.append_event(paths, kind, **fields)
+        return paths.events.read_bytes()
+
+
+def state_fixture() -> None:
+    from dataclasses import fields as dc_fields
+
+    write("state/event-kinds.txt", ("\n".join(state.EVENT_KINDS) + "\n").encode())
+
+    odd = fs(b"src/a\xffb.txt")
+    wide = "src/café \U0001f600.txt"
+    write("state/round-trip.jsonl", appended(
+        ("card_cut", dict(card=1, branch="leadhand/ré", base="b" * 40)),
+        ("conflict", dict(card=1, onto="c" * 40, paths=[odd, wide])),
+        ("violation", dict(stage="found", by="check", dispatch_id="c1-a1-review-1", card=1,
+                           dispatch_kind="review", n=1, ref="refs/leadhand/abc/violations/1",
+                           paths=[odd], head_moved=False, index_dirty=False, expected_head=None,
+                           expected_branch="leadhand/r",
+                           refs={"refs/heads/" + odd: {"old": None, "new": "d" * 40}},
+                           preserved={"refs/heads/" + odd:
+                                      "refs/leadhand/abc/violations/1-" + wide})),
+        ("parked", dict(card="final", reason=wide)),
+    ))
+
+    v = "refs/leadhand/abc/violations/1"
+    left = "refs/leadhand/abc/leftovers/1"
+    write("state/violations.jsonl", appended(
+        ("violation", dict(stage="found", by="check", dispatch_id="c1-a1-review-1", card=1,
+                           dispatch_kind="review", n=1, ref=v, paths=[odd], head_moved=True,
+                           index_dirty=False, expected_head="e" * 40,
+                           expected_branch="leadhand/r--card-1",
+                           refs={"refs/heads/x": {"old": None, "new": "d" * 40}},
+                           preserved={"refs/heads/x": v + "-heads-x"}, hidden=[odd])),
+        ("violation", dict(stage="restored", by="check", dispatch_id="c1-a1-review-1", card=1, n=1,
+                           ref=v, saved="f" * 40, siblings=[v + "-branch"],
+                           preserved={"refs/heads/x": v + "-heads-x"})),
+        ("violation", dict(stage="found", by="implementer", n=1, ref=left, paths=[odd],
+                           operation="merge", head_moved=False, index_dirty=True,
+                           expected_head="e" * 40, expected_branch="leadhand/r--card-1",
+                           after_dispatch="c1-a1-implement-1", why="before review c1-a1-review-1",
+                           untracked=[odd], hidden=[odd])),
+        ("violation", dict(stage="restored", by="implementer", n=1, ref=left, saved=None,
+                           after_dispatch=None, siblings=[])),
+        ("violation", dict(stage="found", by="check", dispatch_id="run-a1-evidence-1", card=None,
+                           dispatch_kind="evidence", n=2, ref=None, base_worktree="/w/b--base",
+                           base_head="e" * 40, paths=["x.txt"], head_moved=False,
+                           index_dirty=False, expected_head=None, expected_branch=None, refs={},
+                           preserved={})),
+        ("violation", dict(stage="restored", by="check", dispatch_id="run-a1-evidence-1",
+                           card=None, n=2, ref=None, saved="e" * 40, siblings=[], preserved={})),
+    ))
+
+    h = "e" * 40
+    write("state/end-of-run.jsonl", appended(
+        ("gate_started", dict(gate="evidence", examined_sha=h, dispatch_id="run-evidence-1")),
+        ("gate_result", dict(gate="evidence", examined_sha=h, passed=False,
+                             dispatch_id="run-evidence-1",
+                             findings="/r/cards/run/run-evidence-1/report.md")),
+        ("card_cut", dict(card="final", branch="leadhand/r--card-final", base=h, wave=1)),
+        ("card_cut", dict(card="final", branch="leadhand/r--card-final", base=h, wave=1,
+                          recut_after="run-w1-final_fix-1")),
+        ("verdict_recorded", dict(card="final", wave=1, verdict="spent", reason="changed nothing",
+                                  findings="/r/x.md", dispatch_id="run-w1-final_fix-1")),
+        ("verdict_recorded", dict(card="final", wave=1, verdict="clean", findings="/r/y.md",
+                                  dispatch_id="run-w1-final_review-1")),
+        ("accept_started", dict(card="final", wave=1, target=h,
+                                dispatch_id="run-w1-final_review-1")),
+        ("accepted", dict(card="final", wave=1, sha=h, dispatch_id="run-w1-final_review-1")),
+        ("outcome", dict(outcome="complete", qualifier="", reasons=[], next_step="none", head=h)),
+        ("report_written", dict(report="/r/report.md", outcome="complete", outcome_seq=10)),
+        ("base_worktree_added", dict(path="/w/b--base")),
+        ("base_worktree_ready", dict(path="/w/b--base")),
+    ))
+
+    # The Rust test's two rulings (as it writes them, `ts` fixed), then the reference's event.
+    with tempfile.TemporaryDirectory() as tmp, patched(state, utc_now=lambda: FIXED_TS):
+        paths = state.run_paths(Path(tmp))
+        paths.events.write_text("".join(
+            dumps({"seq": i, "ts": FIXED_TS, "kind": "ruling", "card": None, "dispatch_id": None,
+                   "text": text}) + "\n" for i, text in ((1, "one"), (2, "two"))))
+        state.append_event(paths, "paused", by="operator")
+        write("state/seq-after-two.jsonl", paths.events.read_bytes())
+        write("state/seq-after-two-read.txt", f"{len(state.read_events(paths))}\n".encode())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = state.run_paths(Path(tmp))
+        state.append_attempt(paths, {"card": 1, "attempt": 3})
+        write("state/attempt-3.jsonl", paths.attempts.read_bytes())
+
+    claude = {"dispatch": "c1-a1-implement-1", "run": "abc123", "card": 1, "attempt": 1,
+              "role": "implementer", "vendor": "claude", "model": "sonnet", "effort": "high",
+              "agent": "leadhand:implementer", "worker_id": "wé",
+              "started_at": "2026-11-14T00:00:00.000Z", "ended_at": "2026-11-14T00:01:00.000Z",
+              "steps": None, "charge_ids": ["c1-a1-implement-1:claude:wé"],
+              "usage": {"input": 3, "cached": 0, "cache_write_5m": 0, "cache_write_1h": 0,
+                        "output": 10, "reasoning": 0, "known": True, "model": "claude-opus-4-1"},
+              "usage_known": True, "cost_estimate": 1e-05, "exit_reason": "completed",
+              "status": "READY", "blocked_by": "", "recorded_by": "engine"}
+    codex = {"dispatch": "c1-a2-implement-1", "run": None, "card": None, "attempt": 2,
+             "role": "implementer", "vendor": "codex", "model": "gpt-6.1-terra", "effort": "high",
+             "worker_id": None, "started_at": "2026-11-14T00:00:00.000Z",
+             "ended_at": "2026-11-14T00:01:00.000Z", "steps": 4,
+             "charge_ids": ["c1-a2-implement-1:codex:unknown"], "usage": None,
+             "usage_known": False, "usage_source": "unknown", "cost_estimate": None,
+             "exit_reason": "interrupted", "status": "SPENT", "blocked_by": "", "generation": 1,
+             "possibly_incomplete": True}
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = state.run_paths(Path(tmp))
+        state.append_attempt(paths, claude)
+        state.append_attempt(paths, codex)
+        write("state/attempts.jsonl", paths.attempts.read_bytes())
+        got = state.read_attempts(paths)
+        same = f"{got == [claude, codex]} {[list(a) for a in got] == [list(claude), list(codex)]}\n"
+        write("state/attempts-read.txt", same.encode())
+
+    roots = [".", "", "./run dir/", "a//b/./c", "/runs/r 1", "//r"]
+    names = [f.name for f in dc_fields(state.RunPaths)]
+    write("state/run-paths.json", sections({
+        "run_paths": mapped(lambda r: [str(getattr(state.run_paths(r), n)) for n in names], roots),
+    }))
+
+
+# --------------------------------------------------------------------------
+# usage/: charges and the vendors' usage records (`usage::tests`)
+
+FROZEN_ROLLOUT = OUT / "usage" / "codex-rollout" / "codex-rollout-interrupted.jsonl"
+
+
+def line_of(value) -> str:
+    return json.dumps(value, separators=(",", ":"))
+
+
+def usage_fixture() -> None:
+    report_frozen(FROZEN_ROLLOUT.parent, ROOT / "tests" / "fixtures", "*.jsonl")
+
+    # A charge of a one-message transcript, as `Case::claude(1, ..)` makes it.
+    with tempfile.TemporaryDirectory() as tmp, patched(u, utc_now=lambda: FIXED_TS):
+        tmp = Path(tmp)
+        (tmp / "run with spaces").mkdir()
+        paths = state.run_paths(tmp / "run with spaces")
+        f = tmp / "t.jsonl"
+        f.write_text(claude_line("m1", 10, 3, 0, 0, 0) + "\n", encoding="utf-8")
+        u.charge(paths, charge_id="d1:claude:agent1", source="claude", key="agent1",
+                 dispatch_id="d1", role="implementer", path_or_thread=f)
+        (c,) = u.read_charges(paths)
+        record = paths.charges.read_text(encoding="ascii")
+        assert record == line_of(u._charge_to_record(c)) + "\n", record
+        checkpoints = (json.dumps(u.charged_checkpoint([c], "claude", "agent1")) + " "
+                       + json.dumps(u.charged_checkpoint([c], "claude", "other")) + "\n")
+    write("usage/charge-record.txt", (record + checkpoints).encode("ascii"))
+
+    s = u.Usage()
+    for x in (u.Usage(input=1, output=10, model="claude-opus-4-1"),
+              u.Usage(input=2, output=20, model="claude-opus-4-1"), u.Usage(model="<synthetic>")):
+        s = u.add(s, x)
+    write("usage/single-model.json", (line_of(u.usage_to_dict(s)) + "\n").encode("ascii"))
+
+    a = u.Usage(input=1000, output=100, model="claude-opus-4")
+    b = u.Usage(input=2000, output=200, model="claude-sonnet-4-5")
+    write("usage/serialized.jsonl", "".join(
+        line_of(u.usage_to_dict(x)) + "\n" for x in (a, u.add(a, b), u.UNKNOWN)).encode("ascii"))
+
+    p = {"opus": {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write_5m": 18.75,
+                  "cache_write_1h": 30.0}}
+    x = u.Usage(input=1234, cached=56789, cache_write_5m=1011, cache_write_1h=1213, output=1415,
+                reasoning=99)
+    write("usage/estimate-cost.txt",
+          f"{u.estimate_cost(x, 'claude-Opus-4', p)!r} {u.estimate_cost(x, 'gpt-5', p)}\n"
+          .encode("ascii"))
+
+    # The Claude records of `claude::tests::records_read_as_the_python_reads_them`.
+    lines = [
+        r'{"type":"assistant","message":{"id":"legacy","usage":{"input_tokens":1,"cache_creation_input_tokens":7,"output_tokens":2}}}',
+        r'{"type":"assistant","message":{"id":"types","model":7,"usage":{"input_tokens":true,"cache_read_input_tokens":"9","output_tokens":3.9,"cache_creation":{"ephemeral_5m_input_tokens":-4,"ephemeral_1h_input_tokens":2}}}}',
+        r'{"type":"user","type":"assistant","message":{"id":"a\udcffb","usage":{"output_tokens":1,"output_tokens":5}}}',
+        r'{"type":"assistant","message":{"id":"","usage":{"output_tokens":1}}}',
+        r'{"type":"assistant","message":{"id":"nousage","usage":[1]}}',
+        r'{"type":"system","message":{"id":"sys","usage":{"output_tokens":1}}}',
+        r'{"type":["assistant"],"message":{"id":"list","usage":{"output_tokens":1}}}',
+        '\x0c{"type":"assistant","message":{"id":"cr","usage":{"output_tokens":6}}}\r'
+        '{"type":"assistant","message":{"id":"crlf","usage":{"output_tokens":8}}}\r',
+        '{"type":"assistant","x":"\xff","message":{"id":"bad","usage":{"output_tokens":2}}}',
+    ]
+    transcript = "\n".join(lines).encode("latin-1")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / "odd.jsonl"
+        f.write_bytes(transcript)
+        messages = "".join(f"{json.dumps(mid)} {line_of(u.usage_to_dict(x))}\n"
+                           for mid, x in u._claude_messages(str(f)).items())
+    write("usage/claude-records/transcript.jsonl", transcript)
+    write("usage/claude-records/messages.txt", messages.encode("ascii"))
+
+    # The rollout of `codex::tests::rollout_reads_as_the_python_reads_it`: the frozen fixture's
+    # lines (as Rust's `str::lines` gives them), and four more.
+    base = FROZEN_ROLLOUT.read_text(encoding="utf-8").split("\n")
+    if base and base[-1] == "":
+        base.pop()
+    base = [line.removesuffix("\r") for line in base]
+    rollout = base + [
+        base[16],
+        '{"type":"token_usage_record","payload":{"response_id":7,"usage":{"input_tokens":5}}}',
+        '{"type":"token_usage_record","payload":[1]}',
+        r'{"type":"token_usage_record","payload":{"response_id":"r\udcff","usage":{"input_tokens":5,"cached_input_tokens":9}}}',
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / "rollout-2026-11-10T00-00-00-thr1.jsonl"
+        f.write_text("".join(line + "\n" for line in rollout), encoding="utf-8")
+        r = u._codex_rollout(str(f))
+
+        def d(v):
+            return None if v is None else u.usage_to_dict(v)
+
+        read = "".join(f"{line_of(rid)} {line_of(d(v))}\n" for rid, v in r.responses.items())
+        read += line_of(d(r.thread_total)) + "\n" + line_of(d(r.token_count_total)) + "\n"
+    write("usage/codex-rollout/read.txt", read.encode("ascii"))
+
+
 def main() -> None:
     procs_samples()
     events_with_raw_bytes()
@@ -462,6 +1055,13 @@ def main() -> None:
     worker_prompts()
     codex_argv_table()
     cli_version()
+    pytext_fixture()
+    wire_fixture()
+    deck_fixture()
+    config_fixture()
+    cli_check_json()
+    state_fixture()
+    usage_fixture()
     for path in sorted(WRITTEN):
         print(f"{path.stat().st_size:>8}  {path.relative_to(OUT)}")
 

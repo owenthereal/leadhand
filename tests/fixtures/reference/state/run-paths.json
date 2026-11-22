@@ -1,0 +1,8 @@
+{"run_paths":[
+{"in":".","out":[".","deck.md","run.json","events.jsonl","status.json","attempts.jsonl","charges.jsonl","state.lock","report.md","handoff.md","run.lock","holder.json","pause","cancel","cards","workers"]},
+{"in":"","out":[".","deck.md","run.json","events.jsonl","status.json","attempts.jsonl","charges.jsonl","state.lock","report.md","handoff.md","run.lock","holder.json","pause","cancel","cards","workers"]},
+{"in":"./run dir/","out":["run dir","run dir/deck.md","run dir/run.json","run dir/events.jsonl","run dir/status.json","run dir/attempts.jsonl","run dir/charges.jsonl","run dir/state.lock","run dir/report.md","run dir/handoff.md","run dir/run.lock","run dir/holder.json","run dir/pause","run dir/cancel","run dir/cards","run dir/workers"]},
+{"in":"a//b/./c","out":["a/b/c","a/b/c/deck.md","a/b/c/run.json","a/b/c/events.jsonl","a/b/c/status.json","a/b/c/attempts.jsonl","a/b/c/charges.jsonl","a/b/c/state.lock","a/b/c/report.md","a/b/c/handoff.md","a/b/c/run.lock","a/b/c/holder.json","a/b/c/pause","a/b/c/cancel","a/b/c/cards","a/b/c/workers"]},
+{"in":"/runs/r 1","out":["/runs/r 1","/runs/r 1/deck.md","/runs/r 1/run.json","/runs/r 1/events.jsonl","/runs/r 1/status.json","/runs/r 1/attempts.jsonl","/runs/r 1/charges.jsonl","/runs/r 1/state.lock","/runs/r 1/report.md","/runs/r 1/handoff.md","/runs/r 1/run.lock","/runs/r 1/holder.json","/runs/r 1/pause","/runs/r 1/cancel","/runs/r 1/cards","/runs/r 1/workers"]},
+{"in":"//r","out":["//r","//r/deck.md","//r/run.json","//r/events.jsonl","//r/status.json","//r/attempts.jsonl","//r/charges.jsonl","//r/state.lock","//r/report.md","//r/handoff.md","//r/run.lock","//r/holder.json","//r/pause","//r/cancel","//r/cards","//r/workers"]}
+]}

@@ -427,12 +427,13 @@ pub(crate) mod tests {
             .into_iter()
             .map(|(id, u)| (id.as_wtf8().to_vec(), crate::wire::to_line(&u).unwrap()))
             .collect();
-        let code = "import json, sys\nfrom leadhand import usage as u\n\
-                    for mid, x in u._claude_messages(sys.argv[1]).items():\n\
-                    \x20   print(json.dumps(mid), json.dumps(u.usage_to_dict(x), separators=(',', ':')))\n";
-        let theirs = crate::wire::tests::python(code, &[f.as_os_str()]);
-        let theirs: Vec<(Vec<u8>, String)> = String::from_utf8(theirs)
-            .unwrap()
+        // The reference read the same bytes as these messages: each ID and its usage.
+        assert_eq!(
+            bytes,
+            crate::wire::tests::read_reference("usage/claude-records/transcript.jsonl")
+        );
+        let theirs = crate::wire::tests::read_reference_text("usage/claude-records/messages.txt");
+        let theirs: Vec<(Vec<u8>, String)> = theirs
             .lines()
             .map(|line| {
                 let (id, usage) = line.split_once(' ').unwrap();

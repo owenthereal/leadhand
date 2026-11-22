@@ -1,0 +1,4 @@
+{"seq":1,"ts":"2026-01-01T00:00:00.000Z","kind":"card_cut","card":1,"branch":"leadhand/r\u00e9","base":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+{"seq":2,"ts":"2026-01-01T00:00:00.000Z","kind":"conflict","card":1,"onto":"cccccccccccccccccccccccccccccccccccccccc","paths":["src/a\udcffb.txt","src/caf\u00e9 \ud83d\ude00.txt"]}
+{"seq":3,"ts":"2026-01-01T00:00:00.000Z","kind":"violation","stage":"found","by":"check","dispatch_id":"c1-a1-review-1","card":1,"dispatch_kind":"review","n":1,"ref":"refs/leadhand/abc/violations/1","paths":["src/a\udcffb.txt"],"head_moved":false,"index_dirty":false,"expected_head":null,"expected_branch":"leadhand/r","refs":{"refs/heads/src/a\udcffb.txt":{"old":null,"new":"dddddddddddddddddddddddddddddddddddddddd"}},"preserved":{"refs/heads/src/a\udcffb.txt":"refs/leadhand/abc/violations/1-src/caf\u00e9 \ud83d\ude00.txt"}}
+{"seq":4,"ts":"2026-01-01T00:00:00.000Z","kind":"parked","card":"final","reason":"src/caf\u00e9 \ud83d\ude00.txt"}

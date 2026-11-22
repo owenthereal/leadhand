@@ -1,0 +1,9 @@
+{"type":"assistant","message":{"id":"legacy","usage":{"input_tokens":1,"cache_creation_input_tokens":7,"output_tokens":2}}}
+{"type":"assistant","message":{"id":"types","model":7,"usage":{"input_tokens":true,"cache_read_input_tokens":"9","output_tokens":3.9,"cache_creation":{"ephemeral_5m_input_tokens":-4,"ephemeral_1h_input_tokens":2}}}}
+{"type":"user","type":"assistant","message":{"id":"a\udcffb","usage":{"output_tokens":1,"output_tokens":5}}}
+{"type":"assistant","message":{"id":"","usage":{"output_tokens":1}}}
+{"type":"assistant","message":{"id":"nousage","usage":[1]}}
+{"type":"system","message":{"id":"sys","usage":{"output_tokens":1}}}
+{"type":["assistant"],"message":{"id":"list","usage":{"output_tokens":1}}}
+{"type":"assistant","message":{"id":"cr","usage":{"output_tokens":6}}}{"type":"assistant","message":{"id":"crlf","usage":{"output_tokens":8}}}
+{"type":"assistant","x":"ÿ","message":{"id":"bad","usage":{"output_tokens":2}}}
