@@ -1,0 +1,45 @@
+#!/bin/sh
+# leadhand's entry point: Claude Code puts the plugin's bin/ folder on the Bash tool's PATH.
+# It runs the leadhand binary that belongs to this plugin folder, with the same arguments.
+set -eu
+
+# <root>, the plugin folder: this script's parent folder.
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+
+# The platform, as the dist branch names its binaries (bin/<target>/leadhand).
+os=$(uname -s)
+arch=$(uname -m)
+# A Rosetta shell on Apple silicon (an x86_64 process) reports x86_64; sysctl says 1 when the
+# process is translated, so the machine is arm64. Anything else leaves it x86_64.
+if [ "$os $arch" = 'Darwin x86_64' ] &&
+    [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || :)" = 1 ]; then
+    arch=arm64
+fi
+case "$os $arch" in
+    'Darwin arm64') target=darwin-arm64 ;;
+    'Linux x86_64') target=linux-x86_64 ;;
+    'Linux aarch64' | 'Linux arm64') target=linux-arm64 ;;
+    *)
+        echo "leadhand: unsupported platform $os $arch; leadhand runs on darwin-arm64, linux-x86_64 and linux-arm64" >&2
+        exit 1
+        ;;
+esac
+
+# On the dist branch: the platform's binary.
+dist=$root/bin/$target/leadhand
+if [ -e "$dist" ]; then
+    if [ ! -x "$dist" ]; then
+        echo "leadhand: $dist is not executable; reinstall the plugin" >&2
+        exit 1
+    fi
+    exec "$dist" "$@"
+fi
+
+# In a source checkout: the release build.
+build=$root/target/release/leadhand
+if [ -x "$build" ]; then
+    exec "$build" "$@"
+fi
+
+echo "leadhand: no leadhand binary for $target at $dist or $build; reinstall the plugin, or in a source checkout run \`cargo build --release\` in $root" >&2
+exit 1
