@@ -106,20 +106,25 @@ pub fn utc_now() -> String {
 /// would read as local time, included).
 #[track_caller]
 pub fn epoch_seconds(ts: &str) -> f64 {
-    let bad = || -> ! { panic!("not an ISO 8601 time with a zone: {ts:?}") };
-    let num = |s: &str| -> i64 {
+    try_epoch_seconds(ts).unwrap_or_else(|| panic!("not an ISO 8601 time with a zone: {ts:?}"))
+}
+
+/// `epoch_seconds`, None where it panics (where Python's `fromisoformat` raises ValueError,
+/// and for a time without a zone).
+pub fn try_epoch_seconds(ts: &str) -> Option<f64> {
+    let num = |s: &str| -> Option<i64> {
         if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-            bad()
+            return None;
         }
-        s.parse().unwrap_or_else(|_| bad())
+        s.parse().ok()
     };
-    let (date, rest) = ts.split_once('T').unwrap_or_else(|| bad());
+    let (date, rest) = ts.split_once('T')?;
     let (clock, offset) = if let Some(c) = rest.strip_suffix('Z') {
         (c, 0)
     } else if rest.len() > 6 && matches!(rest.as_bytes()[rest.len() - 6], b'+' | b'-') {
         let (c, z) = rest.split_at(rest.len() - 6);
-        let (h, m) = z[1..].split_once(':').unwrap_or_else(|| bad());
-        let minutes = num(h) * 60 + num(m);
+        let (h, m) = z[1..].split_once(':')?;
+        let minutes = num(h)? * 60 + num(m)?;
         (
             c,
             if z.starts_with('-') {
@@ -129,19 +134,17 @@ pub fn epoch_seconds(ts: &str) -> f64 {
             } * 60,
         )
     } else {
-        bad()
+        return None;
     };
-    let d: Vec<i64> = date.split('-').map(num).collect();
+    let d: Vec<i64> = date.split('-').map(num).collect::<Option<_>>()?;
     let (hms, frac) = clock.split_once('.').unwrap_or((clock, ""));
-    let t: Vec<i64> = hms.split(':').map(num).collect();
-    let ([year, month, day], [h, m, s]) = (
-        <[i64; 3]>::try_from(d).unwrap_or_else(|_| bad()),
-        <[i64; 3]>::try_from(t).unwrap_or_else(|_| bad()),
-    );
+    let t: Vec<i64> = hms.split(':').map(num).collect::<Option<_>>()?;
+    let ([year, month, day], [h, m, s]) =
+        (<[i64; 3]>::try_from(d).ok()?, <[i64; 3]>::try_from(t).ok()?);
     let frac = if frac.is_empty() {
         0.0
     } else {
-        num(frac) as f64 / 10f64.powi(frac.len() as i32)
+        num(frac)? as f64 / 10f64.powi(frac.len() as i32)
     };
     // Howard Hinnant's days_from_civil.
     let y = if month <= 2 { year - 1 } else { year };
@@ -151,7 +154,7 @@ pub fn epoch_seconds(ts: &str) -> f64 {
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
-    (days * 86_400 + h * 3600 + m * 60 + s - offset) as f64 + frac
+    Some((days * 86_400 + h * 3600 + m * 60 + s - offset) as f64 + frac)
 }
 
 /// Appends one record as one line under `state_lock`, as the CLI does; `build` gets the

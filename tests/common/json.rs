@@ -643,6 +643,12 @@ impl From<i32> for Json {
     }
 }
 
+impl From<usize> for Json {
+    fn from(n: usize) -> Json {
+        Json::Num(n.to_string())
+    }
+}
+
 /// A Python float: `json.dumps` writes it as its `repr` (`20.0`, `12.5`).
 impl From<f64> for Json {
     fn from(f: f64) -> Json {

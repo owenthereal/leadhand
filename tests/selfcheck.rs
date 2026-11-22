@@ -428,6 +428,21 @@ fn live_tests_use_the_crate_only_for_procs() {
         .into_iter()
         .filter(|p| is_live(&tests, p))
         .collect();
+    // Not vacuous: the scan covers the live test and every file under tests/live/.
+    assert!(
+        files.contains(&tests.join("live.rs")),
+        "tests/live.rs was not scanned: {files:?}"
+    );
+    let under_live: Vec<PathBuf> = common::walk(&tests.join("live"))
+        .into_iter()
+        .filter(|p| !p.is_dir())
+        .collect();
+    assert!(!under_live.is_empty(), "no file under tests/live/");
+    let unscanned: Vec<&PathBuf> = under_live.iter().filter(|p| !files.contains(p)).collect();
+    assert!(
+        unscanned.is_empty(),
+        "files under tests/live/ the scan missed: {unscanned:?}"
+    );
     assert_eq!(uses_in(&files, &tests), Vec::<String>::new());
 }
 

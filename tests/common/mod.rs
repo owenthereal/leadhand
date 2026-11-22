@@ -352,6 +352,7 @@ fn seconds_g(d: Duration) -> String {
 /// Runs `argv` with exactly the environment `vars`, collecting both outputs. Err when it ran
 /// past `timeout`: it (or its own group) was killed, and the output is whatever came before
 /// the pipes closed, or a note when a process outside the group held them for another 5 s.
+/// Panics when it cannot be started (`try_run_process` returns that error instead).
 fn run_process<K, V>(
     argv: &[&OsStr],
     vars: impl IntoIterator<Item = (K, V)>,
@@ -360,6 +361,30 @@ fn run_process<K, V>(
     timeout: Duration,
     spawn: Spawn,
 ) -> Result<Out, Out>
+where
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    try_run_process(argv, vars, cwd, stdin, timeout, spawn).unwrap_or_else(|e| {
+        let argv: Vec<OsString> = argv.iter().map(|a| a.to_os_string()).collect();
+        panic!(
+            "could not start {} in {}: {e}",
+            shlex_join(&argv),
+            cwd.display()
+        )
+    })
+}
+
+/// `run_process`, with the error when `argv` cannot be started (Python's `OSError` from
+/// `subprocess.run`) instead of a panic: for callers that record it, as the live drivers do.
+pub fn try_run_process<K, V>(
+    argv: &[&OsStr],
+    vars: impl IntoIterator<Item = (K, V)>,
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+    spawn: Spawn,
+) -> std::io::Result<Result<Out, Out>>
 where
     K: AsRef<OsStr>,
     V: AsRef<OsStr>,
@@ -384,13 +409,7 @@ where
         }
         Group::Inherit => {}
     }
-    let mut child = cmd.spawn().unwrap_or_else(|e| {
-        panic!(
-            "could not start {} in {}: {e}",
-            shlex_join(&argv_owned),
-            cwd.display()
-        )
-    });
+    let mut child = cmd.spawn()?;
     if let Some(hook) = spawn.on_spawn {
         hook(child.id());
     }
@@ -425,12 +444,12 @@ where
     if finished {
         let status = child.wait().expect("waiting for a finished child");
         let [stdout, stderr] = outputs.map(Option::unwrap_or_default);
-        return Ok(Out {
+        return Ok(Ok(Out {
             argv: argv_owned,
             code: code_of(status),
             stdout,
             stderr,
-        });
+        }));
     }
     let pid = Pid::from_child(&child);
     if own_group {
@@ -448,12 +467,12 @@ where
         (Vec::new(), note.as_bytes().to_vec())
     };
     let status = child.wait().expect("waiting for a killed child");
-    Err(Out {
+    Ok(Err(Out {
         argv: argv_owned,
         code: code_of(status),
         stdout,
         stderr,
-    })
+    }))
 }
 
 /// The child's exit status once it has exited, polling until `deadline`; None past it.
@@ -472,7 +491,9 @@ fn wait_until(child: &mut Child, deadline: Instant) -> bool {
     }
 }
 
-fn code_of(status: ExitStatus) -> i32 {
+/// An exit status as a code: the exit code, or minus the signal number when a signal ended
+/// the process (Python's `returncode`).
+pub fn code_of(status: ExitStatus) -> i32 {
     status
         .code()
         .unwrap_or_else(|| -status.signal().unwrap_or(0))
