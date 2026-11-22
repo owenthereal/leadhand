@@ -389,6 +389,41 @@ where
     K: AsRef<OsStr>,
     V: AsRef<OsStr>,
 {
+    Ok(
+        match run_process_until(argv, vars, cwd, stdin, timeout, spawn, &|| false)? {
+            Finished::Done(out) => Ok(out),
+            Finished::TimedOut(out) | Finished::Stopped(out) => Err(out),
+        },
+    )
+}
+
+/// How `run_process_until` ended.
+#[derive(Debug)]
+pub enum Finished {
+    /// The command exited.
+    Done(Out),
+    /// It ran past its timeout and was killed (its group, with `Group::Own`).
+    TimedOut(Out),
+    /// `stop` turned true while it ran (an operator's Ctrl-C), and it was killed the same way.
+    Stopped(Out),
+}
+
+/// `try_run_process`, also killing the command as soon as `stop` returns true (checked
+/// every 100 ms). The kill is by identity: the child is not reaped before it, so neither its
+/// pid nor its group's id can have been reused.
+pub fn run_process_until<K, V>(
+    argv: &[&OsStr],
+    vars: impl IntoIterator<Item = (K, V)>,
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+    spawn: Spawn,
+    stop: &dyn Fn() -> bool,
+) -> std::io::Result<Finished>
+where
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
     let argv_owned: Vec<OsString> = argv.iter().map(|a| a.to_os_string()).collect();
     let mut cmd = Command::new(argv[0]);
     cmd.args(&argv[1..])
@@ -431,20 +466,27 @@ where
     }
     let deadline = Instant::now() + timeout;
     let mut outputs: [Option<Vec<u8>>; 2] = [None, None];
-    let collect = |until: Instant, outputs: &mut [Option<Vec<u8>>; 2]| {
+    let stopped = std::cell::Cell::new(false);
+    let collect = |until: Instant, outputs: &mut [Option<Vec<u8>>; 2], watch: bool| {
         while outputs.iter().any(Option::is_none) {
-            match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            if watch && stop() {
+                stopped.set(true);
+                return false;
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left.min(Duration::from_millis(100))) {
                 Ok((n, buf)) => outputs[usize::from(n - 1)] = Some(buf),
+                Err(mpsc::RecvTimeoutError::Timeout) if !left.is_zero() => {}
                 Err(_) => return false,
             }
         }
         true
     };
-    let finished = collect(deadline, &mut outputs) && wait_until(&mut child, deadline);
+    let finished = collect(deadline, &mut outputs, true) && wait_until(&mut child, deadline);
     if finished {
         let status = child.wait().expect("waiting for a finished child");
         let [stdout, stderr] = outputs.map(Option::unwrap_or_default);
-        return Ok(Ok(Out {
+        return Ok(Finished::Done(Out {
             argv: argv_owned,
             code: code_of(status),
             stdout,
@@ -457,7 +499,8 @@ where
     } else {
         let _ = child.kill();
     }
-    let (stdout, stderr) = if collect(Instant::now() + Duration::from_secs(5), &mut outputs) {
+    let (stdout, stderr) = if collect(Instant::now() + Duration::from_secs(5), &mut outputs, false)
+    {
         let [stdout, stderr] = outputs.map(Option::unwrap_or_default);
         (stdout, stderr)
     } else {
@@ -467,12 +510,17 @@ where
         (Vec::new(), note.as_bytes().to_vec())
     };
     let status = child.wait().expect("waiting for a killed child");
-    Ok(Err(Out {
+    let out = Out {
         argv: argv_owned,
         code: code_of(status),
         stdout,
         stderr,
-    }))
+    };
+    Ok(if stopped.get() {
+        Finished::Stopped(out)
+    } else {
+        Finished::TimedOut(out)
+    })
 }
 
 /// The child's exit status once it has exited, polling until `deadline`; None past it.

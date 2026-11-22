@@ -49,7 +49,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::common::json::{self, Json};
-use crate::common::{self, Group, Spawn};
+use crate::common::plugin::is_word;
+use crate::common::supervisor::{splitlines, truthy};
+use crate::common::{self, Finished, Group, Spawn};
 
 /// A `Facts` from `key => value` pairs, each value anything `Json::from` takes.
 macro_rules! facts {
@@ -59,6 +61,14 @@ macro_rules! facts {
         $(f.set($k, ::std::convert::Into::<$crate::common::json::Json>::into($v));)*
         f
     }};
+}
+
+/// Prints a line straight to the process's stdout (`push_probe::say`), which libtest does
+/// not capture, so the run's progress shows while it runs, without `--nocapture`.
+macro_rules! say {
+    ($($t:tt)*) => {
+        $crate::push_probe::say(&format!($($t)*))
+    };
 }
 
 /// A JSON object from `key => value` pairs (a Python dict literal).
@@ -228,7 +238,7 @@ fn git(
 
 /// The first `n` lines of `text`, stripped, each cut to 200 characters.
 pub fn excerpt(text: &str, n: usize) -> Vec<String> {
-    py_splitlines(text.trim())
+    splitlines(text.trim())
         .into_iter()
         .take(n)
         .map(|l| l.chars().take(200).collect())
@@ -421,7 +431,7 @@ pub fn judge(
     );
     let (_, env_body) = section_of(&sec, "printenv");
     let mut env = Facts::default();
-    for ln in py_splitlines(env_body.trim()) {
+    for ln in splitlines(env_body.trim()) {
         if let Some((k, v)) = ln.split_once('=') {
             env.set(k, v);
         }
@@ -613,17 +623,17 @@ impl Probe {
     }
 
     pub fn plan(&self) {
-        println!("Plan (dry run; nothing is executed):");
-        println!(
+        say!("Plan (dry run; nothing is executed):");
+        say!(
             "1. fixture: git repo {} (branches main, {BRANCH}, {HOST_BRANCH}; {CHECK_SCRIPT} committed)",
             self.repo().display()
         );
-        println!(
+        say!(
             "   core.sshCommand = fake ssh {} (logs to {}, runs",
             self.gitdir().join("probe-fake-ssh").display(),
             self.ssh_log().display()
         );
-        println!(
+        say!(
             "   git-receive-pack against {}/<name>.git; never connects); ssh.variant = ssh",
             self.targets().display()
         );
@@ -632,38 +642,38 @@ impl Probe {
                 || self.p("fetch-only.git").display().to_string(),
                 str::to_string,
             );
-            println!(
+            say!(
                 "     {remote:15} url={url} pushurl={} -> {target}",
                 pushurl.unwrap_or("-")
             );
         }
-        println!(
+        say!(
             "2. host control (operator env minus GIT_SSH_COMMAND; must SUCCEED through the fake ssh):"
         );
         for a in self.control_argvs() {
-            println!(
+            say!(
                 "     (cwd=probe repo) {}",
                 common::shlex_join(&a.map(OsString::from))
             );
         }
-        println!("     gh auth token  (exit code only, output discarded); gh hosts file present?");
-        println!(
+        say!("     gh auth token  (exit code only, output discarded); gh hosts file present?");
+        say!(
             "3. Codex worker through the real dispatcher (re-run while it exits 75 'still running'):"
         );
-        println!(
+        say!(
             "     (cwd={}) {}",
             self.p("").display(),
             common::shlex_join(&self.dispatch_argv())
         );
-        println!("   the brief asks it to run `sh {CHECK_SCRIPT}` once; the script:");
-        for line in py_splitlines(&check_script()) {
-            println!("     | {line}");
+        say!("   the brief asks it to run `sh {CHECK_SCRIPT}` once; the script:");
+        for line in splitlines(&check_script()) {
+            say!("     | {line}");
         }
-        println!(
+        say!(
             "4. verdicts from workers/push-probe-1/stream.jsonl (shell wrapper stripped) and the script's"
         );
-        println!("   sections; fake-ssh log must not grow; targets must hold no push-probe ref");
-        println!(
+        say!("   sections; fake-ssh log must not grow; targets must hold no push-probe ref");
+        say!(
             "5. write {} and {}/; stop any live runner; remove the temp dir",
             self.raw.display(),
             self.art.display()
@@ -672,7 +682,7 @@ impl Probe {
 
     fn section(&mut self, s: Section) {
         self.summary.push(format!("{:12} {}", s.verdict, s.name));
-        println!("[{}] {:12} {}", utc_now_s(), s.verdict, s.name);
+        say!("[{}] {:12} {}", utc_now_s(), s.verdict, s.name);
         self.sections.push(s);
     }
 
@@ -781,7 +791,7 @@ impl Probe {
         let remotes = git(&repo, &["remote", "-v"], true, None)?.stdout;
         let ssh_command = git(&repo, &["config", "--get", "core.sshCommand"], true, None)?.stdout;
         Ok((
-            py_splitlines(remotes.trim())
+            splitlines(remotes.trim())
                 .into_iter()
                 .map(String::from)
                 .collect(),
@@ -797,7 +807,7 @@ impl Probe {
 
     fn ssh_log_lines(&self) -> Vec<String> {
         match fs::read_to_string(self.ssh_log()) {
-            Ok(text) => py_splitlines(&text).into_iter().map(String::from).collect(),
+            Ok(text) => splitlines(&text).into_iter().map(String::from).collect(),
             Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
             Err(e) => panic!("reading {}: {e}", self.ssh_log().display()),
         }
@@ -924,9 +934,17 @@ impl Probe {
                 Err(RunError::Timeout(_)) => {
                     calls.push(obj! {"exit_code" => "timeout", "seconds" => seconds});
                 }
+                Err(RunError::Interrupted) => {
+                    calls.push(obj! {"exit_code" => "interrupted by the operator (Ctrl-C)", "seconds" => seconds});
+                    break;
+                }
                 Err(e) => return Err(e.to_string()),
             }
-            if started.elapsed() > DISPATCH_BUDGET || operator_interrupted() {
+            if operator_interrupted() {
+                calls.push(obj! {"note" => "stopped: the operator pressed Ctrl-C"});
+                break;
+            }
+            if started.elapsed() > DISPATCH_BUDGET {
                 calls
                     .push(obj! {"note" => format!("gave up after {}s", DISPATCH_BUDGET.as_secs())});
                 break;
@@ -1078,7 +1096,7 @@ impl Probe {
 
     /// A phase that failed: its section, with the error.
     fn failed(&mut self, name: &str, error: String) {
-        let lines = py_splitlines(&error)
+        let lines = splitlines(&error)
             .into_iter()
             .rev()
             .take(10)
@@ -1104,7 +1122,7 @@ impl Probe {
         self.cleanup();
         self.write_raw(&started);
         for n in &self.notes {
-            println!("{n}");
+            say!("{n}");
         }
         self.summary.iter().chain(&self.notes).cloned().collect()
     }
@@ -1187,6 +1205,16 @@ pub fn live_env() -> Vec<(OsString, OsString)> {
         .collect()
 }
 
+/// Writes `line` and a newline to the process's stdout and flushes it. libtest captures only
+/// the `print!` family, so this shows on the terminal even when the test passes (ruling
+/// S3-R28): the plan's live commands have no `--nocapture`.
+pub fn say(line: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
 /// Refuses (panics) when CLAUDECODE is set: results from inside a Claude Code session are
 /// not valid.
 pub fn refuse_inside_claude_code() {
@@ -1207,14 +1235,6 @@ pub fn utc_now_s() -> String {
 /// The time now, UTC, to the millisecond.
 pub fn utc_now() -> String {
     common::rundir::utc_now()
-}
-
-/// Seconds since the epoch (`time.time()`).
-pub fn now() -> f64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("the clock is after 1970")
-        .as_secs_f64()
 }
 
 /// An ISO 8601 time as seconds since the epoch; None when it is not one (or not a string).
@@ -1259,13 +1279,10 @@ pub fn sleep_s(secs: f64) -> bool {
 
 /// Runs `f`, turning a panic (Python's exception) into its message.
 pub fn catch<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        Ok(r) => r,
-        Err(payload) => Err(payload
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-            .unwrap_or_else(|| "(a panic without a message)".to_string())),
+    let mut result = None;
+    match common::panic_message(|| result = Some(f())) {
+        Some(message) => Err(message),
+        None => result.expect("a result when nothing panicked"),
     }
 }
 
@@ -1274,6 +1291,9 @@ pub fn catch<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
 pub enum RunError {
     /// It ran past its timeout (Python's `TimeoutExpired`); its group was killed.
     Timeout(Duration),
+    /// The operator pressed Ctrl-C while it ran (Python's KeyboardInterrupt, whose SIGINT
+    /// reached the command too); its group was killed at once.
+    Interrupted,
     /// It could not be started (Python's `OSError`).
     Os(String),
 }
@@ -1282,6 +1302,7 @@ impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RunError::Timeout(t) => write!(f, "timeout after {}s", seconds_text(*t)),
+            RunError::Interrupted => write!(f, "interrupted by the operator (Ctrl-C)"),
             RunError::Os(e) => write!(f, "oserror: {e}"),
         }
     }
@@ -1303,7 +1324,9 @@ pub struct Ran {
 }
 
 /// Runs `argv` with exactly `env`, from `cwd`, stdin from `stdin` (else /dev/null), in a
-/// process group of its own, which a run past `timeout` kills.
+/// process group of its own, which a run past `timeout` kills, and which a Ctrl-C that comes
+/// while it runs kills at once. A command started after the Ctrl-C (the cleanup) runs to
+/// its end, as Python's did after its KeyboardInterrupt.
 pub fn run(
     argv: &[OsString],
     env: &[(OsString, OsString)],
@@ -1317,14 +1340,29 @@ pub fn run(
         on_spawn: None,
     };
     let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-    match common::try_run_process(&args, env.iter().cloned(), cwd, stdin, timeout, spawn) {
-        Ok(Ok(out)) => Ran {
+    let interrupted_before = operator_interrupted();
+    let stop = || !interrupted_before && operator_interrupted();
+    match common::run_process_until(
+        &args,
+        env.iter().cloned(),
+        cwd,
+        stdin,
+        timeout,
+        spawn,
+        &stop,
+    ) {
+        Ok(Finished::Done(out)) => Ran {
             code: Ok(out.code),
             stdout: text(&out.stdout),
             stderr: text(&out.stderr),
         },
-        Ok(Err(out)) => Ran {
+        Ok(Finished::TimedOut(out)) => Ran {
             code: Err(RunError::Timeout(timeout)),
+            stdout: text(&out.stdout),
+            stderr: text(&out.stderr),
+        },
+        Ok(Finished::Stopped(out)) => Ran {
+            code: Err(RunError::Interrupted),
             stdout: text(&out.stdout),
             stderr: text(&out.stderr),
         },
@@ -1434,62 +1472,11 @@ pub fn or_none(items: Vec<Json>) -> Json {
     }
 }
 
-/// Python's truthiness of a JSON value.
-pub fn truthy(v: &Json) -> bool {
-    match v {
-        Json::Null => false,
-        Json::Bool(b) => *b,
-        Json::Num(t) => t.parse::<f64>().is_ok_and(|f| f != 0.0),
-        Json::Str(s) => !s.is_empty(),
-        Json::Arr(items) => !items.is_empty(),
-        Json::Obj(m) => !m.is_empty(),
-    }
-}
-
 static NULL: Json = Json::Null;
 
 /// `v.get(k)` on a dict (None, as null, when `v` is no object or has no `k`).
 pub fn member<'a>(v: &'a Json, k: &str) -> &'a Json {
     v.get(k).unwrap_or(&NULL)
-}
-
-/// `str.splitlines()`: lines split at every line boundary Python knows, without them.
-pub fn py_splitlines(text: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut chars = text.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        let boundary = matches!(
-            c,
-            '\n' | '\r'
-                | '\u{b}'
-                | '\u{c}'
-                | '\u{1c}'
-                | '\u{1d}'
-                | '\u{1e}'
-                | '\u{85}'
-                | '\u{2028}'
-                | '\u{2029}'
-        );
-        if boundary {
-            out.push(&text[start..i]);
-            let mut end = i + c.len_utf8();
-            if c == '\r' && chars.peek().is_some_and(|(_, n)| *n == '\n') {
-                chars.next();
-                end += 1;
-            }
-            start = end;
-        }
-    }
-    if start < text.len() {
-        out.push(&text[start..]);
-    }
-    out
-}
-
-/// A word character for `\b` (Python's Unicode `\w`).
-pub fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
 }
 
 /// Every JSON object in a JSON-lines file (a missing file or folder reads as none; lines that
@@ -1503,7 +1490,7 @@ pub fn read_jsonl(path: &Path) -> Vec<Json> {
         Err(e) => panic!("reading {}: {e}", path.display()),
     };
     let text = String::from_utf8_lossy(&data);
-    py_splitlines(&text)
+    splitlines(&text)
         .into_iter()
         .filter_map(|line| json::try_parse(line.as_bytes()).ok())
         .filter(|v| v.as_object().is_some())

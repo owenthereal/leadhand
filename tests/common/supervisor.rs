@@ -454,7 +454,7 @@ pub struct FakeSupervisor {
 }
 
 /// Python's `str.splitlines`.
-fn splitlines(text: &str) -> Vec<&str> {
+pub fn splitlines(text: &str) -> Vec<&str> {
     let mut lines = Vec::new();
     let mut start = 0;
     let mut chars = text.char_indices().peekable();

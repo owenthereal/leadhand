@@ -62,12 +62,15 @@ use std::time::Duration;
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 
 use crate::common::json::{self, Json};
+use crate::common::launch_world::now;
+use crate::common::plugin::is_word;
+use crate::common::supervisor::{splitlines, truthy};
 use crate::common::{self, py_str};
 use crate::fixture::{self, Fixture};
 use crate::push_probe::{
-    self, Facts, Ran, RunError, SessionFiles, absolute, catch, copy2, copytree, is_word, live_env,
-    member, now, operator_interrupted, or_none, parse_ts, py_splitlines, py_text, read_json,
-    read_jsonl, real, round_to, short, short_text, show, sleep_s, truthy, utc_now,
+    self, Facts, Ran, RunError, SessionFiles, absolute, catch, copy2, copytree, live_env, member,
+    operator_interrupted, or_none, parse_ts, py_text, read_json, read_jsonl, real, round_to, short,
+    short_text, show, sleep_s, utc_now,
 };
 
 const BUDGET_MINUTES: u64 = 45;
@@ -255,13 +258,32 @@ const INTERRUPT_CHECK_DOCS: [(&str, &str); 9] = [
     ),
 ];
 
-/// The check added when LEADHAND_BIN is not the CLI path the launch reported (S3-R14).
+/// The check added when LEADHAND_BIN is not the resolved platform binary (a shim, or the
+/// testing build), or the launch reported no CLI path (S3-R14).
 const LAUNCH_CLI_DOC: (&str, &str) = (
     "launch CLI path is the resolved platform binary",
-    "LEADHAND_BIN is not the CLI path the launch reported (a shim): that path, which the \
-     supervisor's Bash calls are checked against, names the resolved platform binary, \
-     <root>/bin/<target>/leadhand when it exists, else <root>/target/release/leadhand",
+    "added when LEADHAND_BIN is not the resolved platform binary or the launch reported no CLI \
+     path: the path the supervisor's Bash calls are checked against names the resolved \
+     platform binary, <root>/bin/<target>/leadhand when it exists, else \
+     <root>/target/release/leadhand",
 );
+
+/// The check added when the launch reported no CLI path, so the Bash calls were checked
+/// against LEADHAND_BIN instead (S3-R14).
+const LAUNCH_CLI_MISSING_DOC: (&str, &str) = (
+    "launch reported its CLI path",
+    "added only when it fails: neither a first message (\"leadhand CLI: <path>\") in the \
+     supervisor transcripts nor a launch-line output named the CLI path the launch used, so \
+     the CLI-call checks fell back to LEADHAND_BIN",
+);
+
+/// Whether the shim check (`LAUNCH_CLI_DOC`) runs: LEADHAND_BIN (`bin`) does not name the
+/// resolved platform binary under `root`, or the launch's CLI path was not found and fell
+/// back to LEADHAND_BIN. The dry run's plan and the checks both decide by this (the plan,
+/// before any launch, with `fell_back` false).
+pub fn adds_launch_cli_check(bin: &Path, root: &Path, fell_back: bool) -> bool {
+    fell_back || !common::names_file(&platform_binary(root), bin.as_os_str())
+}
 
 /// The first message's text around the CLI path (`src/launch/argv.rs`'s `first_message`).
 const FIRST_MESSAGE_CLI: &str = ". leadhand CLI: ";
@@ -793,7 +815,7 @@ pub(crate) fn agent_id(text: &str) -> Option<String> {
 
 /// The last line of an error (the Python's `traceback.format_exc().splitlines()[-1]`).
 fn last_line(e: &str) -> String {
-    py_splitlines(e)
+    splitlines(e)
         .last()
         .map_or(String::new(), |l| l.to_string())
 }
@@ -981,12 +1003,13 @@ pub fn first_message_cli(records: &[Json]) -> Option<String> {
 
 /// The CLI path the launch reported (S3-R14), where it came from, and every path reported:
 /// the first message's path in each supervisor transcript of `mains`, then the first word of
-/// each `launch-line` output in `launch_lines`. LEADHAND_BIN (`bin`) when none is.
+/// each `launch-line` output in `launch_lines`. LEADHAND_BIN (`bin`) when none is; the last
+/// item says so (the fallback).
 pub fn launch_cli(
     mains: &[PathBuf],
     launch_lines: &[String],
     bin: &Path,
-) -> (String, String, Json) {
+) -> (String, String, Json, bool) {
     let mut seen: Vec<(String, String)> = Vec::new();
     for p in mains {
         if let Some(cli) = first_message_cli(&read_jsonl(p)) {
@@ -1004,11 +1027,12 @@ pub fn launch_cli(
             .collect(),
     );
     match seen.into_iter().next() {
-        Some((p, from)) => (p, from, all),
+        Some((p, from)) => (p, from, all, false),
         None => (
             bin.display().to_string(),
             "not reported by the launch; LEADHAND_BIN used".to_string(),
             all,
+            true,
         ),
     }
 }
@@ -1569,7 +1593,7 @@ impl Tmux {
         let (mut pane, mut keys) = (self.capture(), Vec::new());
         for mv in 0..=MENU_MAX_MOVES {
             let m = highlighted(&pane);
-            let has_yes = py_splitlines(&pane)
+            let has_yes = splitlines(&pane)
                 .iter()
                 .any(|line| has_word(line, &MENU_WANTED, false));
             let Some(group) = m.filter(|_| has_yes) else {
@@ -1652,7 +1676,7 @@ fn lock_holders(lock: &Path) -> Json {
     }
     raising(&r, &argv);
     let (mut out, mut pid) = (Vec::new(), None::<String>);
-    for line in py_splitlines(&r.stdout) {
+    for line in splitlines(&r.stdout) {
         if let Some(p) = line.strip_prefix('p') {
             pid = Some(p.to_string());
         } else if let (Some(c), Some(p)) = (line.strip_prefix('c'), &pid)
@@ -2067,6 +2091,8 @@ pub struct Evidence<'a> {
     /// against, and where it came from.
     pub cli: String,
     pub cli_source: String,
+    /// True when the launch reported no CLI path and `cli` is LEADHAND_BIN.
+    pub cli_fell_back: bool,
     /// This checkout (the plugin dir).
     pub root: PathBuf,
     pub mode: Mode,
@@ -2137,7 +2163,7 @@ impl Checks {
         let how = CHECK_DOCS
             .iter()
             .chain(&INTERRUPT_CHECK_DOCS)
-            .chain([&LAUNCH_CLI_DOC])
+            .chain([&LAUNCH_CLI_DOC, &LAUNCH_CLI_MISSING_DOC])
             .find(|(n, _)| *n == name)
             .map_or("", |(_, h)| *h);
         self.0.push(Check {
@@ -2202,7 +2228,10 @@ pub fn run_checks(ev: &Evidence) -> Vec<Check> {
         ("c_agent_models", c_agent_models),
         ("c_skill", c_skill),
     ];
-    if !common::names_file(&ev.bin, &ev.cli) {
+    if ev.cli_fell_back {
+        steps.push(("c_launch_cli_missing", c_launch_cli_missing));
+    }
+    if adds_launch_cli_check(&ev.bin, &ev.root, ev.cli_fell_back) {
         steps.push(("c_launch_cli", c_launch_cli));
     }
     if ev.interrupt.is_some() {
@@ -2224,7 +2253,7 @@ pub fn run_checks(ev: &Evidence) -> Vec<Check> {
             f(&mut out, &ctx);
             Ok(())
         }) {
-            let lines = py_splitlines(&e);
+            let lines = splitlines(&e);
             let tail = lines[lines.len().saturating_sub(8)..]
                 .iter()
                 .map(|l| l.to_string())
@@ -2276,7 +2305,7 @@ fn c_branch(out: &mut Checks, c: &Ctx) {
     let log = c.ev.repo.log_since_base(&c.branch);
     facts.set(
         "commits since base",
-        or_none(py_splitlines(&log).iter().map(|l| Json::from(*l)).collect()),
+        or_none(splitlines(&log).iter().map(|l| Json::from(*l)).collect()),
     );
     let src = c.ev.repo.show_file(&c.branch, fixture::SOURCE_FILE);
     facts.set(
@@ -2315,7 +2344,7 @@ fn c_report(out: &mut Checks, c: &Ctx) {
     } else {
         String::new()
     };
-    let lines: Vec<String> = py_splitlines(&text).into_iter().map(String::from).collect();
+    let lines: Vec<String> = splitlines(&text).into_iter().map(String::from).collect();
     let line3 = lines.get(2).cloned();
     let by_run = c.ev.facts.get("report.md written by the run") == Some(&Json::Bool(true));
     out.add(
@@ -2688,7 +2717,7 @@ fn c_publish(out: &mut Checks, c: &Ctx) {
             "codex commands scanned" => codex_n,
             "publishing commands" => or_none(hits.iter().map(|h| Json::from(h.as_str())).collect()),
             "origin refs unchanged" => unchanged,
-            "origin refs after" => strs(&py_splitlines(&after)),
+            "origin refs after" => strs(&splitlines(&after)),
         },
         vec![],
     );
@@ -2983,6 +3012,20 @@ fn c_skill(out: &mut Checks, c: &Ctx) {
             "skill calls" => or_none(calls.iter().map(|(i, e, r)| obj!{"input" => i.clone(), "error" => *e, "result" => r.as_str()}).collect()),
             "body marker" => marker.as_str(),
             "body marker found in transcript" => loaded,
+        },
+        vec![],
+    );
+}
+
+fn c_launch_cli_missing(out: &mut Checks, c: &Ctx) {
+    out.add(
+        LAUNCH_CLI_MISSING_DOC.0,
+        "FAIL",
+        facts! {
+            "LEADHAND_BIN (started)" => c.ev.bin.display().to_string(),
+            "CLI path the CLI-call checks used" => c.ev.cli.as_str(),
+            "launch CLI path from" => c.ev.cli_source.as_str(),
+            "supervisor transcripts" => c.main_recs.len(),
         },
         vec![],
     );
@@ -3500,7 +3543,7 @@ impl Driver {
 
     fn log(&self, msg: &str) {
         let line = format!("[{}] {msg}", utc_now());
-        println!("{line}");
+        say!("{line}");
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
@@ -3591,28 +3634,20 @@ impl Driver {
         argv
     }
 
-    /// Whether the launch is expected to report a CLI path other than LEADHAND_BIN (a shim):
-    /// LEADHAND_BIN does not resolve to the platform binary.
-    fn expects_launch_cli_check(&self) -> bool {
-        !common::names_file(&platform_binary(&self.root), self.bin.as_os_str())
-    }
-
     pub fn plan(&self) {
         let t = "<tmp>/lh e2e XXXX";
         let cli = self.bin.display().to_string();
         let join = |argv: &[&str]| common::shlex_join(&common::os_vec(argv));
-        println!("Plan (dry run; nothing is executed):");
+        say!("Plan (dry run; nothing is executed):");
         if !self.opts.skip_push_probe {
-            println!(
-                "0. Step 1, Codex push probe (tests/live/push_probe.rs) into the same folder:"
-            );
+            say!("0. Step 1, Codex push probe (tests/live/push_probe.rs) into the same folder:");
             push_probe::Probe::new(&self.out, false).plan();
         }
-        println!("{}", fixture::plan_line(t, self.opts.interrupt));
-        println!(
+        say!("{}", fixture::plan_line(t, self.opts.interrupt));
+        say!(
             "   env: LEADHAND_CONFIG='{t}/user config.toml' (empty); every command runs from '{t}/elsewhere'"
         );
-        println!(
+        say!(
             "2. versions: claude --version; codex --version{}",
             if self.opts.mode == Mode::Tmux {
                 "; tmux -V"
@@ -3646,7 +3681,7 @@ impl Driver {
             ],
             vec![cli.as_str(), "start", &deck, "--repo", &repo],
         ] {
-            println!("   {}", join(&argv));
+            say!("   {}", join(&argv));
         }
         let root = self.root.display().to_string();
         let first = vec![
@@ -3659,25 +3694,25 @@ impl Driver {
         if self.opts.mode == Mode::Headless {
             let mut a = first.clone();
             a.push("--print");
-            println!("3. launch (headless): {}", join(&a));
-            println!(
+            say!("3. launch (headless): {}", join(&a));
+            say!(
                 "   -> claude ... --permission-mode auto -p --output-format stream-json --verbose '<first message>'"
             );
         } else {
-            println!(
+            say!(
                 "3. launch (tmux): tmux -L {s} ... new-session -d -s {s}-1 -c '{t}/elsewhere' -x 200 -y 50 env -u CLAUDECODE {}",
                 join(&first),
                 s = self.tmux_sock
             );
-            println!(
+            say!(
                 "   dialogs: trust dialog answered with Down, then Enter once 'Yes, I trust' is highlighted"
             );
         }
-        println!(
+        say!(
             "4. poll every {POLL_S:.0}s: status.json headline, events.jsonl; budget {} min",
             self.budget_s / 60
         );
-        println!(
+        say!(
             "   session exits without an outcome -> record open dispatches, relaunch with `{cli} launch-line <run dir>`{}",
             if self.opts.mode == Mode::Headless {
                 " + --print"
@@ -3685,48 +3720,49 @@ impl Driver {
                 ""
             }
         );
-        println!(
+        say!(
             "5. after: {cli} status <run dir>; {cli} report <run dir> (only if report.md is missing)"
         );
         if self.opts.interrupt {
-            println!(
+            say!(
                 "   interrupted run: fixture card 2 gets more work (fixture::make_fixture slow_card2); triggers poll every {INTERRUPT_POLL_S}s"
             );
-            println!(
+            say!(
                 "   a. card 2's Codex implementer live (workers/<id>/runner.json codex pid + start match):"
             );
-            println!(
+            say!(
                 "      SIGKILL that codex pid at its first item.completed or {KILL_AFTER_FIRST_STEP_S:.0}s after; if it already finished: record 'too fast to interrupt'"
             );
-            println!(
+            say!(
                 "   b. card 2's next attempt running (worker_started; Codex: its runner's codex live):"
             );
-            println!(
+            say!(
                 "      run `{cli} launch-line <run dir>` (+ --print) while the supervisor lives -> must exit 3;"
             );
-            println!(
+            say!(
                 "      lsof the run lock; SIGKILL holder.json's supervisor pid (start-time checked)"
             );
-            println!(
+            say!(
                 "   c. the relaunch loop relaunches via launch-line, retrying refusals (exit 3) every {REFUSED_RETRY_S:.0}s; fast polling continues {FAST_AFTER_KILL_S:.0}s after the kill"
             );
         }
-        println!("6. checks:");
+        say!("6. checks:");
         let mut docs: Vec<(&str, &str)> = CHECK_DOCS.to_vec();
-        if self.expects_launch_cli_check() {
+        if adds_launch_cli_check(&self.bin, &self.root, false) {
             docs.push(LAUNCH_CLI_DOC);
         }
         if self.opts.interrupt {
             docs.extend(INTERRUPT_CHECK_DOCS);
         }
         for (name, how) in docs {
-            println!("   - {name}: {how}");
+            say!("   - {name}: {how}");
         }
-        println!(
-            "   (the CLI calls are checked against the CLI path the launch reports; LEADHAND_BIN is {cli}, the platform binary {})",
-            platform_binary(&self.root).display()
+        say!(
+            "   (the CLI calls are checked against the CLI path the launch reports; LEADHAND_BIN is {cli}, the platform binary {}; when the launch reports none, `{}` FAILs and the platform-binary check is added)",
+            platform_binary(&self.root).display(),
+            LAUNCH_CLI_MISSING_DOC.0
         );
-        println!(
+        say!(
             "7. write {} and {}/; stop sessions, runners and tmux; remove the temp dir",
             self.raw.display(),
             self.art.display()
@@ -4354,7 +4390,7 @@ impl Driver {
     }
 
     /// The CLI path the launch reported, where it came from, and every path reported (S3-R14).
-    fn launch_cli(&self) -> (String, String, Json) {
+    fn launch_cli(&self) -> (String, String, Json, bool) {
         let lines: Vec<String> = match self.facts.get("launch-line outputs") {
             Some(Json::Arr(lines)) => lines.iter().map(|l| py_text(Some(l))).collect(),
             _ => Vec::new(),
@@ -4363,7 +4399,7 @@ impl Driver {
     }
 
     fn evidence<'a>(&'a self, repo: &'a dyn Repo) -> Evidence<'a> {
-        let (cli, cli_source, _) = self.launch_cli();
+        let (cli, cli_source, _, cli_fell_back) = self.launch_cli();
         Evidence {
             run_dir: self.run_dir().to_path_buf(),
             files: self.files.clone(),
@@ -4371,6 +4407,7 @@ impl Driver {
             bin: self.bin.clone(),
             cli,
             cli_source,
+            cli_fell_back,
             root: self.root.clone(),
             mode: self.opts.mode,
             sessions: self.sessions.iter().map(|s| s.rec.clone()).collect(),
@@ -4386,7 +4423,7 @@ impl Driver {
     }
 
     fn run_checks(&mut self) -> Result<(), String> {
-        let (cli, source, all) = self.launch_cli();
+        let (cli, source, all, _) = self.launch_cli();
         self.facts.set(
             "launch CLI path (checked against the supervisor's Bash calls)",
             cli,
@@ -4499,7 +4536,15 @@ impl Driver {
         if !operator_interrupted() {
             self.log("Step 2: end-to-end run");
             self.t0 = now();
-            if self.preflight() && self.safe_setup() {
+            let ready = match catch(|| Ok(self.preflight())) {
+                Ok(ready) => ready,
+                Err(e) => {
+                    self.errors.push(format!("preflight: {e}"));
+                    self.stop_reason = "preflight failed".to_string();
+                    false
+                }
+            };
+            if ready && self.safe_setup() {
                 if let Err(e) = catch(|| self.drive()) {
                     self.errors.push(format!("drive: {e}"));
                     if self.stop_reason.is_empty() {
@@ -4543,14 +4588,15 @@ impl Driver {
         {
             let _ = fs::remove_dir_all(tmp);
         }
-        println!("\nSummary:");
+        say!("");
+        say!("Summary:");
         for s in push_summary.iter().flatten() {
-            println!("  push probe: {s}");
+            say!("  push probe: {s}");
         }
         for c in &self.checks {
-            println!("  {:8} {}", c.verdict, c.name);
+            say!("  {:8} {}", c.verdict, c.name);
         }
-        println!("raw results: {}", self.raw.display());
+        say!("raw results: {}", self.raw.display());
         let mut failed: Vec<String> = push_summary
             .iter()
             .flatten()

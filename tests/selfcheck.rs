@@ -428,14 +428,30 @@ fn live_tests_use_the_crate_only_for_procs() {
         .into_iter()
         .filter(|p| is_live(&tests, p))
         .collect();
-    // Not vacuous: the scan covers the live test and every file under tests/live/.
-    assert!(
-        files.contains(&tests.join("live.rs")),
-        "tests/live.rs was not scanned: {files:?}"
-    );
-    let under_live: Vec<PathBuf> = common::walk(&tests.join("live"))
+    // Not vacuous: the scan covers the live test, its three modules by name (as the Python
+    // named its two drivers), and every other file under tests/live/ (hidden ones, such as
+    // a Finder's .DS_Store, aside).
+    for rel in [
+        "live.rs",
+        "live/drive.rs",
+        "live/fixture.rs",
+        "live/push_probe.rs",
+    ] {
+        assert!(
+            files.contains(&tests.join(rel)),
+            "tests/{rel} was not scanned: {files:?}"
+        );
+    }
+    let live = tests.join("live");
+    let under_live: Vec<PathBuf> = common::walk(&live)
         .into_iter()
         .filter(|p| !p.is_dir())
+        .filter(|p| {
+            !p.strip_prefix(&live)
+                .unwrap()
+                .components()
+                .any(|c| c.as_os_str().as_bytes().starts_with(b"."))
+        })
         .collect();
     assert!(!under_live.is_empty(), "no file under tests/live/");
     let unscanned: Vec<&PathBuf> = under_live.iter().filter(|p| !files.contains(p)).collect();

@@ -12,6 +12,9 @@
 //!     cargo test --locked --features testing --test live -- --ignored --test-threads 1
 //! ```
 //!
+//! No `--nocapture` is needed: the drivers write their progress, section, check and summary
+//! lines straight to the process's stdout, which libtest does not capture (ruling S3-R28).
+//!
 //! - `live_complete_run`: the Codex push probe first, then one complete run (the Python
 //!   driver without `--interrupt`).
 //! - `live_interrupted_run`: the interrupted run (the Python driver's `--interrupt`): card 2's
