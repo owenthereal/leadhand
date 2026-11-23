@@ -355,7 +355,7 @@ pub fn main() -> ExitCode {
     let caller = resolve_caller();
     match run(command, &caller) {
         Ok(code) => code,
-        Err(e) => report(&e),
+        Err(e) => report(&e, &mut std::io::stdout(), &mut std::io::stderr().lock()),
     }
 }
 
@@ -436,14 +436,14 @@ fn run(command: Command, caller: &Result<Caller>) -> Result<ExitCode> {
     }
 }
 
-/// Prints `e`: the `still running` line on stdout for exit 75; otherwise `error: <message>`
-/// on stderr, then the fixing command, if any, alone as the last line.
-fn report(e: &Error) -> ExitCode {
+/// Prints `e`: the `still running` line on `out` for exit 75; otherwise `error: <message>`
+/// on `err`, then the fixing command, if any, alone as the last line.
+fn report(e: &Error, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     if e.exit == EXIT_STILL_RUNNING {
-        let _ = writeln!(std::io::stdout(), "{}", e.message);
+        let _ = writeln!(out, "{}", e.message);
         ExitCode::from(e.exit)
     } else {
-        human::fail_with_fix(e.clone())
+        human::fail_with_fix(e.clone(), err)
     }
 }
 
@@ -1187,11 +1187,33 @@ mod tests {
 
     #[test]
     fn errors_print_as_error_lines_and_exit_with_their_code() {
-        assert_eq!(report(&Error::msg("x")), ExitCode::from(1));
-        assert_eq!(report(&Error::refused("x")), ExitCode::from(3));
+        let run = |e: &Error| {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = report(e, &mut out, &mut err);
+            (code, out, err)
+        };
+        let error_x = (b"".to_vec(), b"error: x\n".to_vec());
         assert_eq!(
-            report(&Error::still_running("still running: x")),
-            ExitCode::from(75)
+            run(&Error::msg("x")),
+            (ExitCode::from(1), error_x.0.clone(), error_x.1.clone())
+        );
+        assert_eq!(
+            run(&Error::refused("x")),
+            (ExitCode::from(3), error_x.0, error_x.1)
+        );
+        assert_eq!(
+            run(&Error::still_running("still running: x")),
+            (
+                ExitCode::from(75),
+                b"still running: x\n".to_vec(),
+                Vec::new()
+            )
+        );
+        // Review Focus 5: a printed error keeps its bytes, on the error stream only.
+        let printed = b"error: the checkout /r/\xff itself; with:\nleadhand start '/r/\xff/d.md'\n";
+        assert_eq!(
+            run(&Error::printed(printed.to_vec())),
+            (ExitCode::from(1), Vec::new(), printed.to_vec())
         );
     }
 }

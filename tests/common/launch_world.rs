@@ -28,7 +28,7 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
@@ -477,8 +477,7 @@ impl World {
     #[track_caller]
     pub fn tool(&self, name: &str, body: &str) {
         let path = self.bindir.join(name);
-        fs::write(&path, body).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        super::write_executable(&path, body);
     }
 
     // -- driving ----------------------------------------------------------------

@@ -1,15 +1,20 @@
 //! The harness's own tests: what a failing or hung binary reports, the sealed environment,
-//! the tests' isolation from the crate's library, the JSON decoder and the fake
-//! `codex` and `claude`. Static: these never run LEADHAND_BIN (shell scripts stand in for it).
+//! the tests' isolation from the crate's library, the JSON decoder, the fake
+//! `codex` and `claude` and the executable writer (`write_executable`, which writes the files
+//! tests run). Static: these never run LEADHAND_BIN (shell scripts stand in for it).
 
 #[macro_use]
 mod common;
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
+use std::io::{self, Read};
+use std::mem::MaybeUninit;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use common::json::{self, Json};
@@ -20,8 +25,7 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 
 fn fake_binary(tmp: &Path, body: &str) -> PathBuf {
     let path = tmp.join("fake leadhand");
-    fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&path, format!("#!/bin/sh\n{body}"));
     path
 }
 
@@ -1211,4 +1215,350 @@ mod drive_child {
         let children = children_gone(&top);
         assert_eq!(chains(&children), ["worker", "worker > crash"]);
     }
+}
+
+// --------------------------------------------------------------------------
+// The executable writer (follow-ups round 2)
+
+/// The errno the probe's child fails its spawn with when it holds a write handle on the pipe.
+/// Spawning `/usr/bin/true` can't otherwise fail with it.
+const FOUND: libc::c_int = libc::EOWNERDEAD;
+
+/// The one deadline on the proof's waits on the pipe: its first byte, then its end.
+const PIPE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The soft `RLIMIT_NOFILE`, the scan's bound. Every descriptor number is below the limit in
+/// force when it was opened, and nothing in the tests lowers it, so a scan below it sees every
+/// descriptor a forked child holds. Panics if it is unlimited, or too large for a descriptor
+/// number, rather than scan less.
+fn descriptor_bound() -> libc::c_int {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit(2)` writes only the `rlimit` it is given, which outlives the call.
+    let r = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    assert_eq!(
+        r,
+        0,
+        "getrlimit(RLIMIT_NOFILE): {}",
+        io::Error::last_os_error()
+    );
+    assert!(
+        limit.rlim_cur != libc::RLIM_INFINITY,
+        "the soft RLIMIT_NOFILE is unlimited: no scan can cover every descriptor a child holds"
+    );
+    libc::c_int::try_from(limit.rlim_cur).unwrap_or_else(|_| {
+        panic!(
+            "the soft RLIMIT_NOFILE, {}, is past every descriptor number: no scan can cover \
+             every descriptor a child holds",
+            limit.rlim_cur
+        )
+    })
+}
+
+/// `stat(2)` of `path`, in libc's own types: the scan compares its device and inode with
+/// `fstat`'s, so no cast differs between platforms.
+fn libc_stat(path: &Path) -> libc::stat {
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let mut st = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `stat(2)` reads the NUL-terminated path, which outlives the call, and writes only
+    // the `stat` buffer it is given.
+    let r = unsafe { libc::stat(c_path.as_ptr(), st.as_mut_ptr()) };
+    assert_eq!(
+        r,
+        0,
+        "stat {}: {}",
+        path.display(),
+        io::Error::last_os_error()
+    );
+    // SAFETY: `stat` returned 0, so it filled the buffer.
+    unsafe { st.assume_init() }
+}
+
+/// The probe's scan, run in its forked child before the exec: fails with `FOUND` if any
+/// descriptor below `bound` is open for writing (`O_WRONLY` or `O_RDWR`) on `pipe`'s file, and
+/// with the errno of any call that fails other than as a closed number (EBADF).
+///
+/// It runs in the child of a multi-threaded process, so it makes only raw, async-signal-safe
+/// calls (`fcntl`, `fstat` and errno reads), allocates nothing and takes no lock. It never
+/// makes a `BorrowedFd`: a number may be closed.
+fn scan_for_a_write_handle(bound: libc::c_int, pipe: &libc::stat) -> io::Result<()> {
+    for fd in 0..bound {
+        // SAFETY: `fcntl(2)` with `F_GETFL` only reads a descriptor's status flags, and touches
+        // no memory. The number need not be open: a closed one fails with EBADF, skipped here.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EBADF) {
+                continue;
+            }
+            return Err(e);
+        }
+        let access = flags & libc::O_ACCMODE;
+        if access != libc::O_WRONLY && access != libc::O_RDWR {
+            continue;
+        }
+        let mut st = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fstat(2)` writes only the `stat` buffer it is given, on this stack. The
+        // descriptor is open: `fcntl` just read its flags, and this child runs only this thread.
+        if unsafe { libc::fstat(fd, st.as_mut_ptr()) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fstat` returned 0, so it filled the buffer.
+        let st = unsafe { st.assume_init() };
+        if st.st_dev == pipe.st_dev && st.st_ino == pipe.st_ino {
+            return Err(io::Error::from_raw_os_error(FOUND));
+        }
+    }
+    Ok(())
+}
+
+/// The helper's proof: one fork, at a moment when whatever writes the file must hold it open
+/// for writing, and the forked child looks for that write handle among its own descriptors.
+/// The file is a named pipe, which holds its writer blocked.
+///
+/// 1. On a second thread, the helper writes 4 MiB, many times a pipe's capacity, to the pipe.
+/// 2. The test reads the first byte (nonblocking, under one deadline). From then on the writer
+///    holds the pipe open for writing, until the rest is read.
+/// 3. It forks once: `/usr/bin/true`, with a `pre_exec` scan of the child's descriptors. The
+///    spawn fails with `FOUND` if one is open for writing on the pipe.
+/// 4. The pipe's unread count (FIONREAD) shows the writer still had bytes to write at the fork.
+/// 5. Whatever the fork found, the test drains the pipe and joins the writer; it asserts only
+///    then.
+///
+/// An in-process write fails it, on macOS as on Linux: the write handle is the test process's
+/// own, and the child inherits it. A writer process's handle is the writer's alone.
+#[test]
+fn write_executable_leaves_no_write_handle_for_a_fork() {
+    // Before the writer starts, so that a refusal leaves nothing to clean up.
+    let bound = descriptor_bound();
+    let tmp = TempRoot::new("lh self ");
+    let pipe = tmp.path().join("the pipe");
+    let made = Command::new("/usr/bin/mkfifo").arg(&pipe).output().unwrap();
+    assert!(made.status.success(), "mkfifo {}: {made:?}", pipe.display());
+    let pipe_stat = libc_stat(&pipe);
+    // A repeating pattern, so that a lost or reordered chunk shows.
+    let contents: Vec<u8> = (0..=250u8).cycle().take(4 << 20).collect();
+
+    let deadline = Instant::now() + PIPE_DEADLINE;
+    // The reader opens before the writer starts: nonblocking, it waits for no writer, and the
+    // writer's open then never waits for a reader.
+    let mut reader = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&pipe)
+        .unwrap_or_else(|e| panic!("opening {} to read: {e}", pipe.display()));
+    let writer = {
+        let (pipe, contents) = (pipe.clone(), contents.clone());
+        std::thread::spawn(move || {
+            common::panic_message(|| common::executable::write_executable(&pipe, contents))
+        })
+    };
+
+    // What went wrong in the run itself, reported after the cleanup.
+    let mut problems: Vec<String> = Vec::new();
+    let mut read: Vec<u8> = Vec::with_capacity(contents.len());
+
+    // The first byte. Before any writer opens the pipe, a read gives 0 (or WouldBlock).
+    let mut byte = [0u8; 1];
+    let first = loop {
+        match reader.read(&mut byte) {
+            Ok(0) => {}
+            Ok(_) => {
+                read.push(byte[0]);
+                break true;
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                problems.push(format!("reading the pipe's first byte: {e}"));
+                break false;
+            }
+        }
+        if writer.is_finished() {
+            problems.push("the writer finished before the pipe's first byte".to_string());
+            break false;
+        }
+        if Instant::now() >= deadline {
+            problems.push(format!(
+                "no first byte on the pipe within {PIPE_DEADLINE:?}"
+            ));
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+
+    // The fork, recorded, not asserted yet.
+    let probe: Option<io::Result<ExitStatus>> = first.then(|| {
+        let mut cmd = Command::new("/usr/bin/true");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: the hook runs in the forked child of this multi-threaded process, between
+        // fork and exec, where only async-signal-safe calls are allowed: the scan makes raw
+        // `fcntl` and `fstat` calls and reads errno, allocating nothing and taking no lock. It
+        // captures only plain values, the bound and the pipe's `stat`.
+        unsafe {
+            cmd.pre_exec(move || scan_for_a_write_handle(bound, &pipe_stat));
+        }
+        cmd.status()
+    });
+    // The overlap: bytes still to be written at the fork mean the writer held its write handle
+    // then.
+    let unread = rustix::io::ioctl_fionread(&reader);
+
+    // The drain, to the pipe's end (a read of 0 once its writer has closed it), within the
+    // same deadline.
+    let mut drained = false;
+    if first {
+        let mut chunk = vec![0u8; 1 << 16];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => {
+                    drained = true;
+                    break;
+                }
+                Ok(n) => read.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        problems.push(format!(
+                            "the pipe didn't reach its end within {PIPE_DEADLINE:?} \
+                             ({} of {} bytes read)",
+                            read.len(),
+                            contents.len()
+                        ));
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    problems.push(format!("draining the pipe: {e}"));
+                    break;
+                }
+            }
+        }
+    }
+    // Closing the reader fails a writer still blocked writing to the pipe (EPIPE).
+    drop(reader);
+    // Once the pipe has reached its end, the writer has closed it and finishes. Otherwise it
+    // gets 5 s, then is abandoned: a writer still waiting to open the pipe, which now has no
+    // reader, would wait for ever.
+    if !drained {
+        let grace = Instant::now() + Duration::from_secs(5);
+        while !writer.is_finished() && Instant::now() < grace {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    if drained || writer.is_finished() {
+        match writer.join() {
+            Ok(None) => {}
+            Ok(Some(message)) => problems.push(format!("the writer panicked: {message}")),
+            Err(_) => problems.push("the writer thread panicked outside the helper".to_string()),
+        }
+    } else {
+        problems.push("the writer was still running 5 s after the reader closed".to_string());
+    }
+
+    let found = matches!(&probe, Some(Err(e)) if e.raw_os_error() == Some(FOUND));
+    match &probe {
+        Some(Ok(status)) if !status.success() => {
+            problems.push(format!("the probe's /usr/bin/true exited with {status}"));
+        }
+        Some(Err(e)) if !found => problems.push(format!("the probe's spawn failed: {e}")),
+        _ => {}
+    }
+    assert!(
+        problems.is_empty(),
+        "the proof didn't run cleanly: {}",
+        problems.join("; ")
+    );
+    let unread = unread.unwrap_or_else(|e| panic!("inconclusive: FIONREAD on the pipe: {e}"));
+    assert!(
+        1 + unread < contents.len() as u64,
+        "inconclusive: at the fork the writer had no bytes left to write ({unread} unread and 1 \
+         read, of {} bytes), so it may have closed the pipe already",
+        contents.len()
+    );
+    assert!(
+        !found,
+        "a forked child inherited a write handle on the pipe: the writer held it in this process"
+    );
+    assert!(
+        read == contents,
+        "the pipe's bytes differ from the contents ({} of {} bytes read)",
+        read.len(),
+        contents.len()
+    );
+}
+
+/// The mode bits of `path`'s permissions.
+fn mode_of(path: &Path) -> u32 {
+    let mode = fs::metadata(path)
+        .unwrap_or_else(|e| panic!("metadata of {}: {e}", path.display()))
+        .permissions()
+        .mode();
+    mode & 0o7777
+}
+
+/// In a fresh empty folder, so that nothing in the setup ever holds the file open for writing:
+/// the helper creates the file itself, and it runs at once.
+#[test]
+fn write_executable_creates_a_file_that_runs_at_once() {
+    let tmp = TempRoot::new("lh self ");
+    let script = tmp.path().join("script");
+    let contents = b"#!/bin/sh\necho 'ran at once'\n";
+    common::executable::write_executable(&script, contents);
+    assert_eq!(fs::read(&script).unwrap(), contents);
+    assert_eq!(mode_of(&script), 0o755);
+    let out = Command::new(&script).output().unwrap();
+    assert_eq!(
+        (out.status.code(), out.stdout.as_slice()),
+        (Some(0), &b"ran at once\n"[..]),
+        "{out:?}"
+    );
+}
+
+/// A path with a space and a leading `-` in its components, and bytes that aren't text (a NUL,
+/// `\xff`, no final newline), arrive exactly.
+#[test]
+fn write_executable_keeps_odd_paths_and_bytes() {
+    let tmp = TempRoot::new("lh self ");
+    let dir = tmp.path().join("a dir");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("-x y");
+    let contents = b"\0\xff\nno final newline";
+    common::executable::write_executable(&path, contents);
+    assert_eq!(fs::read(&path).unwrap(), contents);
+    assert_eq!(mode_of(&path), 0o755);
+}
+
+/// A file that already exists, longer and with mode 0644, holds exactly the new bytes
+/// afterwards, with mode 0755: `shim.rs`'s `Tree::kernel` and `rust_launch` rewrite theirs.
+#[test]
+fn write_executable_rewrites_a_longer_file() {
+    let tmp = TempRoot::new("lh self ");
+    let path = tmp.path().join("longer");
+    // Written in-process: this file is never run.
+    fs::write(&path, [b'#'; 1000]).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    common::executable::write_executable(&path, b"#!/bin/sh\n");
+    assert_eq!(fs::read(&path).unwrap(), b"#!/bin/sh\n");
+    assert_eq!(mode_of(&path), 0o755);
+}
+
+/// A write that fails (here its folder doesn't exist) panics, naming the path and the cause:
+/// Rust's wording or bash's (macOS's `sh`), "No such file", or dash's (Ubuntu's `sh`), "cannot
+/// create".
+#[test]
+fn write_executable_panics_naming_the_path() {
+    let tmp = TempRoot::new("lh self ");
+    let path = tmp.path().join("missing").join("x");
+    let message = assert_panics!(common::executable::write_executable(&path, b"#!/bin/sh\n"));
+    assert!(message.contains(&path.display().to_string()), "{message}");
+    assert!(
+        message.contains("No such file") || message.contains("cannot create"),
+        "{message}"
+    );
 }

@@ -993,21 +993,20 @@ fn release_workflow_pins_actions_and_checks_the_tree() {
         value(&jobs["test"], 8, "os"),
         Some("[macos-15, ubuntu-24.04, ubuntu-24.04-arm]")
     );
-    // The Linux legs run the full suite and the unit tests on musl, the C library of the
-    // binaries they ship (S3-R36), after the release build, so rust_cli's release-build tests
-    // check the binary the job uploads, and before it's uploaded (spec task 6).
+    // Every leg runs the full suite and the unit tests on the target it ships (S3-R36, and
+    // follow-ups round 2: macOS too), after the release build, so rust_cli's release-build
+    // tests check the binary the job uploads, and before it's uploaded (spec task 6).
     let release_build = "cargo build --locked --release --target \"$RUST_TARGET\"";
-    let linux = Some("runner.os == 'Linux'".to_string());
     assert_eq!(
         cargo_runs(&jobs["build"]),
         [
             (None, release_build.to_string()),
             (
-                linux.clone(),
+                None,
                 "cargo test --locked --features testing --target \"$RUST_TARGET\"".to_string()
             ),
             (
-                linux,
+                None,
                 "cargo test --locked --lib --target \"$RUST_TARGET\"".to_string()
             ),
         ]
@@ -1039,7 +1038,7 @@ fn release_workflow_pins_actions_and_checks_the_tree() {
         ),
         "{stage:?}"
     );
-    // A test-only change gets the musl run on its pull request.
+    // A test-only change gets every build leg's test run on its pull request.
     let paths = block(&code_lines(&text), 4, "paths").expect("the pull_request paths");
     assert!(paths.contains(&"- 'tests/**'"), "{paths:?}");
 }

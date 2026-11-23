@@ -96,17 +96,16 @@ jobs:
 
       # The release package: no testing feature, so no test hooks and one binary.
       - run: cargo build --locked --release --target "$RUST_TARGET"
-      # The tests on musl, the C library the shipped Linux binaries link against; the test job
-      # tests the glibc build. The full suite's release-build tests (tests/rust_cli.rs) run
-      # target/$RUST_TARGET/release/leadhand, the binary this job stages and uploads; cargo
-      # test builds in the dev profile, so it leaves that binary as the release build made it.
+      # Every leg tests the build it ships: the musl build on Linux (the test job tests the
+      # glibc build), the darwin-arm64 build on macOS. The full suite's release-build tests
+      # (tests/rust_cli.rs) run target/$RUST_TARGET/release/leadhand, the binary this job
+      # stages and uploads; cargo test builds in the dev profile, so it leaves that binary as
+      # the release build made it.
       # The second run checks that the test hooks are compiled out without the feature.
-      - name: Run the tests on musl
-        if: runner.os == 'Linux'
+      - name: Run the tests
         run: cargo test --locked --features testing --target "$RUST_TARGET"
         timeout-minutes: 45
-      - name: Run the unit tests on musl
-        if: runner.os == 'Linux'
+      - name: Run the unit tests
         run: cargo test --locked --lib --target "$RUST_TARGET"
         timeout-minutes: 15
 

@@ -26,4 +26,10 @@ pub mod testing;
 pub mod usage;
 pub mod wire;
 
+// The test harness's executable writer, for the library's own tests that write a file
+// and run it (tests/common/executable.rs says why).
+#[cfg(all(test, feature = "testing"))]
+#[path = "../tests/common/executable.rs"]
+mod test_executable;
+
 pub use error::{Error, Result};

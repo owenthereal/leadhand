@@ -15,6 +15,7 @@
 pub mod dispatch_world;
 pub mod drive;
 pub mod engine;
+pub mod executable;
 pub mod git;
 pub mod json;
 pub mod launch_world;
@@ -24,6 +25,8 @@ pub mod recovery;
 pub mod rundir;
 pub mod rust_src;
 pub mod supervisor;
+
+pub use executable::write_executable;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};

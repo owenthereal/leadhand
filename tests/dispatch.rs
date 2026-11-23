@@ -1234,7 +1234,6 @@ mod runner_commits {
     use common::git::run_git;
     use rustix::process::Signal;
     use serde_json::{Value, json};
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1256,8 +1255,7 @@ mod runner_commits {
             let hooks = w.git(&["rev-parse", "--path-format=absolute", "--git-path", "hooks"]);
             let hook = PathBuf::from(hooks).join("pre-commit");
             fs::create_dir_all(hook.parent().unwrap()).unwrap();
-            fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+            common::write_executable(&hook, "#!/bin/sh\nexit 1\n");
             Commits { w, base_sha }
         }
 
