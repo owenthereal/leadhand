@@ -8,10 +8,10 @@
 #       and .claude-plugin/marketplace.json's leadhand entry; unless <binaries dir> holds
 #       <target>/leadhand for each target (darwin-arm64, linux-x86_64, linux-arm64); unless the
 #       sources are a git checkout of their own; and unless every file git tracks under the
-#       plugin paths is a regular file in the working tree. Then copies exactly those tracked
-#       files, with their working-tree content and modes, into <out dir> (new or empty), the
-#       binaries as bin/<target>/leadhand with mode 0755, points the marketplace's leadhand
-#       entry at "./", and runs --check on the result.
+#       plugin paths is a regular file in the working tree, under no symlinked folder. Then
+#       copies exactly those tracked files, with their working-tree content and executable
+#       bits, into <out dir> (new or empty), the binaries as bin/<target>/leadhand with mode
+#       0755, points the marketplace's leadhand entry at "./", and runs --check on the result.
 #   assemble-dist.sh --check <dir>
 #       Checks an assembled tree, changing nothing: every plugin path is there and nothing
 #       else, each bin/<target>/ holds only an executable leadhand, bin/leadhand is
@@ -237,6 +237,7 @@ fi
 
 # The plugin files are the ones git tracks, so the sources must be a checkout of their own: not
 # a plain copy, which git knows nothing of, nor one inside some other repository.
+command -v git >/dev/null 2>&1 || fail "needs git, to copy only the files git tracks; install git"
 top=$(git -C "$src" rev-parse --show-toplevel 2>/dev/null) || top=''
 [ "$top" = "$src" ] ||
     fail "needs a git checkout of leadhand, to copy only the files git tracks; $src is not one"
@@ -253,16 +254,28 @@ archive=$work/plugin.tar
 git -C "$src" ls-files -z -- $plugin_paths >"$file_list" ||
     fail "can't list the files git tracks in $src"
 
-# Each tracked path must be a regular file in the working tree, or the copy would lose it
-# (deleted) or package something else in its place (a directory's untracked contents, or a
-# symlink). Every such path is named.
+# Each tracked path must be a regular file in the working tree, under no symlinked folder, or
+# the copy would lose it (deleted) or package something else in its place (a directory's
+# untracked contents, a symlink, or whatever a symlinked folder points at). Every such path is
+# named.
 # shellcheck disable=SC2016 # the inner script expands its own arguments
 xargs -0 sh -c '
     cd -- "$1" || exit 1
     shift
     bad=0
     for path do
-        if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        # The outermost folder on the path that is a symlink, if any.
+        under="" parent=$path
+        while [ "${parent%/*}" != "$parent" ]; do
+            parent=${parent%/*}
+            if [ -L "$parent" ]; then
+                under=$parent
+            fi
+        done
+        if [ -n "$under" ]; then
+            echo "assemble-dist: tracked file $path is under a symlink, $under" >&2
+            bad=1
+        elif [ ! -e "$path" ] && [ ! -L "$path" ]; then
             echo "assemble-dist: missing tracked file $path" >&2
             bad=1
         elif [ ! -f "$path" ] || [ -L "$path" ]; then
@@ -274,8 +287,8 @@ xargs -0 sh -c '
 ' sh "$src" <"$file_list" ||
     fail "refused: every file git tracks under the plugin paths must be a regular file in $src"
 
-# Exactly the tracked files, with their working-tree content and modes, through an archive so
-# that each side's exit status is checked.
+# Exactly the tracked files, with their working-tree content and executable bits, through an
+# archive so that each side's exit status is checked.
 tar -cf "$archive" -C "$src" --null -T "$file_list" ||
     fail "can't archive the tracked files in $src"
 mkdir -p "$out/bin"

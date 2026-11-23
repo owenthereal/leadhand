@@ -502,6 +502,74 @@ fn assembly_refuses_a_tracked_file_replaced_by_a_directory() {
     );
 }
 
+/// A tracked file replaced by a symlink, to a file with the same content, is refused by name
+/// before anything is written.
+#[test]
+fn assembly_refuses_a_tracked_file_replaced_by_a_symlink() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    let path = src.join("docs/compatibility.md");
+    let elsewhere = tmp.join("compatibility.md");
+    fs::copy(&path, &elsewhere).unwrap();
+    fs::remove_file(&path).unwrap();
+    common::symlink(&elsewhere, &path);
+    refused(
+        &src,
+        &tmp,
+        "tracked file docs/compatibility.md is not a regular file",
+    );
+}
+
+/// A tracked file under a folder replaced by a symlink, to a folder holding the same names, is
+/// refused by name before anything is written: the file itself is regular, but the copy would
+/// follow the symlink.
+#[test]
+fn assembly_refuses_a_tracked_file_under_a_symlinked_folder() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    let elsewhere = tmp.join("elsewhere docs");
+    copy_tree(&src.join("docs"), &elsewhere);
+    fs::remove_dir_all(src.join("docs")).unwrap();
+    common::symlink(&elsewhere, &src.join("docs"));
+    assert!(src.join("docs/compatibility.md").is_file());
+    refused(
+        &src,
+        &tmp,
+        "tracked file docs/compatibility.md is under a symlink, docs",
+    );
+}
+
+/// Without git installed, the assembly says so, in one line and before writing anything,
+/// rather than calling the sources not a checkout.
+#[test]
+fn assembly_without_git_says_so() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    // A PATH with what the script runs before its checkout check, and no git.
+    let tools = tmp.join("tools");
+    fs::create_dir(&tools).unwrap();
+    for tool in ["jq", "awk", "dirname"] {
+        let real = common::which(tool).unwrap_or_else(|| panic!("no {tool} on PATH"));
+        common::symlink(&real, &tools.join(tool));
+    }
+    let bins = tmp.join("bins");
+    stub_binaries(&bins);
+    let out = tmp.join("dist");
+    let ran = Command::new("/bin/sh")
+        .arg(src.join("scripts/assemble-dist.sh"))
+        .args([VERSION, path_str(&out), path_str(&bins)])
+        .env("PATH", &tools)
+        .current_dir(&src)
+        .stdin(Stdio::null())
+        .output()
+        .expect("running assemble-dist.sh");
+    let stderr = String::from_utf8_lossy(&ran.stderr);
+    assert_eq!(ran.status.code(), Some(1), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("needs git"), "{stderr}");
+    assert!(!out.exists(), "wrote {}", out.display());
+}
+
 /// Sources that aren't a git checkout of their own are refused before anything is written:
 /// a plain copy, and a plain copy inside an unrelated repository.
 #[test]
