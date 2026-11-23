@@ -65,10 +65,10 @@ jobs:
       - run: cargo build --locked
       - run: cargo build --locked --release
       - run: cargo clippy --locked --all-targets --features testing -- -D warnings
-      - name: claude plugin validate .
+      - name: claude plugin validate --strict .
         run: |
           PATH="$RUNNER_TEMP/claude-code/node_modules/.bin:$PATH"
-          claude plugin validate .
+          claude plugin validate --strict .
 
       # Tests. The contract tests (tests/*.rs) run against the testing build; tests/plugin_files.rs
       # also checks the manifests. Measured locally on a developer Mac, the suite took about seven
