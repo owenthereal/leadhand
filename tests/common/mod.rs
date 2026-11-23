@@ -15,6 +15,7 @@
 pub mod dispatch_world;
 pub mod drive;
 pub mod engine;
+pub mod executable;
 pub mod git;
 pub mod json;
 pub mod launch_world;
