@@ -203,11 +203,12 @@ fn assembled_tree_has_every_plugin_file_and_executable_binaries() {
     assert_eq!(ran.code, Some(0), "--check failed: {}", ran.stderr);
     assert!(ran.stdout.contains(VERSION), "{}", ran.stdout);
 
-    // Exactly the listed paths and the binaries, byte for byte, except the marketplace's
-    // rewritten source (assembled_marketplace_points_at_its_own_root).
+    // Exactly the tracked files under the listed paths and the binaries, byte for byte, except
+    // the marketplace's rewritten source (assembled_marketplace_points_at_its_own_root).
     let mut want = BTreeMap::new();
-    for path in PLUGIN_PATHS {
-        files_under(&root(), path, &mut want);
+    for path in tracked_plugin_files(&root()) {
+        let bytes = fs::read(root().join(&path)).unwrap();
+        want.insert(path, bytes);
     }
     for t in TARGETS {
         want.insert(
@@ -322,6 +323,22 @@ fn check_refuses_an_incomplete_tree() {
         fs::create_dir(dir.join("bin/windows-x86_64")).unwrap()
     });
     case(
+        "an extra file for a target",
+        "unexpected bin/darwin-arm64/extra",
+        &|dir| fs::write(dir.join("bin/darwin-arm64/extra"), "").unwrap(),
+    );
+    // A nested folder emptied, so the top-level skills/ still holds something.
+    case("an empty skills/run", "empty folder skills/run", &|dir| {
+        for entry in fs::read_dir(dir.join("skills/run")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                fs::remove_dir_all(path).unwrap();
+            } else {
+                fs::remove_file(path).unwrap();
+            }
+        }
+    });
+    case(
         "a manifest that isn't JSON",
         ".codex-plugin/plugin.json",
         &|dir| fs::write(dir.join(".codex-plugin/plugin.json"), "{\"version\": ").unwrap(),
@@ -342,17 +359,221 @@ fn check_refuses_an_incomplete_tree() {
     assert!(all_files(&good) == before);
 }
 
-/// A copy of the package's sources the assembly reads (its script, `Cargo.toml` and the plugin
-/// files) in `<tmp>/src`, for changing a version without touching the package.
-fn source_copy(tmp: &Path) -> PathBuf {
-    let src = tmp.join("src");
+/// Copies the package's sources the assembly reads (its script, `Cargo.toml` and the plugin
+/// files) into `dir`.
+fn copy_sources(dir: &Path) {
     for path in PLUGIN_PATHS
         .iter()
         .chain(&["Cargo.toml", "scripts/assemble-dist.sh"])
     {
-        copy_tree(&root().join(path), &src.join(path));
+        copy_tree(&root().join(path), &dir.join(path));
     }
+}
+
+/// A copy of the package's sources in `<tmp>/src`, a git repository with the copied files
+/// committed, for changing a version or a file without touching the package.
+fn source_copy(tmp: &Path) -> PathBuf {
+    let src = common::git::make_repo_named(tmp, "src", "main");
+    copy_sources(&src);
+    common::git::run_git(&src, &["add", "--all"]);
+    common::git::run_git(&src, &["commit", "--quiet", "-m", "the sources"]);
     src
+}
+
+/// The plugin files git tracks in `dir`, sorted: `git ls-files -z -- <PLUGIN_PATHS>`.
+fn tracked_plugin_files(dir: &Path) -> Vec<String> {
+    let out = Command::new("git")
+        .args(["ls-files", "-z", "--"])
+        .args(PLUGIN_PATHS)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("running git ls-files");
+    assert!(
+        out.status.success(),
+        "git ls-files in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut files: Vec<String> = String::from_utf8(out.stdout)
+        .expect("UTF-8 file names")
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    files.sort();
+    files
+}
+
+/// Assembles the source copy `src` at `VERSION`, with its own script, into `<tmp>/dist`.
+fn assemble_copy(src: &Path, tmp: &Path) -> (Ran, PathBuf) {
+    assemble_with(&src.join("scripts/assemble-dist.sh"), tmp, VERSION)
+}
+
+/// Asserts the source copy `src` assembles into `<tmp>/dist` and the result passes `--check`.
+#[track_caller]
+fn assembles(src: &Path, tmp: &Path) -> PathBuf {
+    let (ran, out) = assemble_copy(src, tmp);
+    assert_eq!(ran.code, Some(0), "assembly failed: {}", ran.stderr);
+    let ran = check(&out);
+    assert_eq!(ran.code, Some(0), "--check failed: {}", ran.stderr);
+    out
+}
+
+/// Asserts the source copy `src` is refused, naming `named`, with nothing written.
+#[track_caller]
+fn refused(src: &Path, tmp: &Path, named: &str) {
+    let (ran, out) = assemble_copy(src, tmp);
+    assert_eq!(ran.code, Some(1), "{named}: {}", ran.stderr);
+    assert!(ran.stderr.contains(named), "{named}: {}", ran.stderr);
+    assert!(!out.exists(), "{named}: wrote {}", out.display());
+}
+
+/// An untracked file in a plugin folder, at its top or nested, isn't copied.
+#[test]
+fn assembly_copies_only_tracked_files() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    fs::write(src.join("skills/.DS_Store"), "untracked\n").unwrap();
+    fs::write(src.join("skills/run/notes.txt"), "untracked\n").unwrap();
+    let out = assembles(&src, &tmp);
+    for path in ["skills/.DS_Store", "skills/run/notes.txt"] {
+        assert!(!out.join(path).exists(), "{path} was copied");
+    }
+    assert!(out.join("skills/run/SKILL.md").is_file());
+}
+
+/// Review Focus 5: a local dry run copies the working tree's content of a tracked file,
+/// uncommitted edits included.
+#[test]
+fn assembly_copies_the_working_tree_of_tracked_files() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    let path = "docs/deck-format.md";
+    let edited = format!("{}\nAn uncommitted edit.\n", read(&src.join(path)));
+    fs::write(src.join(path), &edited).unwrap();
+    let out = assembles(&src, &tmp);
+    assert!(fs::read(out.join(path)).unwrap() == edited.as_bytes());
+}
+
+/// Review Focus 3: tracked names with a space or a leading `-` arrive byte for byte.
+#[test]
+fn assembly_keeps_names_with_spaces_and_dashes() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    let files = [
+        ("docs/with space.md", "a name with a space\n"),
+        ("docs/-dash.md", "a name with a leading dash\n"),
+    ];
+    common::git::commit(&src, &files, "odd names");
+    let out = assembles(&src, &tmp);
+    for (path, text) in files {
+        assert!(
+            fs::read(out.join(path)).unwrap() == text.as_bytes(),
+            "{path}"
+        );
+    }
+}
+
+/// A tracked file deleted from the working tree, still in the index, is refused by name before
+/// anything is written.
+#[test]
+fn assembly_refuses_a_missing_tracked_file() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    fs::remove_file(src.join("docs/compatibility.md")).unwrap();
+    refused(&src, &tmp, "missing tracked file docs/compatibility.md");
+}
+
+/// A tracked file replaced by a directory is refused by name before anything is written; its
+/// untracked contents aren't packaged.
+#[test]
+fn assembly_refuses_a_tracked_file_replaced_by_a_directory() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    let path = src.join("docs/compatibility.md");
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("notes.md"), "untracked\n").unwrap();
+    refused(
+        &src,
+        &tmp,
+        "tracked file docs/compatibility.md is not a regular file",
+    );
+}
+
+/// Sources that aren't a git checkout of their own are refused before anything is written:
+/// a plain copy, and a plain copy inside an unrelated repository.
+#[test]
+fn assembly_refuses_outside_a_git_checkout() {
+    let tmp = TempRoot::new("leadhand dist");
+    let plain = tmp.join("plain");
+    let src = plain.join("src");
+    copy_sources(&src);
+    refused(&src, &plain, "needs a git checkout");
+
+    let inside = tmp.join("inside");
+    let outer = common::git::make_repo_named(&inside, "outer", "main");
+    let src = outer.join("src");
+    copy_sources(&src);
+    refused(&src, &inside, "needs a git checkout");
+}
+
+/// Review Focus 2: a linked worktree, whose `.git` is a file, assembles normally.
+#[test]
+fn assembly_works_from_a_linked_worktree() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp.join("repo"));
+    let worktree = tmp.join("worktree");
+    common::git::run_git(
+        &src,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            path_str(&worktree),
+        ],
+    );
+    assert!(worktree.join(".git").is_file());
+    let out = assembles(&worktree, &tmp);
+    assert!(out.join("docs/compatibility.md").is_file());
+}
+
+/// Review Focus 1: a checkout of the dist branch, whose top-level `.git` holds empty folders,
+/// passes `--check`.
+#[test]
+fn check_accepts_a_dist_checkout_with_its_git_folder() {
+    let tmp = TempRoot::new("leadhand dist");
+    let good = assembled(&tmp);
+    common::git::run_git(&good, &["init", "--quiet"]);
+    let ran = check(&good);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+}
+
+/// Only plain X.Y.Z versions are published: a source copy at any other version, in all four
+/// places, is refused before anything is written.
+#[test]
+fn assemble_refuses_pre_release_versions() {
+    let tmp = TempRoot::new("leadhand dist");
+    for (n, version) in ["0.3.0-rc1", "1.02.3", "1.2", "1.2.3.4", "01.2.3"]
+        .into_iter()
+        .enumerate()
+    {
+        let case = tmp.join(format!("case-{n}"));
+        let src = source_copy(&case);
+        for file in VERSIONED {
+            set_version(&src, file, version);
+        }
+        let (ran, out) = assemble_with(&src.join("scripts/assemble-dist.sh"), &case, version);
+        assert_eq!(ran.code, Some(1), "{version}: {}", ran.stderr);
+        assert!(
+            ran.stderr.contains("plain X.Y.Z"),
+            "{version}: {}",
+            ran.stderr
+        );
+        assert!(!out.exists(), "{version}: wrote {}", out.display());
+    }
 }
 
 /// Review Focus 4: a version that disagrees with `Cargo.toml`, either `plugin.json` or the

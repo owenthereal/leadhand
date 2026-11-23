@@ -3,18 +3,24 @@
 # the plugin files and the three platform binaries, installable on its own.
 #
 #   assemble-dist.sh <version> <out dir> <binaries dir>
-#       Refuses unless <version> is the version in Cargo.toml, .claude-plugin/plugin.json,
-#       .codex-plugin/plugin.json and .claude-plugin/marketplace.json's leadhand entry, and
-#       unless <binaries dir> holds <target>/leadhand for each target (darwin-arm64,
-#       linux-x86_64, linux-arm64). Then copies the plugin files into <out dir> (new or
-#       empty), the binaries as bin/<target>/leadhand with mode 0755, points the marketplace's
-#       leadhand entry at "./", and runs --check on the result.
+#       Refuses, before writing anything, unless <version> is a plain X.Y.Z release version
+#       and is the version in Cargo.toml, .claude-plugin/plugin.json, .codex-plugin/plugin.json
+#       and .claude-plugin/marketplace.json's leadhand entry; unless <binaries dir> holds
+#       <target>/leadhand for each target (darwin-arm64, linux-x86_64, linux-arm64); unless the
+#       sources are a git checkout of their own; and unless every file git tracks under the
+#       plugin paths is a regular file in the working tree. Then copies exactly those tracked
+#       files, with their working-tree content and modes, into <out dir> (new or empty), the
+#       binaries as bin/<target>/leadhand with mode 0755, points the marketplace's leadhand
+#       entry at "./", and runs --check on the result.
 #   assemble-dist.sh --check <dir>
 #       Checks an assembled tree, changing nothing: every plugin path is there and nothing
-#       else, each bin/<target>/leadhand and bin/leadhand is executable, every manifest is
-#       valid JSON at one version, and the marketplace's leadhand source is "./".
+#       else, each bin/<target>/ holds only an executable leadhand, bin/leadhand is
+#       executable, no folder is empty (outside a top-level .git, as in a checkout of the
+#       branch), every manifest is valid JSON at one version, and the marketplace's leadhand
+#       source is "./".
 #
-# The sources are the package this script belongs to (its parent folder). Needs jq.
+# The sources are the package this script belongs to (its parent folder). Needs jq; assembling
+# also needs git.
 set -eu
 
 # What a dist tree holds besides the binaries.
@@ -107,12 +113,32 @@ check() {
     fi
 
     # Nothing else: at the top, the plugin paths (and .git, in a checkout of the branch); in
-    # bin/, the script and the targets.
+    # bin/, the script and the targets; in each target's folder, its binary.
     # shellcheck disable=SC2086 # the lists are words
     only "$dir" '' $plugin_paths bin .git
     if [ -d "$dir/bin" ]; then
         # shellcheck disable=SC2086
         only "$dir/bin" bin/ leadhand $targets
+    fi
+    for target in $targets; do
+        if [ -d "$dir/bin/$target" ]; then
+            only "$dir/bin/$target" "bin/$target/" leadhand
+        fi
+    done
+
+    # No empty folder anywhere, except under the top-level .git of a checkout of the branch.
+    if empty=$(CDPATH='' cd -- "$dir" && find . -path ./.git -prune -o -type d -empty -print); then
+        set -f
+        IFS=$newline
+        for folder in $empty; do
+            if [ "$folder" != . ]; then
+                problem "empty folder ${folder#./}"
+            fi
+        done
+        IFS=$default_ifs
+        set +f
+    else
+        problem "can't search it for empty folders"
     fi
 
     for target in $targets; do
@@ -161,7 +187,30 @@ version=$1 out=$2 bins=$3
 
 src=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 
-# The version gate: <version> must be the package's version in all four places.
+# Whether $1 is a non-negative integer without leading zeros.
+plain_number() {
+    case $1 in
+        0) return 0 ;;
+        '' | 0* | *[!0-9]*) return 1 ;;
+    esac
+}
+
+# Whether $1 is a plain release version: three dot-separated plain numbers.
+plain_version() {
+    case $1 in
+        *.*.*.* | *[!0-9.]*) return 1 ;;
+        *.*.*) ;;
+        *) return 1 ;;
+    esac
+    major=${1%%.*} rest=${1#*.}
+    minor=${rest%%.*} patch=${rest#*.}
+    plain_number "$major" && plain_number "$minor" && plain_number "$patch"
+}
+
+# The version gate: <version> must be a plain release, since dist is the one channel every
+# install follows, and the package's version in all four places.
+plain_version "$version" || fail "refused: version '$version' is not a plain X.Y.Z release;" \
+    "only plain X.Y.Z versions are published, because every install follows dist"
 mismatches=0
 mismatch() {
     echo "assemble-dist: version '$version' is not $1's version ($2)" >&2
@@ -186,10 +235,51 @@ if [ -e "$out" ] && [ -n "$(names "$out")" ]; then
     fail "$out is not empty; assemble into a new or empty folder"
 fi
 
+# The plugin files are the ones git tracks, so the sources must be a checkout of their own: not
+# a plain copy, which git knows nothing of, nor one inside some other repository.
+top=$(git -C "$src" rev-parse --show-toplevel 2>/dev/null) || top=''
+[ "$top" = "$src" ] ||
+    fail "needs a git checkout of leadhand, to copy only the files git tracks; $src is not one"
+
+# The list of tracked files and the archive of them live outside both the sources and <out dir>,
+# and go on every exit.
+work=$(mktemp -d "${TMPDIR:-/tmp}/assemble-dist.XXXXXX") || fail "can't make a temporary folder"
+trap 'rm -rf "$work"' EXIT
+trap 'exit 1' HUP INT TERM
+file_list=$work/files
+archive=$work/plugin.tar
+
+# shellcheck disable=SC2086 # the list is words
+git -C "$src" ls-files -z -- $plugin_paths >"$file_list" ||
+    fail "can't list the files git tracks in $src"
+
+# Each tracked path must be a regular file in the working tree, or the copy would lose it
+# (deleted) or package something else in its place (a directory's untracked contents, or a
+# symlink). Every such path is named.
+# shellcheck disable=SC2016 # the inner script expands its own arguments
+xargs -0 sh -c '
+    cd -- "$1" || exit 1
+    shift
+    bad=0
+    for path do
+        if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+            echo "assemble-dist: missing tracked file $path" >&2
+            bad=1
+        elif [ ! -f "$path" ] || [ -L "$path" ]; then
+            echo "assemble-dist: tracked file $path is not a regular file" >&2
+            bad=1
+        fi
+    done
+    exit "$bad"
+' sh "$src" <"$file_list" ||
+    fail "refused: every file git tracks under the plugin paths must be a regular file in $src"
+
+# Exactly the tracked files, with their working-tree content and modes, through an archive so
+# that each side's exit status is checked.
+tar -cf "$archive" -C "$src" --null -T "$file_list" ||
+    fail "can't archive the tracked files in $src"
 mkdir -p "$out/bin"
-for path in $plugin_paths; do
-    cp -R "$src/$path" "$out/$path"
-done
+tar -xf "$archive" -C "$out" || fail "can't unpack the tracked files into $out"
 for target in $targets; do
     mkdir "$out/bin/$target"
     cp "$bins/$target/leadhand" "$out/bin/$target/leadhand"
