@@ -800,8 +800,9 @@ mod release_build_lookup {
     ];
     /// The inputs a fabricated release build's dep-info lists.
     const SOURCES: [&str; 3] = ["src/main.rs", "src/lib.rs", "templates/brief.md"];
-    /// The build command for the fabricated trees' native testing build.
-    const NATIVE: &str = "cargo build --locked --release";
+    /// The build command for the fabricated trees' native testing build, backticked as the
+    /// refusals print it.
+    const NATIVE: &str = "`cargo build --locked --release`";
 
     /// T + `secs` s, with T fixed well in the past, so no test depends on the clock's
     /// resolution.
@@ -816,7 +817,7 @@ mod release_build_lookup {
             let path = dir.join(name);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             let text = if name == "Cargo.toml" {
-                "[package]\nname = \"leadhand\"\nversion = \"0.2.0\"\n"
+                "[package]\nname = \"leadhand\"\nversion = \"999.999.999\"\n"
             } else {
                 name
             };

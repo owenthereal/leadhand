@@ -615,6 +615,12 @@ fn check_accepts_a_dist_checkout_with_its_git_folder() {
     let tmp = TempRoot::new("leadhand dist");
     let good = assembled(&tmp);
     common::git::run_git(&good, &["init", "--quiet"]);
+    assert!(
+        common::walk(&good.join(".git"))
+            .iter()
+            .any(|p| p.is_dir() && fs::read_dir(p).unwrap().next().is_none()),
+        "git init left no empty folder in .git, so --check has nothing to skip"
+    );
     let ran = check(&good);
     assert_eq!(ran.code, Some(0), "{}", ran.stderr);
 }
@@ -1021,6 +1027,11 @@ fn release_workflow_pins_actions_and_checks_the_tree() {
     let release_step = &build_steps[at(release_build)];
     assert_eq!(release_step, &[format!("- run: {release_build}")]);
     assert!(!release_step[0].contains("--features"));
+    // And no other cargo command, not even inside a `run: |` block, which `cargo_runs` can't
+    // read: three lines name cargo, and one names a feature, the full suite's.
+    let lines_with = |what: &str| jobs["build"].iter().filter(|l| l.contains(what)).count();
+    assert_eq!(lines_with("cargo "), 3, "{build}");
+    assert_eq!(lines_with("--features"), 1, "{build}");
     let stage = &build_steps[at("- name: Stage the binary")];
     assert!(
         stage.contains(
@@ -1324,6 +1335,8 @@ const MAIN_CHECK_STEP: &str = "Check the tagged commit is on main";
 /// The main check (spec task 5), run as the workflow's own text: a tagged commit on main passes,
 /// at main's tip and further back; the tip of a side branch that forked from main is refused,
 /// with one `::error::` line naming the tag, the commit and main, and the origin is untouched.
+/// Each case runs as the publish job's checkout is: detached at the tagged commit, with no local
+/// branch, only origin's, so neither `HEAD` nor a bare `main` could stand in for origin's main.
 #[test]
 fn publish_refuses_a_tag_off_main() {
     let script = step_script(&workflow(), MAIN_CHECK_STEP);
@@ -1336,12 +1349,19 @@ fn publish_refuses_a_tag_off_main() {
     common::git::run_git(&source, &["switch", "--quiet", "main"]);
     let origin = common::git::make_origin(&source);
     common::git::run_git(&source, &["fetch", "--quiet", "origin"]);
+    common::git::run_git(&source, &["checkout", "--quiet", "--detach"]);
+    common::git::run_git(&source, &["branch", "--quiet", "-D", "main", "side"]);
+    assert_eq!(
+        common::git::run_git(&source, &["for-each-ref", "refs/heads"]),
+        ""
+    );
     let refs = || common::git::run_git(&origin, &["for-each-ref"]);
     let before = refs();
     assert!(before.contains("refs/heads/side"), "{before}");
 
     let tag = "v900.2.0";
     let check = |sha: &str| {
+        common::git::run_git(&source, &["checkout", "--quiet", "--detach", sha]);
         let out = Command::new("bash")
             .args(["--noprofile", "--norc", "-e", "-c", &script])
             .current_dir(&source)

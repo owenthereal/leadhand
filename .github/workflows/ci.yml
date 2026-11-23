@@ -36,8 +36,8 @@ jobs:
           rustup toolchain install 1.99 --profile minimal --component clippy,rustfmt
           rustup default 1.99
 
-      # For `claude plugin validate .`, which needs no login. Kept off PATH for the tests, which
-      # use the fakes in tests/fakes.
+      # For `claude plugin validate --strict .`, which needs no login. Kept off PATH for the
+      # tests, which use the fakes in tests/fakes.
       - name: Install Claude Code
         run: npm install --prefix "$RUNNER_TEMP/claude-code" --no-audit --no-fund @anthropic-ai/claude-code@2.1.325
 
