@@ -3,11 +3,12 @@
   "owner": {
     "name": "leadhand"
   },
+  "description": "The leadhand plugin for Claude Code: give it an approved plan, and it carries the work through implementation and review with fresh, bounded workers.",
   "plugins": [
     {
       "name": "leadhand",
       "source": "./",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "description": "Give leadhand an approved plan. It carries the work through implementation and review with fresh, bounded workers, and returns a checked branch with clear evidence."
     }
   ]
