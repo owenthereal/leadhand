@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use common::TempRoot;
 use common::plugin::{read, root};
 
-const VERSION: &str = "0.2.0";
+const VERSION: &str = "0.2.1";
 
 /// Another version, for the cases where a version must disagree with `VERSION`. Plainly
 /// synthetic, so that no bump of `VERSION` can turn a mismatch case into a match.

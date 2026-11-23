@@ -249,7 +249,7 @@ mod version {
         let tmp = TempRoot::new("lh rust cli ");
         let env = Env::new(&tmp);
         let r = cli(&os_args!["version"], &env, &tmp).ok();
-        assert_eq!(r.stdout_text(), "leadhand 0.2.0\n", "{r}");
+        assert_eq!(r.stdout_text(), "leadhand 0.2.1\n", "{r}");
         assert_eq!(r.stderr_text(), "", "{r}");
         let package = format!("leadhand {}\n", env!("CARGO_PKG_VERSION"));
         assert_eq!(r.stdout, package.as_bytes(), "{package}");
@@ -513,7 +513,7 @@ mod release_build {
         };
         let plain_out = run_release(&os_args!["version"], &plain);
         let hooked_out = run_release(&os_args!["version"], &hooked);
-        assert_eq!(plain_out.stdout_text(), "leadhand 0.2.0\n", "{plain_out}");
+        assert_eq!(plain_out.stdout_text(), "leadhand 0.2.1\n", "{plain_out}");
         assert_eq!(
             (hooked_out.code, &hooked_out.stdout, &hooked_out.stderr),
             (plain_out.code, &plain_out.stdout, &plain_out.stderr),

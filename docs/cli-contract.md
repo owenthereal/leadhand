@@ -133,7 +133,7 @@ there.
 
 | Command | Output |
 |---|---|
-| `version` | `leadhand <package version>`, currently `leadhand 0.2.0` (deliberate change 6: until the cut-over it was the Python's `leadhand 0.1.0`). |
+| `version` | `leadhand <package version>`, currently `leadhand 0.2.1` (deliberate change 6: until the cut-over it was the Python's `leadhand 0.1.0`). |
 | `check` | One problem per line on **stdout**, `error: <message>` or `warning: <message>`, then `ok: <n> cards` when there are no errors. Exit 1 when there is an error. A deck or configuration that does not load prints its single `error: …` line on stdout too. |
 | `route` | The route line `<vendor> <model> <effort>`, then one line per reason. When the ladder is exhausted: `ladder exhausted: …` on stderr, exit 1. |
 | `start` | For a new run, `run: <run dir>`; when another run holds the deck's branch, a note before it, `run branch: <branch> (<requested> belongs to another run)`. For an unfinished run of the same deck: `existing run: <run dir>`. Unsupported settings give `warning: <message>` lines on stderr. |
@@ -632,7 +632,7 @@ a deliberate change alters was pinned only in reference-only tests, which left w
 
 The version string (change 6) was the exception. Rust reported the Python's version,
 `leadhand 0.1.0`, through stage 2, pinned by a parity test (`cli::version`). At the cut-over
-the version became 0.2.0, and that test pins `leadhand 0.2.0`.
+the version became 0.2.0; that test pins the current version, `leadhand 0.2.1`.
 
 **The branch release (change 2, S1-R15).** When a run ends `complete`, `incomplete` or
 `failed`, the Rust binary (not the Python reference) does three things:

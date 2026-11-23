@@ -707,10 +707,11 @@ fn no_include_str_outside_kept_paths() {
     assert!(found >= 18, "{found} embeds found");
 }
 
-/// Ruling S3-R13: every manifest is valid JSON at version 0.2.0, and so is the package.
+/// Ruling S3-R13: every manifest is valid JSON at version 0.2.1, and so is the package. The
+/// 0.2.1 release moved this pin with the manifests.
 #[test]
-fn manifests_are_valid_json_with_version_0_2_0() {
-    const VERSION: &str = "0.2.0";
+fn manifests_are_valid_json_with_version_0_2_1() {
+    const VERSION: &str = "0.2.1";
     let root = common::plugin::root();
     let json = |rel: &str| -> serde_json::Value {
         serde_json::from_str(&common::plugin::read(&root.join(rel)))
