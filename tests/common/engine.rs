@@ -97,13 +97,11 @@ pub fn last<T>(items: &[T], n: usize) -> &[T] {
     &items[items.len().saturating_sub(n)..]
 }
 
-/// Writes an executable script at `path` (`write_text`, then `chmod(0o755)`).
+/// Writes an executable script at `path` (`write_text`, then `chmod(0o755)`), through
+/// `write_executable`.
 #[track_caller]
 pub fn write_script(path: &Path, text: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, text).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .unwrap_or_else(|e| panic!("making {} executable: {e}", path.display()));
+    super::write_executable(path, text);
 }
 
 /// `"<dir>:<the world's PATH>"` (`f"{dir}{os.pathsep}{w.env['PATH']}"`).

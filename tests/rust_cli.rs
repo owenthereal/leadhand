@@ -633,7 +633,6 @@ mod release_build_dispatch {
     //! too). Each case's control runs the same line through LEADHAND_BIN (the testing build),
     //! which honours the hook.
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::time::Duration;
 
@@ -715,16 +714,14 @@ mod release_build_dispatch {
         let mut w = World::new();
         let flag = w.tmp.join("override ran");
         let over = w.tmp.join("fake codex override");
-        fs::write(
+        crate::common::write_executable(
             &over,
             format!(
                 "#!/bin/sh\necho ran >> \"{}\"\nexec \"{}\" \"$@\"\n",
                 flag.display(),
                 w.env.fakes().join("codex").display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&over, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         w.scenario("ready", &[]);
         let env = w.hooked_env(&[("LEADHAND_TEST_CODEX_BIN", &over)]);
         assert_ready!(w, w.release("d1", &env), "d1");

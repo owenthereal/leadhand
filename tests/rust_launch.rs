@@ -218,8 +218,7 @@ mod launch_line {
 
         // A `leadhand` on PATH that is some other program: the absolute path, as without one.
         fs::remove_file(&link).unwrap();
-        fs::write(&link, "#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(&link, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        common::write_executable(&link, "#!/bin/sh\nexit 0\n");
         let line = one_line(common::cli(
             &os_args!["launch-line", w.run_dir],
             &env,

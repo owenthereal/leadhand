@@ -825,12 +825,7 @@ mod tests {
     fn the_library_dispatch_spawns_its_runner_without_the_callers_descriptors() {
         let (tmp, run) = worker_dir();
         let stand_in = tmp.path().join("runner stand-in");
-        fs::write(&stand_in, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        fs::set_permissions(
-            &stand_in,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        crate::test_executable::write_executable(&stand_in, "#!/bin/sh\nexec sleep 30\n");
         let out = caller_with_pipes(
             "dispatch::own::tests::dispatch_child",
             &[

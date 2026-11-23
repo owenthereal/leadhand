@@ -26,6 +26,8 @@ pub mod rundir;
 pub mod rust_src;
 pub mod supervisor;
 
+pub use executable::write_executable;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;

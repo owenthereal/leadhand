@@ -24,8 +24,7 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 
 fn fake_binary(tmp: &Path, body: &str) -> PathBuf {
     let path = tmp.join("fake leadhand");
-    fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&path, format!("#!/bin/sh\n{body}"));
     path
 }
 

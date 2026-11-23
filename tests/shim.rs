@@ -11,8 +11,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use common::TempRoot;
 use common::plugin::root;
+use common::{TempRoot, write_executable};
 
 /// The arguments every run passes, which the binary must receive unchanged.
 const ARGS: [&str; 4] = ["status", "a b", "", "--x=$HOME*"];
@@ -29,8 +29,7 @@ const LINUX_KERNEL: &str = "#1 SMP PREEMPT_DYNAMIC Fri Nov  7 10:00:00 UTC 2026"
 /// Writes an executable `sh` script.
 fn script(path: &Path, body: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(path, format!("#!/bin/sh\n{body}"));
 }
 
 /// A stub binary that prints `tag`, then each argument it got, one per line.
@@ -52,7 +51,13 @@ impl Tree {
         let tmp = TempRoot::new("leadhand shim");
         let shim = tmp.join("plugin/bin/leadhand");
         fs::create_dir_all(shim.parent().unwrap()).unwrap();
-        fs::copy(root().join("bin/leadhand"), &shim).unwrap();
+        let source = root().join("bin/leadhand");
+        let mode = fs::metadata(&source).unwrap().permissions().mode();
+        assert!(
+            mode & 0o100 != 0,
+            "the checkout's bin/leadhand isn't executable (mode {mode:o}); the shim tests' copies would hide that"
+        );
+        write_executable(&shim, fs::read(&source).unwrap());
         let tree = Tree {
             tmp,
             os: os.to_string(),

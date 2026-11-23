@@ -17,7 +17,6 @@ mod worker_environment {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,8 +113,7 @@ mod worker_environment {
     }
 
     fn script(path: &Path, text: &str) {
-        fs::write(path, text).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::common::write_executable(path, text);
     }
 
     fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {

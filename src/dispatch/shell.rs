@@ -1523,13 +1523,11 @@ mod tests {
         // across exec, and `close_fds=True` keeps a descriptor the runner inherited out of
         // Codex.
         use std::os::fd::{AsFd, AsRawFd};
-        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::ExitStatusExt;
 
         let ours = world_with(|_, _| {});
         let probe = ours.root.join("probe codex");
-        fs::write(&probe, PROBE).unwrap();
-        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_executable::write_executable(&probe, PROBE);
         let held = File::create(ours.root.join("held")).unwrap();
         let fd = rustix::io::fcntl_dupfd_cloexec(&held, 60).unwrap();
         let number = fd.as_raw_fd().to_string();
