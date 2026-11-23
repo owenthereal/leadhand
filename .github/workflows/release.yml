@@ -197,14 +197,34 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
-    # One release at a time writes dist.
+    # One release at a time writes dist. With queue: max, a publish that finds the group busy
+    # waits in a queue of up to 100, roughly first come first served (GitHub doesn't guarantee
+    # the order), so a newer tag no longer cancels a waiting publish. That is all it fixes: the
+    # queue doesn't order releases. When a later tag's publish reaches the group first, the
+    # earlier, lower version is refused by the rollback check below, in a visible red run.
+    # Source: GitHub Docs, "Control the concurrency of workflows and jobs".
     concurrency:
       group: release-dist
       cancel-in-progress: false
+      queue: max
     steps:
-      # The tagged sources, for assemble-dist.sh --check. The job's token stays in this
-      # checkout's Git config, for the push below.
+      # The tagged sources, for assemble-dist.sh --check, with the whole history, for the check
+      # below. The job's token stays in this checkout's Git config, for the push below.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Only a commit on main publishes: a tag on any other commit stops here, before anything
+      # is downloaded or pushed. Any failure of the check, an error included, refuses.
+      - name: Check the tagged commit is on main
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::the tag $REF_NAME is on $GITHUB_SHA, which is not on main; tag a commit on main"
+            exit 1
+          fi
+          echo "the tag $REF_NAME is on $GITHUB_SHA, which is on main"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:

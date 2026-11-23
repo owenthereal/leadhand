@@ -803,6 +803,47 @@ fn publish_job_runs_only_for_version_tags() {
     assert_eq!(writes, [&"      contents: write"]);
 }
 
+/// The publish job checks the tag before anything else (spec task 5): its checkout fetches the
+/// whole history and keeps its token, the main check comes right after it, before the download
+/// and the push, and the job's concurrency group queues publishes instead of cancelling one.
+#[test]
+fn publish_job_checks_main_first_and_queues() {
+    let text = workflow();
+    let jobs = jobs(&text);
+    let publish = &jobs["publish"];
+    let steps = steps(publish);
+    let at = |what: &str| {
+        steps
+            .iter()
+            .position(|s| s.iter().any(|l| l.contains(what)))
+            .unwrap_or_else(|| panic!("no publish step with {what}"))
+    };
+
+    assert!(
+        steps[0][0].starts_with("- uses: actions/checkout@"),
+        "{:?}",
+        steps[0]
+    );
+    assert_eq!(steps[1][0], format!("- name: {MAIN_CHECK_STEP}"));
+    assert!(
+        steps[1].contains(&"REF_NAME: ${{ github.ref_name }}"),
+        "{:?}",
+        steps[1]
+    );
+    assert!(1 < at("uses: actions/download-artifact@"));
+    assert!(1 < at("git push"));
+
+    assert_eq!(steps[0][1..], ["with:", "fetch-depth: 0"]);
+    assert_eq!(
+        block(publish, 4, "concurrency"),
+        Some(vec![
+            "group: release-dist",
+            "cancel-in-progress: false",
+            "queue: max"
+        ])
+    );
+}
+
 /// The workflow's other safety nets: every action is pinned to a commit SHA; the assembly is
 /// checked with `--check` where it's built and again before it's published; and the tree
 /// travels as one tar archive, which keeps the executable bits (ruling S3-R16).
@@ -972,7 +1013,6 @@ fn step_script(text: &str, name: &str) -> String {
         out.push_str(line.get(body..).unwrap_or(""));
         out.push('\n');
     }
-    assert!(out.contains("git push"), "{name:?}'s body: {out}");
     out
 }
 
@@ -992,6 +1032,10 @@ impl Publisher {
         let source = common::git::make_repo(&tmp);
         let origin = common::git::make_origin(&source);
         let script = step_script(&workflow(), PUBLISH_STEP);
+        assert!(
+            script.contains("git push"),
+            "{PUBLISH_STEP:?}'s body: {script}"
+        );
         Publisher {
             tmp,
             source,
@@ -1185,4 +1229,65 @@ fn publish_step_adds_one_commit_per_higher_release_and_never_rolls_back() {
     );
     p.refused(&v2_1, "900.2.1", &["900.2.1", "version"]);
     assert_eq!(p.dist().len(), 1);
+}
+
+/// The step that refuses a tag on a commit that isn't on main.
+const MAIN_CHECK_STEP: &str = "Check the tagged commit is on main";
+
+/// The main check (spec task 5), run as the workflow's own text: a tagged commit on main passes,
+/// at main's tip and further back; the tip of a side branch that forked from main is refused,
+/// with one `::error::` line naming the tag, the commit and main, and the origin is untouched.
+#[test]
+fn publish_refuses_a_tag_off_main() {
+    let script = step_script(&workflow(), MAIN_CHECK_STEP);
+    let tmp = TempRoot::new("leadhand main check");
+    let source = common::git::make_repo(&tmp);
+    let c1 = common::git::run_git(&source, &["rev-parse", "HEAD"]);
+    let c2 = common::git::commit(&source, &[("main.txt", "c2\n")], "c2");
+    common::git::run_git(&source, &["switch", "--quiet", "--create", "side", &c1]);
+    let s1 = common::git::commit(&source, &[("side.txt", "s1\n")], "s1");
+    common::git::run_git(&source, &["switch", "--quiet", "main"]);
+    let origin = common::git::make_origin(&source);
+    common::git::run_git(&source, &["fetch", "--quiet", "origin"]);
+    let refs = || common::git::run_git(&origin, &["for-each-ref"]);
+    let before = refs();
+    assert!(before.contains("refs/heads/side"), "{before}");
+
+    let tag = "v900.2.0";
+    let check = |sha: &str| {
+        let out = Command::new("bash")
+            .args(["--noprofile", "--norc", "-e", "-c", &script])
+            .current_dir(&source)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", tmp.path())
+            .envs(common::git::HERMETIC_ENV)
+            .env("GITHUB_WORKSPACE", &source)
+            .env("REF_NAME", tag)
+            .env("GITHUB_SHA", sha)
+            .stdin(Stdio::null())
+            .output()
+            .expect("running the main check");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), text)
+    };
+
+    for (what, sha) in [("main's tip", &c2), ("main's first commit", &c1)] {
+        let (code, out) = check(sha);
+        assert_eq!(code, Some(0), "{what}: {out}");
+        assert!(!out.contains("::error::"), "{what}: {out}");
+    }
+
+    let (code, out) = check(&s1);
+    assert_eq!(code, Some(1), "side's tip: {out}");
+    let errors: Vec<&str> = out.lines().filter(|l| l.starts_with("::error::")).collect();
+    assert_eq!(errors.len(), 1, "side's tip: {out}");
+    for name in [tag, s1.as_str(), "main"] {
+        assert!(errors[0].contains(name), "{name:?} not in {}", errors[0]);
+    }
+    assert_eq!(refs(), before, "the origin changed");
 }
