@@ -887,7 +887,6 @@ fn release_workflow_pins_actions_and_checks_the_tree() {
     // The release build: no test hooks, the lock file honoured, Linux on musl.
     let build = jobs["build"].join("\n");
     assert!(build.contains("cargo build --locked --release"));
-    assert!(!build.contains("testing"));
     // The static-link check reads readelf's output whole, so a failing readelf fails the step,
     // and no pipe can end early and pass it vacuously.
     assert!(build.contains("headers=$(readelf --program-headers \"$bin\")"));
@@ -920,15 +919,18 @@ fn release_workflow_pins_actions_and_checks_the_tree() {
         value(&jobs["test"], 8, "os"),
         Some("[macos-15, ubuntu-24.04, ubuntu-24.04-arm]")
     );
-    // The Linux legs run the unit tests on musl, the C library of the binaries they ship
-    // (S3-R36), before the binary is uploaded.
+    // The Linux legs run the full suite and the unit tests on musl, the C library of the
+    // binaries they ship (S3-R36), after the release build, so rust_cli's release-build tests
+    // check the binary the job uploads, and before it's uploaded (spec task 6).
+    let release_build = "cargo build --locked --release --target \"$RUST_TARGET\"";
     let linux = Some("runner.os == 'Linux'".to_string());
     assert_eq!(
         cargo_runs(&jobs["build"]),
         [
+            (None, release_build.to_string()),
             (
-                None,
-                "cargo build --locked --release --target \"$RUST_TARGET\"".to_string()
+                linux.clone(),
+                "cargo test --locked --features testing --target \"$RUST_TARGET\"".to_string()
             ),
             (
                 linux,
@@ -943,7 +945,24 @@ fn release_workflow_pins_actions_and_checks_the_tree() {
             .position(|s| s.iter().any(|l| l.contains(what)))
             .unwrap_or_else(|| panic!("no build step with {what}"))
     };
-    assert!(at("cargo test --locked --lib") < at("uses: actions/upload-artifact@"));
+    let upload = at("uses: actions/upload-artifact@");
+    assert!(at("cargo test --locked --features testing") < upload);
+    assert!(at("cargo test --locked --lib") < upload);
+    // The release build has no test hooks: its step builds without `--features`, and the
+    // staged binary is that build's, which `cargo test` (the dev profile) leaves untouched.
+    let release_step = &build_steps[at(release_build)];
+    assert_eq!(release_step, &[format!("- run: {release_build}")]);
+    assert!(!release_step[0].contains("--features"));
+    let stage = &build_steps[at("- name: Stage the binary")];
+    assert!(
+        stage.contains(
+            &"cp \"target/$RUST_TARGET/release/leadhand\" \"$RUNNER_TEMP/bins/$TARGET/leadhand\""
+        ),
+        "{stage:?}"
+    );
+    // A test-only change gets the musl run on its pull request.
+    let paths = block(&code_lines(&text), 4, "paths").expect("the pull_request paths");
+    assert!(paths.contains(&"- 'tests/**'"), "{paths:?}");
 }
 
 /// The steps of a job: the lines from each `- ` item under `steps:` to the next.

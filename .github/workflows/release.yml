@@ -7,6 +7,7 @@ on:
   pull_request:
     paths:
       - 'src/**'
+      - 'tests/**'
       - 'Cargo.*'
       - 'bin/**'
       - 'scripts/assemble-dist.sh'
@@ -78,7 +79,7 @@ jobs:
             rust_target: aarch64-unknown-linux-musl
             target: linux-arm64
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 90
     env:
       RUST_TARGET: ${{ matrix.rust_target }}
       TARGET: ${{ matrix.target }}
@@ -95,8 +96,15 @@ jobs:
 
       # The release package: no testing feature, so no test hooks and one binary.
       - run: cargo build --locked --release --target "$RUST_TARGET"
-      # The unit tests on musl, the C library the shipped Linux binaries link against; the
-      # test job tests the glibc build.
+      # The tests on musl, the C library the shipped Linux binaries link against; the test job
+      # tests the glibc build. The full suite's release-build tests (tests/rust_cli.rs) run
+      # target/$RUST_TARGET/release/leadhand, the binary this job stages and uploads; cargo
+      # test builds in the dev profile, so it leaves that binary as the release build made it.
+      # The second run checks that the test hooks are compiled out without the feature.
+      - name: Run the tests on musl
+        if: runner.os == 'Linux'
+        run: cargo test --locked --features testing --target "$RUST_TARGET"
+        timeout-minutes: 45
       - name: Run the unit tests on musl
         if: runner.os == 'Linux'
         run: cargo test --locked --lib --target "$RUST_TARGET"
