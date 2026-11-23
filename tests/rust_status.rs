@@ -1,6 +1,6 @@
 //! `status` and `report` in Rust: the run found from the current directory (deliberate change
 //! 3) and the conventions for the commands a person types (`--json`, candidates listed with
-//! their commands). Rust-only.
+//! their commands). Rust-only while the Python reference existed.
 //!
 //! The Rust form of the Python contract suite's `contract_rust_status`. With no argument, the
 //! command takes the run whose worktree contains the current directory, else the only unfinished
@@ -38,9 +38,6 @@ mod status_finds_the_run {
 
     #[test]
     fn test_status_without_argument_picks_the_current_repos_only_unfinished_run() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = FakeSupervisor::new(&[card_with(
             1,
             CardOpts {
@@ -85,9 +82,6 @@ mod status_finds_the_run {
 
     #[test]
     fn test_status_lists_candidates_when_ambiguous() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = FakeSupervisor::new(&[card(1)]);
         let first = w.start();
         let second = w.start_new();
@@ -141,9 +135,6 @@ mod status_finds_the_run {
 
     #[test]
     fn test_status_inside_a_worktree_finds_its_run_by_scan() {
-        if common::rust_only() {
-            return;
-        }
         let title = |t| {
             card_with(
                 1,
@@ -192,9 +183,6 @@ mod status_finds_the_run {
 
     #[test]
     fn test_status_names_a_run_by_id_name_slug_or_deck() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = FakeSupervisor::new(&[card(1)]);
         let run_dir = w.start();
         let want = status(&w, &os_args![run_dir], &w.tmp).ok().stdout;
@@ -240,9 +228,6 @@ mod json {
 
     #[test]
     fn test_status_json() {
-        if common::rust_only() {
-            return;
-        }
         let reason = "needs a décision \u{1f600}";
         let w = RunDir::with_cards(3);
         w.accept(1);
@@ -335,9 +320,6 @@ mod json {
 
     #[test]
     fn test_status_json_matches_the_status_json_a_checkpoint_writes() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = FakeSupervisor::new(&[card(1), card(2)]);
         let run_dir = w.start();
         w.next();
@@ -352,9 +334,6 @@ mod json {
 
     #[test]
     fn test_report_json() {
-        if common::rust_only() {
-            return;
-        }
         let w = RunDir::with_cards(1);
         w.accept(1);
         w.ev("outcome", outcome("complete", "", &[]));

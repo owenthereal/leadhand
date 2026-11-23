@@ -1,7 +1,8 @@
 //! `start` in Rust: in-place runs refused and the repository taken from the main working tree
 //! (deliberate change 1), the run record in the run worktree's admin folder (spec, "Which
 //! repository and run a directory belongs to"), and the conventions for the commands a person
-//! types (`--json`, the fix command alone on the last line). Rust-only.
+//! types (`--json`, the fix command alone on the last line). Rust-only while the Python
+//! reference existed.
 //!
 //! The Rust form of the Python contract suite's `contract_rust_start`. `start` keeps its contract
 //! output: `run: <dir>` for a new run, or its note naming the existing unfinished run. The
@@ -68,9 +69,6 @@ mod start {
 
     #[test]
     fn test_start_refuses_run_worktree_false() {
-        if common::rust_only() {
-            return;
-        }
         let w = FakeSupervisor::with_options(
             &[card(1)],
             Options {
@@ -96,9 +94,6 @@ mod start {
 
     #[test]
     fn test_start_repo_subdirectory_resolves_to_top() {
-        if common::rust_only() {
-            return;
-        }
         let w = FakeSupervisor::new(&[card(1)]);
         commit(&w.repo, &[("src/deep/a.txt", "a\n")], "src");
         fs::write(
@@ -145,9 +140,6 @@ mod start {
 
     #[test]
     fn test_start_repo_linked_worktree_resolves_to_main_working_tree() {
-        if common::rust_only() {
-            return;
-        }
         let w = FakeSupervisor::new(&[card(1)]);
         let linked = w.tmp.join("elsewhere/linked wt");
         run_git(
@@ -200,9 +192,6 @@ mod start {
 
     #[test]
     fn test_worktree_records_run_dir_separately_from_leadhand_run() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = FakeSupervisor::new(&[card(1)]);
         let first = w.start();
         let second = w.start_new();
@@ -239,9 +228,6 @@ mod start {
 
     #[test]
     fn test_status_inside_worktree_uses_record_after_docs_dir_changes() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = FakeSupervisor::new(&[crate::common::supervisor::card_with(
             1,
             crate::common::supervisor::CardOpts {
@@ -279,9 +265,6 @@ mod start {
 
     #[test]
     fn test_start_json() {
-        if common::rust_only() {
-            return;
-        }
         let w = FakeSupervisor::new(&[card(1)]);
         let r = start(&w, &["--json"], None).ok();
         assert_eq!(r.stdout_text().matches('\n').count(), 1, "{r}");
@@ -334,9 +317,6 @@ mod start {
 
     #[test]
     fn test_start_sparse_refusal_ends_with_fix_command() {
-        if common::rust_only() {
-            return;
-        }
         let w = FakeSupervisor::new(&[card(1)]);
         let before = branches(&w.repo);
         run_git(

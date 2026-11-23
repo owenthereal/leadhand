@@ -1,5 +1,5 @@
 //! The run worktree, recognised by identity before leadhand runs Git there (ruling S2-R54;
-//! spec, bug classes 1 and 4). Rust-only.
+//! spec, bug classes 1 and 4). Rust-only while the Python reference existed.
 //!
 //! The Rust form of the Python contract suite's `contract_rust_worktree_identity`. The run worktree
 //! `<repo>/.worktrees/<slug>` lies inside the operator's checkout. Once its `.git` file is gone,
@@ -13,8 +13,7 @@
 //! workspace and the top Git found, and the one command that fixes it alone on the last line.
 //! While the repository still lists the worktree, that is `git -C <repo> worktree repair`,
 //! which restores the `.git` file. The scenario is the final review's probe. The Python
-//! reference acted on the operator's checkout there, so every test here was Rust-only
-//! (`rust_only`).
+//! reference acted on the operator's checkout there, so every test here was Rust-only.
 
 #[macro_use]
 mod common;
@@ -96,9 +95,6 @@ mod missing_git_file {
 
     #[test]
     fn test_next_refuses_and_leaves_the_operators_checkout_untouched() {
-        if common::rust_only() {
-            return;
-        }
         // Bug classes 1 and 4: the review's probe. Before the fix, `next` switched the
         // operator's checkout to the card branch and moved the edit onto a leftovers ref.
         let mut w = FakeSupervisor::new(&[card(1), card(2)]);
@@ -154,9 +150,6 @@ mod missing_git_file {
 
     #[test]
     fn test_next_names_a_new_run_once_the_worktree_record_is_pruned() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = FakeSupervisor::new(&[card(1)]);
         w.start();
         let (ws, tracked, _) = broken(&w);
@@ -192,9 +185,6 @@ mod run_refuses {
 
     #[test]
     fn test_run_refuses_before_the_supervisor_starts() {
-        if common::rust_only() {
-            return;
-        }
         // `run` would start the supervisor in the folder, where every command it runs acts.
         let w = World::new();
         let (ws, tracked, before) = broken(&w.sup);

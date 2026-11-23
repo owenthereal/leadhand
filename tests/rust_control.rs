@@ -1,5 +1,5 @@
 //! `pause`, `cancel` and `unpark` in Rust: the conventions for the commands a person types.
-//! Rust-only.
+//! Rust-only while the Python reference existed.
 //!
 //! The Rust form of the Python contract suite's `contract_rust_control`. Each finds its run as
 //! `status` does (spec, "Commands you type"): by its directory, its `deck.md`, its run ID,
@@ -94,9 +94,6 @@ mod control_finds_the_run {
 
     #[test]
     fn test_pause_and_cancel_without_argument_take_the_current_repos_only_unfinished_run() {
-        if common::rust_only() {
-            return;
-        }
         for request in ["pause", "cancel"] {
             let mut w = FakeSupervisor::new(&[card(1)]);
             let run_dir = w.start();
@@ -133,9 +130,6 @@ mod control_finds_the_run {
 
     #[test]
     fn test_unpark_without_argument_takes_the_run_of_the_worktree_it_is_in() {
-        if common::rust_only() {
-            return;
-        }
         let w = parked_world();
         let deep = w.workspace().join("deep dir");
         fs::create_dir(&deep).unwrap();
@@ -155,9 +149,6 @@ mod control_finds_the_run {
 
     #[test]
     fn test_each_command_names_a_run_by_id_name_slug_or_deck() {
-        if common::rust_only() {
-            return;
-        }
         let w = parked_world();
         let rd = run_dir(&w);
         let meta = w.meta();
@@ -202,9 +193,6 @@ mod control_finds_the_run {
 
     #[test]
     fn test_candidates_are_listed_with_their_own_commands_when_ambiguous() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = FakeSupervisor::new(&[card(1)]);
         let first = w.start();
         let second = w.start_new();
@@ -278,9 +266,6 @@ mod json {
 
     #[test]
     fn test_pause_and_cancel_json() {
-        if common::rust_only() {
-            return;
-        }
         for request in ["pause", "cancel"] {
             let mut w = FakeSupervisor::new(&[card(1)]);
             let run_dir = w.start();
@@ -312,9 +297,6 @@ mod json {
 
     #[test]
     fn test_unpark_json() {
-        if common::rust_only() {
-            return;
-        }
         let note = "Use JSON; keep the décision \u{1f600}";
         let w = parked_world();
         let rd = run_dir(&w);
@@ -345,9 +327,6 @@ mod json {
 
     #[test]
     fn test_an_error_with_json_is_still_an_error_line() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = FakeSupervisor::new(&[card(1)]);
         w.start();
         w.next();
@@ -378,9 +357,6 @@ mod errors {
 
     #[test]
     fn test_unpark_on_a_run_that_cannot_continue_ends_with_the_start_command() {
-        if common::rust_only() {
-            return;
-        }
         let w = parked_world();
         let rd = run_dir(&w);
         append_event(&rd, "outcome", outcome("incomplete", "", &[]));
@@ -420,9 +396,6 @@ mod errors {
 
     #[test]
     fn test_pause_and_cancel_on_an_ended_run_are_one_error_line() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = FakeSupervisor::new(&[card(1)]);
         w.start();
         let rd = run_dir(&w);
@@ -441,9 +414,6 @@ mod errors {
 
     #[test]
     fn test_cancel_of_a_blocked_run_is_requested_and_pause_is_refused() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = FakeSupervisor::new(&[card(1)]);
         w.start();
         let rd = run_dir(&w);
@@ -460,9 +430,6 @@ mod errors {
 
     #[test]
     fn test_a_directory_that_is_not_a_run_is_refused() {
-        if common::rust_only() {
-            return;
-        }
         let w = FakeSupervisor::new(&[card(1)]);
         for request in ["pause", "cancel"] {
             let r = run_cli(&w, &os_args![request, w.tmp], &w.tmp);

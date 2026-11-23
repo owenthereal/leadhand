@@ -1,7 +1,7 @@
 //! The Rust binary's own command line: the version, clap's closest-match suggestion, the help
 //! of every command a person types, and a release build that ignores every test hook
 //! (deliberate changes 4 and 5, and the conventions for the commands a person types).
-//! Rust-only.
+//! Rust-only while the Python reference existed.
 //!
 //! The Rust form of the Python contract suite's `contract_rust_cli`. In stage 2 the surface tests
 //! ran the Rust binary behind the router (LEADHAND_RUST_BIN); here the binary under test is
@@ -46,7 +46,6 @@ fn require_release_bin() -> PathBuf {
 }
 
 mod version {
-    use super::*;
     use crate::common::{Env, TempRoot, cli};
 
     /// The version line is `leadhand <the package version>` and nothing else. Until the
@@ -54,9 +53,6 @@ mod version {
     /// changes at the cut-over by design (deliberate change 6).
     #[test]
     fn test_version_matches_the_package_version() {
-        if common::rust_only() {
-            return;
-        }
         let tmp = TempRoot::new("lh rust cli ");
         let env = Env::new(&tmp);
         let r = cli(&os_args!["version"], &env, &tmp).ok();
@@ -69,9 +65,6 @@ mod version {
     #[test]
     fn test_version_reaches_the_rust_binary() {
         // The help of a listed command comes from clap, with its example: not from argparse.
-        if common::rust_only() {
-            return;
-        }
         let tmp = TempRoot::new("lh rust cli ");
         let r = cli(&os_args!["version", "--help"], &Env::new(&tmp), &tmp).ok();
         assert!(
@@ -87,9 +80,6 @@ mod surface {
 
     #[test]
     fn test_unknown_command_suggests_closest() {
-        if common::rust_only() {
-            return;
-        }
         let tmp = TempRoot::new("lh rust cli ");
         let r = cli(&os_args!["statu"], &Env::new(&tmp), &tmp);
         assert_eq!(r.code, 2, "{r}");
@@ -121,9 +111,6 @@ mod surface {
 
     #[test]
     fn test_unknown_flag_suggests_closest() {
-        if common::rust_only() {
-            return;
-        }
         let tmp = TempRoot::new("lh rust cli ");
         let r = cli(
             &os_args!["check", "deck.md", "--rpeo", "."],
@@ -145,9 +132,6 @@ mod surface {
 
     #[test]
     fn test_help_has_example_for_each_human_command() {
-        if common::rust_only() {
-            return;
-        }
         let tmp = TempRoot::new("lh rust cli ");
         let env = Env::new(&tmp);
         for name in HUMAN_COMMANDS {
@@ -297,9 +281,6 @@ mod release_build {
 
     #[test]
     fn test_release_binary_ignores_every_test_hook() {
-        if common::rust_only() {
-            return;
-        }
         let release = require_release_bin();
         let tmp = TempRoot::new("lh rust release ");
         let env = Env::new(&tmp);
@@ -537,9 +518,6 @@ mod release_build_dispatch {
 
     #[test]
     fn test_release_dispatch_ignores_the_codex_bin_hook() {
-        if common::rust_only() {
-            return;
-        }
         require_release_bin();
         let mut w = World::new();
         let flag = w.tmp.join("override ran");
@@ -570,9 +548,6 @@ mod release_build_dispatch {
     #[test]
     fn test_release_dispatch_ignores_the_minute_hook() {
         // A one-minute limit, a Codex that answers after 2 s, and a "minute" of 0.05 s.
-        if common::rust_only() {
-            return;
-        }
         require_release_bin();
         let mut w = World::new();
         w.set_limits("implementer", &[("minutes", Json::from(1))]);
@@ -591,9 +566,6 @@ mod release_build_dispatch {
     #[test]
     fn test_release_dispatch_ignores_the_foreground_wait_hook() {
         // The foreground-wait ruling's case: a 1 s hook and a Codex that answers after 4 s.
-        if common::rust_only() {
-            return;
-        }
         let _serial = common::serial(); // group: the foreground wait (S3-R19)
         require_release_bin();
         let mut w = World::new();

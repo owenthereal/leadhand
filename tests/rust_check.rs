@@ -1,6 +1,6 @@
 //! `check` in Rust: in-place runs refused and the repository taken from the main working tree
 //! (deliberate change 1), and the conventions for the commands a person types (`--json`, the
-//! fix command alone on the last line). Rust-only.
+//! fix command alone on the last line). Rust-only while the Python reference existed.
 //!
 //! `check` keeps its contract output: one problem per line on stdout. The fix command, when
 //! one command fixes every error, follows on stderr, alone.
@@ -64,9 +64,6 @@ mod check {
 
     #[test]
     fn test_check_json_lists_problems() {
-        if common::rust_only() {
-            return;
-        }
         let w = FakeSupervisor::with_options(
             &[
                 card(1),
@@ -156,9 +153,6 @@ mod check {
 
     #[test]
     fn test_check_json_reports_a_deck_that_does_not_load() {
-        if common::rust_only() {
-            return;
-        }
         let w = FakeSupervisor::new(&[card(1)]);
         let deck = fs::read_to_string(&w.deck_path).unwrap();
         fs::write(&w.deck_path, deck.replace("Risk: low", "Risk: severe")).unwrap();
@@ -188,9 +182,6 @@ mod check {
 
     #[test]
     fn test_check_refuses_run_worktree_false() {
-        if common::rust_only() {
-            return;
-        }
         let w = FakeSupervisor::with_options(
             &[card(1)],
             Options {
@@ -212,9 +203,6 @@ mod check {
 
     #[test]
     fn test_check_sparse_refusal_ends_with_fix_command() {
-        if common::rust_only() {
-            return;
-        }
         let w = FakeSupervisor::new(&[card(1)]);
         run_git(
             &w.repo,
@@ -262,9 +250,6 @@ mod check {
 
     #[test]
     fn test_check_cycle_error_has_no_fix_line() {
-        if common::rust_only() {
-            return;
-        }
         let w = FakeSupervisor::new(&[
             card_with(
                 1,
@@ -297,9 +282,6 @@ mod check {
 
     #[test]
     fn test_check_resolves_repo_from_linked_worktree() {
-        if common::rust_only() {
-            return;
-        }
         let w = FakeSupervisor::new(&[card_with(
             1,
             CardOpts {

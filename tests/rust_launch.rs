@@ -1,7 +1,7 @@
 //! `run` and `launch-line` in Rust: the conventions for the commands a person types (the run
 //! found from the current directory, `--json`, bare `leadhand` when PATH finds this binary),
 //! a CLI path with a space in it (R28), and the run-lock descriptor, which reaches `claude`
-//! alone. Rust-only.
+//! alone. Rust-only while the Python reference existed.
 //!
 //! The Rust form of the Python contract suite's `contract_rust_launch`, on the launch world
 //! (`common::launch_world::World`).
@@ -55,9 +55,6 @@ mod launch_line {
 
     #[test]
     fn test_launch_line_without_argument_selects_by_cwd() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = World::new();
         let deck = path_str(&w.paths.deck).to_string();
         let want = one_line(w.launch_line(&os_args![w.run_dir]));
@@ -135,9 +132,6 @@ mod launch_line {
 
     #[test]
     fn test_launch_line_json() {
-        if common::rust_only() {
-            return;
-        }
         let w = World::new();
         let plugin = w.tmp.join("plugin dir");
         let cases: [Vec<OsString>; 2] = [
@@ -176,9 +170,6 @@ mod launch_line {
 
     #[test]
     fn test_launch_line_prints_bare_leadhand_when_path_resolves_here() {
-        if common::rust_only() {
-            return;
-        }
         let w = World::new();
         let deck = path_str(&w.paths.deck).to_string();
         let on_path = w.tmp.join("on path");
@@ -254,9 +245,6 @@ mod paths {
     /// binary in a spaced directory) launches, warns, and is quoted wherever it is a word.
     #[test]
     fn test_cli_path_with_space_warns_and_quotes() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = World::new();
         let root = common::TempRoot::new("lh cli ");
         let link = root.path().join("lead hand bin/leadhand");
@@ -394,9 +382,6 @@ mod descriptors {
     /// are /dev/null.
     #[test]
     fn test_lock_fd_reaches_claude_but_not_caffeinate() {
-        if common::rust_only() {
-            return;
-        }
         if keep_awake_unsupported() {
             return;
         }
