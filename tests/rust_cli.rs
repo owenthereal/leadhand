@@ -10,7 +10,11 @@
 #[macro_use]
 mod common;
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// The commands a person types (spec, "Commands you type").
 const HUMAN_COMMANDS: [&str; 10] = [
@@ -26,23 +30,212 @@ const HUMAN_COMMANDS: [&str; 10] = [
     "version",
 ];
 
-fn release_bin() -> PathBuf {
-    common::plugin::root()
-        .join("target")
+/// The release build beside the testing build `testing`:
+/// `<target dir>[/<triple>]/release/leadhand` for a testing build at
+/// `<target dir>[/<triple>]/<profile>/leadhand`, so it follows CARGO_TARGET_DIR (in the
+/// environment or in Cargo configuration) and `--target`.
+fn release_bin_beside(testing: &Path) -> PathBuf {
+    testing
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| panic!("{} isn't in a profile folder", testing.display()))
         .join("release")
         .join("leadhand")
 }
 
+/// The prerequisites of the first rule of the Cargo dep-info file `text` (Makefile-style, spaces
+/// escaped as `\ `), unescaped.
+fn dep_info_inputs(text: &str) -> Vec<PathBuf> {
+    let rule = text.lines().next().unwrap_or("");
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = rule.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&' ') => {
+                chars.next();
+                word.push(' ');
+            }
+            ' ' => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            _ => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    // The rule's target ends with `:`; its prerequisites follow.
+    let first = words
+        .iter()
+        .position(|w| w.ends_with(':'))
+        .map_or(words.len(), |i| i + 1);
+    words[first..].iter().map(PathBuf::from).collect()
+}
+
+/// `path` with its symlinks resolved, or as it is when it can't be resolved.
+fn resolved(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The triple these tests were compiled for, among leadhand's five platforms; `""` on any
+/// other.
+const COMPILED_TRIPLE: &str = if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+    "aarch64-apple-darwin"
+} else if cfg!(all(
+    target_arch = "x86_64",
+    target_os = "linux",
+    target_env = "gnu"
+)) {
+    "x86_64-unknown-linux-gnu"
+} else if cfg!(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_env = "gnu"
+)) {
+    "aarch64-unknown-linux-gnu"
+} else if cfg!(all(
+    target_arch = "x86_64",
+    target_os = "linux",
+    target_env = "musl"
+)) {
+    "x86_64-unknown-linux-musl"
+} else if cfg!(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_env = "musl"
+)) {
+    "aarch64-unknown-linux-musl"
+} else {
+    ""
+};
+
+/// The command that builds the release build beside `testing`: `--target <triple>` exactly
+/// when `testing` sits in `<target dir>/<triple>/<profile>/`.
+fn build_release_command(testing: &Path, triple: &str) -> String {
+    let folder = testing
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name);
+    if folder == Some(OsStr::new(triple)) {
+        format!("cargo build --locked --release --target {triple}")
+    } else {
+        "cargo build --locked --release".to_string()
+    }
+}
+
+/// Why the release build `release` can't stand for the hook-free release build of the package
+/// `root` (the tests' own), or `None` when it can: it must be another file than the testing
+/// build `testing`, exist, have Cargo's dep-info file beside it, have been built from `root`
+/// (its dep-info lists `<root>/src/main.rs`, compared resolved), and be no older than any input
+/// its dep-info lists. Those inputs are what Cargo itself compares by time, so a refusal is one
+/// Cargo agrees with, and the command it prints (`build_release_command`) clears it.
+fn release_build_problem(
+    release: &Path,
+    testing: &Path,
+    root: &Path,
+    triple: &str,
+) -> Option<String> {
+    let build = build_release_command(testing, triple);
+    let shown = release.display();
+    if release == testing {
+        return Some(format!(
+            "the release build at {shown} is the testing build: the tests ran with --release, \
+             whose testing build replaced the hook-free release build there. Rebuild the \
+             hook-free release build with `{build}`, then rerun the tests without --release"
+        ));
+    }
+    if !release.is_file() {
+        return Some(format!(
+            "no release build at {shown}: build it with `{build}`"
+        ));
+    }
+    let dep_info = release.with_file_name("leadhand.d");
+    let text = match fs::read_to_string(&dep_info) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Some(format!(
+                "the release build at {shown} has no Cargo dep-info file {}, so its sources \
+                 can't be checked: rebuild it with `{build}`",
+                dep_info.display()
+            ));
+        }
+        Err(e) => panic!("reading {}: {e}", dep_info.display()),
+    };
+    let inputs = dep_info_inputs(&text);
+    if inputs
+        .iter()
+        .any(|p| p.is_relative() && p.ends_with("src/main.rs"))
+    {
+        return Some(format!(
+            "the release build at {shown} lists a relative src/main.rs in {}, as \
+             build.dep-info-basedir makes Cargo write, so the checkout it was built from can't \
+             be told: rebuild it without build.dep-info-basedir, with `{build}`",
+            dep_info.display()
+        ));
+    }
+    let main = resolved(&root.join("src").join("main.rs"));
+    if !inputs
+        .iter()
+        .any(|p| p.is_absolute() && resolved(p) == main)
+    {
+        let theirs = inputs
+            .iter()
+            .find(|p| p.ends_with("src/main.rs"))
+            .and_then(|p| p.parent()?.parent())
+            .map_or_else(
+                || format!("a checkout {} doesn't name", dep_info.display()),
+                |c| c.display().to_string(),
+            );
+        return Some(format!(
+            "the release build at {shown} was built from another checkout, {theirs}, not from \
+             this one, {}: rebuild it here with `{build}`",
+            root.display()
+        ));
+    }
+    let built = fs::metadata(release)
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|e| panic!("reading the time of {shown}: {e}"));
+    let mut newest: Option<(&Path, SystemTime)> = None;
+    for input in &inputs {
+        let modified = match fs::metadata(input).and_then(|m| m.modified()) {
+            Ok(modified) => modified,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Some(format!(
+                    "the release build at {shown} was built from {}, which is gone: rebuild it \
+                     with `{build}`",
+                    input.display()
+                ));
+            }
+            Err(e) => panic!("reading the time of {}: {e}", input.display()),
+        };
+        if modified > built && newest.is_none_or(|(_, t)| modified > t) {
+            newest = Some((input, modified));
+        }
+    }
+    newest.map(|(input, _)| {
+        format!(
+            "the release build at {shown} is older than {}, one of its sources: rebuild it with \
+             `{build}`",
+            input.display()
+        )
+    })
+}
+
+/// The hook-free release build beside the testing build; panics with the reason it can't be
+/// used (`release_build_problem`).
 #[track_caller]
 fn require_release_bin() -> PathBuf {
-    let bin = release_bin();
-    if !bin.is_file() {
-        panic!(
-            "no release build at {}: build it with `cargo build --locked --release`",
-            bin.display()
-        );
+    let testing = Path::new(env!("CARGO_BIN_EXE_leadhand"));
+    let release = release_bin_beside(testing);
+    if let Some(problem) =
+        release_build_problem(&release, testing, &common::plugin::root(), COMPILED_TRIPLE)
+    {
+        panic!("{problem}");
     }
-    bin
+    release
 }
 
 mod version {
@@ -578,6 +771,321 @@ mod release_build_dispatch {
             r.stdout_text().lines().collect::<Vec<_>>(),
             ["still running: run the same command again (dispatch d2)"],
             "{r}"
+        );
+    }
+}
+
+mod release_build_lookup {
+    //! The release build the release-build tests run: the one beside the testing build, built
+    //! from this checkout, and no older than any input its dep-info lists.
+    //!
+    //! Each test fabricates a tree in a temp root: packages with `src/main.rs`, `src/lib.rs`,
+    //! `templates/brief.md`, `Cargo.toml` and `Cargo.lock`, and a target folder `target/` with a
+    //! testing build at `target/debug/leadhand` and a release build at
+    //! `target/release/leadhand`, whose `leadhand.d` lists the three sources. Every input is at
+    //! T and the release build at T + 10 s.
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+
+    use super::*;
+    use crate::common::{TempRoot, set_mtime, symlink, write_text};
+
+    /// A fabricated package's files.
+    const PACKAGE: [&str; 5] = [
+        "src/main.rs",
+        "src/lib.rs",
+        "templates/brief.md",
+        "Cargo.toml",
+        "Cargo.lock",
+    ];
+    /// The inputs a fabricated release build's dep-info lists.
+    const SOURCES: [&str; 3] = ["src/main.rs", "src/lib.rs", "templates/brief.md"];
+    /// The build command for the fabricated trees' native testing build.
+    const NATIVE: &str = "cargo build --locked --release";
+
+    /// T + `secs` s, with T fixed well in the past, so no test depends on the clock's
+    /// resolution.
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000 + secs)
+    }
+
+    /// Writes the package `dir`, every file at T. Every package has the same files and
+    /// version.
+    fn package(dir: &Path) {
+        for name in PACKAGE {
+            let path = dir.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let text = if name == "Cargo.toml" {
+                "[package]\nname = \"leadhand\"\nversion = \"0.2.0\"\n"
+            } else {
+                name
+            };
+            write_text(&path, text);
+            set_mtime(&path, at(0));
+        }
+    }
+
+    /// The SOURCES of the package `dir`.
+    fn sources(dir: &Path) -> Vec<PathBuf> {
+        SOURCES.iter().map(|name| dir.join(name)).collect()
+    }
+
+    /// Writes `release`'s dep-info listing `inputs`, as Cargo does: one rule, spaces escaped
+    /// as `\ `.
+    fn dep_info(release: &Path, inputs: &[PathBuf]) {
+        let escaped = |p: &Path| p.display().to_string().replace(' ', "\\ ");
+        let listed: Vec<String> = inputs.iter().map(|p| escaped(p)).collect();
+        write_text(
+            &release.with_file_name("leadhand.d"),
+            format!("{}: {}\n", escaped(release), listed.join(" ")),
+        );
+    }
+
+    struct Tree {
+        tmp: TempRoot,
+    }
+
+    impl Tree {
+        /// One package, `pkg/`, and a fresh release build from it.
+        fn new() -> Tree {
+            Tree::of(&["pkg"], |tmp| sources(&tmp.join("pkg")))
+        }
+
+        /// The packages `packages`, sharing one target folder, whose release build's dep-info
+        /// lists `listed(<temp root>)`.
+        fn of(packages: &[&str], listed: impl FnOnce(&Path) -> Vec<PathBuf>) -> Tree {
+            let tree = Tree {
+                tmp: TempRoot::new("lh rust release lookup "),
+            };
+            for name in packages {
+                package(&tree.path(name));
+            }
+            for bin in [tree.testing(), tree.release()] {
+                fs::create_dir_all(bin.parent().unwrap()).unwrap();
+                write_text(&bin, "a build");
+            }
+            dep_info(&tree.release(), &listed(&tree.tmp));
+            set_mtime(&tree.release(), at(10));
+            tree
+        }
+
+        fn path(&self, rel: &str) -> PathBuf {
+            self.tmp.join(rel)
+        }
+
+        fn testing(&self) -> PathBuf {
+            self.path("target/debug/leadhand")
+        }
+
+        fn release(&self) -> PathBuf {
+            self.path("target/release/leadhand")
+        }
+
+        /// The release build's problem for the tests of the package `<temp root>/<root>`.
+        fn problem(&self, root: &str) -> Option<String> {
+            self.problem_at(&self.path(root))
+        }
+
+        fn problem_at(&self, root: &Path) -> Option<String> {
+            release_build_problem(&self.release(), &self.testing(), root, COMPILED_TRIPLE)
+        }
+    }
+
+    /// Asserts `problem` is a refusal that mentions each of `mentions`.
+    #[track_caller]
+    fn assert_refused(problem: Option<String>, mentions: &[&str]) {
+        let Some(message) = problem else {
+            panic!("the release build was not refused");
+        };
+        for part in mentions {
+            assert!(
+                message.contains(part),
+                "the refusal doesn't mention {part:?}: {message}"
+            );
+        }
+    }
+
+    fn shown(path: &Path) -> String {
+        path.display().to_string()
+    }
+
+    #[test]
+    fn beside_a_native_testing_build() {
+        assert_eq!(
+            release_bin_beside(Path::new("/t/debug/leadhand")),
+            PathBuf::from("/t/release/leadhand")
+        );
+    }
+
+    #[test]
+    fn beside_a_cross_testing_build() {
+        assert_eq!(
+            release_bin_beside(Path::new("/t/x86_64-unknown-linux-musl/debug/leadhand")),
+            PathBuf::from("/t/x86_64-unknown-linux-musl/release/leadhand")
+        );
+    }
+
+    #[test]
+    fn beside_a_testing_build_in_another_target_folder() {
+        assert_eq!(
+            release_bin_beside(Path::new("/elsewhere/out/debug/leadhand")),
+            PathBuf::from("/elsewhere/out/release/leadhand")
+        );
+    }
+
+    #[test]
+    fn dep_info_inputs_unescape_spaces() {
+        let text = "/t/release/leadhand: /a\\ b/src/main.rs /a\\ b/templates/t.md\n\n/a\\ b/src/main.rs:\n";
+        assert_eq!(
+            dep_info_inputs(text),
+            [
+                PathBuf::from("/a b/src/main.rs"),
+                PathBuf::from("/a b/templates/t.md")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fresh_build_from_this_checkout_is_usable() {
+        assert_eq!(Tree::new().problem("pkg"), None);
+    }
+
+    #[test]
+    fn the_command_has_no_target_for_a_native_build() {
+        assert_eq!(
+            build_release_command(Path::new("/t/debug/leadhand"), "x86_64-unknown-linux-musl"),
+            "cargo build --locked --release"
+        );
+    }
+
+    #[test]
+    fn the_command_names_the_target_for_a_cross_build() {
+        assert_eq!(
+            build_release_command(
+                Path::new("/t/x86_64-unknown-linux-musl/debug/leadhand"),
+                "x86_64-unknown-linux-musl"
+            ),
+            "cargo build --locked --release --target x86_64-unknown-linux-musl"
+        );
+    }
+
+    #[test]
+    fn compiled_triple_is_this_platforms() {
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(COMPILED_TRIPLE, "aarch64-apple-darwin");
+        } else if cfg!(target_os = "linux") {
+            assert!(
+                COMPILED_TRIPLE.starts_with(std::env::consts::ARCH)
+                    && COMPILED_TRIPLE.contains("-linux-"),
+                "{COMPILED_TRIPLE:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_testing_build_itself_is_refused() {
+        // `cargo test --release`: the testing build is the release build's path.
+        let t = Tree::new();
+        let testing = t.testing();
+        assert_refused(
+            release_build_problem(&testing, &testing, &t.path("pkg"), COMPILED_TRIPLE),
+            &[
+                &shown(&testing),
+                "--release",
+                "hook-free",
+                NATIVE,
+                "without --release",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_missing_build_is_refused() {
+        let t = Tree::new();
+        fs::remove_file(t.release()).unwrap();
+        assert_refused(t.problem("pkg"), &[&shown(&t.release()), NATIVE]);
+    }
+
+    #[test]
+    fn a_build_without_dep_info_is_refused() {
+        let t = Tree::new();
+        fs::remove_file(t.path("target/release/leadhand.d")).unwrap();
+        assert_refused(t.problem("pkg"), &["leadhand.d", NATIVE]);
+    }
+
+    #[test]
+    fn a_build_from_another_checkout_at_the_same_version_is_refused() {
+        // A shared target folder: `a/`'s release build, newer than everything, run by `b/`'s
+        // tests.
+        let t = Tree::of(&["a", "b"], |tmp| sources(&tmp.join("a")));
+        assert_refused(
+            t.problem("b"),
+            &[&shown(&t.path("a")), &shown(&t.path("b")), NATIVE],
+        );
+    }
+
+    #[test]
+    fn a_relative_dep_info_is_refused() {
+        // `build.dep-info-basedir`: both checkouts' builds list plain `src/main.rs`.
+        let t = Tree::of(&["a", "b"], |_| {
+            vec![
+                PathBuf::from("src/main.rs"),
+                PathBuf::from("templates/brief.md"),
+            ]
+        });
+        for root in ["b", "a"] {
+            assert_refused(t.problem(root), &["build.dep-info-basedir", NATIVE]);
+        }
+    }
+
+    #[test]
+    fn a_build_older_than_a_source_is_refused() {
+        let t = Tree::new();
+        set_mtime(&t.path("pkg/src/lib.rs"), at(20));
+        assert_refused(t.problem("pkg"), &["src/lib.rs", NATIVE]);
+    }
+
+    #[test]
+    fn a_build_older_than_an_embedded_file_is_refused() {
+        // An `include_str!` input.
+        let t = Tree::new();
+        set_mtime(&t.path("pkg/templates/brief.md"), at(20));
+        assert_refused(t.problem("pkg"), &["templates/brief.md", NATIVE]);
+    }
+
+    #[test]
+    fn a_build_whose_input_is_gone_is_refused() {
+        let t = Tree::new();
+        fs::remove_file(t.path("pkg/templates/brief.md")).unwrap();
+        assert_refused(t.problem("pkg"), &["templates/brief.md", NATIVE]);
+    }
+
+    #[test]
+    fn cargo_toml_and_cargo_lock_times_are_not_compared() {
+        let t = Tree::new();
+        set_mtime(&t.path("pkg/Cargo.toml"), at(20));
+        set_mtime(&t.path("pkg/Cargo.lock"), at(20));
+        assert_eq!(t.problem("pkg"), None);
+    }
+
+    #[test]
+    fn a_checkout_reached_through_a_symlink_is_the_same_checkout() {
+        // Review focus 4: the same-checkout rule compares resolved paths.
+        let t = Tree::new();
+        let link = t.path("link");
+        symlink(&t.path("pkg"), &link);
+        let resolved = fs::canonicalize(t.path("pkg")).unwrap();
+        dep_info(&t.release(), &sources(&resolved));
+        assert_eq!(
+            t.problem_at(&link),
+            None,
+            "the checkout through the symlink"
+        );
+        dep_info(&t.release(), &sources(&link));
+        assert_eq!(
+            t.problem_at(&resolved),
+            None,
+            "the dep-info through the symlink"
         );
     }
 }
