@@ -466,9 +466,10 @@ Everything above was observed on macOS. What each workflow tests:
 
 - CI tests the binary on three platforms: macOS arm64, and Linux x86_64 and arm64 with
   glibc.
-- The release workflow runs the same tests on the same three platforms, runs the unit tests
-  on both musl targets, and smoke-tests the shipped musl binaries: each must start, print its
-  version and be statically linked. The contract tests (`tests/*.rs`) don't run on musl.
+- The release workflow runs the same tests on the same three platforms. On both musl
+  targets it runs the contract tests (`tests/*.rs`) and the unit tests, with the release-build
+  tests run against the very binaries it ships, and smoke-tests those binaries: each must
+  start, print its version and be statically linked.
 
 These behaviours have not been observed in a live run on Linux:
 

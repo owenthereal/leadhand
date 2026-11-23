@@ -1,6 +1,7 @@
 //! `bin/leadhand`, the plugin's entry point: which binary it runs, and what it says when it
 //! can't run one (Review Focus 2). Static: these run a copy of `bin/leadhand` in a temporary
 //! plugin folder, with stub binaries and a stub `uname` on PATH, and never run LEADHAND_BIN.
+//! On Apple silicon, one more runs the copy under Rosetta with the system's own `uname`.
 
 #[macro_use]
 mod common;
@@ -16,6 +17,15 @@ use common::plugin::root;
 /// The arguments every run passes, which the binary must receive unchanged.
 const ARGS: [&str; 4] = ["status", "a b", "", "--x=$HOME*"];
 
+/// `uname -v` on Apple silicon, natively and under Rosetta alike, as observed on a Mac.
+const ARM64_KERNEL: &str = "Darwin Kernel Version 27.2.0: Thu Oct 15 00:02:46 PDT 2026; root:xnu-13432.41.4~25/RELEASE_ARM64_T6000";
+
+/// `uname -v` on an Intel Mac.
+const INTEL_KERNEL: &str = "Darwin Kernel Version 27.2.0: Thu Oct 15 00:02:46 PDT 2026; root:xnu-13432.41.4~25/RELEASE_X86_64";
+
+/// `uname -v` on Linux.
+const LINUX_KERNEL: &str = "#1 SMP PREEMPT_DYNAMIC Fri Nov  7 10:00:00 UTC 2026";
+
 /// Writes an executable `sh` script.
 fn script(path: &Path, body: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -29,9 +39,12 @@ fn stub_binary(path: &Path, tag: &str) {
 }
 
 /// A plugin folder holding a copy of `bin/leadhand`, and a folder holding a `uname` that
-/// reports `os` for `-s` and `arch` for `-m`.
+/// reports `os` for `-s`, `arch` for `-m`, and that platform's kernel version for `-v`
+/// (`ARM64_KERNEL` for Darwin arm64, `INTEL_KERNEL` for Darwin x86_64, else `LINUX_KERNEL`).
 struct Tree {
     tmp: TempRoot,
+    os: String,
+    arch: String,
 }
 
 impl Tree {
@@ -40,11 +53,29 @@ impl Tree {
         let shim = tmp.join("plugin/bin/leadhand");
         fs::create_dir_all(shim.parent().unwrap()).unwrap();
         fs::copy(root().join("bin/leadhand"), &shim).unwrap();
+        let tree = Tree {
+            tmp,
+            os: os.to_string(),
+            arch: arch.to_string(),
+        };
+        let kernel = match (os, arch) {
+            ("Darwin", "arm64") => ARM64_KERNEL,
+            ("Darwin", "x86_64") => INTEL_KERNEL,
+            _ => LINUX_KERNEL,
+        };
+        tree.kernel(&format!("echo '{kernel}'"));
+        tree
+    }
+
+    /// Makes the stub `uname` run the shell code `answer` when asked `uname -v`.
+    fn kernel(&self, answer: &str) {
         script(
-            &tmp.join("stubs/uname"),
-            &format!("case $1 in -s) echo '{os}' ;; -m) echo '{arch}' ;; *) exit 2 ;; esac\n"),
+            &self.tmp.join("stubs/uname"),
+            &format!(
+                "case $1 in -s) echo '{}' ;; -m) echo '{}' ;; -v) {answer} ;; *) exit 2 ;; esac\n",
+                self.os, self.arch
+            ),
         );
-        Tree { tmp }
     }
 
     fn plugin(&self) -> PathBuf {
@@ -54,19 +85,6 @@ impl Tree {
     /// The plugin folder as the shim names it, with symlinks resolved (`pwd -P`).
     fn plugin_real(&self) -> PathBuf {
         fs::canonicalize(self.plugin()).unwrap()
-    }
-
-    /// Adds a stub `sysctl` that runs the shell code `answer` when asked
-    /// `sysctl -n sysctl.proc_translated`, and exits 2 when asked anything else. Without one,
-    /// the PATH below has no `sysctl` (macOS and Linux keep it in `/usr/sbin` or `/sbin`).
-    fn sysctl(&self, answer: &str) {
-        script(
-            &self.tmp.join("stubs/sysctl"),
-            &format!(
-                "if [ \"$#\" = 2 ] && [ \"$1\" = -n ] && [ \"$2\" = sysctl.proc_translated ]; \
-                 then {answer}; else exit 2; fi\n"
-            ),
-        );
     }
 
     /// PATH: the stub `uname` first, then the system's tools.
@@ -197,9 +215,8 @@ fn unsupported_platform_message() {
         ("Linux", "armv7l"),
         ("FreeBSD", "amd64"),
     ] {
+        // For Darwin x86_64, the stub `uname -v` reports an Intel Mac's kernel.
         let tree = Tree::new(os, arch);
-        // Not translated, whatever the host's own sysctl would say.
-        tree.sysctl("echo 0");
         stub_binary(&tree.plugin().join("target/release/leadhand"), "checkout");
         let line = one_line_failure(&tree.run());
         assert!(line.contains(&format!("{os} {arch}")), "{line}");
@@ -211,30 +228,34 @@ fn unsupported_platform_message() {
 }
 
 /// A Rosetta shell on Apple silicon (an x86_64 process, as the Bash tool of a Claude Code
-/// started by an x86_64 Node is) reports `Darwin x86_64`, and `sysctl.proc_translated` is 1:
-/// the shim runs the darwin-arm64 binary. The answer counts only for Darwin x86_64.
+/// started by an x86_64 Node is) reports `Darwin x86_64`, but `uname -v` still names the arm64
+/// kernel: the shim runs the darwin-arm64 binary. The kernel counts only for Darwin x86_64.
 #[test]
 fn rosetta_shell_runs_darwin_arm64() {
-    for (os, arch, target) in [
-        ("Darwin", "x86_64", "darwin-arm64"),
-        ("Darwin", "arm64", "darwin-arm64"),
-        ("Linux", "x86_64", "linux-x86_64"),
+    let development = ARM64_KERNEL.replace("RELEASE_ARM64_T6000", "DEVELOPMENT_ARM64_T8103");
+    let virtual_machine = ARM64_KERNEL.replace("RELEASE_ARM64_T6000", "RELEASE_ARM64_VMAPPLE");
+    for (os, arch, kernel, target) in [
+        ("Darwin", "x86_64", ARM64_KERNEL, "darwin-arm64"),
+        ("Darwin", "x86_64", development.as_str(), "darwin-arm64"),
+        ("Darwin", "x86_64", virtual_machine.as_str(), "darwin-arm64"),
+        ("Darwin", "arm64", ARM64_KERNEL, "darwin-arm64"),
+        ("Linux", "x86_64", ARM64_KERNEL, "linux-x86_64"),
     ] {
         let tree = Tree::new(os, arch);
-        tree.sysctl("echo 1");
+        tree.kernel(&format!("echo '{kernel}'"));
         for t in ["darwin-arm64", "linux-x86_64", "linux-arm64"] {
             stub_binary(&tree.plugin().join(format!("bin/{t}/leadhand")), t);
         }
         let ran = tree.run();
-        assert_eq!(ran.code, Some(0), "{os} {arch}: {}", ran.stderr);
-        assert_eq!(ran.stdout, expected_output(target), "{os} {arch}");
-        assert_eq!(ran.stderr, "", "{os} {arch}");
+        assert_eq!(ran.code, Some(0), "{os} {arch} {kernel}: {}", ran.stderr);
+        assert_eq!(ran.stdout, expected_output(target), "{os} {arch} {kernel}");
+        assert_eq!(ran.stderr, "", "{os} {arch} {kernel}");
     }
 }
 
-/// Darwin x86_64 that isn't translated (an Intel Mac, which has no `sysctl.proc_translated`,
-/// or a `sysctl` that fails, prints nothing or is missing) stays unsupported, with the
-/// one-line message and nothing of `sysctl`'s own.
+/// Darwin x86_64 that isn't translated (an Intel Mac, whose kernel says `RELEASE_X86_64`, or a
+/// `uname -v` that fails, even after printing an arm64 kernel, or prints nothing or something
+/// else) stays unsupported, with the one-line message and nothing of `uname`'s own.
 #[test]
 fn untranslated_darwin_x86_64_is_unsupported() {
     let check = |what: &str, ran: Ran| {
@@ -244,22 +265,30 @@ fn untranslated_darwin_x86_64_is_unsupported() {
             "{what}: {line}"
         );
     };
+    let failing_arm64 = format!("echo '{ARM64_KERNEL}'; exit 1");
     for (what, answer) in [
-        ("prints 0", "echo 0"),
+        ("an Intel kernel", None),
         (
-            "has no such name",
-            "echo \"sysctl: unknown oid 'sysctl.proc_translated'\" >&2; exit 1",
+            "fails",
+            Some("echo 'uname: illegal option -- v' >&2; exit 1"),
         ),
-        ("prints nothing", ":"),
-        ("prints something else", "echo yes"),
+        (
+            "prints an arm64 kernel and fails",
+            Some(failing_arm64.as_str()),
+        ),
+        ("prints nothing", Some(":")),
+        ("prints something else", Some("echo yes")),
     ] {
         let tree = Tree::new("Darwin", "x86_64");
-        tree.sysctl(answer);
+        if let Some(answer) = answer {
+            tree.kernel(answer);
+        }
         stub_binary(&tree.plugin().join("bin/darwin-arm64/leadhand"), "dist");
         check(what, tree.run());
     }
 
-    // No sysctl at all: PATH holds only the stub `uname` and the `dirname` the shim needs.
+    // No system tools beyond uname and dirname: PATH holds only the stub `uname` and the
+    // `dirname` the shim needs.
     let tree = Tree::new("Darwin", "x86_64");
     stub_binary(&tree.plugin().join("bin/darwin-arm64/leadhand"), "dist");
     let tools = tree.tmp.join("tools");
@@ -268,7 +297,52 @@ fn untranslated_darwin_x86_64_is_unsupported() {
     let path = format!("{}:{}", tree.tmp.join("stubs").display(), tools.display());
     let mut cmd = Command::new(tree.plugin().join("bin/leadhand"));
     cmd.env_clear().env("PATH", path).args(ARGS);
-    check("no sysctl", ran(&mut cmd));
+    check("no system tools beyond uname and dirname", ran(&mut cmd));
+}
+
+/// Under real Rosetta, the way a translated shell runs the shim (through its `#!/bin/sh`
+/// line, with the system's own `uname` and no `/usr/sbin` on PATH), it runs the darwin-arm64
+/// binary with the arguments unchanged. Apple silicon only: on an Intel Mac, `x86_64` is the
+/// truth and the shim rightly refuses.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn rosetta_translated_shell_runs_darwin_arm64_without_usr_sbin() {
+    /// `arch -x86_64 env -i PATH=/usr/bin:/bin`: a translated process with a clean PATH, so
+    /// no arm64-only `uname` (such as GNU coreutils') can answer for it.
+    fn translated() -> Command {
+        let mut cmd = Command::new("/usr/bin/arch");
+        cmd.env_clear()
+            .args(["-x86_64", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin"]);
+        cmd
+    }
+
+    let rosetta = Command::new("/usr/bin/arch")
+        .args(["-x86_64", "/usr/bin/true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("running /usr/bin/arch");
+    if !rosetta.success() {
+        panic!("needs Rosetta 2: softwareupdate --install-rosetta --agree-to-license");
+    }
+
+    // The premise: a process started this way really is translated.
+    let machine = ran(translated().arg("/usr/bin/uname").arg("-m"));
+    assert_eq!(machine.code, Some(0), "uname -m: {}", machine.stderr);
+    assert_eq!(machine.stdout, "x86_64\n", "uname -m under arch -x86_64");
+
+    // The stub `uname` (an Intel Mac's) is not on this PATH; the system's own answers.
+    let tree = Tree::new("Darwin", "x86_64");
+    for t in ["darwin-arm64", "linux-x86_64", "linux-arm64"] {
+        stub_binary(&tree.plugin().join(format!("bin/{t}/leadhand")), t);
+    }
+    let ran = ran(translated()
+        .arg(tree.plugin().join("bin/leadhand"))
+        .args(ARGS));
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, expected_output("darwin-arm64"));
+    assert_eq!(ran.stderr, "");
 }
 
 /// With no binary at either path, one line naming the platform, both paths it looked for and

@@ -1,4 +1,5 @@
-//! The branch release (deliberate change 2, spec "The branch release"). Rust-only.
+//! The branch release (deliberate change 2, spec "The branch release"). Rust-only while the
+//! Python reference existed.
 //!
 //! The Rust form of the Python contract suite's `contract_rust_release`. When a run ends complete,
 //! incomplete or failed, leadhand detaches the run worktree at the run head, between the
@@ -157,9 +158,6 @@ mod branch_release {
 
     #[test]
     fn test_complete_run_detaches_worktree_and_reports_branch_free() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = gated_with(&[card(1)], "");
         w.start();
         let ws = w.workspace();
@@ -217,9 +215,6 @@ mod branch_release {
         // The run's worktree folder is deleted by hand: Git keeps its record (prunable),
         // which still has the run branch checked out. The run fails (its branch cannot be
         // read there); the release has nothing to detach, and the report gives the fix.
-        if common::rust_only() {
-            return;
-        }
         let mut w = gated_with(&[card(1)], "");
         w.start();
         let ws = w.workspace();
@@ -265,9 +260,6 @@ mod branch_release {
 
     #[test]
     fn test_blocked_run_keeps_branch_checked_out() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = gated_with(&[card(1)], "[run]\nevidence = \"block\"\n");
         w.start();
         let gap = || Step {
@@ -296,9 +288,6 @@ mod branch_release {
 
     #[test]
     fn test_release_never_runs_worktree_prune() {
-        if common::rust_only() {
-            return;
-        }
         let mut w = gated_with(&[card(1)], "");
         w.start();
         to_last_step(&mut w); // the next `next` ends the run
@@ -348,9 +337,6 @@ mod branch_release {
         // exact shape, with the worktree still on the run branch (the crash came before the
         // detach) or already detached (after it). The release has no named crash points
         // (S2-R48).
-        if common::rust_only() {
-            return;
-        }
         let all = [
             "outcome",
             "branch_release_started",

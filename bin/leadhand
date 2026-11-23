@@ -9,11 +9,14 @@ root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 # The platform, as the dist branch names its binaries (bin/<target>/leadhand).
 os=$(uname -s)
 arch=$(uname -m)
-# A Rosetta shell on Apple silicon (an x86_64 process) reports x86_64; sysctl says 1 when the
-# process is translated, so the machine is arm64. Anything else leaves it x86_64.
-if [ "$os $arch" = 'Darwin x86_64' ] &&
-    [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || :)" = 1 ]; then
-    arch=arm64
+# A Rosetta shell on Apple silicon (an x86_64 process) reports x86_64, but the kernel's version
+# string still names an arm64 kernel (.../RELEASE_ARM64_T6000), so the machine is arm64. Not
+# sysctl's proc_translated: Claude Code's sandbox refuses the sysctl tool, and /usr/sbin may not
+# be on PATH. The string counts only when uname -v succeeds; anything else leaves it x86_64.
+if [ "$os $arch" = 'Darwin x86_64' ] && kernel=$(uname -v 2>/dev/null); then
+    case $kernel in
+        *ARM64*) arch=arm64 ;;
+    esac
 fi
 case "$os $arch" in
     'Darwin arm64') target=darwin-arm64 ;;

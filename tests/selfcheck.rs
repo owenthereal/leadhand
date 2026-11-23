@@ -1,5 +1,5 @@
 //! The harness's own tests: what a failing or hung binary reports, the sealed environment,
-//! the tests' isolation from the crate's library, the tags, the JSON decoder and the fake
+//! the tests' isolation from the crate's library, the JSON decoder and the fake
 //! `codex` and `claude`. Static: these never run LEADHAND_BIN (shell scripts stand in for it).
 
 #[macro_use]
@@ -470,99 +470,6 @@ fn live_tests_use_the_crate_only_for_procs() {
         "files under tests/live/ the scan missed: {unscanned:?}"
     );
     assert_eq!(uses_in(&files, &tests), Vec::<String>::new());
-}
-
-// --------------------------------------------------------------------------
-// Tags
-
-/// What LEADHAND_IMPL=python now says: the Python reference is gone, so a test can't run
-/// against it, and must not pass by skipping.
-const PYTHON_GONE: &str = "the Python reference left at the cut-over";
-
-/// The Rust-only tag never skips: unset, empty and `rust` run the test, `python` panics
-/// naming the cut-over, and any other value panics too (ruling S3-R37, M4).
-#[test]
-fn rust_only_runs_and_refuses_python() {
-    for value in [None, Some(""), Some("rust")] {
-        assert!(
-            !common::rust_only_under(value.map(OsStr::new)),
-            "LEADHAND_IMPL={value:?} skips"
-        );
-    }
-    let python = assert_panics!(common::rust_only_under(Some(OsStr::new("python"))));
-    assert!(
-        python.contains("LEADHAND_IMPL=python") && python.contains(PYTHON_GONE),
-        "{python}"
-    );
-    let other = assert_panics!(common::rust_only_under(Some(OsStr::new("pypy"))));
-    assert!(
-        other.contains("LEADHAND_IMPL") && other.contains("pypy"),
-        "{other}"
-    );
-}
-
-/// Set in the child that `rust_only_never_skips_and_fails_under_python` starts: the probe
-/// below then reports what `rust_only()` did.
-const PROBE: &str = "LEADHAND_SELFCHECK_RUST_ONLY_PROBE";
-
-/// Not a check on its own: under PROBE it calls the real `rust_only()` and prints what it
-/// returned, for the test below to read. Otherwise it does nothing.
-#[test]
-fn rust_only_probe() {
-    if std::env::var_os(PROBE).is_some() {
-        let skipped = common::rust_only();
-        println!("probe: rust_only() returned {skipped}");
-    }
-}
-
-/// The real tag, `rust_only()`, which every Rust-only test calls: it returns false (run the
-/// test) unless LEADHAND_IMPL=python, where the test fails, naming the cut-over, and never
-/// prints `skipped: rust-only`. Each case runs this test binary again as a child with that
-/// LEADHAND_IMPL (this process's environment is never changed), running only
-/// `rust_only_probe`.
-#[test]
-fn rust_only_never_skips_and_fails_under_python() {
-    let exe = std::env::current_exe().unwrap();
-    for (value, runs) in [
-        (None, true),
-        (Some(""), true),
-        (Some("rust"), true),
-        (Some("python"), false),
-    ] {
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args([
-            "--exact",
-            "rust_only_probe",
-            "--nocapture",
-            "--test-threads",
-            "1",
-        ])
-        .env(PROBE, "1")
-        .stdin(std::process::Stdio::null());
-        match value {
-            Some(v) => cmd.env("LEADHAND_IMPL", v),
-            None => cmd.env_remove("LEADHAND_IMPL"),
-        };
-        let out = cmd.output().unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let what = format!("LEADHAND_IMPL={value:?}: {stdout}{stderr}");
-        assert_eq!(out.status.success(), runs, "{what}");
-        assert_eq!(
-            stdout.contains("probe: rust_only() returned false\n"),
-            runs,
-            "{what}"
-        );
-        assert!(!stdout.contains("returned true"), "{what}");
-        assert!(!stdout.contains("skipped: rust-only"), "{what}");
-        if !runs {
-            assert!(
-                stderr.contains("LEADHAND_IMPL=python") && stderr.contains(PYTHON_GONE),
-                "{what}"
-            );
-            assert!(stdout.contains("test rust_only_probe ... FAILED"), "{what}");
-        }
-    }
 }
 
 // --------------------------------------------------------------------------

@@ -1079,7 +1079,7 @@ mod tests {
 
     #[test]
     fn version_is_the_release_version() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.1");
     }
 
     fn caller(vars: &[(&str, &str)]) -> Result<Caller> {

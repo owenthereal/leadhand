@@ -4,8 +4,6 @@
 //! - LEADHAND_BIN: the binary under test (default the testing build, `CARGO_BIN_EXE_leadhand`).
 //!   A relative value is resolved against the test process's working directory, the package
 //!   root (ruling S3-R5), so `LEADHAND_BIN=target/release/leadhand` works.
-//! - LEADHAND_IMPL: `rust`, or unset. `python`, which named the Python reference until the
-//!   cut-over, fails the test (`rust_only`).
 //!
 //! Tests run in parallel (ruling S3-R19): nothing here changes the test process's own
 //! environment or relies on running alone. Each test makes its own `TempRoot`, and `Env`
@@ -121,7 +119,7 @@ const FAKE_CLAUDE: &str = env!(
 );
 
 // --------------------------------------------------------------------------
-// The binary and the tags
+// The binary
 
 /// The binary under test: LEADHAND_BIN, made absolute against the working directory, else
 /// the testing build.
@@ -131,38 +129,6 @@ pub fn bin() -> PathBuf {
             .unwrap_or_else(|e| panic!("LEADHAND_BIN={}: {e}", value.to_string_lossy())),
         None => PathBuf::from(env!("CARGO_BIN_EXE_leadhand")),
     }
-}
-
-/// Checks LEADHAND_IMPL=`value` (None: unset): it must be `rust`, empty or unset. `python`
-/// named the Python reference, which left at the cut-over, so it panics rather than let a
-/// test pass by skipping.
-fn check_impl(value: Option<&OsStr>) {
-    match value.map(OsStr::as_bytes) {
-        None | Some(b"" | b"rust") => {}
-        Some(b"python") => panic!(
-            "LEADHAND_IMPL=python: the Python reference left at the cut-over, so every test \
-             runs the Rust binary; unset LEADHAND_IMPL"
-        ),
-        Some(other) => panic!(
-            "LEADHAND_IMPL must be rust or unset, not {:?}",
-            String::from_utf8_lossy(other)
-        ),
-    }
-}
-
-/// Whether a rust-only test skips under LEADHAND_IMPL=`value` (None: unset): never. Any value
-/// but `rust` or empty panics (`check_impl`).
-pub fn rust_only_under(value: Option<&OsStr>) -> bool {
-    check_impl(value);
-    false
-}
-
-/// The rust-only tag, from before the cut-over, when a test of new Rust behaviour skipped
-/// under the Python reference. Every binary under test is Rust now, so it returns false, and
-/// panics under LEADHAND_IMPL=python. Its calls, `if common::rust_only() { return; }`, stay
-/// until a follow-up removes them.
-pub fn rust_only() -> bool {
-    rust_only_under(std::env::var_os("LEADHAND_IMPL").as_deref())
 }
 
 // --------------------------------------------------------------------------
@@ -632,7 +598,7 @@ impl AsRef<Path> for TempRoot {
 }
 
 /// The suite's own settings, passed through to the binary.
-const SUITE_VARS: [&str; 2] = ["LEADHAND_BIN", "LEADHAND_IMPL"];
+const SUITE_VARS: [&str; 1] = ["LEADHAND_BIN"];
 /// Inherited variables that would steer the binary or the fakes: other LEADHAND_* names are
 /// test hooks or set by leadhand itself.
 const INHERITED_PREFIXES: [&str; 3] = ["LEADHAND_", "FAKE_CODEX_", "FAKE_CLAUDE_"];

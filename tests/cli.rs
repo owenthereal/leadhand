@@ -13,7 +13,7 @@ mod version {
     fn test_prints_package_version() {
         let tmp = TempRoot::new("lh cli ");
         let r = cli(&os_args!["version"], &Env::new(&tmp), &tmp).ok();
-        assert_eq!(r.stdout_text(), "leadhand 0.2.0\n", "{r}");
+        assert_eq!(r.stdout_text(), "leadhand 0.2.1\n", "{r}");
     }
 }
 

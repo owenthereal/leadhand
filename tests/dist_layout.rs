@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use common::TempRoot;
 use common::plugin::{read, root};
 
-const VERSION: &str = "0.2.0";
+const VERSION: &str = "0.2.1";
 
 /// Another version, for the cases where a version must disagree with `VERSION`. Plainly
 /// synthetic, so that no bump of `VERSION` can turn a mismatch case into a match.
@@ -203,11 +203,12 @@ fn assembled_tree_has_every_plugin_file_and_executable_binaries() {
     assert_eq!(ran.code, Some(0), "--check failed: {}", ran.stderr);
     assert!(ran.stdout.contains(VERSION), "{}", ran.stdout);
 
-    // Exactly the listed paths and the binaries, byte for byte, except the marketplace's
-    // rewritten source (assembled_marketplace_points_at_its_own_root).
+    // Exactly the tracked files under the listed paths and the binaries, byte for byte, except
+    // the marketplace's rewritten source (assembled_marketplace_points_at_its_own_root).
     let mut want = BTreeMap::new();
-    for path in PLUGIN_PATHS {
-        files_under(&root(), path, &mut want);
+    for path in tracked_plugin_files(&root()) {
+        let bytes = fs::read(root().join(&path)).unwrap();
+        want.insert(path, bytes);
     }
     for t in TARGETS {
         want.insert(
@@ -322,6 +323,22 @@ fn check_refuses_an_incomplete_tree() {
         fs::create_dir(dir.join("bin/windows-x86_64")).unwrap()
     });
     case(
+        "an extra file for a target",
+        "unexpected bin/darwin-arm64/extra",
+        &|dir| fs::write(dir.join("bin/darwin-arm64/extra"), "").unwrap(),
+    );
+    // A nested folder emptied, so the top-level skills/ still holds something.
+    case("an empty skills/run", "empty folder skills/run", &|dir| {
+        for entry in fs::read_dir(dir.join("skills/run")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                fs::remove_dir_all(path).unwrap();
+            } else {
+                fs::remove_file(path).unwrap();
+            }
+        }
+    });
+    case(
         "a manifest that isn't JSON",
         ".codex-plugin/plugin.json",
         &|dir| fs::write(dir.join(".codex-plugin/plugin.json"), "{\"version\": ").unwrap(),
@@ -342,17 +359,295 @@ fn check_refuses_an_incomplete_tree() {
     assert!(all_files(&good) == before);
 }
 
-/// A copy of the package's sources the assembly reads (its script, `Cargo.toml` and the plugin
-/// files) in `<tmp>/src`, for changing a version without touching the package.
-fn source_copy(tmp: &Path) -> PathBuf {
-    let src = tmp.join("src");
+/// Copies the package's sources the assembly reads (its script, `Cargo.toml` and the plugin
+/// files) into `dir`.
+fn copy_sources(dir: &Path) {
     for path in PLUGIN_PATHS
         .iter()
         .chain(&["Cargo.toml", "scripts/assemble-dist.sh"])
     {
-        copy_tree(&root().join(path), &src.join(path));
+        copy_tree(&root().join(path), &dir.join(path));
     }
+}
+
+/// A copy of the package's sources in `<tmp>/src`, a git repository with the copied files
+/// committed, for changing a version or a file without touching the package.
+fn source_copy(tmp: &Path) -> PathBuf {
+    let src = common::git::make_repo_named(tmp, "src", "main");
+    copy_sources(&src);
+    common::git::run_git(&src, &["add", "--all"]);
+    common::git::run_git(&src, &["commit", "--quiet", "-m", "the sources"]);
     src
+}
+
+/// The plugin files git tracks in `dir`, sorted: `git ls-files -z -- <PLUGIN_PATHS>`.
+fn tracked_plugin_files(dir: &Path) -> Vec<String> {
+    let out = Command::new("git")
+        .args(["ls-files", "-z", "--"])
+        .args(PLUGIN_PATHS)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("running git ls-files");
+    assert!(
+        out.status.success(),
+        "git ls-files in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut files: Vec<String> = String::from_utf8(out.stdout)
+        .expect("UTF-8 file names")
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    files.sort();
+    files
+}
+
+/// Assembles the source copy `src` at `VERSION`, with its own script, into `<tmp>/dist`.
+fn assemble_copy(src: &Path, tmp: &Path) -> (Ran, PathBuf) {
+    assemble_with(&src.join("scripts/assemble-dist.sh"), tmp, VERSION)
+}
+
+/// Asserts the source copy `src` assembles into `<tmp>/dist` and the result passes `--check`.
+#[track_caller]
+fn assembles(src: &Path, tmp: &Path) -> PathBuf {
+    let (ran, out) = assemble_copy(src, tmp);
+    assert_eq!(ran.code, Some(0), "assembly failed: {}", ran.stderr);
+    let ran = check(&out);
+    assert_eq!(ran.code, Some(0), "--check failed: {}", ran.stderr);
+    out
+}
+
+/// Asserts the source copy `src` is refused, naming `named`, with nothing written.
+#[track_caller]
+fn refused(src: &Path, tmp: &Path, named: &str) {
+    let (ran, out) = assemble_copy(src, tmp);
+    assert_eq!(ran.code, Some(1), "{named}: {}", ran.stderr);
+    assert!(ran.stderr.contains(named), "{named}: {}", ran.stderr);
+    assert!(!out.exists(), "{named}: wrote {}", out.display());
+}
+
+/// An untracked file in a plugin folder, at its top or nested, isn't copied.
+#[test]
+fn assembly_copies_only_tracked_files() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    fs::write(src.join("skills/.DS_Store"), "untracked\n").unwrap();
+    fs::write(src.join("skills/run/notes.txt"), "untracked\n").unwrap();
+    let out = assembles(&src, &tmp);
+    for path in ["skills/.DS_Store", "skills/run/notes.txt"] {
+        assert!(!out.join(path).exists(), "{path} was copied");
+    }
+    assert!(out.join("skills/run/SKILL.md").is_file());
+}
+
+/// Review Focus 5: a local dry run copies the working tree's content of a tracked file,
+/// uncommitted edits included.
+#[test]
+fn assembly_copies_the_working_tree_of_tracked_files() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    let path = "docs/deck-format.md";
+    let edited = format!("{}\nAn uncommitted edit.\n", read(&src.join(path)));
+    fs::write(src.join(path), &edited).unwrap();
+    let out = assembles(&src, &tmp);
+    assert!(fs::read(out.join(path)).unwrap() == edited.as_bytes());
+}
+
+/// Review Focus 3: tracked names with a space or a leading `-` arrive byte for byte.
+#[test]
+fn assembly_keeps_names_with_spaces_and_dashes() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    let files = [
+        ("docs/with space.md", "a name with a space\n"),
+        ("docs/-dash.md", "a name with a leading dash\n"),
+    ];
+    common::git::commit(&src, &files, "odd names");
+    let out = assembles(&src, &tmp);
+    for (path, text) in files {
+        assert!(
+            fs::read(out.join(path)).unwrap() == text.as_bytes(),
+            "{path}"
+        );
+    }
+}
+
+/// A tracked file deleted from the working tree, still in the index, is refused by name before
+/// anything is written.
+#[test]
+fn assembly_refuses_a_missing_tracked_file() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    fs::remove_file(src.join("docs/compatibility.md")).unwrap();
+    refused(&src, &tmp, "missing tracked file docs/compatibility.md");
+}
+
+/// A tracked file replaced by a directory is refused by name before anything is written; its
+/// untracked contents aren't packaged.
+#[test]
+fn assembly_refuses_a_tracked_file_replaced_by_a_directory() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    let path = src.join("docs/compatibility.md");
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("notes.md"), "untracked\n").unwrap();
+    refused(
+        &src,
+        &tmp,
+        "tracked file docs/compatibility.md is not a regular file",
+    );
+}
+
+/// A tracked file replaced by a symlink, to a file with the same content, is refused by name
+/// before anything is written.
+#[test]
+fn assembly_refuses_a_tracked_file_replaced_by_a_symlink() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    let path = src.join("docs/compatibility.md");
+    let elsewhere = tmp.join("compatibility.md");
+    fs::copy(&path, &elsewhere).unwrap();
+    fs::remove_file(&path).unwrap();
+    common::symlink(&elsewhere, &path);
+    refused(
+        &src,
+        &tmp,
+        "tracked file docs/compatibility.md is not a regular file",
+    );
+}
+
+/// A tracked file under a folder replaced by a symlink, to a folder holding the same names, is
+/// refused by name before anything is written: the file itself is regular, but the copy would
+/// follow the symlink.
+#[test]
+fn assembly_refuses_a_tracked_file_under_a_symlinked_folder() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    let elsewhere = tmp.join("elsewhere docs");
+    copy_tree(&src.join("docs"), &elsewhere);
+    fs::remove_dir_all(src.join("docs")).unwrap();
+    common::symlink(&elsewhere, &src.join("docs"));
+    assert!(src.join("docs/compatibility.md").is_file());
+    refused(
+        &src,
+        &tmp,
+        "tracked file docs/compatibility.md is under a symlink, docs",
+    );
+}
+
+/// Without git installed, the assembly says so, in one line and before writing anything,
+/// rather than calling the sources not a checkout.
+#[test]
+fn assembly_without_git_says_so() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp);
+    // A PATH with what the script runs before its checkout check, and no git.
+    let tools = tmp.join("tools");
+    fs::create_dir(&tools).unwrap();
+    for tool in ["jq", "awk", "dirname"] {
+        let real = common::which(tool).unwrap_or_else(|| panic!("no {tool} on PATH"));
+        common::symlink(&real, &tools.join(tool));
+    }
+    let bins = tmp.join("bins");
+    stub_binaries(&bins);
+    let out = tmp.join("dist");
+    let ran = Command::new("/bin/sh")
+        .arg(src.join("scripts/assemble-dist.sh"))
+        .args([VERSION, path_str(&out), path_str(&bins)])
+        .env("PATH", &tools)
+        .current_dir(&src)
+        .stdin(Stdio::null())
+        .output()
+        .expect("running assemble-dist.sh");
+    let stderr = String::from_utf8_lossy(&ran.stderr);
+    assert_eq!(ran.status.code(), Some(1), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("needs git"), "{stderr}");
+    assert!(!out.exists(), "wrote {}", out.display());
+}
+
+/// Sources that aren't a git checkout of their own are refused before anything is written:
+/// a plain copy, and a plain copy inside an unrelated repository.
+#[test]
+fn assembly_refuses_outside_a_git_checkout() {
+    let tmp = TempRoot::new("leadhand dist");
+    let plain = tmp.join("plain");
+    let src = plain.join("src");
+    copy_sources(&src);
+    refused(&src, &plain, "needs a git checkout");
+
+    let inside = tmp.join("inside");
+    let outer = common::git::make_repo_named(&inside, "outer", "main");
+    let src = outer.join("src");
+    copy_sources(&src);
+    refused(&src, &inside, "needs a git checkout");
+}
+
+/// Review Focus 2: a linked worktree, whose `.git` is a file, assembles normally.
+#[test]
+fn assembly_works_from_a_linked_worktree() {
+    let tmp = TempRoot::new("leadhand dist");
+    let src = source_copy(&tmp.join("repo"));
+    let worktree = tmp.join("worktree");
+    common::git::run_git(
+        &src,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            path_str(&worktree),
+        ],
+    );
+    assert!(worktree.join(".git").is_file());
+    let out = assembles(&worktree, &tmp);
+    assert!(out.join("docs/compatibility.md").is_file());
+}
+
+/// Review Focus 1: a checkout of the dist branch, whose top-level `.git` holds empty folders,
+/// passes `--check`.
+#[test]
+fn check_accepts_a_dist_checkout_with_its_git_folder() {
+    let tmp = TempRoot::new("leadhand dist");
+    let good = assembled(&tmp);
+    common::git::run_git(&good, &["init", "--quiet"]);
+    assert!(
+        common::walk(&good.join(".git"))
+            .iter()
+            .any(|p| p.is_dir() && fs::read_dir(p).unwrap().next().is_none()),
+        "git init left no empty folder in .git, so --check has nothing to skip"
+    );
+    let ran = check(&good);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+}
+
+/// Only plain X.Y.Z versions are published: a source copy at any other version, in all four
+/// places, is refused before anything is written.
+#[test]
+fn assemble_refuses_pre_release_versions() {
+    let tmp = TempRoot::new("leadhand dist");
+    for (n, version) in ["0.3.0-rc1", "1.02.3", "1.2", "1.2.3.4", "01.2.3"]
+        .into_iter()
+        .enumerate()
+    {
+        let case = tmp.join(format!("case-{n}"));
+        let src = source_copy(&case);
+        for file in VERSIONED {
+            set_version(&src, file, version);
+        }
+        let (ran, out) = assemble_with(&src.join("scripts/assemble-dist.sh"), &case, version);
+        assert_eq!(ran.code, Some(1), "{version}: {}", ran.stderr);
+        assert!(
+            ran.stderr.contains("plain X.Y.Z"),
+            "{version}: {}",
+            ran.stderr
+        );
+        assert!(!out.exists(), "{version}: wrote {}", out.display());
+    }
 }
 
 /// Review Focus 4: a version that disagrees with `Cargo.toml`, either `plugin.json` or the
@@ -582,6 +877,47 @@ fn publish_job_runs_only_for_version_tags() {
     assert_eq!(writes, [&"      contents: write"]);
 }
 
+/// The publish job checks the tag before anything else (spec task 5): its checkout fetches the
+/// whole history and keeps its token, the main check comes right after it, before the download
+/// and the push, and the job's concurrency group queues publishes instead of cancelling one.
+#[test]
+fn publish_job_checks_main_first_and_queues() {
+    let text = workflow();
+    let jobs = jobs(&text);
+    let publish = &jobs["publish"];
+    let steps = steps(publish);
+    let at = |what: &str| {
+        steps
+            .iter()
+            .position(|s| s.iter().any(|l| l.contains(what)))
+            .unwrap_or_else(|| panic!("no publish step with {what}"))
+    };
+
+    assert!(
+        steps[0][0].starts_with("- uses: actions/checkout@"),
+        "{:?}",
+        steps[0]
+    );
+    assert_eq!(steps[1][0], format!("- name: {MAIN_CHECK_STEP}"));
+    assert!(
+        steps[1].contains(&"REF_NAME: ${{ github.ref_name }}"),
+        "{:?}",
+        steps[1]
+    );
+    assert!(1 < at("uses: actions/download-artifact@"));
+    assert!(1 < at("git push"));
+
+    assert_eq!(steps[0][1..], ["with:", "fetch-depth: 0"]);
+    assert_eq!(
+        block(publish, 4, "concurrency"),
+        Some(vec![
+            "group: release-dist",
+            "cancel-in-progress: false",
+            "queue: max"
+        ])
+    );
+}
+
 /// The workflow's other safety nets: every action is pinned to a commit SHA; the assembly is
 /// checked with `--check` where it's built and again before it's published; and the tree
 /// travels as one tar archive, which keeps the executable bits (ruling S3-R16).
@@ -625,7 +961,6 @@ fn release_workflow_pins_actions_and_checks_the_tree() {
     // The release build: no test hooks, the lock file honoured, Linux on musl.
     let build = jobs["build"].join("\n");
     assert!(build.contains("cargo build --locked --release"));
-    assert!(!build.contains("testing"));
     // The static-link check reads readelf's output whole, so a failing readelf fails the step,
     // and no pipe can end early and pass it vacuously.
     assert!(build.contains("headers=$(readelf --program-headers \"$bin\")"));
@@ -658,15 +993,18 @@ fn release_workflow_pins_actions_and_checks_the_tree() {
         value(&jobs["test"], 8, "os"),
         Some("[macos-15, ubuntu-24.04, ubuntu-24.04-arm]")
     );
-    // The Linux legs run the unit tests on musl, the C library of the binaries they ship
-    // (S3-R36), before the binary is uploaded.
+    // The Linux legs run the full suite and the unit tests on musl, the C library of the
+    // binaries they ship (S3-R36), after the release build, so rust_cli's release-build tests
+    // check the binary the job uploads, and before it's uploaded (spec task 6).
+    let release_build = "cargo build --locked --release --target \"$RUST_TARGET\"";
     let linux = Some("runner.os == 'Linux'".to_string());
     assert_eq!(
         cargo_runs(&jobs["build"]),
         [
+            (None, release_build.to_string()),
             (
-                None,
-                "cargo build --locked --release --target \"$RUST_TARGET\"".to_string()
+                linux.clone(),
+                "cargo test --locked --features testing --target \"$RUST_TARGET\"".to_string()
             ),
             (
                 linux,
@@ -681,7 +1019,29 @@ fn release_workflow_pins_actions_and_checks_the_tree() {
             .position(|s| s.iter().any(|l| l.contains(what)))
             .unwrap_or_else(|| panic!("no build step with {what}"))
     };
-    assert!(at("cargo test --locked --lib") < at("uses: actions/upload-artifact@"));
+    let upload = at("uses: actions/upload-artifact@");
+    assert!(at("cargo test --locked --features testing") < upload);
+    assert!(at("cargo test --locked --lib") < upload);
+    // The release build has no test hooks: its step builds without `--features`, and the
+    // staged binary is that build's, which `cargo test` (the dev profile) leaves untouched.
+    let release_step = &build_steps[at(release_build)];
+    assert_eq!(release_step, &[format!("- run: {release_build}")]);
+    assert!(!release_step[0].contains("--features"));
+    // And no other cargo command, not even inside a `run: |` block, which `cargo_runs` can't
+    // read: three lines name cargo, and one names a feature, the full suite's.
+    let lines_with = |what: &str| jobs["build"].iter().filter(|l| l.contains(what)).count();
+    assert_eq!(lines_with("cargo "), 3, "{build}");
+    assert_eq!(lines_with("--features"), 1, "{build}");
+    let stage = &build_steps[at("- name: Stage the binary")];
+    assert!(
+        stage.contains(
+            &"cp \"target/$RUST_TARGET/release/leadhand\" \"$RUNNER_TEMP/bins/$TARGET/leadhand\""
+        ),
+        "{stage:?}"
+    );
+    // A test-only change gets the musl run on its pull request.
+    let paths = block(&code_lines(&text), 4, "paths").expect("the pull_request paths");
+    assert!(paths.contains(&"- 'tests/**'"), "{paths:?}");
 }
 
 /// The steps of a job: the lines from each `- ` item under `steps:` to the next.
@@ -751,7 +1111,6 @@ fn step_script(text: &str, name: &str) -> String {
         out.push_str(line.get(body..).unwrap_or(""));
         out.push('\n');
     }
-    assert!(out.contains("git push"), "{name:?}'s body: {out}");
     out
 }
 
@@ -771,6 +1130,10 @@ impl Publisher {
         let source = common::git::make_repo(&tmp);
         let origin = common::git::make_origin(&source);
         let script = step_script(&workflow(), PUBLISH_STEP);
+        assert!(
+            script.contains("git push"),
+            "{PUBLISH_STEP:?}'s body: {script}"
+        );
         Publisher {
             tmp,
             source,
@@ -964,4 +1327,74 @@ fn publish_step_adds_one_commit_per_higher_release_and_never_rolls_back() {
     );
     p.refused(&v2_1, "900.2.1", &["900.2.1", "version"]);
     assert_eq!(p.dist().len(), 1);
+}
+
+/// The step that refuses a tag on a commit that isn't on main.
+const MAIN_CHECK_STEP: &str = "Check the tagged commit is on main";
+
+/// The main check (spec task 5), run as the workflow's own text: a tagged commit on main passes,
+/// at main's tip and further back; the tip of a side branch that forked from main is refused,
+/// with one `::error::` line naming the tag, the commit and main, and the origin is untouched.
+/// Each case runs as the publish job's checkout is: detached at the tagged commit, with no local
+/// branch, only origin's, so neither `HEAD` nor a bare `main` could stand in for origin's main.
+#[test]
+fn publish_refuses_a_tag_off_main() {
+    let script = step_script(&workflow(), MAIN_CHECK_STEP);
+    let tmp = TempRoot::new("leadhand main check");
+    let source = common::git::make_repo(&tmp);
+    let c1 = common::git::run_git(&source, &["rev-parse", "HEAD"]);
+    let c2 = common::git::commit(&source, &[("main.txt", "c2\n")], "c2");
+    common::git::run_git(&source, &["switch", "--quiet", "--create", "side", &c1]);
+    let s1 = common::git::commit(&source, &[("side.txt", "s1\n")], "s1");
+    common::git::run_git(&source, &["switch", "--quiet", "main"]);
+    let origin = common::git::make_origin(&source);
+    common::git::run_git(&source, &["fetch", "--quiet", "origin"]);
+    common::git::run_git(&source, &["checkout", "--quiet", "--detach"]);
+    common::git::run_git(&source, &["branch", "--quiet", "-D", "main", "side"]);
+    assert_eq!(
+        common::git::run_git(&source, &["for-each-ref", "refs/heads"]),
+        ""
+    );
+    let refs = || common::git::run_git(&origin, &["for-each-ref"]);
+    let before = refs();
+    assert!(before.contains("refs/heads/side"), "{before}");
+
+    let tag = "v900.2.0";
+    let check = |sha: &str| {
+        common::git::run_git(&source, &["checkout", "--quiet", "--detach", sha]);
+        let out = Command::new("bash")
+            .args(["--noprofile", "--norc", "-e", "-c", &script])
+            .current_dir(&source)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", tmp.path())
+            .envs(common::git::HERMETIC_ENV)
+            .env("GITHUB_WORKSPACE", &source)
+            .env("REF_NAME", tag)
+            .env("GITHUB_SHA", sha)
+            .stdin(Stdio::null())
+            .output()
+            .expect("running the main check");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), text)
+    };
+
+    for (what, sha) in [("main's tip", &c2), ("main's first commit", &c1)] {
+        let (code, out) = check(sha);
+        assert_eq!(code, Some(0), "{what}: {out}");
+        assert!(!out.contains("::error::"), "{what}: {out}");
+    }
+
+    let (code, out) = check(&s1);
+    assert_eq!(code, Some(1), "side's tip: {out}");
+    let errors: Vec<&str> = out.lines().filter(|l| l.starts_with("::error::")).collect();
+    assert_eq!(errors.len(), 1, "side's tip: {out}");
+    for name in [tag, s1.as_str(), "main"] {
+        assert!(errors[0].contains(name), "{name:?} not in {}", errors[0]);
+    }
+    assert_eq!(refs(), before, "the origin changed");
 }
