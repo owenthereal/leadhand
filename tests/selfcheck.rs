@@ -1,6 +1,7 @@
 //! The harness's own tests: what a failing or hung binary reports, the sealed environment,
-//! the tests' isolation from the crate's library, the JSON decoder and the fake
-//! `codex` and `claude`. Static: these never run LEADHAND_BIN (shell scripts stand in for it).
+//! the tests' isolation from the crate's library, the JSON decoder, the fake
+//! `codex` and `claude` and the executable writer (`write_executable`, which writes the files
+//! tests run). Static: these never run LEADHAND_BIN (shell scripts stand in for it).
 
 #[macro_use]
 mod common;

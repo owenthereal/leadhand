@@ -1038,7 +1038,7 @@ fn release_workflow_pins_actions_and_checks_the_tree() {
         ),
         "{stage:?}"
     );
-    // A test-only change gets the musl run on its pull request.
+    // A test-only change gets every build leg's test run on its pull request.
     let paths = block(&code_lines(&text), 4, "paths").expect("the pull_request paths");
     assert!(paths.contains(&"- 'tests/**'"), "{paths:?}");
 }
