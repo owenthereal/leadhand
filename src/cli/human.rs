@@ -26,10 +26,10 @@ pub fn print_or_json<T: Serialize>(text: &str, value: &T, json: bool) -> Result<
     Ok(())
 }
 
-/// Prints `e` on stderr (`error: <message>`, then the fix command alone, when there is one)
+/// Prints `e` on `err` (`error: <message>`, then the fix command alone, when there is one)
 /// and gives its exit code.
-pub fn fail_with_fix(e: Error) -> ExitCode {
-    let _ = render_error(&e, &mut std::io::stderr().lock());
+pub fn fail_with_fix(e: Error, err: &mut dyn Write) -> ExitCode {
+    let _ = render_error(&e, err);
     ExitCode::from(e.exit)
 }
 
@@ -124,8 +124,11 @@ mod tests {
 
     #[test]
     fn fail_with_fix_exits_with_the_error_code() {
-        assert_eq!(fail_with_fix(Error::msg("x")), ExitCode::from(1));
-        assert_eq!(fail_with_fix(Error::refused("x")), ExitCode::from(3));
+        for (e, code) in [(Error::msg("x"), 1), (Error::refused("x"), 3)] {
+            let mut err = Vec::new();
+            assert_eq!(fail_with_fix(e, &mut err), ExitCode::from(code));
+            assert_eq!(err, b"error: x\n");
+        }
     }
 
     #[test]
