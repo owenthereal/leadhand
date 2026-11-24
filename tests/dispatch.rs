@@ -1577,6 +1577,45 @@ mod runner_commits {
     }
 
     #[test]
+    fn test_stop_dispatch_leaves_the_runner_time_to_commit_partial_work() {
+        // stop-dispatch's cancel request gives the runner until the canceller's deadline, still
+        // ahead, so the runner commits what Codex left before it stops.
+        let _serial = common::serial(); // group: the stop ladder
+        let mut c = Commits::new();
+        let req = c.commit_request("d1");
+        c.w.scenario_steps(
+            &[
+                json!({"type": "thread.started", "thread_id": "{thread}"}),
+                json!({"type": "turn.started"}),
+                json!({"action": "write_file", "path": "src/widget.py", "text": "WIDGET = 1\n"}),
+                json!({"action": "sleep", "seconds": 60}),
+            ],
+            &[],
+        );
+        c.w.start_detached_with("d1", &req);
+        let widget = c.w.ws.join("src/widget.py");
+        wait_for("Codex's edit", || when(widget.exists()));
+        let before = now_wall();
+        c.w.stop("d1").ok();
+        let saved = c.w.result("d1");
+        assert_eq!(saved["exit_reason"], "cancelled");
+        assert!(saved.get("commit_error").is_none(), "{saved}");
+        assert_eq!(saved["committed"], c.head().as_str());
+        assert!(
+            c.head_files().contains(&"src/widget.py".to_string()),
+            "{:?}",
+            c.head_files()
+        );
+        let cancel = c.w.read("d1", "cancel").expect("the cancel request");
+        assert!(
+            cancel["deadline_wall"]
+                .as_f64()
+                .is_some_and(|wall| wall > before),
+            "{cancel}"
+        );
+    }
+
+    #[test]
     fn test_externally_killed_codex_is_possibly_incomplete_and_partial_work_committed() {
         let mut c = Commits::new();
         let req = c.commit_request("d1");
