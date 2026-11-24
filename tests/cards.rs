@@ -1981,6 +1981,28 @@ mod decision_needed {
         assert_eq!(done["outcome"], "incomplete", "{}", done["reasons"]);
     }
 
+    /// Each parked card is judged by its own latest park: another card's later decision park
+    /// does not make the operator's plain park wait on a decision.
+    #[test]
+    fn test_a_decision_park_after_another_cards_plain_park_still_ends_incomplete() {
+        let mut w = gated(&[card(1), card(2)]);
+        w.start();
+        let a = w.next();
+        w.act(&a);
+        recorded(
+            &w,
+            "park",
+            &os_args!["--card", "1", "--reason", "operator: skip"],
+        );
+        w.script(2, "implement", [with_status("QUESTION")]);
+        w.parks
+            .insert(2, "decision needed: which storage format".to_string());
+        let done = w.run().pop().unwrap();
+        assert_json_eq!(field(&w.events("parked"), "card"), jv("[1, 2]"));
+        assert_eq!(done["outcome"], "incomplete", "{}", done["reasons"]);
+        assert_ne!(done["qualifier"], "decision needed", "{}", done["reasons"]);
+    }
+
     #[test]
     fn test_unpark_refuses_on_a_run_it_cannot_reopen_and_hides_the_hint() {
         let mut w = gated(&[card(1), card(2)]);

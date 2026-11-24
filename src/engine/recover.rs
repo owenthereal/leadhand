@@ -816,4 +816,111 @@ mod tests {
         assert!(!run.paths.pause_flag.exists());
         assert_eq!(kinds(&run), ["cancelled", "paused"]);
     }
+
+    /// Appends event lines to the run's log.
+    fn append_lines(root: &Path, lines: &str) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(crate::state::run_paths(root).events)
+            .unwrap();
+        file.write_all(lines.as_bytes()).unwrap();
+    }
+
+    /// `cut_run`, then card 1's implement reported, its review gave findings and its fix round
+    /// was recorded, with no fix requested yet. The run folder.
+    fn fix_round_recorded(f: &Fixture) -> PathBuf {
+        let (root, _, base) = cut_run(f);
+        append_lines(
+            &root,
+            &format!(
+                r#"{{"seq":4,"ts":"t","kind":"result_recorded","dispatch_id":"{ID}","card":1,"attempt":1,"dispatch_kind":"implement","worker_id":"agent0001","tip":"{base}","session_id":null,"files":{{}},"stopped":false,"charge_ids":[],"status":"READY","blocked_by":"","source":"report","raw_kept":false}}
+{{"seq":5,"ts":"t","kind":"dispatch_requested","dispatch_id":"c1-a1-review-1","card":1,"attempt":1,"dispatch_kind":"review","role":"reviewer","vendor":"claude","model":"sonnet","effort":"medium","brief":"/b","report":"/r","extra":{{}},"notes":"","resumes":null,"resume_worker":null,"resume_session":null,"minutes":60}}
+{{"seq":6,"ts":"t","kind":"worker_started","dispatch_id":"c1-a1-review-1","worker_id":"agent0002","card":1,"deadline":"2099-01-01T00:00:00Z","session":null}}
+{{"seq":7,"ts":"t","kind":"result_recorded","dispatch_id":"c1-a1-review-1","card":1,"attempt":1,"dispatch_kind":"review","worker_id":"agent0002","tip":null,"session_id":null,"files":{{}},"stopped":false,"charge_ids":[],"status":"DONE","blocked_by":"","source":"report","raw_kept":false}}
+{{"seq":8,"ts":"t","kind":"verdict_recorded","card":1,"verdict":"changes","findings":"/r","dispatch_id":"c1-a1-review-1"}}
+{{"seq":9,"ts":"t","kind":"fix_round","card":1,"n":1,"attempt":1,"pre_tip":"{base}","findings":"/r","review":"c1-a1-review-1"}}
+"#
+            ),
+        );
+        root
+    }
+
+    /// The summary `reconcile` records: its `found` lines and its headline.
+    fn reconciled_summary(root: &Path) -> (Vec<String>, String) {
+        let Some(Event::Reconciled(r)) = reconcile(root).unwrap() else {
+            panic!("no reconciled summary");
+        };
+        let found = given(&r.found)
+            .expect("found")
+            .iter()
+            .map(|s| s.lossy().to_string())
+            .collect();
+        (
+            found,
+            given(&r.headline).expect("headline").lossy().to_string(),
+        )
+    }
+
+    // A relaunch between the fix round and its fix's request: the summary says the fix round
+    // resumes from its findings, as `next` then requests the fix.
+    #[test]
+    fn a_fix_round_left_before_its_fix_was_requested_resumes_from_its_findings() {
+        let f = Fixture::new();
+        let root = fix_round_recorded(&f);
+        append_lines(
+            &root,
+            "{\"seq\":10,\"ts\":\"t\",\"kind\":\"resumed\",\"run_id\":\"abc123abc123\"}\n",
+        );
+        assert_eq!(
+            reconciled_summary(&root),
+            (
+                vec!["card 1's fix round resumes from its findings".to_string()],
+                "Resumed at card 1; card 1's fix round resumes from its findings".to_string()
+            )
+        );
+    }
+
+    // A relaunch once the fix is requested, its Codex runner still running: the summary waits
+    // for that worker and never says the fix round resumes from its findings.
+    #[test]
+    fn a_fix_still_running_is_waited_for_not_resumed_from_its_findings() {
+        let f = Fixture::new();
+        let root = fix_round_recorded(&f);
+        let fix = "c1-a1-fix-1";
+        append_lines(
+            &root,
+            &format!(
+                r#"{{"seq":10,"ts":"t","kind":"dispatch_requested","dispatch_id":"{fix}","card":1,"attempt":1,"dispatch_kind":"fix","role":"implementer","vendor":"codex","model":"gpt","effort":"medium","brief":"/b","report":"/r","extra":{{}},"notes":"","resumes":null,"resume_worker":null,"resume_session":null,"minutes":60}}
+{{"seq":11,"ts":"t","kind":"worker_started","dispatch_id":"{fix}","worker_id":"agent0003","card":1,"deadline":"2099-01-01T00:00:00Z","session":null}}
+{{"seq":12,"ts":"t","kind":"resumed","run_id":"abc123abc123"}}
+"#
+            ),
+        );
+        // The runner was just spawned and is alive: `spawn.json` names a live process.
+        let runner = crate::sys::tests::sleeper(true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let info = loop {
+            if let Some(info) = crate::sys::proc_info(runner.pid()) {
+                break info;
+            }
+            assert!(std::time::Instant::now() < deadline, "no process record");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let wd = root.join("workers").join(fix);
+        std::fs::create_dir_all(&wd).unwrap();
+        let spawn = serde_json::json!({
+            "pid": info.pid, "pgid": info.pgid, "start": info.start,
+            "at": crate::dispatch::wall_now(),
+        });
+        std::fs::write(wd.join(crate::dispatch::own::SPAWN), spawn.to_string()).unwrap();
+        let waiting = "card 1's Codex worker is still running; waiting for it";
+        assert_eq!(
+            reconciled_summary(&root),
+            (
+                vec![waiting.to_string()],
+                format!("Resumed at card 1; {waiting}")
+            )
+        );
+    }
 }
