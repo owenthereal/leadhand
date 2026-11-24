@@ -175,6 +175,42 @@ mod report {
     }
 
     #[test]
+    fn test_cards_table_shows_a_parked_cards_reason() {
+        let w = RunDir::with_cards(2);
+        w.accept(1);
+        w.ev(
+            "card_cut",
+            [
+                ("card", Json::from(2)),
+                ("branch", Json::from("b2")),
+                ("base", Json::from("b")),
+            ],
+        );
+        w.ev(
+            "parked",
+            [
+                ("card", Json::from(2)),
+                ("reason", Json::from("needs a decision")),
+            ],
+        );
+        w.ev(
+            "outcome",
+            outcome("incomplete", "", &["card 2 parked: needs a decision"]),
+        );
+        let cards = section(&report(&w), "Cards", Some("Rulings"));
+        let row = cards
+            .lines()
+            .find(|line| line.starts_with("| 2. "))
+            .unwrap_or_else(|| panic!("no row for card 2 in {cards}"));
+        // The row's cells: card, outcome, attempts, final route.
+        assert_eq!(
+            row.split(" | ").nth(1),
+            Some("parked: needs a decision"),
+            "{row}"
+        );
+    }
+
+    #[test]
     fn test_report_usage_includes_supervisor_and_proxy_and_unknown_count() {
         let w = finished();
         w.charge_with(
