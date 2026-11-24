@@ -205,6 +205,23 @@ mod status_finds_the_run {
             "{r}"
         );
     }
+
+    #[test]
+    fn test_status_of_a_directory_that_is_not_a_run_is_refused() {
+        let w = FakeSupervisor::new(&[card(1)]);
+        let dir = w.tmp.join("not a run");
+        fs::create_dir(&dir).unwrap();
+        for args in [&os_args![dir][..], &os_args![dir, "--json"]] {
+            let r = status(&w, args, &w.tmp);
+            assert_eq!(r.code, 1, "{r}");
+            assert_eq!(
+                r.stderr_text(),
+                format!("error: not a run directory: {}\n", dir.display()),
+                "{r}"
+            );
+            assert_eq!(r.stdout_text(), "", "{r}");
+        }
+    }
 }
 
 mod json {
