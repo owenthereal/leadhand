@@ -65,11 +65,20 @@ pub fn descendants(root: i32) -> Vec<ProcInfo> {
     out
 }
 
+/// An entry no environment can hold: an environment is a run of NUL-terminated entries, so a
+/// correct reader never finds one with a NUL in it. A reader that does would find anything.
+const IMPOSSIBLE_ENTRY: &[u8] = b"LEADHAND_TAG_SWEEP_CHECK=\0";
+
 /// This user's live processes whose initial environment holds `entry` (`NAME=value`), and
 /// the pids of this user's live processes whose environment could not be read; never the
-/// calling process (`procs.tagged_processes`). `None` when the process table cannot be read.
+/// calling process (`procs.tagged_processes`). `None` when the process table cannot be read,
+/// or when the environment reader finds `IMPOSSIBLE_ENTRY` in this process's environment: its
+/// answers cannot be trusted then, and a stop that swept on them could signal anything.
 pub fn tagged(entry: &str) -> Option<(Vec<ProcInfo>, Vec<i32>)> {
     let (me, uid) = (getpid().as_raw_pid(), getuid().as_raw());
+    if sys::env_has(me, IMPOSSIBLE_ENTRY) == Some(true) {
+        return None;
+    }
     let (mut found, mut unreadable) = (Vec::new(), Vec::new());
     for info in sys::all_procs()? {
         if info.zombie || info.pid == 0 || info.pid == me || info.uid != uid {
