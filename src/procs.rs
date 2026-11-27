@@ -126,7 +126,7 @@ pub fn signal_if_same(id: &ProcId, sig: Signal) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::{BufRead, BufReader};
     use std::os::unix::process::ExitStatusExt;
     use std::process::{ChildStdin, Command, Stdio};
@@ -329,11 +329,12 @@ mod tests {
     // Python's `ps` fallback, and Rust never runs `ps`.
 
     /// Set in `waiting_child`'s process only; unset in an ordinary run.
-    const WAITING: &str = "LEADHAND_PROCS_TEST_WAITING";
+    pub(crate) const WAITING: &str = "LEADHAND_PROCS_TEST_WAITING";
 
     /// Not a test of its own: the tagged process `tagged_processes_finds_a_process_by_an_
-    /// environment_entry` starts (this test binary, running this test alone). It waits for its
-    /// stdin to close, starting nothing. Does nothing in an ordinary run.
+    /// environment_entry` and `dispatch::own`'s `tagged_kid` start (this test binary, running
+    /// this test alone). It waits for its stdin to close, starting nothing. Does nothing in an
+    /// ordinary run.
     #[test]
     fn waiting_child() {
         if std::env::var_os(WAITING).is_some() {
