@@ -332,9 +332,9 @@ pub(crate) mod tests {
     pub(crate) const WAITING: &str = "LEADHAND_PROCS_TEST_WAITING";
 
     /// Not a test of its own: the tagged process `tagged_processes_finds_a_process_by_an_
-    /// environment_entry` and `dispatch::own`'s `tagged_kid` start (this test binary, running
-    /// this test alone). It waits for its stdin to close, starting nothing. Does nothing in an
-    /// ordinary run.
+    /// environment_entry` starts, and the processes `dispatch::own`'s `waiting_kid` starts (this
+    /// test binary, running this test alone). It waits for its stdin to close, starting
+    /// nothing. Does nothing in an ordinary run.
     #[test]
     fn waiting_child() {
         if std::env::var_os(WAITING).is_some() {
@@ -558,6 +558,13 @@ pub(crate) mod tests {
         let mut child = child;
         child.0.wait().unwrap();
         assert!(eventually(|| tagged(&tag).unwrap().0.is_empty()));
+    }
+
+    #[test]
+    fn sweep_check_reads_this_process_and_finds_no_impossible_entry() {
+        // `tagged`'s check guards only while this process's own environment can be read: a
+        // `None` here would leave a reader that finds anything unchecked.
+        assert_eq!(sys::env_has(me(), IMPOSSIBLE_ENTRY), Some(false));
     }
 
     #[test]

@@ -472,26 +472,30 @@ mod tests {
         spawn_kid(cmd)
     }
 
-    /// A stray carrying the dispatch tag `tag`: this test binary as `procs::tests::
+    /// A process whose environment a sweep reads: this test binary as `procs::tests::
     /// waiting_child` (the process table shows its environment on macOS too, unlike a platform
     /// binary's such as `/bin/sleep`), in a session of its own, waiting for its stdin, held open
-    /// here, to close. Returned once it has printed: it runs then, past its `exec`, so a sweep
-    /// sees its environment.
-    fn tagged_kid(tag: &str) -> Kid {
+    /// here, to close. It carries the dispatch tag `tag`, or with `None` no tag variable at all
+    /// (not even one this test inherited, as inside a dispatch). Returned once it has printed:
+    /// it runs then, past its `exec`, so a sweep sees its environment.
+    fn waiting_kid(tag: Option<&str>) -> Kid {
         let mut cmd = Command::new(std::env::current_exe().unwrap());
         cmd.args(["procs::tests::waiting_child", "--exact", "--test-threads=1"])
             .env(procs::tests::WAITING, "1")
-            .env(super::super::TAG_VAR, tag)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        match tag {
+            Some(tag) => cmd.env(super::super::TAG_VAR, tag),
+            None => cmd.env_remove(super::super::TAG_VAR),
+        };
         detach_session(&mut cmd);
         let mut kid = Kid(cmd.spawn().unwrap());
         let mut line = String::new();
         let read = BufReader::new(kid.0.stdout.as_mut().unwrap())
             .read_line(&mut line)
             .unwrap();
-        assert!(read > 0, "the tagged child ended before it ran");
+        assert!(read > 0, "the waiting child ended before it ran");
         kid
     }
 
@@ -653,9 +657,9 @@ mod tests {
         // and two tests sharing a tag would stop each other's processes.
         let tag = format!("own-strays-{}-{n}:d1:1", std::process::id());
         let (_tmp, wd) = worker_dir();
-        let mut stray = tagged_kid(&tag);
-        let mut longer = tagged_kid(&format!("{tag}0"));
-        let mut untagged = sleeper();
+        let mut stray = waiting_kid(Some(&tag));
+        let mut longer = waiting_kid(Some(&format!("{tag}0")));
+        let mut untagged = waiting_kid(None);
         let record = format!(
             "{{\"runner\": {{\"pid\": 1, \"pgid\": 1, \"start\": \"gone\"}}, \"codex\": null, \
              \"tag\": \"{tag}\"}}"
