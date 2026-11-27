@@ -307,6 +307,35 @@ mod tests {
         assert_eq!(ours, theirs);
     }
 
+    // `^#+\s` ends the question only at a line start: a `#` and a space inside a line do not.
+    #[test]
+    fn a_hash_inside_a_line_does_not_end_the_question() {
+        assert_eq!(
+            question(
+                "## Question\nShould widgets use C# or F#?\nOptions:\n- A: C#\n## Concerns\nNone\n"
+            ),
+            "Should widgets use C# or F#?\nOptions:\n- A: C#"
+        );
+    }
+
+    // Only a missing file or a folder reads as no report; any other read error is an error.
+    // Reading below a regular file fails with ENOTDIR, for every user, root included.
+    #[test]
+    fn an_unreadable_report_is_an_error_not_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report.md");
+        std::fs::write(&report, "Status: READY\n").unwrap();
+        let read = |p: &std::path::Path| read_text(&crate::pytext::path_text(p));
+        let below = read(&report.join("x"));
+        assert!(
+            below.is_err(),
+            "a report below a regular file read as {:?}, not an error",
+            below.ok()
+        );
+        assert_eq!(read(&dir.path().join("missing.md")).ok(), Some(None));
+        assert_eq!(read(dir.path()).ok(), Some(None));
+    }
+
     #[test]
     fn heads_cross_check_findings_as_the_python_does() {
         let texts = [

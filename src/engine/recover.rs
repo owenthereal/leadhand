@@ -923,4 +923,29 @@ mod tests {
             )
         );
     }
+
+    // A relaunch while a card is integrating with nothing in flight (the session died at
+    // `before_rebase` or `after_rebase`): the summary says its integration resumes from Git's
+    // state.
+    #[test]
+    fn an_integration_left_before_its_outcome_resumes_from_gits_state() {
+        let f = Fixture::new();
+        let (root, _, base) = cut_run(&f);
+        append_lines(
+            &root,
+            &format!(
+                r#"{{"seq":4,"ts":"t","kind":"result_recorded","dispatch_id":"{ID}","card":1,"attempt":1,"dispatch_kind":"implement","worker_id":"agent0001","tip":"{base}","session_id":null,"files":{{}},"stopped":false,"charge_ids":[],"status":"READY","blocked_by":"","source":"report","raw_kept":false}}
+{{"seq":5,"ts":"t","kind":"integration_started","card":1,"onto":"{base}","tip":"{base}","keep":"refs/leadhand/abc123abc123/integration/1-1"}}
+{{"seq":6,"ts":"t","kind":"resumed","run_id":"abc123abc123"}}
+"#
+            ),
+        );
+        assert_eq!(
+            reconciled_summary(&root),
+            (
+                vec!["card 1's integration resumes from Git's state".to_string()],
+                "Resumed at card 1; card 1's integration resumes from Git's state".to_string()
+            )
+        );
+    }
 }

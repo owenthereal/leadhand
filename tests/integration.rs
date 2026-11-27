@@ -818,6 +818,36 @@ mod violations {
         assert_eq!(run_git(&w.repo, &["rev-parse", &format!("{RUN}^")]), base);
     }
 
+    /// A check violation's `restored` record lists the refs it preserved, as its `found` record
+    /// does.
+    #[test]
+    fn test_a_restored_violation_lists_the_refs_it_preserved() {
+        let tamper = |_w: &FakeSupervisor, ws: &Path, _a: &Json| {
+            let back = current_branch(ws).expect("a checked-out branch");
+            run_git(ws, &["checkout", "--quiet", RUN]);
+            commit(
+                ws,
+                &[("src/sneaky.txt", "on the run branch\n")],
+                "reviewer commit on the run branch",
+            );
+            run_git(ws, &["checkout", "--quiet", &back]);
+        };
+        let mut w = world("review", tampering(tamper));
+        w.run();
+        let v = one(found(&w));
+        let done = one(staged(&w, "restored"));
+        let keep = format!(
+            "refs/leadhand/{}/violations/1-heads-leadhand-demo",
+            run_id(&w)
+        );
+        assert_json_eq!(
+            done.get("preserved").cloned().unwrap_or(Json::Null),
+            Json::object([(format!("refs/heads/{RUN}").as_str(), keep.as_str().into())]),
+            "{done}"
+        );
+        assert_json_eq!(done["preserved"], v["preserved"]);
+    }
+
     #[test]
     fn test_reviewer_creating_and_deleting_refs_is_violation() {
         // R14': under refs/leadhand/ only this run's namespace is watched.
@@ -1226,6 +1256,28 @@ mod fix_round1 {
             run_git(&w.repo, &["show", &format!("{RUN}:README.md")]),
             "hello"
         );
+    }
+
+    /// A run's implementer leftovers are numbered 1, 2, ... in the order they were found.
+    #[test]
+    fn test_each_implementer_leftovers_gets_the_next_number() {
+        let leave_dirty = |_w: &FakeSupervisor, ws: &Path, _a: &Json| {
+            git::write(ws, &[("README.md", "uncommitted by the implementer\n")]);
+        };
+        let mut w = FakeSupervisor::new(&[card(1), card(2)]);
+        w.start();
+        w.script(1, "implement", [tampering(leave_dirty)]);
+        w.script(2, "implement", [tampering(leave_dirty)]);
+        w.run();
+        let left = found_by(&w, "implementer");
+        assert_json_eq!(field(&left, "n"), jv("[1, 2]"), "the leftovers' numbers");
+        let run_id = run_id(&w);
+        let want: Vec<String> = (1..=2)
+            .map(|n| format!("refs/leadhand/{run_id}/leftovers/{n}"))
+            .collect();
+        assert_json_eq!(field(&left, "ref"), Json::from(&want[..]));
+        assert_eq!(leadhand_refs(&w, "leftovers"), want);
+        assert_json_eq!(accepted_cards(&w), jv("[1, 2]"));
     }
 
     #[test]

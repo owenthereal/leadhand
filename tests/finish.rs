@@ -1117,7 +1117,8 @@ mod guards {
     }
 
     /// The `found` record of an evidence base violation carries the voided request's guard
-    /// (`expected_head`, `expected_branch`), as `docs/cli-contract.md` lists it.
+    /// (`expected_head`, `expected_branch`) and `head_moved`, as `docs/cli-contract.md` lists
+    /// them.
     #[test]
     fn test_evidence_base_violation_records_the_requests_guard() {
         let tamper = |world: &FakeSupervisor, _ws: &Path, _a: &Json| {
@@ -1146,6 +1147,11 @@ mod guards {
                 .unwrap_or_else(|| panic!("the request has no {key}: {req}"));
             assert_eq!(v.get(key), Some(guard), "{key}: {v}");
         }
+        assert_eq!(
+            v.get("head_moved").and_then(Json::as_bool),
+            Some(true),
+            "{v}"
+        );
     }
 
     #[test]
