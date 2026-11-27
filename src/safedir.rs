@@ -291,6 +291,29 @@ mod tests {
     }
 
     #[test]
+    fn safedir_refuses_a_root_that_is_not_a_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        fs::write(&file, b"not a folder\n").unwrap();
+        // The root itself is refused with the OS's reason, not opened as a file, and not
+        // blamed on a component below it.
+        let want = format!("[Errno 20] Not a directory: '{}'", file.display());
+        assert_eq!(
+            SafeDir::open_under(&file, &[]).err().map(|e| e.message),
+            Some(want.clone())
+        );
+        let rel = [os(".leadhand")];
+        assert_eq!(
+            SafeDir::open_under(&file, &rel).err().unwrap().message,
+            want
+        );
+        assert_eq!(
+            SafeDir::create_under(&file, &rel).err().unwrap().message,
+            want
+        );
+    }
+
+    #[test]
     fn safedir_refuses_fifo_without_blocking() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().to_path_buf();

@@ -1025,6 +1025,13 @@ mod tests {
             r#""kind":"reconciled","resumed_seq":1,"found":[],"headline":"Resumed at card 2""#,
         ];
         assert_eq!(headline(&resumed), "Resumed at card 2");
+        // A later relaunch not yet reconciled: the earlier relaunch's summary is not current.
+        let mut again = resumed.to_vec();
+        again.push(r#""kind":"resumed","run_id":"abc""#);
+        assert_eq!(
+            headline(&again),
+            "Running · Waiting for the supervisor · 0 of 0 accepted"
+        );
         let mut started = resumed.to_vec();
         started.push(r#""kind":"worker_started","dispatch_id":"d","worker_id":"w""#);
         assert_eq!(
