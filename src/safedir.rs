@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_leftover_temporary_name_is_skipped() {
+    fn safedir_write_skips_a_leftover_temporary_name() {
         // A temporary file left behind (a writer killed before its rename, or a planted file)
         // holds the next temporary name: the write takes a fresh one and leaves it alone.
         let tmp = tempfile::tempdir().unwrap();
@@ -426,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_writer_that_keeps_clashing_gives_up() {
+    fn safedir_write_gives_up_when_every_name_clashes() {
         // A writer whose every temporary name clashes fails rather than trying for ever, and
         // leaves the folder as it was. 150 names are well over its limit, so how many it tries
         // is not pinned.
@@ -441,7 +441,7 @@ mod tests {
         FORCED_TEMP.with_borrow_mut(|q| q.extend(leftovers.iter().cloned()));
         let wrote = dir.write_file(os("brief.md"), b"x\n");
         assert!(
-            FORCED_TEMP.with_borrow(|q| q.len()) < 150,
+            FORCED_TEMP.with_borrow(|q| q.len()) < leftovers.len(),
             "the write never took a clashing name"
         );
         assert!(
@@ -466,6 +466,7 @@ mod tests {
                 k.to_string()
             );
         }
+        // Drop the names the writer never reached.
         FORCED_TEMP.with_borrow_mut(|q| q.clear());
     }
 }

@@ -171,10 +171,10 @@ mod tests {
         for (k, name) in leftovers.iter().enumerate() {
             fs::write(tmp.path().join(name), k.to_string()).unwrap();
         }
-        FORCED_TEMP.with_borrow_mut(|q| q.extend(leftovers.iter().map(std::ffi::OsString::from)));
+        FORCED_TEMP.with_borrow_mut(|q| q.extend(leftovers.iter().map(Into::into)));
         let wrote = write_json_atomic(&target, &Flag { ok: true });
         assert!(
-            FORCED_TEMP.with_borrow(|q| q.len()) < 150,
+            FORCED_TEMP.with_borrow(|q| q.len()) < leftovers.len(),
             "the write never took a clashing name"
         );
         assert!(
@@ -191,6 +191,7 @@ mod tests {
                 k.to_string()
             );
         }
+        // Drop the names the writer never reached.
         FORCED_TEMP.with_borrow_mut(|q| q.clear());
     }
 
