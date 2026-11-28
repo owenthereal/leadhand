@@ -2670,4 +2670,56 @@ mod tests {
             Some(PyStr::from("integration needs a Claude worker"))
         );
     }
+
+    // `_after_integrate`: an integrate attempt's READY is judged against the card's own
+    // integration, never a later one of another card onto another run tip.
+    #[test]
+    fn decide_reads_the_cards_own_integration_after_an_integrate_ready() {
+        let w = world("");
+        let [b, c, d, e, f, x] = ["b", "c", "d", "e", "f", "9"].map(|h| h.repeat(40));
+        let id = "c1-a2-integrate-1";
+        let mut owned = implemented();
+        owned.push((
+            "integration_started",
+            format!(r#""card":1,"onto":"{e}","tip":"{c}","keep":"refs/leadhand/abc123abc123/integration/1-1""#),
+        ));
+        owned.push((
+            "conflict",
+            format!(r#""card":1,"onto":"{e}","paths":["src/card1/x"]"#),
+        ));
+        owned.push((
+            "integration_started",
+            format!(r#""card":2,"onto":"{d}","tip":"{x}","keep":"refs/leadhand/abc123abc123/integration/2-1""#),
+        ));
+        owned.push(("dispatch_requested", requested(id, "integrate", 2, SONNET)));
+        owned.push(("worker_started", started(id, "w2")));
+        owned.push((
+            "result_recorded",
+            result(id, "integrate", "READY", "")
+                .replace(r#""attempt":1"#, r#""attempt":2"#)
+                .replace(&c, &f),
+        ));
+        let st = RunState::new(&w.run, log(&lines(&owned)));
+        let mut o = obs(&["claude"]);
+        o.contains
+            .insert((PyStr::from("leadhand/demo--card-1"), e.clone()), true);
+        o.merge_bases.insert(
+            (PyStr::from(e.as_str()), PyStr::from(c.as_str())),
+            b.clone(),
+        );
+        o.changed.insert((b, c), vec![PyStr::from("src/card1/x")]);
+        o.changed
+            .insert((e.clone(), f.clone()), vec![PyStr::from("src/card1/x")]);
+        assert_eq!(
+            decide_clean(&st, &mut o),
+            Decision::Append(Box::new(Event::Rebased(events::Rebased {
+                card: Some(CardRef::Number(1)),
+                onto: Some(e),
+                tip: Some(f),
+                dispatch_id: Some(Some(id.into())),
+                ..events::Rebased::default()
+            }))),
+            "card 1's integrate READY was not judged against card 1's integration"
+        );
+    }
 }
