@@ -914,12 +914,20 @@ mod tests {
     }
 
     /// `rust_runner`, the child also inheriting `fd` without close-on-exec, as a runner can
-    /// inherit a descriptor from whoever started it.
+    /// inherit a descriptor from whoever started it. A runner still running after 60 s fails
+    /// the test, once it is killed and so is the Codex its record names (by that identity).
     fn rust_runner_with(
         wd: &Path,
         env: &[(OsString, OsString)],
         fd: Option<BorrowedFd<'_>>,
     ) -> Output {
+        fn drain(mut pipe: impl std::io::Read + Send + 'static) -> JoinHandle<Vec<u8>> {
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = pipe.read_to_end(&mut buf);
+                buf
+            })
+        }
         let mut cmd = Command::new(std::env::current_exe().unwrap());
         cmd.args([
             "dispatch::shell::tests::runner_child",
@@ -930,11 +938,42 @@ mod tests {
         .env_clear()
         .envs(env.iter().cloned())
         .env(CHILD_WD, wd)
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
         if let Some(fd) = fd {
             crate::sys::pass_fd_to_child(&mut cmd, fd);
         }
-        cmd.output().unwrap()
+        let mut child = cmd.spawn().unwrap();
+        // Read meanwhile, so that a runner writing more than a pipe holds is never blocked.
+        let stdout = drain(child.stdout.take().unwrap());
+        let stderr = drain(child.stderr.take().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let codex = read_json_object(&wd.join(RUNNER))
+                    .ok()
+                    .flatten()
+                    .and_then(|runner| crate::dispatch::field::<StoppedProc>(&runner, "codex"));
+                if let Some(codex) = codex
+                    && let (Some(pgid), Some(id)) = (codex.pgid, codex.id())
+                {
+                    crate::procs::signal_group_if_same(&id, pgid, rustix::process::Signal::KILL);
+                }
+                panic!("the runner was still running after 60 s");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        Output {
+            status,
+            stdout: stdout.join().unwrap(),
+            stderr: stderr.join().unwrap(),
+        }
     }
 
     /// What the Python reference runner did on the same scenario, in a world of its own
@@ -1621,22 +1660,34 @@ mod tests {
             (true, StopReason::Cancelled),
             (false, StopReason::StepLimit),
         ] {
-            let tmp = tempfile::tempdir().unwrap();
-            let mut tracker = Tracker::new(tmp.path(), None, None, None);
-            let term = AtomicBool::new(term);
-            let mut shell = bare_shell(tmp.path(), &mut tracker, &term);
-            let limits = Limits {
-                steps: 1,
-                time: Duration::MAX,
-            };
-            let mut core = Runner::with_limits(limits, Instant::now());
-            let step = StreamView::parse(
-                br#"{"type": "item.completed", "item": {"type": "command_execution"}}"#,
-            )
-            .unwrap();
-            shell.feed(&mut core, Event::Line(step)).unwrap();
-            assert_eq!(shell.finish.map(|f| f.stopped_for), Some(Some(want)));
-            let ack = fs::read_to_string(tmp.path().join(STOPPING)).unwrap();
+            // On a thread of its own, so that a feed that never returns fails the test.
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut tracker = Tracker::new(tmp.path(), None, None, None);
+                let term = AtomicBool::new(term);
+                let mut shell = bare_shell(tmp.path(), &mut tracker, &term);
+                let limits = Limits {
+                    steps: 1,
+                    time: Duration::MAX,
+                };
+                let mut core = Runner::with_limits(limits, Instant::now());
+                let step = StreamView::parse(
+                    br#"{"type": "item.completed", "item": {"type": "command_execution"}}"#,
+                )
+                .unwrap();
+                shell.feed(&mut core, Event::Line(step)).unwrap();
+                let fed = (
+                    shell.finish,
+                    fs::read_to_string(tmp.path().join(STOPPING)).unwrap(),
+                );
+                tmp.close().unwrap();
+                let _ = tx.send(fed);
+            });
+            let (finish, ack) = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("feed never returned");
+            assert_eq!(finish.map(|f| f.stopped_for), Some(Some(want)));
             assert!(
                 ack.contains(&format!("\"reason\": \"{}\"", want.as_str())),
                 "{ack}"

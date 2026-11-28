@@ -1052,10 +1052,17 @@ mod tests {
     }
 
     /// The shell's part in a test: each request is answered at once with `procs`, under its
-    /// own token; every action is recorded (tokens aside), the answers' too.
+    /// own token; every action is recorded (tokens aside), the answers' too. One event leads
+    /// to a handful of actions: 1,000 fails the test, as a runner that keeps asking.
     fn act(r: &mut Runner, ev: Event, now: Instant, procs: Liveness, log: &mut Vec<Action>) {
         let mut todo = std::collections::VecDeque::from(r.step(ev, now));
+        let mut count = 0;
         while let Some(a) = todo.pop_front() {
+            count += 1;
+            assert!(
+                count < 1_000,
+                "one event led to 1,000 actions: the runner keeps asking"
+            );
             let ask = ask_of(&a);
             log.push(logged(a));
             if let Some(ask) = ask {
