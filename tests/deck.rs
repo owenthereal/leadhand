@@ -440,6 +440,27 @@ mod deck {
     }
 
     #[test]
+    fn test_a_base_that_is_not_a_commit_hash_is_an_error() {
+        // A branch name that resolves, and hex too short to be a hash, are both refused as
+        // not a commit hash, before Git is asked.
+        let mut t = DeckCase::new();
+        let (repo, _) = t.make_repo();
+        for base in ["main", "abc"] {
+            let d =
+                t.write(&deck_text(&[(1, "implementer", "no", "none")]).replace("abc1234", base));
+            let msgs = t.messages(&d, Some(&repo));
+            assert!(
+                has(
+                    &msgs,
+                    "error",
+                    &format!("base commit '{base}' is not a commit hash")
+                ),
+                "the base {base:?}: {msgs:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_compact_header_line_parses() {
         // Covers C5: the spec's deck example puts `Base:` and `Branch:` on one line; a known
         // header key after two or more spaces starts a new field. `check` finds no error and

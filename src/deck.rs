@@ -925,6 +925,22 @@ Context: pointers to the plan section and files, not copies.
         }
     }
 
+    #[test]
+    fn a_blank_deck_has_no_title() {
+        let dir = Dir::new();
+        for text in ["", "\n  \n"] {
+            let path = dir.write(text);
+            // Caught, so a reader that panics on a blank deck fails this assertion.
+            let got =
+                std::panic::catch_unwind(|| parse_deck(&path).map(drop).map_err(|e| e.to_string()));
+            assert_eq!(
+                got.map_err(|_| "parse_deck panicked"),
+                Ok(Err("line 1: expected '# Deck: <title>' first".to_string())),
+                "the deck {text:?}"
+            );
+        }
+    }
+
     // CATALOG: test_deck::DeckTests::test_spec_example_header_parses
     #[test]
     fn spec_example_header_parses() {

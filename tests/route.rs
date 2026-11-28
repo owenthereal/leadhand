@@ -287,6 +287,24 @@ mod route {
     }
 
     #[test]
+    fn test_a_pin_escalated_below_the_ceiling_is_not_clamped() {
+        // A pinned high moves up one at attempt 2, to xhigh, and nothing clamped it.
+        let mut t = RouteCase::new();
+        let pinned = t.deck(CardChange {
+            pin: Some("claude opus high"),
+            ..CardChange::default()
+        });
+        let (key, reasons) = t.r("implementer", Some(&pinned), attempt(2));
+        assert_eq!(key, super::key("claude", "opus", "xhigh"));
+        assert!(has(&reasons, "pinned: claude opus high"), "{reasons:?}");
+        assert!(has(&reasons, "attempt 2: +1"), "{reasons:?}");
+        assert!(
+            !reasons.iter().any(|r| r.starts_with("clamped to")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
     fn test_ladder_attempts_1_to_4_then_exhausted() {
         let mut t = RouteCase::new();
         let [a1, a2, a3, a4] = [1, 2, 3, 4].map(|n| t.r("implementer", None, attempt(n)).0);

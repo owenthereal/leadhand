@@ -162,6 +162,20 @@ mod config {
     }
 
     #[test]
+    fn test_invalid_prefer_raises_config_error_naming_key() {
+        let w = world();
+        repo_config(&w, "[roles.implementer]\nprefer = \"gemini\"\n");
+        let r = check(&w);
+        assert_eq!(r.code, 1, "{r}");
+        assert!(r.stdout_text().starts_with("error: "), "{r}");
+        assert!(
+            r.stdout_text()
+                .contains("roles.implementer.prefer: 'gemini' is not one of claude, codex, other"),
+            "{r}"
+        );
+    }
+
+    #[test]
     fn test_unknown_top_level_key_raises() {
         let w = world();
         repo_config(&w, "bogus = 1\n");
@@ -304,6 +318,17 @@ mod snapshot {
         )
         .unwrap();
         assert_json_eq!(w.next()["action"], Json::from("dispatch")); // the broken live file is never read
+    }
+
+    #[test]
+    fn test_a_run_without_a_snapshot_reads_the_live_files() {
+        // A run started before snapshots existed has no config.json; it reads the live files.
+        let mut w = world_with("");
+        let run_dir = w.start();
+        fs::remove_file(run_dir.join("config.json")).unwrap();
+        let r = w.cli(&os_args!["next", run_dir]);
+        assert_eq!(r.code, 0, "{r}");
+        assert_json_eq!(r.json()["action"], Json::from("dispatch"));
     }
 
     #[test]

@@ -486,6 +486,8 @@ pub(crate) mod tests {
         );
         assert_eq!(codex_session_file(&"hr1".into(), &sessions), Some(f));
         assert_eq!(codex_session_file(&"thr".into(), &sessions), None);
+        // An empty thread ID names no file, though every rollout's name ends with `.jsonl`.
+        assert_eq!(codex_session_file(&"".into(), &sessions), None);
         // A thread ID whose file name is not UTF-8 where the file system allows one, else
         // not ASCII.
         let odd: &[u8] = if crate::usage::claude::tests::odd_names_allowed(dir.path()) {
