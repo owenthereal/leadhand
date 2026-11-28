@@ -556,4 +556,30 @@ mod tests {
         let procs_json = fs::read_to_string(tmp.path().join("procs.json")).unwrap();
         assert!(procs_json.contains("\"descendants\": []"), "{procs_json}");
     }
+
+    #[test]
+    fn procs_json_lists_what_the_tag_sweep_could_not_read() {
+        // `procs.json` names what the last tag sweep could not read (pids, or "unsupported"
+        // where no process table could be read), and has no such key when it read everything.
+        // The sweep's result is set here: no test can make an unreadable process portably.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tracker = Tracker::new(tmp.path(), None, None, None);
+        for (unreadable, want) in [
+            (
+                Unreadable::Pids(vec![4242]),
+                Some(serde_json::json!([4242])),
+            ),
+            (
+                Unreadable::Unsupported,
+                Some(serde_json::json!("unsupported")),
+            ),
+            (Unreadable::Pids(Vec::new()), None),
+        ] {
+            tracker.unreadable = unreadable;
+            tracker.snapshot(false);
+            let text = fs::read_to_string(tmp.path().join("procs.json")).unwrap();
+            let procs_json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(procs_json.get("tag_unreadable"), want.as_ref(), "{text}");
+        }
+    }
 }

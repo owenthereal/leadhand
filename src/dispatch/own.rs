@@ -584,6 +584,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_stale_heartbeat_refreshed_during_the_recheck_is_running() {
+        // A live runner whose heartbeat is stale at the first look is looked at again: one
+        // that refreshes it meanwhile (as after a laptop sleep) is running, not hung.
+        let (_tmp, wd) = worker_dir();
+        let runner = holding_runner_lock(&wd);
+        let record = format!("{{\"runner\": {}, \"codex\": null}}", runner.record());
+        fs::write(wd.join(RUNNER), record).unwrap();
+        let heartbeat = wd.join(HEARTBEAT);
+        File::create(&heartbeat).unwrap();
+        age(&heartbeat, 600);
+        let refresh = {
+            let heartbeat = heartbeat.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(300));
+                age(&heartbeat, 0);
+            })
+        };
+        let state = super::runner_state(&wd, Some(Duration::from_secs(5))).unwrap();
+        refresh.join().unwrap();
+        assert_eq!(
+            state,
+            RunnerState::Running,
+            "a heartbeat refreshed during the recheck still counted as hung"
+        );
+        runner.kill();
+    }
+
+    #[test]
+    fn stop_strays_gives_a_stray_its_sigterm_grace_before_sigkill() {
+        // The stop ladder waits after SIGTERM before it sends SIGKILL: a stray that handles
+        // SIGTERM (a tool shell cleaning up) has the time to finish.
+        let (tmp, wd) = worker_dir();
+        let marker = tmp.path().join("cleaned up");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "trap 'sleep 1; : > \"$0\"; exit 0' TERM; echo trapped; while :; do sleep 0.1; done",
+        ])
+        .arg(&marker);
+        let mut stray = spawn_kid(cmd);
+        // Its trap is set before it can be signalled.
+        let mut line = String::new();
+        BufReader::new(stray.0.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "trapped");
+        fs::write(
+            wd.join(RUNNER),
+            "{\"runner\": {\"pid\": 1, \"pgid\": 1, \"start\": \"gone\"}, \"codex\": null}",
+        )
+        .unwrap();
+        let procs = format!("{{\"descendants\": [{}]}}", stray.record());
+        fs::write(wd.join(PROCS), procs).unwrap();
+        let left = super::stop_strays(&wd, Duration::from_secs(15)).unwrap();
+        assert!(
+            marker.exists(),
+            "a stray handling SIGTERM was killed before its grace"
+        );
+        assert_eq!(left, []);
+    }
+
     // test_recovery::RunnerHelpers::test_stop_strays_stops_what_a_dead_runner_left_and_
     // leaves_a_live_runner_alone (P14), against real processes.
     #[test]
@@ -686,6 +748,31 @@ mod tests {
         assert!(wd.join(SUPERSEDED).join("3").join(RUNNER).exists());
         supersede(&wd).unwrap();
         assert!(wd.join(SUPERSEDED).join("4").is_dir());
+    }
+
+    #[test]
+    fn supersede_fails_when_a_generation_file_cannot_be_moved() {
+        use std::os::unix::fs::PermissionsExt;
+        // A generation file that cannot be moved is an error, never left behind for the next
+        // generation to read as its own. As root, permissions do not stop a rename.
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let (_tmp, wd) = worker_dir();
+        fs::write(wd.join(RUNNER), "{\"generation\": 2}").unwrap();
+        fs::write(wd.join(RESULT), "{}").unwrap();
+        fs::create_dir(wd.join(SUPERSEDED)).unwrap();
+        let mode = |mode| fs::set_permissions(&wd, fs::Permissions::from_mode(mode)).unwrap();
+        mode(0o555);
+        let moved = supersede(&wd);
+        mode(0o755);
+        assert!(
+            moved.is_err(),
+            "supersede succeeded with its generation files left behind"
+        );
+        for name in [RUNNER, RESULT] {
+            assert!(wd.join(name).exists(), "{name}");
+        }
     }
 
     #[test]

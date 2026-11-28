@@ -840,6 +840,37 @@ mod runner_lifecycle {
     }
 
     #[test]
+    fn test_runner_dead_after_its_launch_intent_is_recorded_as_interrupted() {
+        // A runner that died after its launch intent, before Codex was recorded, may have
+        // started Codex: the next `dispatch` records that generation as an interrupted
+        // attempt before it replaces the runner.
+        let mut w = World::new();
+        w.scenario("ready", &[]);
+        w.env.set("LEADHAND_CRASH_AT", "before_worker_launch");
+        let r = w.dispatch("d1");
+        assert_eq!(r.code, 1, "{r}");
+        w.env.remove("LEADHAND_CRASH_AT");
+        let r = w.dispatch("d1").ok();
+        assert_eq!(r.stdout_text().lines().next(), Some("Status: READY"), "{r}");
+        let superseded = w.wd("d1").join("superseded/1/result.json");
+        assert!(
+            superseded.exists(),
+            "the dead runner's generation was replaced without a result"
+        );
+        assert_eq!(read_json(&superseded)["exit_reason"], "interrupted");
+        let attempts = w
+            .attempts()
+            .iter()
+            .map(|a| pick(a, &["generation", "exit_reason"]))
+            .collect();
+        assert_json_eq!(
+            Json::Arr(attempts),
+            jv(r#"[[1, "interrupted"], [2, "completed"]]"#),
+            "one attempt for each generation launched"
+        );
+    }
+
+    #[test]
     fn test_ready_result_landing_during_replacement_cancel_is_kept() {
         let _serial = common::serial(); // group: the stop ladder (a hung runner replaced)
         let mut w = World::new();
@@ -1574,6 +1605,45 @@ mod runner_commits {
             "{saved}"
         );
         assert_eq!(c.head(), c.base_sha);
+    }
+
+    #[test]
+    fn test_stop_dispatch_leaves_the_runner_time_to_commit_partial_work() {
+        // stop-dispatch's cancel request gives the runner until the canceller's deadline, still
+        // ahead, so the runner commits what Codex left before it stops.
+        let _serial = common::serial(); // group: the stop ladder
+        let mut c = Commits::new();
+        let req = c.commit_request("d1");
+        c.w.scenario_steps(
+            &[
+                json!({"type": "thread.started", "thread_id": "{thread}"}),
+                json!({"type": "turn.started"}),
+                json!({"action": "write_file", "path": "src/widget.py", "text": "WIDGET = 1\n"}),
+                json!({"action": "sleep", "seconds": 60}),
+            ],
+            &[],
+        );
+        c.w.start_detached_with("d1", &req);
+        let widget = c.w.ws.join("src/widget.py");
+        wait_for("Codex's edit", || when(widget.exists()));
+        let before = now_wall();
+        c.w.stop("d1").ok();
+        let saved = c.w.result("d1");
+        assert_eq!(saved["exit_reason"], "cancelled");
+        assert!(saved.get("commit_error").is_none(), "{saved}");
+        assert_eq!(saved["committed"], c.head().as_str());
+        assert!(
+            c.head_files().contains(&"src/widget.py".to_string()),
+            "{:?}",
+            c.head_files()
+        );
+        let cancel = c.w.read("d1", "cancel").expect("the cancel request");
+        assert!(
+            cancel["deadline_wall"]
+                .as_f64()
+                .is_some_and(|wall| wall > before),
+            "{cancel}"
+        );
     }
 
     #[test]

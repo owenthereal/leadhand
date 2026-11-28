@@ -446,6 +446,57 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_main_worktree_listed_without_a_path_is_refused() {
+        // A listing whose main working tree has no path (as Git would list a repository whose
+        // working tree is `/`) is refused: an empty top would be read from the process's cwd.
+        let f = Fixture::new();
+        let repo = f.make_repo("my repo");
+        let linked = repo.join(".worktrees/my slug");
+        f.git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "run",
+                linked.to_str().unwrap(),
+            ],
+        );
+        // A stand-in `git`, first on this thread's Git `PATH`: the pathless listing for
+        // `worktree list`, the real Git (the rest of `PATH`) for everything else.
+        let bin = f.root().join("fake bin");
+        std::fs::create_dir(&bin).unwrap();
+        crate::test_executable::write_executable(
+            &bin.join("git"),
+            "#!/bin/sh\n\
+             for a; do [ \"$a\" = list ] && { printf 'worktree \\000HEAD 0123\\000detached\\000\\000'; exit 0; }; done\n\
+             PATH=\"${PATH#*:}\" exec git \"$@\"\n",
+        );
+        let mut path = bin.into_os_string();
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        let mut env = f.hermetic_env();
+        env.push(("PATH".into(), Some(path)));
+        crate::git::runner::set_test_env(env);
+        let tops = [
+            ("repo_identity", repo_identity(&linked).map(|id| id.top)),
+            (
+                "linked_worktree",
+                linked_worktree(&linked).map(|wt| wt.expect("a linked worktree").repo.top),
+            ),
+        ];
+        for (call, top) in tops {
+            assert!(
+                top.as_ref()
+                    .is_err_and(|e| e.to_string().contains("no main working tree listed")),
+                "{call}: a main working tree listed without a path was taken: {top:?}"
+            );
+        }
+    }
+
     #[test]
     fn sparse_problem_is_the_python_refusal() {
         let f = Fixture::new();
