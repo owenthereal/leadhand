@@ -65,11 +65,20 @@ pub fn descendants(root: i32) -> Vec<ProcInfo> {
     out
 }
 
+/// An entry no environment can hold: an environment is a run of NUL-terminated entries, so a
+/// correct reader never finds one with a NUL in it. A reader that does would find anything.
+const IMPOSSIBLE_ENTRY: &[u8] = b"LEADHAND_TAG_SWEEP_CHECK=\0";
+
 /// This user's live processes whose initial environment holds `entry` (`NAME=value`), and
 /// the pids of this user's live processes whose environment could not be read; never the
-/// calling process (`procs.tagged_processes`). `None` when the process table cannot be read.
+/// calling process (`procs.tagged_processes`). `None` when the process table cannot be read,
+/// or when the environment reader finds `IMPOSSIBLE_ENTRY` in this process's environment: its
+/// answers cannot be trusted then, and a stop that swept on them could signal anything.
 pub fn tagged(entry: &str) -> Option<(Vec<ProcInfo>, Vec<i32>)> {
     let (me, uid) = (getpid().as_raw_pid(), getuid().as_raw());
+    if sys::env_has(me, IMPOSSIBLE_ENTRY) == Some(true) {
+        return None;
+    }
     let (mut found, mut unreadable) = (Vec::new(), Vec::new());
     for info in sys::all_procs()? {
         if info.zombie || info.pid == 0 || info.pid == me || info.uid != uid {
@@ -117,7 +126,7 @@ pub fn signal_if_same(id: &ProcId, sig: Signal) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::{BufRead, BufReader};
     use std::os::unix::process::ExitStatusExt;
     use std::process::{ChildStdin, Command, Stdio};
@@ -320,11 +329,12 @@ mod tests {
     // Python's `ps` fallback, and Rust never runs `ps`.
 
     /// Set in `waiting_child`'s process only; unset in an ordinary run.
-    const WAITING: &str = "LEADHAND_PROCS_TEST_WAITING";
+    pub(crate) const WAITING: &str = "LEADHAND_PROCS_TEST_WAITING";
 
     /// Not a test of its own: the tagged process `tagged_processes_finds_a_process_by_an_
-    /// environment_entry` starts (this test binary, running this test alone). It waits for its
-    /// stdin to close, starting nothing. Does nothing in an ordinary run.
+    /// environment_entry` starts, and the processes `dispatch::own`'s `waiting_kid` starts (this
+    /// test binary, running this test alone). It waits for its stdin to close, starting
+    /// nothing. Does nothing in an ordinary run.
     #[test]
     fn waiting_child() {
         if std::env::var_os(WAITING).is_some() {
@@ -548,6 +558,13 @@ mod tests {
         let mut child = child;
         child.0.wait().unwrap();
         assert!(eventually(|| tagged(&tag).unwrap().0.is_empty()));
+    }
+
+    #[test]
+    fn sweep_check_reads_this_process_and_finds_no_impossible_entry() {
+        // `tagged`'s check guards only while this process's own environment can be read: a
+        // `None` here would leave a reader that finds anything unchecked.
+        assert_eq!(sys::env_has(me(), IMPOSSIBLE_ENTRY), Some(false));
     }
 
     #[test]

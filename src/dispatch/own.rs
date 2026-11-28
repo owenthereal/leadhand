@@ -404,6 +404,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::io::{BufRead, BufReader, Read};
     use std::os::unix::process::ExitStatusExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use rustix::process::Signal;
 
@@ -469,6 +470,33 @@ mod tests {
         let mut cmd = Command::new("sleep");
         cmd.arg("120");
         spawn_kid(cmd)
+    }
+
+    /// A process whose environment a sweep reads: this test binary as `procs::tests::
+    /// waiting_child` (the process table shows its environment on macOS too, unlike a platform
+    /// binary's such as `/bin/sleep`), in a session of its own, waiting for its stdin, held open
+    /// here, to close. It carries the dispatch tag `tag`, or with `None` no tag variable at all
+    /// (not even one this test inherited, as inside a dispatch). Returned once it has printed:
+    /// it runs then, past its `exec`, so a sweep sees its environment.
+    fn waiting_kid(tag: Option<&str>) -> Kid {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["procs::tests::waiting_child", "--exact", "--test-threads=1"])
+            .env(procs::tests::WAITING, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        match tag {
+            Some(tag) => cmd.env(super::super::TAG_VAR, tag),
+            None => cmd.env_remove(super::super::TAG_VAR),
+        };
+        detach_session(&mut cmd);
+        let mut kid = Kid(cmd.spawn().unwrap());
+        let mut line = String::new();
+        let read = BufReader::new(kid.0.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert!(read > 0, "the waiting child ended before it ran");
+        kid
     }
 
     /// The lock file `lock_holder_child` takes; unset in an ordinary run.
@@ -678,6 +706,49 @@ mod tests {
         }
         // Nothing left: a no-op.
         assert!(super::stop_strays(&wd, timeout).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stop_strays_stops_only_what_carries_the_dispatch_tag() {
+        // A dead runner's tag sweep stops the process whose environment holds the tag's exact
+        // entry, and nothing else: not one with a longer value of the same variable, nor one
+        // without the variable.
+        static TAGS: AtomicU64 = AtomicU64::new(0);
+        let n = TAGS.fetch_add(1, Ordering::Relaxed);
+        // A prefix of its own: the tracker's and the shell worlds' tags are `r<pid>-<n>:d1:1`,
+        // and two tests sharing a tag would stop each other's processes.
+        let tag = format!("own-strays-{}-{n}:d1:1", std::process::id());
+        let (_tmp, wd) = worker_dir();
+        let mut stray = waiting_kid(Some(&tag));
+        let mut longer = waiting_kid(Some(&format!("{tag}0")));
+        let mut untagged = waiting_kid(None);
+        let record = format!(
+            "{{\"runner\": {{\"pid\": 1, \"pgid\": 1, \"start\": \"gone\"}}, \"codex\": null, \
+             \"tag\": \"{tag}\"}}"
+        );
+        fs::write(wd.join(RUNNER), record).unwrap();
+        assert_eq!(
+            super::stop_strays(&wd, Duration::from_secs(15)).unwrap(),
+            []
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stray.0.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the tagged stray outlived stop_strays"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            longer.0.try_wait().unwrap().is_none(),
+            "a process with another tag was stopped"
+        );
+        assert!(
+            untagged.0.try_wait().unwrap().is_none(),
+            "an untagged process was stopped"
+        );
+        longer.kill();
+        untagged.kill();
     }
 
     #[test]
