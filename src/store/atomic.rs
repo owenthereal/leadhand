@@ -83,7 +83,7 @@ mod tests {
     use serde::{Serialize, Serializer};
 
     use super::*;
-    use crate::store::FSYNCS;
+    use crate::store::{FORCED_TEMP, FSYNCS};
 
     fn names(dir: &Path) -> Vec<String> {
         let mut out: Vec<String> = fs::read_dir(dir)
@@ -130,6 +130,68 @@ mod tests {
             "{\n  \"ok\": true\n}\n"
         );
         assert_eq!(names(tmp.path()), ["status.json"]);
+    }
+
+    #[test]
+    fn write_json_atomic_skips_a_leftover_temporary_name() {
+        // A temporary file left by a writer killed before its rename holds the next temporary
+        // name: the write takes a fresh one and leaves it alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("status.json");
+        let leftover = tmp.path().join(".status.json.clash.tmp");
+        fs::write(&leftover, b"leftover\n").unwrap();
+        FORCED_TEMP.with_borrow_mut(|q| q.push_back(".status.json.clash.tmp".into()));
+        let wrote = write_json_atomic(&target, &Flag { ok: true });
+        assert!(
+            FORCED_TEMP.with_borrow(|q| q.is_empty()),
+            "the write never took the clashing name"
+        );
+        assert!(
+            wrote.is_ok(),
+            "a clashing temporary name was not retried: {wrote:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "{\n  \"ok\": true\n}\n"
+        );
+        assert_eq!(fs::read(&leftover).unwrap(), b"leftover\n");
+        assert_eq!(names(tmp.path()), [".status.json.clash.tmp", "status.json"]);
+    }
+
+    #[test]
+    fn write_json_atomic_gives_up_when_every_name_clashes() {
+        // A writer whose every temporary name clashes fails rather than trying for ever, and
+        // leaves the folder as it was. 150 names are well over its limit, so how many it tries
+        // is not pinned.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("status.json");
+        let leftovers: Vec<String> = (0..150)
+            .map(|k| format!(".status.json.clash-{k}.tmp"))
+            .collect();
+        for (k, name) in leftovers.iter().enumerate() {
+            fs::write(tmp.path().join(name), k.to_string()).unwrap();
+        }
+        FORCED_TEMP.with_borrow_mut(|q| q.extend(leftovers.iter().map(std::ffi::OsString::from)));
+        let wrote = write_json_atomic(&target, &Flag { ok: true });
+        assert!(
+            FORCED_TEMP.with_borrow(|q| q.len()) < 150,
+            "the write never took a clashing name"
+        );
+        assert!(
+            wrote.is_err(),
+            "a writer whose every temporary name clashed did not give up"
+        );
+        assert!(!target.exists(), "status.json was written");
+        let mut want = leftovers.clone();
+        want.sort();
+        assert_eq!(names(tmp.path()), want);
+        for (k, name) in leftovers.iter().enumerate() {
+            assert_eq!(
+                fs::read_to_string(tmp.path().join(name)).unwrap(),
+                k.to_string()
+            );
+        }
+        FORCED_TEMP.with_borrow_mut(|q| q.clear());
     }
 
     #[test]

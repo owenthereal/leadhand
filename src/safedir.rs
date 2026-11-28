@@ -229,6 +229,7 @@ fn one_component(name: &OsStr, under: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::process::Command;
@@ -236,6 +237,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::store::FORCED_TEMP;
 
     fn os(s: &str) -> &OsStr {
         OsStr::new(s)
@@ -391,5 +393,79 @@ mod tests {
         // A name that is not one component is refused.
         assert!(dir.read_file(os("../x"), 100).is_err());
         assert!(dir.write_file(os(".."), b"").is_err());
+    }
+
+    #[test]
+    fn test_a_leftover_temporary_name_is_skipped() {
+        // A temporary file left behind (a writer killed before its rename, or a planted file)
+        // holds the next temporary name: the write takes a fresh one and leaves it alone.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(".brief.md.clash.tmp"), b"leftover\n").unwrap();
+        let dir = SafeDir::open_under(tmp.path(), &[]).unwrap().unwrap();
+        FORCED_TEMP.with_borrow_mut(|q| q.push_back(".brief.md.clash.tmp".into()));
+        let wrote = dir.write_file(os("brief.md"), b"x\n");
+        assert!(
+            FORCED_TEMP.with_borrow(|q| q.is_empty()),
+            "the write never took the clashing name"
+        );
+        assert!(
+            wrote.is_ok(),
+            "a clashing temporary name was not retried: {wrote:?}"
+        );
+        assert_eq!(fs::read(tmp.path().join("brief.md")).unwrap(), b"x\n");
+        assert_eq!(
+            fs::read(tmp.path().join(".brief.md.clash.tmp")).unwrap(),
+            b"leftover\n"
+        );
+        let mut names: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, [os(".brief.md.clash.tmp"), os("brief.md")]);
+    }
+
+    #[test]
+    fn test_a_writer_that_keeps_clashing_gives_up() {
+        // A writer whose every temporary name clashes fails rather than trying for ever, and
+        // leaves the folder as it was. 150 names are well over its limit, so how many it tries
+        // is not pinned.
+        let tmp = tempfile::tempdir().unwrap();
+        let leftovers: Vec<OsString> = (0..150)
+            .map(|k| OsString::from(format!(".brief.md.clash-{k}.tmp")))
+            .collect();
+        for (k, name) in leftovers.iter().enumerate() {
+            fs::write(tmp.path().join(name), k.to_string()).unwrap();
+        }
+        let dir = SafeDir::open_under(tmp.path(), &[]).unwrap().unwrap();
+        FORCED_TEMP.with_borrow_mut(|q| q.extend(leftovers.iter().cloned()));
+        let wrote = dir.write_file(os("brief.md"), b"x\n");
+        assert!(
+            FORCED_TEMP.with_borrow(|q| q.len()) < 150,
+            "the write never took a clashing name"
+        );
+        assert!(
+            wrote.is_err(),
+            "a writer whose every temporary name clashed did not give up"
+        );
+        assert!(
+            !tmp.path().join("brief.md").exists(),
+            "brief.md was written"
+        );
+        let mut names: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        let mut want = leftovers.clone();
+        want.sort();
+        assert_eq!(names, want);
+        for (k, name) in leftovers.iter().enumerate() {
+            assert_eq!(
+                fs::read_to_string(tmp.path().join(name)).unwrap(),
+                k.to_string()
+            );
+        }
+        FORCED_TEMP.with_borrow_mut(|q| q.clear());
     }
 }
