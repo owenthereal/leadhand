@@ -44,6 +44,10 @@ pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
 /// A fresh temporary name beside `name`: `.<name>.<pid>.<hex>.tmp`. Callers create it with
 /// `O_EXCL` and take another on a clash.
 pub(crate) fn temp_name(name: &OsStr) -> OsString {
+    #[cfg(test)]
+    if let Some(n) = FORCED_TEMP.with_borrow_mut(|q| q.pop_front()) {
+        return n;
+    }
     static TAKEN: AtomicU64 = AtomicU64::new(0);
     let n = TAKEN.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -70,4 +74,11 @@ pub(crate) fn parent(file: &Path) -> &Path {
 thread_local! {
     /// The `fsync` calls this thread made, for the tests that count them.
     pub(crate) static FSYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Names `temp_name` hands out, in order, before making its own (tests only).
+    pub(crate) static FORCED_TEMP: std::cell::RefCell<std::collections::VecDeque<OsString>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
