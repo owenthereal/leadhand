@@ -746,6 +746,60 @@ mod tests {
     }
 
     #[test]
+    fn prepare_worktree_rejects_an_option_or_a_name_git_refuses() {
+        // The run branch is checked before the repository is touched: a name that would read
+        // as an option, or one Git does not take as a branch, makes no excludes, branch or
+        // worktree.
+        let f = Fixture::new();
+        let repo = f.make_repo("my repo");
+        let base = f.git(&repo, &["rev-parse", "HEAD"]);
+        let id = repo_identity(&repo).unwrap();
+        let run_dir = f.root().join("run dir");
+        let exclude = id.common_dir.join("info/exclude");
+        let branches = || {
+            f.git(
+                &repo,
+                &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+            )
+        };
+        let (excludes, before) = (std::fs::read(&exclude).ok(), branches());
+        for name in ["--detach", "-b", "bad..name", "two words"] {
+            let made = prepare_worktree(&id, name, &base, "slug", &run_dir);
+            assert_eq!(
+                made.err().map(|e| e.message),
+                Some(format!("not a valid branch name: {}", py_repr(name))),
+                "{name:?}"
+            );
+        }
+        assert!(!repo.join(".worktrees").exists());
+        assert_eq!(branches(), before);
+        assert_eq!(std::fs::read(&exclude).ok(), excludes);
+    }
+
+    #[test]
+    fn prepare_worktree_creates_a_missing_exclude_file() {
+        // A repository without `info/exclude` (made with other templates, or the file
+        // deleted) gets one, with the run's patterns.
+        let f = Fixture::new();
+        let repo = f.make_repo("my repo");
+        let base = f.git(&repo, &["rev-parse", "HEAD"]);
+        let id = repo_identity(&repo).unwrap();
+        std::fs::remove_dir_all(id.common_dir.join("info")).unwrap();
+        let run_dir = f.root().join("docs dir/runs/2026-11-10-demo");
+        let made = prepare_worktree(&id, RUN, &base, "2026-11-10-demo", &run_dir);
+        assert!(
+            made.is_ok(),
+            "a missing exclude file was not created: {:?}",
+            made.err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(id.common_dir.join("info/exclude")).unwrap(),
+            ".worktrees/\n.leadhand/\n"
+        );
+        assert_eq!(f.git(&repo, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
     fn prepare_worktree_makes_the_branch_worktree_excludes_and_record() {
         use std::os::unix::fs::PermissionsExt;
         let f = Fixture::new();

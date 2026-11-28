@@ -661,6 +661,27 @@ mod tests {
     }
 
     #[test]
+    fn a_git_killed_by_a_signal_fails_with_the_negative_signal() {
+        // As Python's `returncode`: a Git killed by signal N failed with exit -N, which no
+        // exit code can be.
+        let f = Fixture::new();
+        let repo = f.make_repo("my repo");
+        let git = Git::at(&repo).unwrap();
+        let out = Output {
+            // A raw wait status: killed by SIGKILL, no exit code.
+            status: std::process::ExitStatus::from_raw(9),
+            stdout: Vec::new(),
+            stderr: b"killed\n".to_vec(),
+        };
+        let e = git.failure(&[os("rev-parse"), os("HEAD")], &out);
+        assert!(
+            e.message
+                .starts_with("git rev-parse HEAD failed with exit -9 (in "),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn failure_text_keeps_bytes_and_failure_shows_them_as_before() {
         let f = Fixture::new();
         let repo = f.make_repo("my repo");

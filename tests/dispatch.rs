@@ -840,6 +840,37 @@ mod runner_lifecycle {
     }
 
     #[test]
+    fn test_runner_dead_after_its_launch_intent_is_recorded_as_interrupted() {
+        // A runner that died after its launch intent, before Codex was recorded, may have
+        // started Codex: the next `dispatch` records that generation as an interrupted
+        // attempt before it replaces the runner.
+        let mut w = World::new();
+        w.scenario("ready", &[]);
+        w.env.set("LEADHAND_CRASH_AT", "before_worker_launch");
+        let r = w.dispatch("d1");
+        assert_eq!(r.code, 1, "{r}");
+        w.env.remove("LEADHAND_CRASH_AT");
+        let r = w.dispatch("d1").ok();
+        assert_eq!(r.stdout_text().lines().next(), Some("Status: READY"), "{r}");
+        let superseded = w.wd("d1").join("superseded/1/result.json");
+        assert!(
+            superseded.exists(),
+            "the dead runner's generation was replaced without a result"
+        );
+        assert_eq!(read_json(&superseded)["exit_reason"], "interrupted");
+        let attempts = w
+            .attempts()
+            .iter()
+            .map(|a| pick(a, &["generation", "exit_reason"]))
+            .collect();
+        assert_json_eq!(
+            Json::Arr(attempts),
+            jv(r#"[[1, "interrupted"], [2, "completed"]]"#),
+            "one attempt for each generation launched"
+        );
+    }
+
+    #[test]
     fn test_ready_result_landing_during_replacement_cancel_is_kept() {
         let _serial = common::serial(); // group: the stop ladder (a hung runner replaced)
         let mut w = World::new();
