@@ -610,6 +610,37 @@ mod fix_waves {
     }
 
     #[test]
+    fn test_a_fix_waves_acceptance_intent_names_its_wave() {
+        let mut w = gated(&[card(1)]);
+        w.start();
+        w.script(None, "final_review", [with_verdict("defects")]);
+        w.run();
+        let intent = one(w
+            .events("accept_started")
+            .into_iter()
+            .filter(|e| e["card"] == "final")
+            .collect());
+        let acc = one(accepted_of(&w, &Json::from("final")));
+        // The record the Python reference writes for a fix wave's acceptance.
+        let got = Json::Arr(
+            ["card", "wave", "target", "dispatch_id"]
+                .iter()
+                .map(|k| intent.get(k).cloned().unwrap_or(Json::Null))
+                .collect(),
+        );
+        assert_json_eq!(
+            got,
+            Json::Arr(vec![
+                "final".into(),
+                Json::from(1_i64),
+                acc["sha"].clone(),
+                "run-w1-final_review-1".into()
+            ]),
+            "the fix wave's accept_started: {intent}"
+        );
+    }
+
+    #[test]
     fn test_verify_fix_after_security_pass_reruns_security_and_evidence() {
         let mut w = gated(&[risky(1, "medium")]);
         w.start();
@@ -830,6 +861,63 @@ mod evidence {
         assert!(!w.paths().handoff.exists()); // the blocked run's handoff is gone
         assert_eq!(runs_lines(&w).len(), 1);
         assert!(runs_lines(&w)[0].contains("| complete |"));
+    }
+
+    #[test]
+    fn test_handoff_lists_the_outcomes_reasons() {
+        let (w, done) = evidence_fails("[run]\nevidence = \"block\"\n");
+        let reasons = strs(&done["reasons"]);
+        assert!(
+            reasons.iter().any(|r| r == "blocked: decision needed"),
+            "{reasons:?}"
+        );
+        let handoff = lines(&read_text(&w.paths().handoff));
+        let at = |heading: &str| {
+            handoff
+                .iter()
+                .position(|l| l == heading)
+                .unwrap_or_else(|| panic!("no {heading:?} in {handoff:#?}"))
+        };
+        // "## Why", a blank line, the reasons, a blank line, "## What to do".
+        let why = &handoff[at("## Why") + 2..at("## What to do") - 1];
+        let listed: Vec<String> = reasons.iter().map(|r| format!("- {r}")).collect();
+        assert_eq!(why, listed, "the handoff's reasons are not the outcome's");
+    }
+
+    #[test]
+    fn test_a_resumed_runs_line_is_replaced_in_place() {
+        let (mut w, _done) = evidence_fails("[run]\nevidence = \"block\"\n");
+        // A later run sharing the docs folder writes its own line after this run's.
+        let other =
+            "| 2026-01-01 | Another deck | complete | 1/1 cards | $0.00 | /elsewhere/another-run |";
+        let index = w.docs.join("runs.md");
+        fs::write(&index, format!("{}{other}\n", read_text(&index))).unwrap();
+        relaunch(&w);
+        w.script(
+            None,
+            "evidence",
+            [Step {
+                result: Some("pass".into()),
+                ..Step::default()
+            }],
+        );
+        assert_eq!(finish_run(&mut w)["outcome"], "complete");
+        let all = lines(&read_text(&index));
+        let cell = format!("| {} |", s(&run_dir(&w)));
+        let ours: Vec<usize> = (0..all.len())
+            .filter(|i| all[*i].ends_with(&cell))
+            .collect();
+        let [ours] = <[usize; 1]>::try_from(ours)
+            .unwrap_or_else(|o| panic!("expected one line of this run: {o:?} in {all:#?}"));
+        assert!(all[ours].contains("| complete |"), "{}", all[ours]);
+        let theirs = all
+            .iter()
+            .position(|l| l == other)
+            .unwrap_or_else(|| panic!("the other run's line is gone: {all:#?}"));
+        assert!(
+            ours < theirs,
+            "this run's line moved below the later run's instead of being replaced in place: {all:#?}"
+        );
     }
 }
 
@@ -1836,6 +1924,22 @@ mod base_worktree_ownership {
             field(&passed, "gate"),
             jv(r#"["final_review", "evidence", "verify"]"#)
         );
+    }
+
+    #[test]
+    fn test_a_clean_worktree_at_the_base_path_outside_the_crash_window_is_refused() {
+        // Detached at the base and holding nothing, but with no add recorded: not the run's.
+        let mut w = gated(&[card(1)]);
+        w.start();
+        let path = base_wt(&w);
+        run_git(
+            &w.repo,
+            &["worktree", "add", "--quiet", "--detach", s(&path), &w.base],
+        );
+        assert!(!marker(&path).exists());
+        assert_refused!(drive_until_refused(&mut w), path);
+        assert!(!marker(&path).exists(), "the run claimed the worktree");
+        assert_empty!(w.events("base_worktree_ready"));
     }
 }
 

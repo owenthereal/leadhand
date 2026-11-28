@@ -677,6 +677,21 @@ mod tests {
     }
 
     #[test]
+    fn a_suffix_pattern_matches_before_a_final_newline_as_python_does() {
+        // Python's `$` also matches right before a final newline, so a worker cannot dodge the
+        // security gate by ending a key file's name with one.
+        for p in [
+            "certs/server.pem\n",
+            "main.tf\n",
+            "ops/docker-compose.yml\n",
+        ] {
+            assert!(is_sensitive_path(&PyStr::from(p)), "{p:?} is not sensitive");
+        }
+        // A newline that is not the last character is not the end.
+        assert!(!is_sensitive_path(&PyStr::from("certs/server.pem\nx")));
+    }
+
+    #[test]
     fn the_risk_card_is_the_first_of_the_highest_risk_stripped_of_pins() {
         let card = |n: u32, risk: &str| Card {
             number: n,

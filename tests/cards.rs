@@ -366,6 +366,44 @@ mod loop_ {
     }
 
     #[test]
+    fn test_a_blocked_answer_after_an_answered_question_is_retried_once() {
+        // The earlier answer's QUESTION is not a failure: the BLOCKED answer is the first one,
+        // so it gets its one retry.
+        let mut w = FakeSupervisor::new(&[card(1)]);
+        w.start();
+        w.script(1, "implement", [with_status("QUESTION")]);
+        w.script(
+            1,
+            "answer",
+            [
+                with_status("QUESTION"),
+                Step {
+                    blocked_by: Some("environment".into()),
+                    ..with_status("BLOCKED")
+                },
+                with_status("READY"),
+            ],
+        );
+        w.rulings
+            .insert(1, common::str_vec(&["Use JSON.", "Keep the old name."]));
+        let done = w.run().pop().unwrap();
+        assert_eq!(
+            w.dispatch_ids(),
+            [
+                "c1-a1-implement-1",
+                "c1-a1-answer-1",
+                "c1-a1-answer-2",
+                "c1-a1-answer-3",
+                "c1-a1-review-1"
+            ],
+            "the first BLOCKED answer was not retried: {done}"
+        );
+        // The card loop ends with the card accepted and the run not ended.
+        assert_json_eq!(pick(&done, &["action", "outcome"]), jv(r#"["done", null]"#));
+        assert_json_eq!(field(&w.events("accepted"), "card"), jv("[1]"));
+    }
+
+    #[test]
     fn test_by_risk_review_skips_low_risk_card() {
         let mut w = FakeSupervisor::with_options(
             &[
@@ -1841,6 +1879,34 @@ mod by_risk {
         let accepted = w.events("accepted");
         assert!(accepted.is_empty(), "{accepted:?}");
         assert_eq!(w.branch_tip(RUN), w.base);
+        assert_json_eq!(
+            pick(&nxt, &["action", "kind"]),
+            jv(r#"["dispatch", "review"]"#)
+        );
+    }
+
+    #[test]
+    fn test_ready_at_an_escalated_attempts_start_tip_goes_to_review() {
+        // Attempt 2 starts on attempt 1's committed work, not on the card's base: a READY
+        // that adds nothing to it changed nothing, so it is reviewed.
+        let mut w = by_risk_world();
+        w.start();
+        w.script(1, "implement", [with_status("SPENT")]);
+        let a = w.next();
+        w.act(&a);
+        let a2 = w.next();
+        assert_json_eq!(
+            pick(&a2, &["action", "kind", "dispatch_id"]),
+            jv(r#"["dispatch", "implement", "c1-a2-implement-1"]"#)
+        );
+        let worker = w.launch(&a2);
+        result(&w, &a2, &worker, "Status: READY\nReport: none", &[]);
+        let nxt = w.next();
+        let accepted = w.events("accepted");
+        assert!(
+            accepted.is_empty(),
+            "accepted without review at attempt 1's tip: {accepted:?}"
+        );
         assert_json_eq!(
             pick(&nxt, &["action", "kind"]),
             jv(r#"["dispatch", "review"]"#)

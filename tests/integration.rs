@@ -22,14 +22,15 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use common::engine::{
-    CARD1, NOTE, RUN, codex_world, files, found, found_by, last, parked_world, parked_world_with,
-    requested, run_id, seq, tampering, unpark, with_status, with_verdict,
+    CARD1, CODEX_CARD, NOTE, RUN, codex_world, files, found, found_by, last, parked_world,
+    parked_world_with, requested, run_id, seq, tampering, unpark, with_status, with_verdict,
 };
 use common::git::{self, commit, current_branch, git_ok, run_git};
 use common::json::Json;
 use common::rundir::append_event;
 use common::supervisor::{
-    CliOpts, FakeSupervisor, Options, Step, card, os_path, run_dir, text, truthy,
+    CardOpts, CliOpts, FakeSupervisor, Options, Step, card, card_with, os_path, run_dir, text,
+    truthy,
 };
 use common::{field, index, jv, n_of, one, pick, read_text, shlex_split};
 
@@ -400,6 +401,45 @@ mod unpark {
         assert_json_eq!(accepted_cards(&w), jv("[1]"));
         assert_run_tip_is_accepted!(w, 1);
         assert!(on_branch(&w, RUN, "src/card1/c1-a1-implement-2.txt"));
+    }
+
+    #[test]
+    fn test_unparked_codex_card_resumes_its_codex_worker() {
+        // A Codex worker that recorded its session can still be reached: the note answers it,
+        // instead of a fresh worker starting without its context.
+        let mut w = codex_world(
+            &[
+                card_with(
+                    1,
+                    CardOpts {
+                        route: Some(CODEX_CARD),
+                        ..CardOpts::default()
+                    },
+                ),
+                card(2),
+            ],
+            Options::default(),
+        );
+        w.session("supervisor-1");
+        w.start();
+        w.script(1, "implement", [with_status("QUESTION")]);
+        w.parks
+            .insert(1, "decision needed: storage format".to_string());
+        w.run();
+        w.parks.remove(&1).expect("card 1's park");
+        unpark(&w, 1, NOTE);
+        w.run();
+        let ids = w.dispatch_ids();
+        assert!(
+            !ids.iter().any(|i| i == "c1-a1-implement-2"),
+            "a fresh worker replaced the Codex one: {ids:?}"
+        );
+        assert!(ids.iter().any(|i| i == "c1-a1-answer-1"), "{ids:?}");
+        let ans = requested(&w, "c1-a1-answer-1");
+        assert_json_eq!(
+            pick(&ans, &["resumes", "vendor"]),
+            jv(r#"["c1-a1-implement-1", "codex"]"#)
+        );
     }
 
     /// Covers limit M6 (run forgery): `unpark` has no caller check; any process that can run
