@@ -495,6 +495,35 @@ mod tests {
         );
     }
 
+    // Detached at a commit other than the run head, the worktree is left where it is and the
+    // release is skipped, naming both commits.
+    #[test]
+    fn a_worktree_detached_off_the_run_head_is_skipped_with_its_reason() {
+        let f = Fixture::new();
+        let (run, sha) = run(&f);
+        f.git(&run.ws, &["switch", "-q", "--detach"]);
+        f.git(
+            &run.ws,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "moved off the run head",
+            ],
+        );
+        let at = f.git(&run.ws, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            detach(&run.repo, &run.ws, &run.branch, Some(&sha)).map(|w| w.lossy().into_owned()),
+            Some(format!(
+                "the run worktree is detached at {}, not at the run head {}",
+                &at[..12],
+                &sha[..12]
+            ))
+        );
+        assert_eq!(f.git(&run.ws, &["rev-parse", "HEAD"]), at);
+    }
+
     #[test]
     fn a_deleted_worktree_folder_still_holds_the_branch_until_pruned() {
         let f = Fixture::new();

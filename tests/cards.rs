@@ -1517,7 +1517,7 @@ mod codex {
     use super::*;
     use crate::common::engine::{CARD1, codex_world};
     use crate::common::launch_world::now;
-    use crate::common::rundir::epoch_seconds;
+    use crate::common::rundir::{epoch_seconds, read_records};
     use crate::common::supervisor::{Options, card};
     use crate::common::{index, names_bin, shlex_split};
 
@@ -1589,6 +1589,42 @@ mod codex {
         w.act(&review);
         assert_eq!(w.run().last().unwrap()["action"], "done");
         assert_json_eq!(field(&w.events("accepted"), "card"), jv("[1]"));
+    }
+
+    /// `record result` for a Codex dispatch writes the engine's attempt for its proxy, though the
+    /// runner already wrote its own attempt record for the dispatch.
+    #[test]
+    fn test_codex_result_writes_the_proxys_engine_attempt() {
+        let mut w = codex_world(&[card(1)], Options::default());
+        w.start();
+        let a = w.next();
+        let did = text(&a["dispatch_id"]).to_string();
+        let worker = w.launch(&a);
+        let reply = w.perform(&a, &worker).expect("a reply");
+        result(&w, &a, &worker, &reply, &[]);
+        let runner: Vec<Json> = read_records(&w.paths().attempts)
+            .into_iter()
+            .filter(|r| r["dispatch"] == did.as_str() && r.get("recorded_by").is_none())
+            .collect();
+        assert_json_eq!(
+            field(&runner, "vendor"),
+            jv(r#"["codex"]"#),
+            "the runner's attempt for {did}"
+        );
+        let engine: Vec<Json> = w
+            .attempts()
+            .into_iter()
+            .filter(|r| r["dispatch"] == did.as_str())
+            .collect();
+        assert_json_eq!(
+            field(&engine, "role"),
+            jv(r#"["proxy"]"#),
+            "the engine's attempts for {did}"
+        );
+        assert_json_eq!(
+            field(&engine, "charge_ids"),
+            Json::from(vec![Json::from(&[format!("{did}:claude:{worker}")][..])])
+        );
     }
 
     #[test]
@@ -1979,6 +2015,28 @@ mod decision_needed {
         );
         let done = w.run().pop().unwrap();
         assert_eq!(done["outcome"], "incomplete", "{}", done["reasons"]);
+    }
+
+    /// Each parked card is judged by its own latest park: another card's later decision park
+    /// does not make the operator's plain park wait on a decision.
+    #[test]
+    fn test_a_decision_park_after_another_cards_plain_park_still_ends_incomplete() {
+        let mut w = gated(&[card(1), card(2)]);
+        w.start();
+        let a = w.next();
+        w.act(&a);
+        recorded(
+            &w,
+            "park",
+            &os_args!["--card", "1", "--reason", "operator: skip"],
+        );
+        w.script(2, "implement", [with_status("QUESTION")]);
+        w.parks
+            .insert(2, "decision needed: which storage format".to_string());
+        let done = w.run().pop().unwrap();
+        assert_json_eq!(field(&w.events("parked"), "card"), jv("[1, 2]"));
+        assert_eq!(done["outcome"], "incomplete", "{}", done["reasons"]);
+        assert_ne!(done["qualifier"], "decision needed", "{}", done["reasons"]);
     }
 
     #[test]

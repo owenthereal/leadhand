@@ -1116,6 +1116,44 @@ mod guards {
         assert_json_eq!(field(&evidence, "dispatch_id"), jv(r#"["run-evidence-2"]"#));
     }
 
+    /// The `found` record of an evidence base violation carries the voided request's guard
+    /// (`expected_head`, `expected_branch`) and `head_moved`, as `docs/cli-contract.md` lists
+    /// them.
+    #[test]
+    fn test_evidence_base_violation_records_the_requests_guard() {
+        let tamper = |world: &FakeSupervisor, _ws: &Path, _a: &Json| {
+            let bw = base_wt(world);
+            commit(
+                &bw,
+                &[("src/moved.txt", "moved\n")],
+                "verifier moved the base",
+            );
+        };
+        let mut w = gated(&[card(1)]);
+        w.start();
+        w.script(None, "evidence", [tampering(tamper), Step::default()]);
+        let done = finish_run(&mut w);
+        assert_eq!(done["outcome"], "complete", "{}", done["reasons"]);
+        let v = one(found_violations(&w));
+        let req = one(w
+            .events("dispatch_requested")
+            .into_iter()
+            .filter(|e| e["dispatch_id"] == v["dispatch_id"])
+            .collect());
+        assert_eq!(req["dispatch_id"], "run-evidence-1");
+        for key in ["expected_head", "expected_branch"] {
+            let guard = req
+                .get(key)
+                .unwrap_or_else(|| panic!("the request has no {key}: {req}"));
+            assert_eq!(v.get(key), Some(guard), "{key}: {v}");
+        }
+        assert_eq!(
+            v.get("head_moved").and_then(Json::as_bool),
+            Some(true),
+            "{v}"
+        );
+    }
+
     #[test]
     fn test_evidence_base_edit_hidden_behind_an_index_flag_is_violation() {
         let tamper = |world: &FakeSupervisor, _ws: &Path, _a: &Json| {
@@ -1535,6 +1573,41 @@ mod fix_round2 {
             ),
             "run-w1-final_fix-1"
         );
+    }
+
+    /// R36, twice: each voided final fix's commits are kept under its own violation's number,
+    /// so the second keep ref never takes the first one's place.
+    #[test]
+    fn test_each_voided_final_fix_is_kept_under_its_own_violation_number() {
+        let mut w = gated(&[card(1)]);
+        w.start();
+        w.script(None, "final_review", [with_verdict("defects")]);
+        let rewind = |world: &FakeSupervisor, ws: &Path, _a: &Json| {
+            run_git(ws, &["branch", "-f", RUN, &world.base]);
+        };
+        w.script(
+            None,
+            "final_fix",
+            [tampering(rewind), tampering(rewind), Step::default()],
+        );
+        let done = finish_run(&mut w);
+        assert_eq!(done["outcome"], "complete", "{}", done["reasons"]);
+        let found = found_violations(&w);
+        assert_json_eq!(
+            field(&found, "dispatch_id"),
+            jv(r#"["run-w1-final_fix-1", "run-w1-final_fix-2"]"#)
+        );
+        // Worker k's own file, read from the keep ref of the violation that voided it.
+        let kept: Vec<String> = found
+            .iter()
+            .zip(1..)
+            .map(|(v, k)| {
+                let keep = format!("refs/leadhand/{}/violations/{}-final", run_id(&w), v["n"]);
+                let path = format!("{keep}:src/final/run-w1-final_fix-{k}.txt");
+                run_git_unchecked(&w.repo, &["show", &path])
+            })
+            .collect();
+        assert_eq!(kept, ["run-w1-final_fix-1", "run-w1-final_fix-2"]);
     }
 }
 

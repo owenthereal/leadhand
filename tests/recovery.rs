@@ -465,6 +465,31 @@ mod reconcile {
         assert_eq!(implements, 1);
     }
 
+    /// The result the reconciliation records for a dead worker is marked `reconciled`; one the
+    /// supervisor records is not.
+    #[test]
+    fn test_a_result_the_reconciliation_records_is_marked_reconciled() {
+        let mut w = session_world(&[card(1)]);
+        let a = w.next();
+        let worker = w.launch(&a);
+        w.perform(&a, &worker);
+        resume(&mut w);
+        let nxt = w.next();
+        let res = one(w.events("result_recorded"));
+        assert_eq!(
+            res.get("reconciled").and_then(Json::as_bool),
+            Some(true),
+            "{res}"
+        );
+        w.act(&nxt);
+        let review = w
+            .events("result_recorded")
+            .into_iter()
+            .find(|e| e["dispatch_id"] == "c1-a1-review-1")
+            .expect("no result_recorded for the review");
+        assert!(review.get("reconciled").is_none(), "{review}");
+    }
+
     #[test]
     fn test_commits_without_report_continue_not_discard() {
         let mut w = session_world(&[card(1)]);
@@ -724,6 +749,34 @@ mod codex {
             ja![did.as_str(), "READY"]
         );
         assert_eq!(codex_starts(&w), started_once(&did));
+    }
+
+    /// The session died once the proxy's runner had finished, before `record result`: the
+    /// relaunch records the runner's result and charges the proxy's session, as `record result`
+    /// would have.
+    #[test]
+    fn test_a_finished_codex_runner_is_recorded_and_its_proxy_charged_on_relaunch() {
+        let mut w = started_codex_world();
+        let a = w.next();
+        let did = text(&a["dispatch_id"]).to_string();
+        let worker = w.launch(&a);
+        w.perform(&a, &worker); // the proxy and its runner ran to the end; nothing recorded it
+        resume(&mut w);
+        w.next();
+        let rec = one(w.events("reconciled"));
+        assert!(
+            json_in(
+                "card 1's Codex worker had finished; its result was recorded",
+                &rec["found"]
+            ),
+            "{rec}"
+        );
+        let charge_id = format!("{did}:claude:{worker}");
+        let res = one(w.events("result_recorded"));
+        assert_json_eq!(res["charge_ids"], ja![charge_id.as_str()], "{res}");
+        assert!(res.get("reconciled").is_none(), "{res}");
+        let ids = field(&w.charges(), "charge_id");
+        assert!(json_in(&charge_id, &ids), "{ids}");
     }
 
     #[test]
